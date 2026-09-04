@@ -1,0 +1,987 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<!-- 本原型决议（wayfinder #08 游玩界面设计）：多模板 = A 聊天流 / B 剧本式（纸面浅色）/ C 沉浸式视觉小说 三套演出模板并存、玩家/创作者可随时切换；同一场戏、同一回合模型，仅呈现层不同。共性（Q2-Q6 决议）：单栏叙事为主舞台，面板走抽屉/边栏且各变体形态不同；机制动作=流内挂起确认卡片（可全局免确认）；元指令=同一输入框 / 前缀 + 常驻快捷按钮；角色状态=常驻紧凑演员卡、点开全表；流式=就地打字机+可跳过+管线阶段徽标（主线思考中→角色回应中→结算中）。判定卡呈现跟随故事书判定器（本演示为 d20 风格参数）。演示：坠星谷·酒馆，玩家输入→判定「观察」→确认→结算→日志更新。 -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>游玩界面原型 · 坠星谷 — wayfinder #08</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#151a22; --panel2:#1b2230; --line:#262f3f;
+    --ink:#e8edf5; --muted:#8b97a8; --accent:#6ea8ff; --ok:#4ade80; --warn:#fbbf24; --err:#f87171;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14px;line-height:1.55;height:100vh;overflow:hidden}
+  #topbar{height:46px;display:flex;align-items:center;gap:14px;padding:0 16px;background:var(--panel);border-bottom:1px solid var(--line);position:relative;z-index:5}
+  #topbar .badge{font-size:11px;font-weight:700;letter-spacing:.5px;padding:3px 8px;border-radius:4px;background:rgba(255,255,255,.06);color:var(--muted);border:1px solid var(--line);white-space:nowrap}
+  #topbar .title{font-weight:700;white-space:nowrap}
+  #topbar .spacer{flex:1}
+  #topbar button{background:transparent;border:1px solid var(--line);color:var(--ink);padding:4px 10px;border-radius:6px;font-size:12px;cursor:pointer;font-family:var(--sans);white-space:nowrap}
+  #topbar button:hover{border-color:var(--accent)}
+  #topbar button.on{border-color:var(--ok);color:var(--ok)}
+  #view{position:absolute;top:46px;left:0;right:0;bottom:0}
+  .variant{display:none;height:100%}
+  body[data-variant="A"] .variant.A{display:block}
+  body[data-variant="B"] .variant.B{display:block}
+  body[data-variant="C"] .variant.C{display:block}
+  #switchbar{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);z-index:50;display:flex;align-items:center;gap:8px;background:#0b0e14;border:1px solid #334155;border-radius:999px;padding:6px 12px;box-shadow:0 8px 30px rgba(0,0,0,.5)}
+  #switchbar .sw-arrow{width:30px;height:30px;border-radius:50%;border:1px solid #334155;background:transparent;color:var(--ink);font-size:16px;cursor:pointer;display:flex;align-items:center;justify-content:center}
+  #switchbar .sw-arrow:hover{border-color:var(--accent)}
+  #switchbar .sw-label{font-size:12px;color:var(--muted);min-width:210px;text-align:center}
+  #switchbar .sw-label b{color:var(--ink);font-size:13px}
+  #drawer{position:fixed;top:0;right:0;bottom:0;width:46vw;min-width:480px;background:#0a0d12;border-left:1px solid var(--line);z-index:60;transform:translateX(100%);transition:transform .18s ease;display:flex;flex-direction:column}
+  #drawer.open{transform:translateX(0)}
+  #drawer header{padding:12px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px;font-weight:700}
+  #drawer .close{margin-left:auto;background:none;border:1px solid var(--line);color:var(--muted);cursor:pointer;border-radius:6px;padding:2px 8px}
+  #drawer .body{flex:1;overflow:auto;padding:16px 20px;font-size:13.5px;color:var(--ink);line-height:1.7}
+  #drawer .body h4{margin:14px 0 6px;color:var(--accent);font-size:13px}
+  #drawer .body p{margin:4px 0;color:var(--muted)}
+  #drawer .body b{color:var(--ink)}
+  /* 演出模板选择器 */
+  #tplWrap{position:relative}
+  #tplBtn{background:var(--panel2);border:1px solid var(--line);color:var(--ink);padding:5px 12px;border-radius:8px;font-size:12.5px;cursor:pointer;font-family:var(--sans);white-space:nowrap}
+  #tplBtn:hover{border-color:var(--accent)}
+  #tplMenu{position:absolute;top:calc(100% + 6px);left:0;background:#0b0e14;border:1px solid var(--line);border-radius:12px;padding:6px;width:270px;display:none;z-index:70;box-shadow:0 8px 30px rgba(0,0,0,.5)}
+  #tplMenu.open{display:block}
+  #tplMenu .tpl{padding:9px 11px;border-radius:9px;cursor:pointer;border:1px solid transparent}
+  #tplMenu .tpl:hover{background:rgba(110,168,255,.1)}
+  #tplMenu .tpl.sel{border-color:var(--accent);background:rgba(110,168,255,.14)}
+  #tplMenu .tpl .tn{font-weight:700;font-size:13px}
+  #tplMenu .tpl .td{color:var(--muted);font-size:11.5px;margin-top:2px}
+
+  /* ============ 通用小件 ============ */
+  .btn{border:1px solid var(--line);background:var(--panel2);color:var(--ink);padding:6px 14px;border-radius:8px;font-size:13px;cursor:pointer;font-family:var(--sans)}
+  .btn.primary{background:var(--accent);border-color:var(--accent);color:#081018;font-weight:700}
+  .btn.small{padding:3px 10px;font-size:12px;border-radius:6px}
+  .btn:hover{filter:brightness(1.1)}
+  .chip{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:var(--muted);background:rgba(255,255,255,.05);border:1px solid var(--line);border-radius:999px;padding:3px 10px}
+  .chip .dot{width:6px;height:6px;border-radius:50%;background:var(--warn);animation:blink 1s infinite}
+  @keyframes blink{50%{opacity:.25}}
+  .spacer{flex:1}
+  /* 全局浮层：切换器 / 侧边信息（不随变体切换器走，故独立于 .A 作用域） */
+  .switcher{position:fixed;inset:0;background:rgba(5,7,10,.6);display:none;align-items:center;justify-content:center;z-index:40}
+  .switcher.open{display:flex}
+  .switcher .card{background:#0b0e14;border:1px solid var(--line);border-radius:16px;padding:20px;width:340px}
+  .switcher .card .p-title{font-weight:800;color:var(--warn);font-size:12px;letter-spacing:.5px;margin-bottom:12px}
+  .switcher .opt{display:flex;align-items:center;gap:10px;padding:10px;border-radius:10px;cursor:pointer;border:1px solid transparent}
+  .switcher .opt:hover{background:rgba(255,255,255,.05)}
+  .switcher .opt.sel{border-color:var(--accent);background:rgba(110,168,255,.1)}
+  .switcher .card .av{width:36px;height:36px;border-radius:10px;font-weight:800;font-size:13px;display:flex;align-items:center;justify-content:center;color:#081018}
+  .switcher .card .nm{font-weight:800;font-size:14px}
+  .switcher .card .rl{color:var(--muted);font-size:11.5px}
+  .sideinfo{position:fixed;top:46px;right:0;bottom:0;width:300px;background:var(--panel);border-left:1px solid var(--line);z-index:20;transform:translateX(100%);transition:transform .18s ease;padding:16px;overflow-y:auto}
+  .sideinfo.open{transform:translateX(0)}
+  .sideinfo h3{font-size:13px;color:var(--muted);margin:12px 0 6px}
+  .sideinfo .mapbox{background:var(--panel2);border:1px solid var(--line);border-radius:10px;height:140px;position:relative;overflow:hidden}
+  .sideinfo .mapbox .node{position:absolute;font-size:10px;color:var(--muted);background:#0b0e14;border:1px solid var(--line);padding:2px 7px;border-radius:6px}
+  .sideinfo .mapbox .node.cur{color:var(--accent);border-color:var(--accent)}
+  .sideinfo .quest{border-left:2px solid var(--accent);padding:4px 0 4px 10px;margin:6px 0}
+  .sideinfo .quest .qt{font-weight:700}
+  .sideinfo .quest .qd{color:var(--muted);font-size:12.5px}
+
+  /* ==================== 变体 A · 聊天流 ==================== */
+  .A{background:var(--bg)}
+  .A .awrap{display:flex;height:100%}
+  .A .chat{flex:1;min-width:0;display:flex;flex-direction:column;max-width:820px;margin:0 auto;width:100%}
+  .A .chathead{display:flex;align-items:center;gap:10px;padding:10px 18px 6px;color:var(--muted);font-size:12.5px}
+  .A .chathead .scene{font-weight:700;color:var(--ink)}
+  .A .msgs{flex:1;overflow-y:auto;padding:10px 18px 16px;display:flex;flex-direction:column;gap:12px}
+  .A .msg{max-width:78%;display:flex;gap:10px;align-items:flex-start}
+  .A .msg .av{width:34px;height:34px;border-radius:50%;flex:none;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:800;color:#081018}
+  .A .msg .bub{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:9px 13px;font-size:14px;line-height:1.6}
+  .A .msg .who{font-size:11.5px;color:var(--muted);margin-bottom:3px;font-weight:700}
+  .A .msg.mine{flex-direction:row-reverse;margin-left:auto}
+  .A .msg.mine .bub{background:rgba(110,168,255,.14);border-color:rgba(110,168,255,.4)}
+  .A .msg.mine .who{text-align:right}
+  .A .narration{max-width:88%;align-self:center;text-align:center;color:var(--muted);font-size:13.5px;font-style:italic}
+  .A .emote{align-self:center;color:#c9a86a;font-style:italic;font-size:13.5px;text-align:center}
+  .A .stage{display:flex;justify-content:center;padding:2px 0}
+  .A .sys{max-width:88%;align-self:center;color:#a0b3c9;font-size:12.5px;background:rgba(110,168,255,.08);border:1px dashed rgba(110,168,255,.35);border-radius:10px;padding:8px 14px}
+  .A .checkcard{max-width:88%;align-self:center;width:100%;background:linear-gradient(180deg,#17202e,#121722);border:1px solid #31415a;border-radius:14px;padding:14px 16px}
+  .A .checkcard .ch-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .A .checkcard .dice{width:44px;height:44px;border-radius:10px;background:#e9c46a;color:#14100a;font-family:var(--mono);font-weight:800;font-size:22px;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 14px rgba(233,196,106,.3)}
+  .A .checkcard .line{font-size:13.5px}
+  .A .checkcard .line b{font-size:15px}
+  .A .checkcard .mod{color:var(--muted);font-size:12.5px}
+  .A .checkcard .out{font-weight:800}
+  .A .checkcard .out.ok{color:var(--ok)} .A .checkcard .out.crit{color:#a7f3d0}
+  .A .checkcard .out.part{color:var(--warn)} .A .checkcard .out.fail{color:var(--err)}
+  .A .pending{align-self:center;width:100%;max-width:88%;border:1px solid var(--warn);border-radius:14px;background:rgba(251,191,36,.07);padding:12px 16px}
+  .A .pending .p-title{font-weight:800;color:var(--warn);font-size:12px;letter-spacing:.5px;margin-bottom:6px}
+  .A .pending .p-body{font-size:14px}
+  .A .pending .p-detail{color:var(--muted);font-size:12.5px;margin:4px 0 10px}
+  .A .pending .p-actions{display:flex;gap:10px}
+  .A .actorpanel{width:264px;flex:none;border-left:1px solid var(--line);background:var(--panel);padding:14px;overflow-y:auto;display:flex;flex-direction:column;gap:12px}
+  .A .actorpanel .act-head{display:flex;gap:10px;align-items:center}
+  .A .actorpanel .act-head .av{width:44px;height:44px;border-radius:12px;font-size:15px;font-weight:800;display:flex;align-items:center;justify-content:center;color:#081018}
+  .A .actorpanel .act-head .nm{font-weight:800;font-size:15px}
+  .A .actorpanel .act-head .rl{color:var(--muted);font-size:11.5px}
+  .A .actorpanel .tag{font-size:10.5px;background:rgba(110,168,255,.2);color:var(--accent);border-radius:999px;padding:2px 8px;font-weight:700}
+  .A .attrgrid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+  .A .attr{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:6px 9px}
+  .A .attr .k{font-size:11px;color:var(--muted)}
+  .A .attr .v{font-size:15px;font-weight:800}
+  .A .resbar{margin-top:3px}
+  .A .resbar .rk{font-size:11px;color:var(--muted);display:flex;justify-content:space-between}
+  .A .resbar .bar{height:6px;border-radius:99px;background:var(--panel2);margin-top:3px;overflow:hidden}
+  .A .resbar .bar i{display:block;height:100%;background:linear-gradient(90deg,#6ea8ff,#4ade80);border-radius:99px}
+  .A .skillwrap{display:flex;flex-wrap:wrap;gap:6px}
+  .A .skill{font-size:11.5px;background:rgba(255,255,255,.06);border:1px solid var(--line);padding:3px 9px;border-radius:99px;color:var(--muted)}
+  .A .inputbar{border-top:1px solid var(--line);background:var(--panel);padding:10px 16px;display:flex;gap:8px;align-items:center}
+  .A .quick{display:flex;gap:6px}
+  .A .inputbar input{flex:1;background:var(--panel2);border:1px solid var(--line);border-radius:10px;color:var(--ink);padding:10px 14px;font-size:14px;font-family:var(--sans);outline:none}
+  .A .inputbar input:focus{border-color:var(--accent)}
+  .A .inputbar input:disabled{opacity:.45}
+  .A .hint{color:var(--muted);font-size:12px}
+  .A .cmds{position:relative;flex:1;display:flex}
+  .A .cmdpop{position:absolute;bottom:calc(100% + 6px);left:0;background:#0b0e14;border:1px solid var(--line);border-radius:10px;padding:6px;width:230px;display:none;box-shadow:0 8px 30px rgba(0,0,0,.5)}
+  .A .cmdpop.open{display:block}
+  .A .cmdpop .it{padding:6px 10px;border-radius:6px;font-size:13px;cursor:pointer;display:flex;justify-content:space-between;color:var(--muted)}
+  .A .cmdpop .it:hover{background:rgba(110,168,255,.12);color:var(--ink)}
+  .A .cmdpop .it b{color:var(--accent);font-family:var(--mono)}
+
+  /* ==================== 变体 B · 剧本式（纸面） ==================== */
+  .B{--paper:#f6f1e6; --paper2:#efe7d6; --ink:#23252b; --muted:#7a7466; --line:#d8cbb0; --accent:#b45309; --ok:#4a7c3a; --warn:#a16207; --err:#b3352b;
+      background:var(--paper);color:var(--ink);font-family:Georgia,"Songti SC","SimSun",serif}
+  .B .bwrap{display:flex;height:100%}
+  .B .bcast{width:220px;flex:none;background:var(--paper2);border-right:1px solid var(--line);padding:16px 14px;overflow-y:auto}
+  .B .bcast h2{font-size:12px;letter-spacing:2px;color:var(--accent);font-family:var(--sans);font-weight:800;margin-bottom:12px}
+  .B .castitem{padding:9px 10px;border-radius:8px;cursor:pointer;margin-bottom:6px;border:1px solid transparent}
+  .B .castitem:hover{background:rgba(0,0,0,.04)}
+  .B .castitem.cur{background:#fff;border-color:var(--line);box-shadow:0 1px 4px rgba(0,0,0,.06)}
+  .B .castitem .cn{font-weight:700}
+  .B .castitem .cr{font-size:11.5px;color:var(--muted)}
+  .B .castitem .you{font-size:10px;background:var(--accent);color:#fff;border-radius:99px;padding:1px 7px;margin-left:6px}
+  .B .bmain{flex:1;min-width:0;display:flex;flex-direction:column;overflow-y:auto}
+  .B .script{max-width:640px;margin:0 auto;width:100%;padding:0 26px 26px}
+  .B .slug{border-bottom:2px solid var(--accent);margin:18px 0 14px;padding-bottom:8px}
+  .B .slug .st{font-size:20px;font-weight:800;letter-spacing:1px}
+  .B .slug .sl{font-size:12.5px;color:var(--muted);margin-top:3px;font-family:var(--sans)}
+  .B .line{margin:9px 0;display:grid;grid-template-columns:110px 1fr;gap:14px}
+  .B .line .sp{font-weight:800;text-align:right;padding-top:2px}
+  .B .line .sp small{display:block;font-weight:400;color:var(--muted);font-size:11px;font-family:var(--sans)}
+  .B .line .tx{font-size:15px;line-height:1.65}
+  .B .par{margin:8px 0;padding-left:124px;font-style:italic;color:var(--muted);font-size:13.5px}
+  .B .bchat{margin:9px 0;padding-left:124px}
+  .B .bchat .inner{display:inline-flex;gap:10px;background:var(--paper2);border:1px solid var(--line);border-radius:10px;padding:9px 13px;font-family:var(--sans);font-size:14px;max-width:100%}
+  .B .bchat .av{width:26px;height:26px;border-radius:50%;flex:none;font-size:11px;font-weight:800;display:flex;align-items:center;justify-content:center;color:#fff}
+  .B .checkb{margin:12px 0;padding-left:124px}
+  .B .checkb .inner{background:#fff;border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:8px;padding:11px 14px;font-family:var(--sans);font-size:13.5px;box-shadow:0 1px 3px rgba(0,0,0,.05)}
+  .B .checkb .drow{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  .B .checkb .dice{width:40px;height:40px;border-radius:8px;background:var(--accent);color:#fff;font-family:var(--mono);font-weight:800;font-size:20px;display:flex;align-items:center;justify-content:center}
+  .B .pendingb{margin:12px 0;padding-left:124px}
+  .B .pendingb .inner{background:#fff7e6;border:1px solid #e2c98f;border-left:4px solid var(--warn);border-radius:8px;padding:11px 14px;font-family:var(--sans);font-size:13.5px}
+  .B .pendingb .p-title{font-weight:800;color:var(--warn);font-size:11.5px;letter-spacing:1px;margin-bottom:6px}
+  .B .binput{padding:14px 26px;background:#fff;border-top:1px solid var(--line);display:flex;gap:10px;align-items:center;font-family:var(--sans)}
+  .B .binput input{flex:1;background:var(--paper);border:1px solid var(--line);border-radius:8px;padding:9px 13px;font-size:13.5px;font-family:var(--sans);outline:none}
+  .B .binput input:disabled{opacity:.5}
+  .B .bmeta{font-size:12px;color:var(--muted);font-family:var(--sans);white-space:nowrap}
+  .B .bmap{background:#fff;border:1px solid var(--line);border-radius:8px;padding:10px;margin-top:14px;font-family:var(--sans);font-size:12.5px}
+  .B .bmap h4{color:var(--accent);font-size:11px;letter-spacing:1px;margin-bottom:6px}
+  .B .bmap .mn{display:flex;justify-content:space-between;color:var(--muted);font-size:11.5px}
+  .B .bmap .mn b{color:var(--ink)}
+  .B .bnote{background:#fff;border:1px dashed var(--line);border-radius:8px;padding:10px;margin-top:10px;font-family:var(--sans);font-size:12.5px;color:var(--muted)}
+  .B .bnote h4{color:var(--accent);font-size:11px;letter-spacing:1px;margin-bottom:5px}
+
+  /* ==================== 变体 C · 沉浸式视觉小说 ==================== */
+  .C{--ink:#f2ecdd; --muted:#b8ad99; --line:rgba(255,255,255,.14);
+     background:
+       radial-gradient(900px 420px at 72% -6%, rgba(120,96,190,.55), transparent 62%),
+       radial-gradient(700px 300px at 18% 8%, rgba(64,120,170,.28), transparent 60%),
+       linear-gradient(180deg,#141024 0%,#0d0f1c 55%,#0c121e 100%);
+     color:var(--ink);font-family:"Songti SC","SimSun",Georgia,serif}
+  .C .cstage{position:relative;height:100%;overflow:hidden}
+  .C .moon{position:absolute;top:9%;right:16%;width:96px;height:96px;border-radius:50%;background:radial-gradient(circle at 38% 36%, #fff8e6, #f3e3bd 60%, #cbbd96);box-shadow:0 0 60px 18px rgba(243,227,189,.22);opacity:.9}
+  .C .mountains{position:absolute;left:-5%;right:-5%;bottom:34%;height:200px;transform:rotate(180deg)}
+  .C .mountains:before,.C .mountains:after{content:"";position:absolute;bottom:0;width:55%;height:100%}
+  .C .mountains:before{left:0;background:linear-gradient(160deg,#16182a 0%,#0d1020 60%);clip-path:polygon(0 100%,0 30%,18% 12%,34% 38%,52% 8%,70% 34%,86% 16%,100% 40%,100% 100%)}
+  .C .mountains:after{right:0;background:linear-gradient(200deg,#121426 0%,#0b0d1b 60%);clip-path:polygon(100% 100%,100% 34%,82% 14%,64% 42%,46% 10%,30% 36%,16% 18%,0 38%,0 100%)}
+  .C .stars{position:absolute;inset:0;background-image:
+       radial-gradient(1.5px 1.5px at 20% 18%, rgba(255,255,255,.9), transparent 60%),
+       radial-gradient(1px 1px at 40% 8%, rgba(255,255,255,.7), transparent 60%),
+       radial-gradient(1.6px 1.6px at 62% 22%, rgba(255,255,255,.8), transparent 60%),
+       radial-gradient(1px 1px at 80% 10%, rgba(255,255,255,.6), transparent 60%),
+       radial-gradient(1.2px 1.2px at 88% 30%, rgba(255,255,255,.75), transparent 60%),
+       radial-gradient(1px 1px at 12% 32%, rgba(255,255,255,.55), transparent 60%),
+       radial-gradient(1.4px 1.4px at 52% 38%, rgba(255,255,255,.7), transparent 60%);opacity:.7}
+  .C .fallstar{position:absolute;top:6%;left:26%;width:2px;height:90px;background:linear-gradient(180deg,rgba(255,255,255,.95),transparent);transform:rotate(24deg);filter:drop-shadow(0 0 6px rgba(255,255,255,.7));opacity:.8}
+  .C .hud{position:absolute;top:0;left:0;right:0;display:flex;align-items:center;gap:12px;padding:14px 18px;background:linear-gradient(180deg,rgba(8,9,16,.7),transparent);z-index:5;font-family:var(--sans)}
+  .C .hud .scenename{font-size:13px;letter-spacing:2px}
+  .C .hud .sceneinfo{font-size:11px;color:var(--muted)}
+  .C .hud .questchip{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.15);border-radius:999px;padding:4px 12px;font-size:11.5px;color:var(--muted)}
+  .C .hud .questchip b{color:var(--ink)}
+  .C .actor-btn{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.18);color:var(--ink);border-radius:999px;padding:5px 12px;font-size:12px;cursor:pointer;font-family:var(--sans)}
+  .C .actor-pop{position:absolute;top:52px;left:18px;width:250px;background:rgba(10,11,20,.92);border:1px solid rgba(255,255,255,.16);border-radius:14px;padding:14px;z-index:8;display:none;font-family:var(--sans)}
+  .C .actor-pop.open{display:block}
+  .C .actor-pop .ah{display:flex;gap:10px;align-items:center;margin-bottom:10px}
+  .C .actor-pop .ah .av{width:40px;height:40px;border-radius:10px;font-weight:800;font-size:14px;display:flex;align-items:center;justify-content:center;color:#0a0b14}
+  .C .actor-pop .attrgrid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+  .C .actor-pop .attr{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:5px 8px}
+  .C .actor-pop .attr .k{font-size:10.5px;color:var(--muted)}
+  .C .actor-pop .attr .v{font-size:14px;font-weight:800}
+  .C .dialoguebox{position:absolute;left:50%;bottom:16%;transform:translateX(-50%);width:min(680px,88%);background:rgba(8,9,16,.72);border:1px solid rgba(255,255,255,.16);border-radius:16px;padding:18px 22px 16px;backdrop-filter:blur(6px);box-shadow:0 12px 40px rgba(0,0,0,.5);z-index:6;font-size:16px;line-height:1.8;min-height:120px;display:flex;flex-direction:column;justify-content:flex-end;cursor:pointer}
+  .C .dialoguebox .speaker{font-family:var(--sans);font-size:12px;letter-spacing:2px;color:#e8c37a;font-weight:800;margin-bottom:6px;display:flex;align-items:center;gap:8px}
+  .C .dialoguebox .speaker .who{border:1px solid rgba(232,195,122,.4);border-radius:999px;padding:1px 9px}
+  .C .dialoguebox .txt{color:var(--ink)}
+  .C .dialoguebox .txt.narr{color:#cfc6b4;font-style:italic}
+  .C .advance{position:absolute;right:14px;bottom:6px;color:var(--muted);font-size:11px;font-family:var(--sans);letter-spacing:1px;display:none}
+  .C .advance.show{display:block;animation:blink 1.4s infinite}
+  .C .checkc{margin-top:10px;border-top:1px dashed rgba(255,255,255,.18);padding-top:10px;font-family:var(--sans);font-size:13.5px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  .C .checkc .dice{width:42px;height:42px;border-radius:10px;background:#e9c46a;color:#14100a;font-family:var(--mono);font-weight:800;font-size:20px;display:flex;align-items:center;justify-content:center}
+  .C .pendingc{margin-top:10px;border-top:1px dashed rgba(251,191,36,.4);padding-top:10px;font-family:var(--sans);font-size:13.5px}
+  .C .pendingc .pt{color:var(--warn);font-weight:800;font-size:11px;letter-spacing:1px;margin-bottom:6px}
+  .C .pendingc .acts{display:flex;gap:10px;margin-top:10px}
+  .C .cinput{position:absolute;left:50%;bottom:2.4%;transform:translateX(-50%);width:min(680px,88%);display:flex;gap:10px;align-items:center;z-index:7;font-family:var(--sans)}
+  .C .cinput input{flex:1;background:rgba(10,11,20,.75);border:1px solid rgba(255,255,255,.18);border-radius:12px;padding:11px 16px;color:var(--ink);font-size:14px;font-family:var(--sans);outline:none;backdrop-filter:blur(6px)}
+  .C .cinput input:disabled{opacity:.4}
+  .C .cinput input:focus{border-color:rgba(232,195,122,.6)}
+  .C .cquick{display:flex;gap:6px}
+  .C .stagechip{position:absolute;top:58px;right:18px;z-index:7;font-family:var(--sans);display:flex;flex-direction:column;align-items:flex-end;gap:6px}
+</style>
+</head>
+<body data-variant="A">
+  <div id="topbar">
+    <span class="badge">原型 · wayfinder #08</span>
+    <span class="title">游玩界面设计</span>
+    <span class="badge">坠星谷 · 星陨旅店</span>
+    <div id="tplWrap">
+      <button id="tplBtn">🎭 模板：聊天流</button>
+      <div id="tplMenu"></div>
+    </div>
+    <span class="spacer"></span>
+    <span class="chip" id="pipeChip" style="display:none"><span class="dot"></span><span id="pipeText">主线思考中</span></span>
+    <button id="noConfirmBtn">免确认：关</button>
+    <button id="drawerBtn">决议</button>
+  </div>
+  <div id="view">
+    <div id="vA" class="variant A"></div>
+    <div id="vB" class="variant B"></div>
+    <div id="vC" class="variant C"></div>
+  </div>
+  <div id="switchbar">
+    <button class="sw-arrow" id="sw-prev">←</button>
+    <div class="sw-label"><b id="sw-name">A — 聊天流</b></div>
+    <button class="sw-arrow" id="sw-next">→</button>
+  </div>
+  <div id="drawer">
+    <header>游玩界面设计 · 决议备忘
+      <button class="close" id="drawerClose">关闭</button>
+    </header>
+    <div class="body">
+      <h4>Q1 叙事演出形态（多模板）</h4><p>三种<b>演出模板</b>并存、可随时切换：<b>A 聊天流 / B 剧本式 / C 沉浸式视觉小说</b>——同一场戏、同一回合模型，仅呈现层不同；顶栏 🎭 或底栏 ←→ 切换（默认聊天流）。</p>
+      <h4>Q2 布局骨架</h4><p>单栏叙事为主舞台；面板走抽屉/边栏且形态各不同：A 右侧演员卡 + 地图/日志右抽屉；B 左侧角色表 + 剧本旁批注；C 顶部 HUD + 底部文本框，演员卡为悬浮小面板。</p>
+      <h4>Q3 确认门</h4><p>机制动作 = <b>流内挂起确认卡片</b>（拟执行动作 + 后果 + 确认/取消，确认后原位变结算结果）；顶栏「免确认」可全局开关。</p>
+      <h4>Q4 元指令</h4><p>同一输入框 <b>/ 前缀</b> + 常驻快捷按钮（切换角色 / 存档 / 重来）。</p>
+      <h4>Q5 角色状态</h4><p>常驻紧凑<b>演员卡</b>（关键属性/资源/状态，点开全表）；NPC 在场时轻量出现。</p>
+      <h4>Q6 流式与等待</h4><p>就地<b>打字机 + 可跳过</b>；管线阶段徽标（主线思考中 → 角色回应中 → 结算中）。判定卡呈现跟随故事书声明的判定器（本演示故事书为 d20 风格参数）。</p>
+      <h4>演示脚本</h4><p>坠星谷·星陨旅店（傍晚）。玩家输入 → 打听谷底传闻 → 主线 AI 判定「观察」→ 确认卡 → d20 结算（16 vs DC12 成功）→ 日志线索更新。可输入任意话、或试 /切换 /存档 /重来。</p>
+    </div>
+  </div>
+<script>
+"use strict";
+var $=function(s){return document.querySelector(s);};
+var body=document.body;
+var VARIANTS={A:["A — 聊天流","IM 气泡 · 最贴「故事对话模拟」"],B:["B — 剧本式","纸面脚本 · 强节奏、场景切割"],C:["C — 沉浸式","视觉小说 · 背景 + 逐行演出"]};
+
+function h(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e;}
+
+var cast={
+  阿莱西奥:{role:"你 · 佣兵剑士",color:"#6ea8ff",attrs:{力量:12,敏捷:14,感知:16,魅力:11},res:{体力:[24,30]},skills:["观察","格斗","交涉"],status:["良好"]},
+  琳:{role:"游侠",color:"#4ade80",attrs:{敏捷:16,感知:15,力量:10},res:{体力:[22,24]},skills:["射击","追踪","潜伏"],status:["良好"]},
+  薇拉:{role:"老板娘",color:"#fbbf24",attrs:{魅力:14,感知:12},res:{},skills:["交涉"],status:["友好"]}
+};
+var controlled="阿莱西奥";
+var noConfirm=false;
+var runId=0;
+var curResolve=null;
+var freePlay=false;
+var roleWaitResolve=null;
+
+function sleep(ms){return new Promise(function(r){setTimeout(r,ms);});}
+function streamText(el,text,speed){
+  if(!speed)speed=16;
+  return new Promise(function(res){
+    var i=0,stopped=false;
+    var t=setInterval(function(){
+      i++;el.textContent=text.slice(0,i);
+      if(i>=text.length){clearInterval(t);res();}
+    },speed);
+    var done=function(){if(stopped)return;stopped=true;clearInterval(t);el.textContent=text;res();};
+    curResolve=done;
+    el.__skip=done;
+    el.style.cursor="pointer";
+    el.onclick=done;
+  });
+}
+function skipStream(){if(curResolve){var r=curResolve;curResolve=null;r();}}
+
+function chip(label){
+  var c=document.createElement("div");
+  c.style.cssText="font-family:var(--sans);font-size:11px;color:#e8c37a;display:inline-flex;align-items:center;gap:6px;";
+  var d=document.createElement("span");d.style.cssText="width:6px;height:6px;border-radius:50%;background:#e8c37a;animation:blink 1s infinite";
+  var s=document.createElement("span");s.textContent=label;
+  c.appendChild(d);c.appendChild(s);
+  return c;
+}
+function pipe(label){var el=$("#pipeChip");var tx=$("#pipeText");el.style.display="inline-flex";tx.textContent=label;}
+function pipeOff(){$("#pipeChip").style.display="none";}
+function scrollBottom(el){el.scrollTop=el.scrollHeight;}
+
+var R={A:null,B:null,C:null};
+
+/* ---------- 变体 A ---------- */
+function buildA(){
+  var wrap=h("div","awrap");
+  var chat=h("div","chat");
+  var head=h("div","chathead");
+  head.appendChild(h("span","scene","星陨旅店 · 傍晚"));
+  head.appendChild(h("span","","—"));
+  head.appendChild(h("span","","坠星谷"));
+  var msgs=h("div","msgs");msgs.id="amsgs";
+  chat.appendChild(head);chat.appendChild(msgs);
+  var panel=h("div","actorpanel");
+  var cmds=h("div","cmds");
+  var input=h("input");
+  input.placeholder="扮演阿莱西奥发言…（输入 / 查看元指令）";
+  input.disabled=true;
+  var cmdpop=h("div","cmdpop");
+  var mkCmd=function(name,desc){
+    var it=h("div","it");
+    var b=h("b",name);var s=h("span",desc);
+    it.appendChild(b);it.appendChild(s);
+    it.onclick=function(){R.A.input.value=name;R.A.cmdpop.classList.remove("open");R.A.input.focus();};
+    return it;
+  };
+  cmdpop.appendChild(mkCmd("/切换","切换控制角色"));
+  cmdpop.appendChild(mkCmd("/存档","保存进度"));
+  cmdpop.appendChild(mkCmd("/重来","重新演示"));
+  input.addEventListener("input",function(){cmdpop.classList.toggle("open",input.value.charAt(0)==="/");});
+  input.addEventListener("keydown",function(e){if(e.key==="Enter")submitInput();});
+  cmds.appendChild(input);cmds.appendChild(cmdpop);
+  var quick=h("div","quick");
+  var bSwitch=h("button","btn small","⇄ 切换");bSwitch.onclick=openSwitcher;
+  var bSave=h("button","btn small","💾 存档");bSave.onclick=function(){metaChip("/存档","已存档（快照 + 命令日志）");};
+  var bRestart=h("button","btn small","↺ 重来");bRestart.onclick=function(){startDemo();};
+  quick.appendChild(bSwitch);quick.appendChild(bSave);quick.appendChild(bRestart);
+  var inputbar=h("div","inputbar");
+  inputbar.appendChild(quick);inputbar.appendChild(cmds);
+  chat.appendChild(inputbar);
+  wrap.appendChild(chat);wrap.appendChild(panel);
+  document.getElementById("vA").appendChild(wrap);
+  R.A={msgs:msgs,input:input,panel:panel,cmdpop:cmdpop};
+  renderActorCardA();
+  buildSideinfo();
+  buildSwitcher();
+}
+function buildSideinfo(){
+  var side=h("div","sideinfo");
+  var mapb=h("div","mapbox");
+  var mkNode=function(t,left,top,cur){
+    var n=h("div","node"+(cur?" cur":""),t);
+    n.style.left=left;n.style.top=top;
+    return n;
+  };
+  mapb.appendChild(mkNode("坠星谷口","8%","12%",false));
+  mapb.appendChild(mkNode("星陨旅店","38%","40%",true));
+  mapb.appendChild(mkNode("谷底裂隙","62%","62%",false));
+  mapb.appendChild(mkNode("铁匠铺","70%","22%",false));
+  var questBox=h("div","");questBox.id="aQuest";
+  var q=h("div","quest");
+  q.appendChild(h("div","qt","「谷底异响」"));
+  q.appendChild(h("div","qd","查明谷底怪声的来源（线索待定）"));
+  questBox.appendChild(q);
+  side.appendChild(h("h3","地图"));
+  side.appendChild(mapb);
+  side.appendChild(h("h3","任务日志"));
+  side.appendChild(questBox);
+  side.id="aSide";
+  document.body.appendChild(side);
+}
+function buildSwitcher(){
+  var sw=h("div","switcher");sw.id="aSwitcher";
+  var card=h("div","card");
+  card.appendChild(h("div","p-title","切换控制角色"));
+  ["阿莱西奥","琳","薇拉"].forEach(function(n){
+    var opt=h("div","opt"+(n===controlled?" sel":""));
+    var av=h("div","av",n.charAt(0));av.style.background=cast[n].color;
+    var tx=h("div","");
+    tx.appendChild(h("div","nm",n));
+    tx.appendChild(h("div","rl",cast[n].role+(n==="薇拉"?"（NPC · 仅剧情节点响应）":"（非控制时由角色 AI 扮演）")));
+    opt.appendChild(av);opt.appendChild(tx);
+    opt.onclick=function(){controlled=n;sw.classList.remove("open");renderActorCardA();startDemo();};
+    card.appendChild(opt);
+  });
+  var closeB=h("button","btn","取消");closeB.onclick=function(){sw.classList.remove("open");};
+  card.appendChild(closeB);
+  sw.appendChild(card);
+  document.body.appendChild(sw);
+}
+function openSwitcher(){var s=$("#aSwitcher");if(s)s.classList.add("open");}
+function metaChip(label,text){
+  var m=h("div","sys");
+  var line=h("span","","");
+  line.appendChild(chip(label));
+  var t=h("span","","　"+text);line.appendChild(t);
+  m.appendChild(line);
+  R.A.msgs.appendChild(m);scrollBottom(R.A.msgs);
+}
+function renderActorCardA(){
+  var p=R.A.panel;p.innerHTML="";
+  var ah=h("div","act-head");
+  var av=h("div","av",controlled.charAt(0));av.style.background=cast[controlled].color;
+  var nm=h("div","");
+  nm.appendChild(h("div","nm",controlled));
+  nm.appendChild(h("div","rl",cast[controlled].role));
+  ah.appendChild(av);ah.appendChild(nm);ah.appendChild(h("div","tag","当前控制"));
+  p.appendChild(ah);
+  var g=h("div","attrgrid");
+  Object.keys(cast[controlled].attrs).forEach(function(k){
+    var a=h("div","attr");
+    a.appendChild(h("div","k",k));
+    a.appendChild(h("div","v",cast[controlled].attrs[k]));
+    g.appendChild(a);
+  });
+  p.appendChild(g);
+  var res=h("div","resbar");
+  Object.keys(cast[controlled].res).forEach(function(k){
+    var v=cast[controlled].res[k];
+    var r=h("div","");
+    var rk=h("div","rk");
+    rk.innerHTML='<span>'+k+'</span><span>'+v[0]+'/'+v[1]+'</span>';
+    var b=h("div","bar");
+    var i=h("i");i.style.width=(v[0]/v[1]*100)+"%";
+    b.appendChild(i);
+    r.appendChild(rk);r.appendChild(b);
+    res.appendChild(r);
+  });
+  p.appendChild(res);
+  var sw=h("div","skillwrap");
+  cast[controlled].skills.forEach(function(s){sw.appendChild(h("span","skill",s));});
+  p.appendChild(sw);
+  p.appendChild(h("div","tag","在场同伴：琳 · 薇拉"));
+}
+function updateQuestA(clue){
+  var qb=document.getElementById("aQuest");
+  if(!qb)return;
+  qb.innerHTML="";
+  var q=h("div","quest");
+  q.appendChild(h("div","qt","「谷底异响」"));
+  q.appendChild(h("div","qd","查明谷底怪声的来源 — 新线索："+clue));
+  qb.appendChild(q);
+}
+function submitInput(){
+  var inp=R.A.input;var v=inp.value.trim();if(!v)return;
+  R.A.cmdpop.classList.remove("open");
+  if(v.charAt(0)==="/"){inp.value="";handleMeta(v);return;}
+  inp.value="";
+  addUserMsgA(v);
+  notifyRoleInput(v);
+  if(freePlay){setTimeout(function(){metaChip("主线 AI","（演示到此为止。真正的游戏里，主线 AI 会基于这句话继续即兴演出。）");},400);}
+}
+function addUserMsgA(v){
+  var m=h("div","msg mine");
+  var av=h("div","av",controlled.charAt(0));av.style.background=cast[controlled].color;
+  var col=h("div","");
+  col.appendChild(h("div","who",controlled+"（你）"));
+  var bub=h("div","bub",v);
+  col.appendChild(bub);
+  m.appendChild(av);m.appendChild(col);
+  R.A.msgs.appendChild(m);scrollBottom(R.A.msgs);
+}
+
+/* ---------- 变体 B ---------- */
+function buildB(){
+  var wrap=h("div","bwrap");
+  var bcast=h("div","bcast");
+  bcast.appendChild(h("h2","在 场"));
+  var castList=h("div","");castList.id="bCast";
+  bcast.appendChild(castList);
+  var bmain=h("div","bmain");
+  var script=h("div","script");script.id="bScript";
+  bmain.appendChild(script);
+  var binput=h("div","binput");
+  var bi=h("input");
+  bi.placeholder="（台词）或输入 / 查看元指令…";bi.disabled=true;
+  bi.addEventListener("keydown",function(e){if(e.key==="Enter")submitInputB();});
+  binput.appendChild(h("span","bmeta","元指令：/切换 /存档 /重来"));
+  binput.appendChild(bi);
+  bmain.appendChild(binput);
+  wrap.appendChild(bcast);wrap.appendChild(bmain);
+  document.getElementById("vB").appendChild(wrap);
+  R.B={script:script,input:bi,castList:castList};
+  renderCastB();
+}
+function renderCastB(){
+  var el=R.B.castList;el.innerHTML="";
+  ["阿莱西奥","琳","薇拉"].forEach(function(n){
+    var it=h("div","castitem"+(n===controlled?" cur":""));
+    var cn=h("div","cn",n);
+    if(n===controlled)cn.appendChild(h("span","you","你"));
+    it.appendChild(cn);
+    it.appendChild(h("div","cr",cast[n].role+(n==="薇拉"?"（NPC）":"（非控制=角色 AI 扮演）")));
+    it.onclick=function(){controlled=n;renderCastB();renderActorCardA();addNoteB("切换控制","控制角色切换为 "+n+"。");};
+    el.appendChild(it);
+  });
+}
+function addNoteB(title,text){
+  var note=h("div","bnote");
+  note.appendChild(h("h4",title));
+  note.appendChild(h("div","",text));
+  R.B.script.appendChild(note);scrollBottom(R.B.script);
+}
+function submitInputB(){
+  var inp=R.B.input;var v=inp.value.trim();if(!v)return;
+  if(v.charAt(0)==="/"){inp.value="";handleMeta(v);return;}
+  inp.value="";
+  addUserMsgB(v);
+  notifyRoleInput(v);
+  if(freePlay){setTimeout(function(){addNoteB("主线 AI","（演示到此为止。真正的游戏里，主线 AI 会基于这句话继续即兴演出。）");},400);}
+}
+function addUserMsgB(v){
+  var m=h("div","line");
+  var sp=h("div","sp",controlled);
+  sp.appendChild(h("small","（你）"));
+  var tx=h("div","tx",v);
+  m.appendChild(sp);m.appendChild(tx);
+  R.B.script.appendChild(m);scrollBottom(R.B.script);
+}
+
+/* ---------- 变体 C ---------- */
+function buildC(){
+  var stage=h("div","cstage");
+  stage.appendChild(h("div","stars"));
+  stage.appendChild(h("div","moon"));
+  stage.appendChild(h("div","fallstar"));
+  stage.appendChild(h("div","mountains"));
+  var hud=h("div","hud");
+  hud.appendChild(h("div","scenename","星陨旅店 · 坠星谷"));
+  hud.appendChild(h("div","sceneinfo","傍晚 · 酒馆大厅"));
+  hud.appendChild(h("div","spacer"));
+  var qchip=h("div","questchip");
+  qchip.innerHTML='任务 <b>「谷底异响」</b>：查明谷底怪声';
+  hud.appendChild(qchip);
+  var actorBtn=h("button","actor-btn","☰ "+controlled+"（你）");
+  actorBtn.id="cActorBtn";
+  var actorPop=h("div","actor-pop");actorPop.id="cActorPop";
+  actorBtn.onclick=function(){actorPop.classList.toggle("open");renderActorCardC();};
+  hud.appendChild(actorBtn);hud.appendChild(actorPop);
+  stage.appendChild(hud);
+  var box=h("div","dialoguebox");box.id="cBox";
+  var speaker=h("div","speaker");speaker.id="cSpeaker";
+  var txt=h("div","txt");txt.id="cTxt";
+  var adv=h("div","advance","▼ 点击继续");adv.id="cAdv";
+  box.appendChild(speaker);box.appendChild(txt);box.appendChild(adv);
+  stage.appendChild(box);
+  var stageChip=h("div","stagechip");stageChip.id="cPipe";
+  stage.appendChild(stageChip);
+  var ci=h("div","cinput");
+  var cquick=h("div","cquick");
+  var cb1=h("button","btn small","⇄ 切换");cb1.onclick=openSwitcher;
+  var cb2=h("button","btn small","存档");cb2.onclick=function(){addCmeta("/存档","已存档");};
+  cquick.appendChild(cb1);cquick.appendChild(cb2);
+  var cin=h("input");
+  cin.placeholder="（扮演阿莱西奥说话，或输入 / 查看元指令）";cin.disabled=true;
+  cin.addEventListener("keydown",function(e){if(e.key==="Enter")submitInputC();});
+  ci.appendChild(cquick);ci.appendChild(cin);
+  stage.appendChild(ci);
+  document.getElementById("vC").appendChild(stage);
+  R.C={box:box,speaker:speaker,txt:txt,adv:adv,input:cin,actorPop:actorPop,actorBtn:actorBtn,pipe:stageChip};
+}
+function renderActorCardC(){
+  var pop=R.C.actorPop;pop.innerHTML="";
+  var ah=h("div","ah");
+  var av=h("div","av",controlled.charAt(0));av.style.background=cast[controlled].color;
+  ah.appendChild(av);
+  var nm=h("div","");
+  nm.appendChild(h("div","nm",controlled));
+  nm.appendChild(h("div","rl",cast[controlled].role));
+  ah.appendChild(nm);
+  pop.appendChild(ah);
+  var g=h("div","attrgrid");
+  Object.keys(cast[controlled].attrs).forEach(function(k){
+    var a=h("div","attr");
+    a.appendChild(h("div","k",k));
+    a.appendChild(h("div","v",cast[controlled].attrs[k]));
+    g.appendChild(a);
+  });
+  pop.appendChild(g);
+}
+function cShow(type,who,text){
+  var sp=R.C.speaker,tx=R.C.txt,adv=R.C.adv;
+  sp.innerHTML="";
+  if(type==="narr"){sp.style.display="none";tx.className="txt narr";}
+  else{sp.style.display="flex";sp.appendChild(h("span","who",who));tx.className="txt";}
+  return streamText(tx,text,13).then(function(){curResolve=null;adv.classList.add("show");});
+}
+function cNext(){
+  return new Promise(function(res){
+    var adv=R.C.adv;
+    var box=R.C.box;
+    box.onclick=function(){adv.classList.remove("show");box.onclick=null;res();};
+  });
+}
+function cPipe(label){R.C.pipe.innerHTML="";R.C.pipe.appendChild(chip(label));}
+function cPipeOff(){R.C.pipe.innerHTML="";}
+function addCmeta(label,text){
+  var m=h("div","sys");
+  m.style.cssText="font-family:var(--sans);font-size:12px;color:#e8c37a;margin-top:6px;display:flex;gap:6px;align-items:center;";
+  m.appendChild(chip(label));
+  m.appendChild(h("span","",text));
+  R.C.box.appendChild(m);
+}
+function submitInputC(){
+  var inp=R.C.input;var v=inp.value.trim();if(!v)return;
+  if(v.charAt(0)==="/"){inp.value="";handleMeta(v);return;}
+  inp.value="";
+  addUserMsgC(v);
+  notifyRoleInput(v);
+  if(freePlay){setTimeout(function(){addCmeta("主线 AI","（演示到此为止。真正的游戏里，主线 AI 会基于这句话继续即兴演出。）");},400);}
+}
+function addUserMsgC(v){
+  var m=h("div","","你："+v);
+  m.style.cssText="font-family:var(--sans);font-size:12px;color:#9fd0ff;margin-top:6px;";
+  R.C.box.appendChild(m);
+}
+
+/* ---------- 元指令 ---------- */
+function handleMeta(cmd){
+  var c=cmd.trim();
+  if(c.indexOf("/切换")===0){
+    var pick=c.split(/\s+/)[1];
+    if(pick&&cast[pick]){
+      controlled=pick;
+      renderActorCardA();renderCastB();renderActorCardC();
+      metaChipGlobal("/切换","已切换控制 → "+pick);
+      return;
+    }
+    openSwitcher();return;
+  }
+  if(c.indexOf("/存档")===0){metaChipGlobal("/存档","已存档（快照 + 命令日志）");return;}
+  if(c.indexOf("/重来")===0){startDemo();return;}
+  metaChipGlobal(c,"未识别的元指令");
+}
+function metaChipGlobal(label,text){
+  var V=body.dataset.variant;
+  if(V==="A")metaChip(label,text);
+  else if(V==="B")addNoteB("元指令",label+" — "+text);
+  else addCmeta(label,text);
+}
+
+/* ---------- 事件渲染（按当前变体分发） ---------- */
+function play(e){
+  var V=body.dataset.variant;
+  if(V==="A")return playA(e);
+  if(V==="B")return playB(e);
+  return playC(e);
+}
+function playA(e){
+  var msgs=R.A.msgs;
+  if(e.type==="scene"){metaChip("场景",e.sub+" · "+e.time);return Promise.resolve();}
+  if(e.type==="narration"){
+    var m=h("div","narration");
+    msgs.appendChild(m);scrollBottom(msgs);
+    return streamText(m,e.text,14).then(function(){curResolve=null;return sleep(240);});
+  }
+  if(e.type==="dialogue"){
+    var m=h("div","msg");
+    var av=h("div","av",e.who.charAt(0));av.style.background=cast[e.who].color;
+    var col=h("div","");
+    col.appendChild(h("div","who",e.who));
+    var bub=h("div","bub");
+    col.appendChild(bub);m.appendChild(av);m.appendChild(col);
+    msgs.appendChild(m);scrollBottom(msgs);
+    if(e.stream)return streamText(bub,e.text,13).then(function(){curResolve=null;return sleep(220);});
+    bub.textContent=e.text;return Promise.resolve();
+  }
+  if(e.type==="emote"){
+    var em=h("div","emote","* "+e.text);
+    msgs.appendChild(em);scrollBottom(msgs);return sleep(200);
+  }
+  if(e.type==="sys"){
+    var m2=h("div","sys");
+    var line=h("span","","");
+    line.appendChild(chip(e.label||"系统"));
+    line.appendChild(h("span","","　"+e.text));
+    m2.appendChild(line);
+    msgs.appendChild(m2);scrollBottom(msgs);return sleep(200);
+  }
+  if(e.type==="pipe"){pipe(e.label);return sleep(e.dur||700).then(pipeOff);}
+  if(e.type==="check"){
+    pipeOff();
+    var c=h("div","checkcard");
+    var row=h("div","ch-row");
+    row.appendChild(h("div","dice",String(e.roll)));
+    var l=h("div","");
+    var line2=h("div","line");
+    line2.innerHTML='<b>'+e.who+'</b> 判定「'+e.attr+'」：d20 <b>'+e.roll+'</b> '+(e.mod>=0?'+':'−')+Math.abs(e.mod)+' = <b>'+e.total+'</b> · 难度 '+e.dc;
+    var mod=h("div","mod","成功度："+(e.level==="crit"?"圆满成功（+5 及以上）":e.level==="ok"?"成功（+2~+4）":"勉强成功（+1）"));
+    var out=h("div","out "+(e.level==="fail"?"fail":e.level==="part"?"part":e.level==="ok"?"ok":"crit"),e.result);
+    l.appendChild(line2);l.appendChild(mod);l.appendChild(out);
+    row.appendChild(l);
+    c.appendChild(row);
+    msgs.appendChild(c);scrollBottom(msgs);return sleep(300);
+  }
+  return Promise.resolve();
+}
+function playB(e){
+  var sc=R.B.script;
+  if(e.type==="scene"){
+    var s=h("div","slug");
+    s.appendChild(h("div","st","第一幕 · "+e.sub));
+    s.appendChild(h("div","sl",e.time+"　｜　在 场："+e.cast.join("、")+"　｜　"+e.map));
+    sc.appendChild(s);scrollBottom(sc);return Promise.resolve();
+  }
+  if(e.type==="narration"){
+    var p=h("div","par");
+    sc.appendChild(p);scrollBottom(sc);
+    return streamText(p,e.text,14).then(function(){curResolve=null;return sleep(240);});
+  }
+  if(e.type==="dialogue"){
+    var l=h("div","line");
+    var sp=h("div","sp",e.who);
+    sp.appendChild(h("small",e.who===controlled?"（你）":cast[e.who].role.split(" ")[0]));
+    var tx=h("div","tx");
+    l.appendChild(sp);l.appendChild(tx);
+    sc.appendChild(l);scrollBottom(sc);
+    if(e.stream)return streamText(tx,e.text,13).then(function(){curResolve=null;return sleep(220);});
+    tx.textContent=e.text;return Promise.resolve();
+  }
+  if(e.type==="emote"){
+    var p2=h("div","par","（"+e.text+"）");
+    sc.appendChild(p2);scrollBottom(sc);return sleep(200);
+  }
+  if(e.type==="sys"){
+    var n=h("div","bnote");
+    n.appendChild(h("h4",e.label||"系统"));
+    n.appendChild(h("div","",e.text));
+    sc.appendChild(n);scrollBottom(sc);return sleep(200);
+  }
+  if(e.type==="pipe"){
+    var n2=h("div","bnote");
+    n2.appendChild(chip(e.label));
+    sc.appendChild(n2);scrollBottom(sc);return sleep(e.dur||700);
+  }
+  if(e.type==="check"){
+    var cb=h("div","checkb");
+    var inner=h("div","inner");
+    var row=h("div","drow");
+    row.appendChild(h("div","dice",String(e.roll)));
+    var l2=h("div","");
+    l2.innerHTML='<b>判定 · '+e.who+'</b> — 「'+e.attr+'」<br><span style="color:#7a7466;font-size:12.5px">d20 '+e.roll+' '+(e.mod>=0?'+':'−')+Math.abs(e.mod)+' = '+e.total+'　难度 '+e.dc+'　→　<b style="color:'+(e.level==='ok'?'#4a7c3a':'#a16207')+'">'+e.result+'</b></span>';
+    row.appendChild(l2);
+    inner.appendChild(row);
+    cb.appendChild(inner);
+    sc.appendChild(cb);scrollBottom(sc);return sleep(300);
+  }
+  return Promise.resolve();
+}
+function playC(e){
+  if(e.type==="scene"){return cShow("narr",null,"— 第一幕 · 星陨旅店（"+e.time+"） —").then(cNext);}
+  if(e.type==="narration"){return cShow("narr",null,e.text).then(cNext);}
+  if(e.type==="dialogue"){return cShow("talk",e.who,e.text).then(cNext);}
+  if(e.type==="emote"){return cShow("talk",controlled,"（神态）"+e.text).then(cNext);}
+  if(e.type==="sys"){return cShow("narr",null,"〔"+e.label+"〕"+e.text).then(cNext);}
+  if(e.type==="pipe"){cPipe(e.label);return sleep(e.dur||800).then(cPipeOff);}
+  if(e.type==="check"){
+    var box=R.C.box,tx=R.C.txt,sp=R.C.speaker;
+    sp.innerHTML="";sp.appendChild(h("span","who","判定"));sp.style.display="flex";
+    tx.className="txt";
+    var c=h("div","checkc");
+    c.appendChild(h("div","dice",String(e.roll)));
+    var l=h("div","");
+    l.innerHTML='<b>'+e.who+'</b> 判定「'+e.attr+'」：d20 <b>'+e.roll+'</b> '+(e.mod>=0?'+':'−')+Math.abs(e.mod)+' = <b>'+e.total+'</b> · 难度 '+e.dc+'<br><span style="color:#a7f3d0;font-weight:700">'+e.result+'</span>';
+    c.appendChild(l);
+    tx.appendChild(c);
+    return sleep(400).then(cNext);
+  }
+  return Promise.resolve();
+}
+
+/* ---------- 演示序列 ---------- */
+function startDemo(){
+  var my=++runId;
+  var V=body.dataset.variant;
+  freePlay=false;
+  roleWaitResolve=null;
+  if(V==="A"){R.A.msgs.innerHTML="";}
+  if(V==="B"){R.B.script.innerHTML="";renderCastB();}
+  if(V==="C"){R.C.speaker.innerHTML="";R.C.txt.innerHTML="";R.C.txt.className="txt";R.C.adv.classList.remove("show");R.C.box.onclick=null;}
+  renderActorCardA();renderCastB();renderActorCardC();
+  pipeOff();cPipeOff();
+  disableInput(true);
+
+  var seq=[
+    {type:"scene",sub:"星陨旅店 · 坠星谷",time:"傍晚 · 酒馆大厅",cast:["阿莱西奥","琳","薇拉"],map:"坠星谷"},
+    {type:"narration",text:"坠星谷的傍晚比别处来得早。天边那枚紫蓝的裂痕——三个月前坠下的那颗星——正把最后一点光吐在镇口的旧屋顶上。风从谷底上来，夹着细碎的石响。"},
+    {type:"dialogue",who:"薇拉",stream:true,text:"“又是来找星星的？”老板娘把一杯冒热气的麦酒搁在你面前，“镇上的人都说，入夜后谷底有东西在敲石头。”"},
+    {type:"emote",who:"阿莱西奥",text:"你端起杯子没急着喝，目光落向窗外暗下来的山脊。"},
+    {type:"dialogue",who:"琳",stream:true,text:"“我不管敲不敲石头——定金够咱们住一周就行。”琳在窗边擦弓，头也没抬。"},
+    {type:"pipe",label:"主线思考中…",dur:900}
+  ];
+  var run=function(i){
+    if(my!==runId)return;
+    if(i>=seq.length){afterIntro(my);return;}
+    return play(seq[i]).then(function(){return run(i+1);});
+  };
+  run(0);
+}
+function afterIntro(my){
+  if(my!==runId)return;
+  disableInput(false);
+  waitRoleInput(my).then(function(){
+    if(my!==runId)return;
+    disableInput(true);
+    var seq2=[
+      {type:"pipe",label:"角色回应中…",dur:800},
+      {type:"dialogue",who:"薇拉",stream:true,text:"“想知道谷底的事，得先过我这关。”"},
+      {type:"sys",label:"主线 AI 意图",text:"判定「观察」（机制动作，结算前待确认）"}
+    ];
+    var run2=function(i){
+      if(my!==runId)return;
+      if(i>=seq2.length){doConfirm(my);return;}
+      return play(seq2[i]).then(function(){return run2(i+1);});
+    };
+    run2(0);
+  });
+}
+function doConfirm(my){
+  if(my!==runId)return;
+  confirmGate(my).then(function(ok){
+    if(my!==runId)return;
+    var tail;
+    if(ok){
+      var check={type:"check",who:controlled,attr:"观察",roll:14,mod:2,total:16,dc:12,result:"成功",level:"ok"};
+      play(check).then(function(){
+        if(body.dataset.variant==="A")updateQuestA("三短一长的敲击声，疑似信号");
+        tail=[
+          {type:"narration",text:"你听出那敲击声有节奏——三短一长，像某种信号，不像塌方。薇拉挑了挑眉：“有点意思，这单你接了。”"},
+          {type:"sys",label:"任务日志更新",text:"「谷底异响」→ 新线索：三短一长的敲击声，疑似信号。"},
+          {type:"sys",label:"演示结束",text:"可继续输入任意话观看演出；或试 /切换 /存档 /重来。"}
+        ];
+        var rt=function(i){if(my!==runId)return;if(i>=tail.length){freePlay=true;disableInput(false);return;}return play(tail[i]).then(function(){return rt(i+1);});};
+        rt(0);
+      });
+    }else{
+      tail=[
+        {type:"narration",text:"你摆手说算了，把酒喝完。老板娘耸耸肩：“那你们今晚就住着，谷底的事别去管。”"},
+        {type:"sys",label:"演示结束",text:"（已取消判定）可继续输入任意话，或试 /切换 /存档 /重来。"}
+      ];
+      var rt2=function(i){if(my!==runId)return;if(i>=tail.length){freePlay=true;disableInput(false);return;}return play(tail[i]).then(function(){return rt2(i+1);});};
+      rt2(0);
+    }
+  });
+}
+function notifyRoleInput(v){
+  if(roleWaitResolve){var r=roleWaitResolve;roleWaitResolve=null;r(v);}
+}
+function waitRoleInput(my){
+  return new Promise(function(res){roleWaitResolve=res;});
+}
+function confirmGate(my){
+  if(noConfirm)return Promise.resolve(true);
+  return new Promise(function(res){
+    var V=body.dataset.variant;
+    var done=false;
+    var finish=function(v){if(done)return;done=true;res(v);};
+    var mkBtns=function(a){
+      var okB=h("button","btn primary","确认");okB.onclick=function(){finish(true);};
+      var noB=h("button","btn","取消");noB.onclick=function(){finish(false);};
+      a.appendChild(okB);a.appendChild(noB);
+    };
+    if(V==="A"){
+      var c=h("div","pending");
+      c.appendChild(h("div","p-title","⚙ 待确认 · 机制动作"));
+      c.appendChild(h("div","p-body","判定「观察」— "+controlled+"（结算前暂停确认，可顶栏全局免确认）"));
+      c.appendChild(h("div","p-detail","预估：d20 + 感知修正(+2) vs 难度 12 · 成败影响谷底线索"));
+      var acts=h("div","p-actions");mkBtns(acts);
+      c.appendChild(acts);
+      R.A.msgs.appendChild(c);scrollBottom(R.A.msgs);
+    }else if(V==="B"){
+      var cb=h("div","pendingb");
+      var inner=h("div","inner");
+      inner.appendChild(h("div","p-title","待确认 · 判定「观察」"));
+      inner.appendChild(h("div","",controlled+"：预估 d20+2 vs 难度 12，成败影响谷底线索。"));
+      var acts2=h("div","p-actions");acts2.style.cssText="display:flex;gap:10px;margin-top:10px";
+      mkBtns(acts2);
+      inner.appendChild(acts2);
+      cb.appendChild(inner);
+      R.B.script.appendChild(cb);scrollBottom(R.B.script);
+    }else{
+      var c2=h("div","pendingc");
+      c2.appendChild(h("div","pt","⚙ 待确认 · 判定「观察」"));
+      c2.appendChild(h("div","",controlled+"：d20+2 vs 难度 12，成败影响谷底线索。"));
+      var acts3=h("div","acts");mkBtns(acts3);
+      c2.appendChild(acts3);
+      R.C.txt.innerHTML="";R.C.txt.appendChild(c2);
+    }
+  });
+}
+function disableInput(d){
+  var ph=(d?"（演出中…）":"（扮演"+controlled+"发言…（输入 / 查看元指令））");
+  if(R.A){R.A.input.disabled=d;R.A.input.placeholder=d?"（主线 AI 演出中…）":("扮演"+controlled+"发言…（输入 / 查看元指令）");}
+  if(R.B){R.B.input.disabled=d;R.B.input.placeholder=d?"（演出中…）":"（台词）或输入 / 查看元指令…";}
+  if(R.C){R.C.input.disabled=d;R.C.input.placeholder=d?"（演出中…）":("（扮演"+controlled+"说话，或输入 / 查看元指令）");}
+}
+
+/* ---------- 变体切换 / 全局 ---------- */
+function setVariant(v){
+  body.dataset.variant=v;
+  document.getElementById("sw-name").textContent="模板 · "+VARIANTS[v][0];
+  document.getElementById("tplBtn").textContent="🎭 模板："+VARIANTS[v][0].split("—")[1].trim();
+  var items=document.querySelectorAll("#tplMenu .tpl");
+  for(var i=0;i<items.length;i++){items[i].classList.toggle("sel",items[i].dataset.v===v);}
+  startDemo();
+  var url=new URL(location.href);url.searchParams.set("variant",v);history.replaceState(null,"",url);
+}
+function buildTemplateMenu(){
+  var menu=document.getElementById("tplMenu");
+  Object.keys(VARIANTS).forEach(function(v){
+    var it=h("div","tpl");
+    it.dataset.v=v;
+    var col=h("div","");
+    col.appendChild(h("div","tn",VARIANTS[v][0]));
+    col.appendChild(h("div","td",VARIANTS[v][1]));
+    it.appendChild(col);
+    it.onclick=function(){setVariant(v);menu.classList.remove("open");};
+    menu.appendChild(it);
+  });
+}
+function wire(){
+  var names=Object.keys(VARIANTS);
+  buildTemplateMenu();
+  document.getElementById("tplBtn").onclick=function(){$("#tplMenu").classList.toggle("open");};
+  document.addEventListener("click",function(e){if(!e.target.closest("#tplWrap"))$("#tplMenu").classList.remove("open");});
+  document.getElementById("sw-prev").onclick=function(){var i=names.indexOf(body.dataset.variant);setVariant(names[(i-1+names.length)%names.length]);};
+  document.getElementById("sw-next").onclick=function(){var i=names.indexOf(body.dataset.variant);setVariant(names[(i+1)%names.length]);};
+  document.addEventListener("keydown",function(e){
+    if(e.target.closest("input,textarea,[contenteditable]"))return;
+    if(e.key==="ArrowLeft"){document.getElementById("sw-prev").click();}
+    if(e.key==="ArrowRight"){document.getElementById("sw-next").click();}
+    if(e.key===" ")skipStream();
+  });
+  document.getElementById("drawerBtn").onclick=function(){$("#drawer").classList.add("open");};
+  document.getElementById("drawerClose").onclick=function(){$("#drawer").classList.remove("open");};
+  document.getElementById("noConfirmBtn").onclick=function(){
+    noConfirm=!noConfirm;
+    var b=document.getElementById("noConfirmBtn");
+    b.textContent=noConfirm?"免确认：开":"免确认：关";
+    b.classList.toggle("on",noConfirm);
+  };
+}
+function init(){
+  buildA();buildB();buildC();
+  wire();
+  var vp=new URLSearchParams(location.search).get("variant");
+  if(vp&&VARIANTS[vp])body.dataset.variant=vp;
+  document.getElementById("sw-name").textContent="模板 · "+VARIANTS[body.dataset.variant][0];
+  document.getElementById("tplBtn").textContent="🎭 模板："+VARIANTS[body.dataset.variant][0].split("—")[1].trim();
+  var items=document.querySelectorAll("#tplMenu .tpl");
+  for(var i=0;i<items.length;i++){items[i].classList.toggle("sel",items[i].dataset.v===body.dataset.variant);}
+  startDemo();
+}
+window.addEventListener("load",init);
+</script>
+</body>
+</html>

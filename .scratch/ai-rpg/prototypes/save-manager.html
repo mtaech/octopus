@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<!-- 本原型决议（wayfinder #21 存档管理界面设计）：三个结构不同的「存档管理抽屉」变体，切换见底部浮条 / ?variant=。
+     前提（#18/#14/#06）：无独立存档区，存档列表/详情为游玩页内抽屉；单文件 .sqlite 自包含；版次升级 = 打开存档检测到新版次只提示、不自动，两段式（dry-run 报告→确认→执行，执行前自动备份）；人物消失逐项裁决（遗留冻结 vs 叙事离场）；新原点 = 显式维护操作（先备份、旧日志归档）；导出/导入 = 单文件拷贝。
+     变体 A = 分栏控制台（左列表 + 右详情，全部操作在一个滚动详情区）；变体 B = 存读档菜单（窄抽屉、卡片钻取内联展开）；变体 C = 标签工作台（存读档/升级迁移/维护/分享导入，升级=向导步进）。
+     决议（#21 已关票）：默认骨架 = B（存读档菜单）+ 版次升级独立聚焦向导（C 步进形态、面包屑返回）；A/C 保留作对比。
+     演示数据：坠星谷·酒馆之夜（当前，rev 3→故事书已发 rev 4，有升级待办）、灰烬行者（rev 3，同上）、雾镇疑云·调查档案（rev 2，无升级）。 -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>存档管理界面原型 — wayfinder #21</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#151a22; --panel2:#1b2230; --line:#262f3f;
+    --ink:#e8edf5; --muted:#8b97a8; --accent:#6ea8ff; --ok:#4ade80; --warn:#fbbf24; --err:#f87171;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14px;line-height:1.55;height:100vh;overflow:hidden}
+  button{font-family:var(--sans)}
+  /* ===== 顶栏（复用 #08 视觉） ===== */
+  #topbar{height:46px;display:flex;align-items:center;gap:14px;padding:0 16px;background:var(--panel);border-bottom:1px solid var(--line);position:relative;z-index:5}
+  #topbar .badge{font-size:11px;font-weight:700;letter-spacing:.5px;padding:3px 8px;border-radius:4px;background:rgba(255,255,255,.06);color:var(--muted);border:1px solid var(--line);white-space:nowrap}
+  #topbar .title{font-weight:700;white-space:nowrap}
+  #topbar .spacer{flex:1}
+  #topbar button{background:transparent;border:1px solid var(--line);color:var(--ink);padding:4px 10px;border-radius:6px;font-size:12px;cursor:pointer;white-space:nowrap}
+  #topbar button:hover{border-color:var(--accent)}
+  #topbar button.on{border-color:var(--ok);color:var(--ok)}
+  #saveBtn{position:relative}
+  #saveBtn .dot{position:absolute;top:-4px;right:-4px;width:9px;height:9px;border-radius:50%;background:var(--warn);border:2px solid var(--panel)}
+  /* ===== 叙事列（聊天流 stub，三变体共用） ===== */
+  #stage{position:absolute;top:46px;left:0;right:0;bottom:0;display:flex}
+  #chat{flex:1;min-width:0;display:flex;flex-direction:column;max-width:820px;margin:0 auto;width:100%}
+  #chathead{display:flex;align-items:center;gap:10px;padding:10px 18px 6px;color:var(--muted);font-size:12.5px}
+  #chathead .scene{font-weight:700;color:var(--ink)}
+  #msgs{flex:1;overflow-y:auto;padding:10px 18px 16px;display:flex;flex-direction:column;gap:12px}
+  .msg{max-width:78%;display:flex;gap:10px;align-items:flex-start}
+  .msg .av{width:34px;height:34px;border-radius:50%;flex:none;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:800;color:#081018}
+  .msg .bub{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:9px 13px;font-size:14px;line-height:1.6}
+  .msg .who{font-size:11.5px;color:var(--muted);margin-bottom:3px;font-weight:700}
+  .msg.mine{flex-direction:row-reverse;margin-left:auto}
+  .msg.mine .bub{background:rgba(110,168,255,.14);border-color:rgba(110,168,255,.4)}
+  .msg.mine .who{text-align:right}
+  .sys{max-width:88%;align-self:center;color:#a0b3c9;font-size:12.5px;background:rgba(110,168,255,.08);border:1px dashed rgba(110,168,255,.35);border-radius:10px;padding:8px 14px}
+  #inputbar{border-top:1px solid var(--line);background:var(--panel);padding:10px 16px;display:flex;gap:8px;align-items:center}
+  .quick{display:flex;gap:6px}
+  #inputbar input{flex:1;background:var(--panel2);border:1px solid var(--line);border-radius:10px;color:var(--ink);padding:10px 14px;font-size:14px;font-family:var(--sans);outline:none}
+  #inputbar input:focus{border-color:var(--accent)}
+  .hint{color:var(--muted);font-size:12px}
+  /* ===== 通用小件 ===== */
+  .btn{border:1px solid var(--line);background:var(--panel2);color:var(--ink);padding:6px 14px;border-radius:8px;font-size:13px;cursor:pointer}
+  .btn.primary{background:var(--accent);border-color:var(--accent);color:#081018;font-weight:700}
+  .btn.warnb{border-color:var(--warn);color:var(--warn)}
+  .btn.small{padding:3px 10px;font-size:12px;border-radius:6px}
+  .btn:disabled{opacity:.45;cursor:not-allowed}
+  .btn:hover:not(:disabled){filter:brightness(1.1)}
+  .chip{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:var(--muted);background:rgba(255,255,255,.05);border:1px solid var(--line);border-radius:999px;padding:3px 10px;white-space:nowrap}
+  .chip.up{border-color:rgba(251,191,36,.5);color:var(--warn);background:rgba(251,191,36,.08)}
+  .chip .dot{width:6px;height:6px;border-radius:50%;background:var(--warn)}
+  .muted{color:var(--muted)}
+  .mono{font-family:var(--mono)}
+  .tag{font-size:10.5px;background:rgba(110,168,255,.2);color:var(--accent);border-radius:999px;padding:2px 8px;font-weight:700;white-space:nowrap}
+  .tag.ok{background:rgba(74,222,128,.15);color:var(--ok)}
+  .tag.warn{background:rgba(251,191,36,.15);color:var(--warn)}
+  /* ===== 抽屉（宽度随变体） ===== */
+  #drawer{position:fixed;top:46px;right:0;bottom:0;background:#0a0d12;border-left:1px solid var(--line);z-index:60;transform:translateX(100%);transition:transform .18s ease;display:flex;flex-direction:column}
+  #drawer.open{transform:translateX(0)}
+  body[data-variant="A"] #drawer{width:min(64vw,880px)}
+  body[data-variant="B"] #drawer{width:min(40vw,560px)}
+  body[data-variant="C"] #drawer{width:min(52vw,720px)}
+  #drawer header{padding:11px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px;font-weight:700}
+  #drawer header .sub{font-size:12px;color:var(--muted);font-weight:400}
+  #drawer .close{margin-left:auto;background:none;border:1px solid var(--line);color:var(--muted);cursor:pointer;border-radius:6px;padding:2px 8px}
+  .dbody{flex:1;overflow:auto;padding:14px 16px 26px}
+  /* ==================== 变体 A · 分栏控制台 ==================== */
+  #dA{display:none;height:100%;flex:1;min-height:0}
+  body[data-variant="A"] #dA{display:flex}
+  #dA .list{width:248px;flex:none;border-right:1px solid var(--line);overflow-y:auto;padding:10px}
+  #dA .list h3{font-size:11px;letter-spacing:1px;color:var(--muted);margin:4px 6px 8px;font-weight:700}
+  #dA .srow{padding:10px 11px;border-radius:10px;cursor:pointer;border:1px solid transparent;margin-bottom:6px}
+  #dA .srow:hover{background:rgba(255,255,255,.04)}
+  #dA .srow.sel{background:rgba(110,168,255,.1);border-color:rgba(110,168,255,.4)}
+  #dA .srow .nm{font-weight:700;font-size:13.5px;display:flex;align-items:center;gap:6px}
+  #dA .srow .nm .cur{font-size:10px;background:rgba(110,168,255,.2);color:var(--accent);border-radius:99px;padding:1px 7px;font-weight:700}
+  #dA .srow .meta{font-size:11.5px;color:var(--muted);margin-top:3px;display:flex;gap:8px;flex-wrap:wrap}
+  #dA .srow .uprow{display:flex;align-items:center;justify-content:space-between;margin-top:6px;gap:6px}
+  #dA .detail{flex:1;min-width:0;overflow-y:auto;padding:14px 18px 30px}
+  #dA .dhead{display:flex;align-items:flex-start;gap:12px;flex-wrap:wrap}
+  #dA .dhead .nm{font-size:17px;font-weight:800}
+  #dA .dhead .meta{color:var(--muted);font-size:12.5px;margin-top:2px}
+  #dA .dhead .acts{margin-left:auto;display:flex;gap:8px}
+  #dA h4{font-size:11px;letter-spacing:1.5px;color:var(--muted);margin:22px 0 8px;font-weight:800}
+  .upbanner{border:1px solid rgba(251,191,36,.5);background:rgba(251,191,36,.07);border-radius:12px;padding:12px 14px;margin-top:14px}
+  .upbanner .t{font-weight:800;color:var(--warn);font-size:13px}
+  .upbanner .d{color:var(--muted);font-size:12.5px;margin:3px 0 10px}
+  .report{border:1px solid var(--line);border-radius:12px;margin-top:10px;overflow:hidden;background:var(--panel)}
+  .report.hidden{display:none}
+  .report .sec{padding:11px 14px;border-top:1px solid var(--line)}
+  .report .sec:first-child{border-top:none}
+  .report .sec h5{font-size:12.5px;font-weight:800;display:flex;align-items:center;gap:8px}
+  .report .sec .desc{font-size:12px;color:var(--muted);margin-top:2px}
+  .report .row{display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px dashed rgba(255,255,255,.06);font-size:13px}
+  .report .row:last-child{border-bottom:none}
+  .report .row .arrow{color:var(--muted);font-size:11px}
+  .report .row .act{margin-left:auto;font-size:12px;color:var(--muted)}
+  .report .row .act b{color:var(--ink)}
+  .adjud{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}
+  .adjud label{display:flex;align-items:flex-start;gap:8px;border:1px solid var(--line);border-radius:10px;padding:8px 11px;cursor:pointer;font-size:12.5px;flex:1;min-width:180px}
+  .adjud label:hover{border-color:var(--accent)}
+  .adjud input{accent-color:var(--accent);margin-top:2px}
+  .adjud .a-t{font-weight:700}
+  .adjud .a-d{color:var(--muted);font-size:11.5px;margin-top:1px}
+  .adjud label.pick{border-color:var(--warn);background:rgba(251,191,36,.08)}
+  .execbar{display:flex;align-items:center;gap:10px;margin-top:10px;flex-wrap:wrap}
+  .backup-note{font-size:12px;color:var(--muted);border:1px dashed rgba(110,168,255,.4);background:rgba(110,168,255,.06);border-radius:8px;padding:8px 11px;margin-top:8px}
+  .backup-note .f{font-family:var(--mono);color:var(--accent)}
+  .ops{display:flex;gap:10px;flex-wrap:wrap}
+  .opcard{border:1px solid var(--line);border-radius:12px;padding:12px 14px;background:var(--panel);flex:1;min-width:230px}
+  .opcard .t{font-weight:800;font-size:13px}
+  .opcard .d{color:var(--muted);font-size:12px;margin:3px 0 10px}
+  .hist{width:100%;border-collapse:collapse;font-size:12.5px;margin-top:6px}
+  .hist th{text-align:left;color:var(--muted);font-weight:600;border-bottom:1px solid var(--line);padding:6px 8px;font-size:11.5px}
+  .hist td{padding:7px 8px;border-bottom:1px solid rgba(255,255,255,.05);vertical-align:top}
+  .hist tr.new td{background:rgba(74,222,128,.06)}
+  .hist .sum{color:var(--muted);font-size:12px}
+  .share-grid{display:flex;gap:10px;flex-wrap:wrap}
+  .share-card{border:1px solid var(--line);border-radius:12px;padding:14px;background:var(--panel);flex:1;min-width:240px}
+  .share-card .t{font-weight:800;font-size:13.5px}
+  .share-card .d{color:var(--muted);font-size:12.5px;margin:3px 0 12px}
+  .drop{border:2px dashed var(--line);border-radius:12px;padding:16px;text-align:center;color:var(--muted);font-size:12.5px;cursor:pointer;margin-top:10px}
+  .drop:hover{border-color:var(--accent);color:var(--ink)}
+  /* ==================== 变体 B · 存读档菜单（钻取） ==================== */
+  #dB{display:none;flex-direction:column;height:100%;flex:1;min-height:0}
+  body[data-variant="B"] #dB{display:flex}
+  #dB .bread{display:flex;align-items:center;gap:8px;padding:9px 14px;border-bottom:1px solid var(--line);font-size:12.5px;color:var(--muted)}
+  #dB .bread button{background:none;border:none;color:var(--accent);cursor:pointer;font-size:12.5px;padding:0}
+  #dB .save-list{padding:10px;overflow-y:auto;flex:1}
+  #dB .card{border:1px solid var(--line);border-radius:12px;background:var(--panel);margin-bottom:8px;overflow:hidden}
+  #dB .card .row{padding:11px 13px;cursor:pointer;display:flex;align-items:center;gap:10px}
+  #dB .card .row:hover{background:rgba(255,255,255,.03)}
+  #dB .card .nm{font-weight:700;font-size:13.5px;display:flex;align-items:center;gap:6px}
+  #dB .card .meta{font-size:11.5px;color:var(--muted);margin-top:2px;display:flex;gap:8px;flex-wrap:wrap}
+  #dB .card .row .chev{color:var(--muted);font-size:11px;margin-left:auto}
+  #dB .card .upbar{background:rgba(251,191,36,.07);border-top:1px solid rgba(251,191,36,.35);padding:7px 13px;display:flex;align-items:center;gap:8px;font-size:12px;color:var(--warn)}
+  #dB .card .upbar button{margin-left:auto}
+  #dB .exp{display:none;border-top:1px solid var(--line);padding:12px 14px}
+  #dB .card.open .exp{display:block}
+  #dB .exp .stat{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+  #dB .exp .stat .chip{background:var(--panel2)}
+  #dB .exp h5{font-size:11px;letter-spacing:1px;color:var(--muted);margin:12px 0 6px;font-weight:800}
+  #dB .report{background:var(--panel2)}
+  #dB .mhist{font-size:12px;color:var(--muted)}
+  #dB .mhist .hrow{padding:5px 0;border-bottom:1px dashed rgba(255,255,255,.06)}
+  #dB .mhist .hrow b{color:var(--ink)}
+  /* ==================== 变体 C · 标签工作台 ==================== */
+  #dC{display:none;flex-direction:column;height:100%;flex:1;min-height:0}
+  body[data-variant="C"] #dC{display:flex}
+  #dC .tabs{display:flex;gap:2px;padding:0 10px;border-bottom:1px solid var(--line);flex:none}
+  #dC .tabs button{background:none;border:none;color:var(--muted);padding:11px 13px;font-size:13px;cursor:pointer;border-bottom:2px solid transparent;font-weight:600}
+  #dC .tabs button.on{color:var(--ink);border-bottom-color:var(--accent)}
+  #dC .tabpane{display:none;flex:1;overflow-y:auto;padding:14px 16px 26px}
+  #dC .tabpane.on{display:block}
+  #dC .savegrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  #dC .scard{border:1px solid var(--line);border-radius:12px;background:var(--panel);padding:13px}
+  #dC .scard .nm{font-weight:700;font-size:13.5px;display:flex;align-items:center;gap:6px}
+  #dC .scard .meta{font-size:11.5px;color:var(--muted);margin:3px 0 10px;display:flex;gap:8px;flex-wrap:wrap}
+  #dC .scard .acts{display:flex;gap:6px;flex-wrap:wrap}
+  #dC .wizard{max-width:540px}
+  #dC .stepdots{display:flex;align-items:center;gap:8px;margin:6px 0 14px}
+  #dC .stepdots .sd{width:26px;height:26px;border-radius:50%;border:1px solid var(--line);color:var(--muted);font-size:12px;display:flex;align-items:center;justify-content:center;font-weight:800}
+  #dC .stepdots .sd.done{background:rgba(74,222,128,.15);border-color:var(--ok);color:var(--ok)}
+  #dC .stepdots .sd.cur{background:rgba(110,168,255,.15);border-color:var(--accent);color:var(--accent)}
+  #dC .stepdots .sdline{flex:1;height:1px;background:var(--line)}
+  #dC .wstep{display:none}
+  #dC .wstep.on{display:block}
+  #dC .wtitle{font-weight:800;font-size:14.5px;margin-bottom:4px}
+  #dC .wsub{color:var(--muted);font-size:12.5px;margin-bottom:12px}
+  /* ===== 浮条（切换器） ===== */
+  #switchbar{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);z-index:80;display:flex;align-items:center;gap:8px;background:#0b0e14;border:1px solid #334155;border-radius:999px;padding:6px 12px;box-shadow:0 8px 30px rgba(0,0,0,.5)}
+  #switchbar .sw-arrow{width:30px;height:30px;border-radius:50%;border:1px solid #334155;background:transparent;color:var(--ink);font-size:16px;cursor:pointer;display:flex;align-items:center;justify-content:center}
+  #switchbar .sw-arrow:hover{border-color:var(--accent)}
+  #switchbar .sw-label{font-size:12px;color:var(--muted);min-width:230px;text-align:center}
+  #switchbar .sw-label b{color:var(--ink);font-size:13px}
+  #toast{position:fixed;left:50%;bottom:64px;transform:translateX(-50%) translateY(20px);background:#0b0e14;border:1px solid var(--ok);color:var(--ink);border-radius:10px;padding:9px 16px;font-size:13px;opacity:0;pointer-events:none;transition:.2s;z-index:90;box-shadow:0 8px 30px rgba(0,0,0,.5)}
+  #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+  #toast .f{font-family:var(--mono);color:var(--ok)}
+</style>
+</head>
+<body data-variant="B">
+<div id="topbar">
+  <span class="badge">PROTOTYPE · #21</span>
+  <span class="title">坠星谷 · 酒馆之夜</span>
+  <span class="badge">版次 3</span>
+  <span class="spacer"></span>
+  <button class="on">免确认</button>
+  <button>🎭 聊天流</button>
+  <button id="saveBtn" data-open-drawer>💾 存档<span class="dot" id="saveDot" style="display:none"></span></button>
+</div>
+
+<div id="stage">
+  <div id="chat">
+    <div id="chathead"><span class="scene">坠星谷 · 酒馆</span><span class="muted">· 序章 · 炉火正旺</span></div>
+    <div id="msgs">
+      <div class="sys">▸ 主线思考中 → 角色回应中 → 结算中</div>
+      <div class="msg"><div class="av" style="background:#6ea8ff">鸦</div><div><div class="who">旁白</div><div class="bub">炉火噼啪作响。老板娘把一杯热麦酒推到你面前：「今天外面不太平，旅人。」</div></div></div>
+      <div class="msg mine"><div class="av" style="background:#f6b26b">你</div><div><div class="who">你（艾琳）</div><div class="bub">观察一下酒馆里的可疑人物</div></div></div>
+      <div class="msg"><div class="av" style="background:#6ea8ff">鸦</div><div><div class="who">旁白</div><div class="bub">你扫视四周——角落里一个裹着斗篷的身影正低声与酒保交谈。</div></div></div>
+      <div class="sys">▸ 存档 · 存读档（演示：点顶栏「💾 存档」打开抽屉）</div>
+    </div>
+    <div id="inputbar">
+      <div class="quick"><button class="btn small">切换角色</button><button class="btn small" data-open-drawer>存档</button><button class="btn small">重来</button></div>
+      <input placeholder="输入你的行动…（/ 为元指令）">
+      <span class="hint">↵</span>
+    </div>
+  </div>
+</div>
+
+<div id="drawer">
+  <header>
+    <span>存档</span><span class="sub">存读档 · 维护 · 分享</span>
+    <button class="close" data-close-drawer>✕</button>
+  </header>
+  <div class="dbody" id="drawerBody" style="display:flex;flex-direction:column;min-height:0;padding:0">
+
+    <!-- 变体 A：分栏控制台 -->
+    <div id="dA">
+      <div class="list"><h3>存档列表</h3><div id="dA-list"></div></div>
+      <div class="detail" id="dA-detail"></div>
+    </div>
+
+    <!-- 变体 B：存读档菜单（钻取） -->
+    <div id="dB">
+      <div class="bread"><button data-db-home>← 存档列表</button><span id="dB-crumb"></span></div>
+      <div class="save-list" id="dB-list"></div>
+    </div>
+
+    <!-- 变体 C：标签工作台 -->
+    <div id="dC">
+      <div class="tabs">
+        <button data-tab="load" class="on">存读档</button>
+        <button data-tab="upgrade" id="tabUpgrade">升级迁移</button>
+        <button data-tab="maint">维护</button>
+        <button data-tab="share">分享导入</button>
+      </div>
+      <div class="tabpane on" data-pane="load" id="dC-load"></div>
+      <div class="tabpane" data-pane="upgrade" id="dC-upgrade"></div>
+      <div class="tabpane" data-pane="maint" id="dC-maint"></div>
+      <div class="tabpane" data-pane="share" id="dC-share"></div>
+    </div>
+
+  </div>
+</div>
+
+<div id="switchbar">
+  <button class="sw-arrow" data-sw="-1">‹</button>
+  <div class="sw-label"><b id="swName">A · 分栏控制台</b><br><span id="swHint">左列表 + 右详情</span></div>
+  <button class="sw-arrow" data-sw="1">›</button>
+</div>
+<div id="toast"></div>
+
+<script>
+const VARS = [
+  { key:'A', name:'A · 分栏控制台', hint:'左列表 + 右详情，一屏全览' },
+  { key:'B', name:'B · 存读档菜单', hint:'窄抽屉 · 卡片钻取内联展开' },
+  { key:'C', name:'C · 标签工作台', hint:'存读档 / 升级 / 维护 / 分享分页' },
+];
+const SAVES = [
+  { id:'tavern', name:'坠星谷 · 酒馆之夜', story:'坠星谷', rev:3, latestRev:4, last:'刚刚', cmds:1284, cur:true, up:true },
+  { id:'ash', name:'灰烬行者', story:'坠星谷', rev:3, latestRev:4, last:'昨天', cmds:3214, cur:false, up:true },
+  { id:'mist', name:'雾镇疑云 · 调查档案', story:'雾镇疑云', rev:2, latestRev:2, last:'上周', cmds:512, cur:false, up:false },
+];
+const REPORT = {
+  refs: [
+    { kind:'技能', name:'洞察术', owner:'艾琳（角色）', action:'移除技能引用' },
+    { kind:'物品', name:'旧怀表', owner:'艾琳（背包）', action:'从背包移除' },
+  ],
+  chars: [
+    { name:'艾琳', note:'人物定义在 v4 中已删除', opts:[
+      { key:'freeze', t:'遗留冻结', d:'旧定义挪入存档遗留区，实例继续可用' },
+      { key:'leave', t:'叙事离场', d:'实例标记已离场，由主线 AI 圆叙事' } ] }
+  ]
+};
+let hist = [
+  { when:'2024-06-12 14:02', what:'新原点', sum:'3,214 条命令归档，自快照 seq 3,214 起' },
+  { when:'2024-05-03 20:47', what:'版次 2→3', sum:'技能移除 2 · 物品移除 1' },
+];
+let adjud = {};
+let A_SEL = 'tavern';
+let A_REPORT_OPEN = false;
+let B_OPEN = null;
+let C_STEP = 1;
+let C_WIZ = null; // 当前 C 向导所在存档（null=不在向导）
+const doneUp = {};   // 已完成版次升级的存档集合
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmtN = n => n.toLocaleString('en-US');
+const saveById = id => SAVES.find(s => s.id === id);
+
+function toast(html){ const t=$('toast'); t.innerHTML=html; t.className='show'; clearTimeout(toast._t); toast._t=setTimeout(()=>t.className='',2600); }
+
+/* ---------- 通用片段 ---------- */
+function upChip(s){ return s.up ? '<span class="chip up"><span class="dot"></span>新版次 '+s.latestRev+'</span>' : ''; }
+function reportHTML(id){
+  const adjudOK = REPORT.chars.every(c => adjud[c.name]);
+  return '<div class="sec"><h5>引用变更 <span class="tag">'+REPORT.refs.length+' 项</span></h5>'
+    + '<div class="desc">实体 id 消失（v4 删除），默认从在档状态移除引用，逐项列入报告。</div>'
+    + REPORT.refs.map(r => '<div class="row"><span class="tag">'+r.kind+'</span><span>'+esc(r.name)+'</span><span class="arrow">→</span><span class="act"><b>'+esc(r.owner)+'</b> · '+esc(r.action)+'</span></div>').join('')
+    + '</div>'
+    + '<div class="sec"><h5>人物消失 <span class="tag warn">'+REPORT.chars.length+' 项 · 需逐项裁决</span></h5>'
+    + '<div class="desc">人物定义已删除，默认阻挡升级；须为每个实例选择处置方式。</div>'
+    + REPORT.chars.map(c => '<div style="margin-top:8px"><b>'+esc(c.name)+'</b> <span class="muted">· '+esc(c.note)+'</span>'
+      + '<div class="adjud">'+c.opts.map(o => '<label class="'+(adjud[c.name]===o.key?'pick':'')+'"><input type="radio" name="adj" data-adj-char="'+esc(c.name)+'" data-adj-val="'+o.key+'" '+(adjud[c.name]===o.key?'checked':'')+'><span><span class="a-t">'+o.t+'</span><br><span class="a-d">'+o.d+'</span></span></label>').join('')+'</div>'
+      + (adjud[c.name] ? '<div class="muted" style="font-size:12px;margin-top:6px">已选择：'+(adjud[c.name]==='freeze'?'遗留冻结（定义入遗留区，实例继续可用）':'叙事离场（实例标记离场，主线 AI 圆叙事）')+'</div>' : '')
+      + '</div>').join('')
+    + '</div>'
+    + '<div class="execbar"><button class="btn primary" data-confirm="'+id+'" '+(adjudOK?'':'disabled')+'>确认升级并执行</button>'
+    + (adjudOK ? '' : '<span class="muted" style="font-size:12px">先完成人物消失裁决</span>') + '</div>';
+}
+function histRows(){
+  return hist.map((h,i) => '<tr'+(i===0?' class="new"':'')+'><td class="mono">'+esc(h.when)+'</td><td><b>'+esc(h.what)+'</b></td><td class="sum">'+esc(h.sum)+'</td></tr>').join('');
+}
+
+/* ---------- 变体 A ---------- */
+function ARender(){
+  $('dA-list').innerHTML = SAVES.map(s => {
+    const sel = s.id === A_SEL;
+    return '<div class="srow'+(sel?' sel':'')+'" data-sel="'+s.id+'">'
+      + '<div class="nm">'+esc(s.name)+(s.cur?'<span class="cur">当前</span>':'')+'</div>'
+      + '<div class="meta"><span>'+esc(s.story)+'</span><span>版次 '+s.rev+'</span><span>'+esc(s.last)+'</span></div>'
+      + (s.up ? '<div class="uprow"><span class="chip up"><span class="dot"></span>新版次 '+s.latestRev+'</span><button class="btn small" data-showup>查看</button></div>' : '')
+      + '</div>';
+  }).join('');
+  ARenderDetail();
+}
+function ARenderDetail(){
+  const s = saveById(A_SEL);
+  let h = '<div class="dhead"><div><div class="nm">'+esc(s.name)+'</div>'
+    + '<div class="meta">'+esc(s.story)+' · 版次 '+s.rev+' → 最新 '+s.latestRev+' · 命令 '+fmtN(s.cmds)+' · '+esc(s.last)+'</div></div>'
+    + '<div class="acts"><button class="btn primary" data-play="'+s.id+'">▶ 继续游玩</button><button class="btn">详情</button></div></div>';
+  if (s.up) {
+    const done = doneUp[s.id];
+    h += '<div class="upbanner" id="upArea"><div class="t">⚑ 故事书已发布新版次 '+s.latestRev+'</div>'
+      + '<div class="d">存档基于版次 '+s.rev+'。升级为两段式：先看迁移报告，确认后执行（执行前自动备份）。可稍后再说，不影响继续游玩。</div>'
+      + (done
+        ? '<div class="backup-note">✔ 已升级至版次 '+s.latestRev+' · 备份 <span class="f">'+s.id+'.backup-20240731-183022.sqlite</span> 已生成</div>'
+        : '<button class="btn warnb" data-reptoggle>查看迁移报告</button><div class="report'+(A_REPORT_OPEN?'':' hidden')+'" id="upReport">'+reportHTML(s.id)+'</div>')
+      + '</div>';
+  }
+  h += '<h4>维护操作</h4><div class="ops">'
+    + '<div class="opcard"><div class="t">压缩为新原点</div><div class="d">以最新快照为起点，旧命令日志归档为只读（先自动备份）。回滚上限 = 新原点。</div><button class="btn small" data-op="neworigin" data-id="'+s.id+'">压缩为新原点</button></div>'
+    + '<div class="opcard"><div class="t">回滚 / 分支</div><div class="d">从历史命令序号叉出新分支，旧序列原样保留。</div><button class="btn small">管理分支</button></div>'
+    + '</div>'
+    + '<h4>维护历史</h4><table class="hist"><tr><th>时间</th><th>操作</th><th>摘要</th></tr>'+histRows()+'</table>'
+    + '<h4>分享 / 导入</h4><div class="share-grid">'
+    + '<div class="share-card"><div class="t">导出存档</div><div class="d">单文件 <span class="mono">'+s.id+'.sqlite</span>（自包含，可拷贝备份 / 发给他人）。</div><button class="btn small" data-op="export" data-id="'+s.id+'">导出 .sqlite</button></div>'
+    + '<div class="share-card"><div class="t">导入存档</div><div class="d">拖入或选择他人导出的 .sqlite 文件。</div><div class="drop" data-import>点击选择文件（演示）</div></div>'
+    + '</div>';
+  $('dA-detail').innerHTML = h;
+}
+
+/* ---------- 变体 B ---------- */
+function BRender(){
+  $('dB-crumb').textContent = B_OPEN ? saveById(B_OPEN).name : '';
+  $('dB-list').innerHTML = SAVES.map(s => {
+    const open = s.id === B_OPEN;
+    return '<div class="card'+(open?' open':'')+'" data-bopen="'+s.id+'">'
+      + '<div class="row"><div><div class="nm">'+esc(s.name)+(s.cur?'<span class="tag">当前</span>':'')+'</div>'
+      + '<div class="meta"><span>'+esc(s.story)+'</span><span>版次 '+s.rev+'</span><span>'+esc(s.last)+'</span><span>'+fmtN(s.cmds)+' 命令</span></div></div><span class="chev">'+(open?'▾':'▸')+'</span></div>'
+      + (s.up ? '<div class="upbar"><span>⚑ 新版次 '+s.latestRev+'</span>'
+        + (doneUp[s.id] ? '<span class="muted" style="font-size:11.5px">✔ 已升级</span>' : '<button class="btn small warnb" data-bup="'+s.id+'">升级</button>')
+        + '</div>' : '')
+      + '<div class="exp">'+BExp(s)+'</div>'
+      + '</div>';
+  }).join('');
+}
+function BExp(s){
+  return '<div class="stat"><span class="chip">故事书 '+esc(s.story)+'</span><span class="chip">版次 '+s.rev+'</span><span class="chip">命令 '+fmtN(s.cmds)+'</span><span class="chip">快照 5 份</span></div>'
+    + (s.up ? '<h5>版次升级</h5><div class="upbanner" style="margin-top:0"><div class="d">'+esc(s.story)+' 已发布版次 '+s.latestRev+'（存档为 '+s.rev+'）。</div>'
+      + (doneUp[s.id] ? '<div class="backup-note">✔ 已升级 · 备份已生成</div>' : '<button class="btn warnb small" data-breport>查看迁移报告</button><div class="report hidden" id="bReport" style="margin-top:8px">'+reportHTML(s.id)+'</div>')
+      + '</div>' : '')
+    + '<h5>维护</h5><button class="btn small" data-op="neworigin" data-id="'+s.id+'">压缩为新原点</button>'
+    + '<h5>维护历史</h5><div class="mhist">'+hist.map(h => '<div class="hrow"><b>'+esc(h.when)+'</b> · '+esc(h.what)+' — <span class="muted">'+esc(h.sum)+'</span></div>').join('')+'</div>'
+    + '<h5>分享 / 导入</h5><button class="btn small" data-op="export" data-id="'+s.id+'">导出 .sqlite</button> <button class="btn small" data-import>导入存档</button>';
+}
+
+/* ---------- 变体 C ---------- */
+function CRender(){
+  $('dC-load').innerHTML = '<div class="savegrid">'+SAVES.map(s =>
+    '<div class="scard"><div class="nm">'+esc(s.name)+(s.cur?'<span class="tag">当前</span>':'')+'</div>'
+    + '<div class="meta"><span>'+esc(s.story)+'</span><span>版次 '+s.rev+'</span><span>'+esc(s.last)+'</span></div>'+upChip(s)
+    + '<div class="acts"><button class="btn small primary" data-play="'+s.id+'">继续游玩</button><button class="btn small" data-cup="'+s.id+'">'+(s.up?'升级':'详情')+'</button></div></div>'
+  ).join('')+'</div>'
+  + '<div style="margin-top:14px;font-size:12.5px;color:var(--muted)">列表页「继续游玩」直达最近存档（#18 已定）。</div>';
+  updateUpgradeBadge();
+  const ups = SAVES.filter(s => s.up);
+  $('dC-upgrade').innerHTML = ups.length === 0
+    ? '<div class="muted" style="padding:20px 4px">没有待升级的存档。</div>'
+    : ups.map(s => '<div style="margin-bottom:18px"><div class="wtitle">'+esc(s.name)+'</div><div class="wsub">'+esc(s.story)+' · 版次 '+s.rev+' → 最新 '+s.latestRev+'</div>'
+      + (doneUp[s.id]
+        ? '<div class="backup-note">✔ 已升级至版次 '+s.latestRev+' · 备份 <span class="f">'+s.id+'.backup-20240731-183022.sqlite</span></div>'
+        : '<button class="btn warnb" data-cstart="'+s.id+'">开始升级向导</button>')
+      + '</div>').join('');
+  $('dC-maint').innerHTML = '<div class="wtitle">压缩为新原点</div><div class="wsub">以最新快照为存档新起点，旧命令日志归档只读；执行前自动备份单文件。</div>'
+    + '<button class="btn small" data-op="neworigin" data-id="tavern">压缩为新原点</button>'
+    + '<div class="wtitle" style="margin-top:20px">维护历史</div>'
+    + '<table class="hist"><tr><th>时间</th><th>操作</th><th>摘要</th></tr>'+histRows()+'</table>';
+  $('dC-share').innerHTML = '<div class="share-grid">'
+    + '<div class="share-card"><div class="t">导出存档</div><div class="d">导出单文件 .sqlite，可拷贝备份或发送给他人（自包含：内嵌故事书 + 日志 + 快照）。</div><button class="btn small" data-op="export" data-id="tavern">导出 .sqlite</button></div>'
+    + '<div class="share-card"><div class="t">导入存档</div><div class="d">选择他人导出的 .sqlite 文件，校验后加入列表。</div><div class="drop" data-import>点击选择文件（演示）</div></div>'
+    + '</div>';
+}
+function wizardHTML(s){
+  const done = doneUp[s.id];
+  return '<button class="btn small" style="margin-bottom:10px" data-cback-list>← 返回升级列表</button>'
+    + '<div class="wizard"><div class="wtitle">'+esc(s.name)+' · 升级至版次 '+s.latestRev+'</div>'
+    + '<div class="wsub">'+esc(s.story)+'：旧版次 '+s.rev+' → 新版次 '+s.latestRev+'</div>'
+    + '<div class="stepdots"><div class="sd '+(C_STEP>=1?'done':'')+'">1</div><div class="sdline"></div><div class="sd '+(C_STEP>=2?'done':'cur')+'">2</div><div class="sdline"></div><div class="sd '+(C_STEP>=3?'done':'')+'">3</div></div>'
+    + (done ? '<div class="backup-note">✔ 升级完成 · 备份 '+s.id+'.backup-20240731-183022.sqlite · 已写入维护历史</div>'
+      : C_STEP===1 ? '<div class="wstep on"><div class="wtitle">① 迁移报告（dry-run）</div><div class="wsub">仅预览，不改变任何东西。</div>'+reportHTML(s.id)+'</div>'
+      : C_STEP===2 ? '<div class="wstep on"><div class="wtitle">② 确认执行</div><div class="wsub">执行前自动备份存档单文件。</div>'
+        + '<div class="backup-note">将自动备份：<span class="f">'+s.id+'.backup-20240731-183022.sqlite</span></div>'
+        + '<div class="execbar"><button class="btn primary" data-confirm="'+s.id+'">确认升级并执行</button><button class="btn" data-cstep="1" data-id="'+s.id+'">← 返回报告</button></div></div>'
+      : '<div class="wstep on"><div class="wtitle">③ 执行结果</div><div class="wsub">升级完成，可继续游玩。</div>'
+        + '<div class="backup-note">✔ 备份 '+s.id+'.backup-20240731-183022.sqlite 已生成 · 维护历史已记录：版次 '+s.rev+'→'+s.latestRev+'</div>'
+        + '<button class="btn primary" data-cfinish="'+s.id+'">完成</button></div>')
+    + '</div>';
+}
+function updateUpgradeBadge(){
+  const ups = SAVES.filter(s => s.up);
+  const remaining = ups.filter(s => !doneUp[s.id]).length;
+  $('tabUpgrade').innerHTML = '升级迁移' + (remaining ? ' <span class="tag warn">'+remaining+'</span>' : '');
+}
+function openUpgrade(id){
+  C_WIZ = id;
+  updateUpgradeBadge();
+  switchTab('upgrade');
+  $('dC-upgrade').innerHTML = wizardHTML(saveById(id));
+}
+
+/* ---------- 共享操作 ---------- */
+function pickAdj(name, val){
+  adjud[name] = val;
+  if (document.body.dataset.variant === 'C' && C_WIZ){ C_STEP = 1; openUpgrade(C_WIZ); return; }
+  reRender();
+}
+function reRender(){
+  if (document.body.dataset.variant === 'A') ARender();
+  else if (document.body.dataset.variant === 'B') BRender();
+  else CRender();
+}
+function doUpgrade(id){
+  doneUp[id] = true;
+  hist.unshift({ when:'2024-07-31 18:30', what:'版次 3→4', sum:'技能移除 1 · 物品移除 1 · 艾琳：'+(adjud['艾琳']==='freeze'?'遗留冻结':'叙事离场') });
+  toast('✔ 升级完成 · 自动备份 <span class="f">'+id+'.backup-20240731-183022.sqlite</span> 已生成');
+  if (document.body.dataset.variant === 'C'){ C_STEP = 3; openUpgrade(C_WIZ || id); }
+  else reRender();
+}
+function doNewOrigin(id){
+  hist.unshift({ when:'2024-07-31 18:32', what:'新原点', sum:'命令日志已归档 · 自快照 seq '+fmtN(saveById(id).cmds)+' 起' });
+  toast('✔ 已压缩为新原点 · 备份 <span class="f">'+id+'.backup-20240731-183245.sqlite</span>');
+  reRender();
+}
+function doExport(id){ toast('已导出 <span class="f">'+id+'.sqlite</span> · 2.4 MB'); }
+function doImport(){ toast('已导入 <span class="f">北境信使.sqlite</span> · 校验通过 · 加入列表'); }
+
+/* ---------- 抽屉 / 变体 ---------- */
+function toggleDrawer(open){
+  $('drawer').classList.toggle('open', open);
+  if (open){ document.body.dataset.variant==='A' ? ARender() : document.body.dataset.variant==='B' ? BRender() : CRender(); }
+}
+function switchVar(d){
+  const keys = VARS.map(v => v.key);
+  let i = keys.indexOf(document.body.dataset.variant);
+  i = (i + d + VARS.length) % VARS.length;
+  document.body.dataset.variant = VARS[i].key;
+  $('swName').textContent = VARS[i].name;
+  $('swHint').textContent = VARS[i].hint;
+  if ($('drawer').classList.contains('open')){ reRender(); }
+}
+function switchTab(tab){
+  document.querySelectorAll('#dC .tabs button').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
+  document.querySelectorAll('#dC .tabpane').forEach(p => p.classList.toggle('on', p.dataset.pane === tab));
+}
+
+/* ---------- 事件委托（消除内联带参 onclick） ---------- */
+document.addEventListener('click', e => {
+  const target = e.target.closest('[data-open-drawer],[data-close-drawer],[data-sel],[data-showup],[data-play],[data-reptoggle],[data-confirm],[data-cstep],[data-cfinish],[data-cback-list],[data-cstart],[data-cup],[data-bopen],[data-bup],[data-breport],[data-op],[data-import],[data-db-home],[data-sw],[data-tab]');
+  if (!target) return;
+  const has = attr => target.hasAttribute(attr);
+  if (has('data-open-drawer')) return toggleDrawer(true);
+  if (has('data-close-drawer')) return toggleDrawer(false);
+  if (has('data-db-home')) { B_OPEN = null; BRender(); return; }
+  if (has('data-sw')) return switchVar(+target.dataset.sw);
+  if (has('data-tab')) return switchTab(target.dataset.tab);
+  if (has('data-sel')) { A_SEL = target.dataset.sel; ARender(); return; }
+  if (has('data-showup')) { const el = $('upArea'); if (el) el.scrollIntoView({behavior:'smooth', block:'start'}); return; }
+  if (has('data-play')) { toast('继续游玩 · '+esc(saveById(target.dataset.play).name)); return; }
+  if (has('data-reptoggle')) { A_REPORT_OPEN = !A_REPORT_OPEN; ARenderDetail(); return; }
+  if (has('data-breport')) { const r = $('bReport'); if (r) r.classList.toggle('hidden'); return; }
+  if (has('data-bup')) { const id = target.dataset.bup; B_OPEN = id; BRender(); const r = $('bReport'); if (r) r.classList.remove('hidden'); return; }
+  if (has('data-bopen')) { B_OPEN = (B_OPEN === target.dataset.bopen ? null : target.dataset.bopen); BRender(); return; }
+  if (has('data-cup')) { openUpgrade(target.dataset.cup); return; }
+  if (has('data-cstart')) { C_STEP = 1; openUpgrade(target.dataset.cstart); return; }
+  if (has('data-cstep')) { C_STEP = +target.dataset.cstep; openUpgrade(target.dataset.id); return; }
+  if (has('data-cback-list')) { C_WIZ = null; switchTab('upgrade'); CRender(); return; }
+  if (has('data-cfinish')) { C_STEP = 1; openUpgrade(target.dataset.cfinish); return; }
+  if (has('data-confirm')) { doUpgrade(target.dataset.confirm); return; }
+  if (has('data-op')) {
+    const id = target.dataset.id;
+    if (target.dataset.op === 'neworigin') doNewOrigin(id);
+    if (target.dataset.op === 'export') doExport(id);
+    return;
+  }
+  if (has('data-import')) { doImport(); return; }
+});
+document.addEventListener('change', e => {
+  const t = e.target.closest('[data-adj-char]');
+  if (t) pickAdj(t.dataset.adjChar, t.dataset.adjVal);
+});
+window.addEventListener('keydown', e => { if (e.key === 'Escape') toggleDrawer(false); });
+
+/* init */
+(function(){
+  const q = new URLSearchParams(location.search).get('variant');
+  if (q && VARS.some(v => v.key === q.toUpperCase())) document.body.dataset.variant = q.toUpperCase();
+  const v = VARS.find(x => x.key === document.body.dataset.variant);
+  $('swName').textContent = v.name;
+  $('swHint').textContent = v.hint;
+  if (SAVES.find(s => s.cur).up) $('saveDot').style.display = 'block';
+})();
+</script>
+</body>
+</html>

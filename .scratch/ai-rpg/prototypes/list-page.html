@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<!-- 本原型决议（wayfinder #25 列表页设计）：故事书 / 存档入口页（/ 路由）。三变体对比，切换见底部浮条 / ?variant=A|B|C。
+     前提（#18/#23/#24/#21）：三路由 /（列表）、/storybook/:id/edit（编辑器）、/play/:saveId（游玩页）；列表页 = 故事书列表（含「继续游玩」最近存档直达）；
+     数据源 = GET /api/storybooks?released=1（{ id,title,revision,released_at? }）+ GET /api/saves（[{ id,storybook_id,storybook_title,embedded_revision,latest_revision,needs_upgrade,created_at,updated_at,last_played_at }]，按 last_played_at 降序）；
+     新建游戏 = 基于已发布故事书开档 POST /api/saves；导入 = POST /api/saves/import（#21：文件选择 + 能打开即通过 + 「新导入」标记）；存档管理（升级/新原点/分享）在游玩页抽屉（#18/#21，本页是否留入口待 #25 拍板）。
+     变体 A = 分区并置（动作带 → 故事书网格 → 存档列表；新建游戏 = 选书 + 起名确认弹窗）；
+     变体 B = 卡片流混合（单一滚动流按时间混合两类卡片 + 顶部「继续游玩」大卡；即点即开、无确认弹窗）；
+     变体 C = 侧栏分栏（左导航 + 右工作区详情；存档管理从列表可触达（深链游玩页抽屉）；「继续游玩」对需升级存档先出提示中间态）。
+     演示数据：坠星谷·酒馆之夜（当前，rev 3→4 需升级）、北境信使·初雪（新导入）、灰烬行者、雾镇疑云·调查档案；故事书 = 坠星谷 rev4 / 雾镇疑云 rev2 / 灰烬行者 rev3 / 北境信使 rev1。 -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>列表页设计原型 — wayfinder #25</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#151a22; --panel2:#1b2230; --line:#262f3f;
+    --ink:#e8edf5; --muted:#8b97a8; --accent:#6ea8ff; --ok:#4ade80; --warn:#fbbf24; --err:#f87171;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14px;line-height:1.55;overflow:hidden}
+  button{font-family:var(--sans)}
+  #topbar{height:52px;display:flex;align-items:center;gap:12px;padding:0 18px;background:var(--panel);border-bottom:1px solid var(--line);position:relative;z-index:5}
+  #topbar .logo{font-weight:800;font-size:15px;letter-spacing:.3px}
+  #topbar .logo .dot{color:var(--accent)}
+  #topbar .badge{font-size:11px;font-weight:700;letter-spacing:.5px;padding:3px 8px;border-radius:4px;background:rgba(255,255,255,.06);color:var(--muted);border:1px solid var(--line);white-space:nowrap}
+  #topbar .spacer{flex:1}
+  #topbar button{background:transparent;border:1px solid var(--line);color:var(--ink);padding:5px 12px;border-radius:7px;font-size:12.5px;cursor:pointer;white-space:nowrap}
+  #topbar button:hover{border-color:var(--accent)}
+  #stage{position:absolute;top:52px;left:0;right:0;bottom:0;overflow-y:auto;background:var(--bg)}
+  .variant{display:none;max-width:920px;margin:0 auto;padding:22px 20px 90px}
+  body[data-variant="A"] .variant.A{display:block}
+  body[data-variant="B"] .variant.B{display:block}
+  body[data-variant="C"] .variant.C{display:block}
+  .btn{border:1px solid var(--line);background:var(--panel2);color:var(--ink);padding:7px 14px;border-radius:8px;font-size:13px;cursor:pointer;font-weight:600}
+  .btn.primary{background:var(--accent);border-color:var(--accent);color:#081018}
+  .btn.small{padding:4px 11px;font-size:12px;border-radius:7px}
+  .btn.warnb{border-color:var(--warn);color:var(--warn);background:transparent}
+  .btn:disabled{opacity:.45;cursor:not-allowed}
+  .btn:hover:not(:disabled){filter:brightness(1.08)}
+  .chip{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:var(--muted);background:rgba(255,255,255,.05);border:1px solid var(--line);border-radius:999px;padding:3px 10px;white-space:nowrap}
+  .chip.up{border-color:rgba(251,191,36,.5);color:var(--warn);background:rgba(251,191,36,.08)}
+  .chip.up .dot{width:6px;height:6px;border-radius:50%;background:var(--warn)}
+  .chip.imp{border-color:rgba(74,222,128,.5);color:var(--ok);background:rgba(74,222,128,.08)}
+  .muted{color:var(--muted)}
+  .mono{font-family:var(--mono)}
+  .sec-h{display:flex;align-items:baseline;gap:10px;margin:26px 2px 12px}
+  .sec-h h2{font-size:14.5px;font-weight:800;letter-spacing:.3px}
+  .sec-h .cnt{font-size:11.5px;color:var(--muted)}
+  .sec-h .more{margin-left:auto;font-size:12px;color:var(--accent);cursor:pointer}
+  /* A 分区并置 */
+  .A .hero{display:flex;gap:14px;align-items:stretch;margin-bottom:8px}
+  .A .resume{flex:1;min-width:0;background:linear-gradient(135deg,#16233a 0%,#151a22 70%);border:1px solid rgba(110,168,255,.45);border-radius:16px;padding:18px 20px;display:flex;flex-direction:column;justify-content:center;cursor:pointer;position:relative;overflow:hidden}
+  .A .resume:hover{border-color:var(--accent)}
+  .A .resume .lbl{font-size:11.5px;font-weight:800;letter-spacing:1.5px;color:var(--accent);text-transform:uppercase}
+  .A .resume .tt{font-size:19px;font-weight:800;margin:6px 0 4px}
+  .A .resume .meta{font-size:12.5px;color:var(--muted);display:flex;gap:10px;flex-wrap:wrap}
+  .A .resume .go{position:absolute;right:20px;top:50%;transform:translateY(-50%);font-size:26px;color:var(--accent);opacity:.7}
+  .A .actions{display:flex;flex-direction:column;gap:10px;width:216px;flex:none}
+  .A .actions .act{flex:1;border:1px solid var(--line);border-radius:14px;background:var(--panel);display:flex;flex-direction:column;justify-content:center;padding:12px 16px;cursor:pointer;gap:3px}
+  .A .actions .act:hover{border-color:var(--accent)}
+  .A .actions .act .t{font-weight:800;font-size:14px;display:flex;align-items:center;gap:8px}
+  .A .actions .act .d{font-size:12px;color:var(--muted)}
+  .A .sb-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .A .sb-card{border:1px solid var(--line);border-radius:14px;background:var(--panel);padding:14px 16px}
+  .A .sb-card:hover{border-color:rgba(110,168,255,.5)}
+  .A .sb-card .row1{display:flex;align-items:center;gap:8px}
+  .A .sb-card .nm{font-weight:800;font-size:14.5px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .A .sb-card .meta{color:var(--muted);font-size:12px;margin:4px 0 12px;display:flex;gap:8px;flex-wrap:wrap}
+  .A .sb-card .ops{display:flex;gap:8px}
+  .A .save-list{display:flex;flex-direction:column;gap:10px}
+  .A .save-row{border:1px solid var(--line);border-radius:14px;background:var(--panel);padding:13px 16px;display:flex;align-items:center;gap:14px}
+  .A .save-row:hover{border-color:rgba(110,168,255,.5)}
+  .A .save-row .nm{font-weight:800;font-size:14px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .A .save-row .meta{color:var(--muted);font-size:12px;margin-top:3px;display:flex;gap:10px;flex-wrap:wrap}
+  .A .save-row .ops{margin-left:auto;display:flex;gap:8px;flex:none}
+  .A .foot{color:var(--muted);font-size:12px;margin-top:22px;display:flex;align-items:center;gap:8px}
+  /* B 卡片流混合 */
+  .B .big-resume{background:linear-gradient(135deg,#16233a 0%,#131a26 75%);border:1px solid rgba(110,168,255,.5);border-radius:18px;padding:22px 24px;cursor:pointer;margin-bottom:20px;position:relative}
+  .B .big-resume:hover{border-color:var(--accent)}
+  .B .big-resume .lbl{font-size:11.5px;font-weight:800;letter-spacing:2px;color:var(--accent);text-transform:uppercase}
+  .B .big-resume .tt{font-size:22px;font-weight:800;margin:8px 0 5px}
+  .B .big-resume .meta{font-size:13px;color:var(--muted);display:flex;gap:12px;flex-wrap:wrap}
+  .B .big-resume .go{position:absolute;right:26px;top:50%;transform:translateY(-50%);font-size:30px;color:var(--accent)}
+  .B .feed{display:flex;flex-direction:column;gap:10px}
+  .B .card{display:flex;align-items:center;gap:14px;border:1px solid var(--line);border-radius:14px;background:var(--panel);padding:14px 16px}
+  .B .card:hover{border-color:rgba(110,168,255,.5)}
+  .B .card .ic{width:40px;height:40px;border-radius:11px;flex:none;display:flex;align-items:center;justify-content:center;font-size:17px;font-weight:800;color:#081018}
+  .B .card .bd{flex:1;min-width:0}
+  .B .card .tt{font-weight:800;font-size:14px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .B .card .meta{color:var(--muted);font-size:12px;margin-top:3px;display:flex;gap:10px;flex-wrap:wrap}
+  .B .card .ops{display:flex;gap:8px;flex:none}
+  .B .daymark{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:11.5px;margin:4px 2px 6px}
+  .B .daymark::after{content:"";flex:1;height:1px;background:var(--line)}
+  /* C 侧栏分栏 */
+  .C .split{display:flex;gap:18px;align-items:flex-start}
+  .C .rail{width:292px;flex:none}
+  .C .rail .seg{border:1px solid var(--line);border-radius:14px;background:var(--panel);overflow:hidden;margin-bottom:14px}
+  .C .rail .seg h3{font-size:11.5px;font-weight:800;letter-spacing:1px;color:var(--muted);padding:10px 14px 6px}
+  .C .rail .rrow{display:flex;align-items:center;gap:9px;padding:9px 14px;cursor:pointer;border-top:1px solid rgba(255,255,255,.04)}
+  .C .rail .rrow:hover{background:rgba(255,255,255,.04)}
+  .C .rail .rrow.sel{background:rgba(110,168,255,.1)}
+  .C .rail .rrow.sel .nm{color:var(--accent)}
+  .C .rail .rrow .nm{font-weight:700;font-size:13px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .C .rail .rrow .rev{font-size:10.5px;color:var(--muted);font-family:var(--mono)}
+  .C .work{flex:1;min-width:0;border:1px solid var(--line);border-radius:16px;background:var(--panel);padding:20px 22px;min-height:420px}
+  .C .work .w-title{font-size:19px;font-weight:800}
+  .C .work .w-sub{color:var(--muted);font-size:12.5px;margin:3px 0 16px;display:flex;gap:10px;flex-wrap:wrap}
+  .C .work .w-ops{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+  .C .work .w-empty{color:var(--muted);font-size:13px;padding:40px 10px;text-align:center;border:1px dashed var(--line);border-radius:14px}
+  .C .up-alert{border:1px solid rgba(251,191,36,.5);background:rgba(251,191,36,.07);border-radius:12px;padding:13px 15px;margin-bottom:14px}
+  .C .up-alert .t{font-weight:800;color:var(--warn);font-size:13px}
+  .C .up-alert .d{color:var(--muted);font-size:12.5px;margin:3px 0 10px}
+  .C .up-alert .ops{display:flex;gap:8px;flex-wrap:wrap}
+  .C .recent{display:flex;flex-direction:column;gap:8px;margin-top:4px}
+  .C .recent .ri{display:flex;align-items:center;gap:10px;border:1px solid var(--line);border-radius:12px;background:var(--panel);padding:11px 13px;cursor:pointer}
+  .C .recent .ri:hover{border-color:rgba(110,168,255,.5)}
+  .C .recent .ri .nm{font-weight:700;font-size:13.5px;flex:1;min-width:0}
+  .C .recent .ri .when{font-size:11.5px;color:var(--muted)}
+  /* 弹窗 / 抽屉 */
+  #modalBack{position:fixed;inset:0;background:rgba(3,6,10,.66);z-index:70;display:none;align-items:center;justify-content:center}
+  #modalBack.open{display:flex}
+  #modal{width:min(460px,92vw);background:#0c1017;border:1px solid var(--line);border-radius:16px;padding:20px 22px;box-shadow:0 20px 60px rgba(0,0,0,.6)}
+  #modal h3{font-size:15px;font-weight:800;margin-bottom:4px}
+  #modal .msub{color:var(--muted);font-size:12.5px;margin-bottom:16px}
+  #modal .field{display:flex;flex-direction:column;gap:6px;margin-bottom:16px}
+  #modal .field label{font-size:12px;color:var(--muted);font-weight:700}
+  #modal input[type=text],#modal select{background:var(--panel2);border:1px solid var(--line);color:var(--ink);border-radius:9px;padding:9px 12px;font-size:13.5px;font-family:var(--sans);outline:none}
+  #modal input:focus,#modal select:focus{border-color:var(--accent)}
+  #modal .m-ops{display:flex;gap:10px;justify-content:flex-end}
+  #drawer{position:fixed;top:52px;right:0;bottom:0;width:min(420px,94vw);background:#0a0d12;border-left:1px solid var(--line);z-index:60;transform:translateX(100%);transition:transform .18s ease;display:flex;flex-direction:column}
+  #drawer.open{transform:translateX(0)}
+  #drawer header{padding:12px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px;font-weight:800}
+  #drawer header .close{margin-left:auto;background:none;border:1px solid var(--line);color:var(--muted);cursor:pointer;border-radius:6px;padding:2px 9px}
+  #drawer .body{flex:1;overflow-y:auto;padding:16px 18px 30px}
+  #drawer h4{font-size:13px;font-weight:800;margin:16px 0 6px;color:var(--accent)}
+  #drawer h4:first-child{margin-top:0}
+  #drawer p{font-size:12.5px;color:#c6d0dd;margin-bottom:4px}
+  #drawer p b{color:var(--ink)}
+  #switchbar{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);z-index:80;display:flex;align-items:center;gap:8px;background:#0b0e14;border:1px solid #334155;border-radius:999px;padding:6px 12px;box-shadow:0 8px 30px rgba(0,0,0,.5)}
+  #switchbar .sw-arrow{width:30px;height:30px;border-radius:50%;border:1px solid #334155;background:transparent;color:var(--ink);font-size:16px;cursor:pointer;display:flex;align-items:center;justify-content:center}
+  #switchbar .sw-arrow:hover{border-color:var(--accent)}
+  #switchbar .sw-label{font-size:12px;color:var(--muted);min-width:235px;text-align:center}
+  #switchbar .sw-label b{color:var(--ink);font-size:13px}
+  #toast{position:fixed;left:50%;bottom:64px;transform:translateX(-50%) translateY(20px);background:#0b0e14;border:1px solid var(--ok);color:var(--ink);border-radius:10px;padding:9px 16px;font-size:13px;opacity:0;pointer-events:none;transition:.2s;z-index:90;box-shadow:0 8px 30px rgba(0,0,0,.5)}
+  #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+  #toast .f{font-family:var(--mono);color:var(--ok)}
+
+</style>
+</head>
+<body data-variant="A">
+<div id="topbar">
+  <span class="logo">Octopus<span class="dot">◈</span></span>
+  <span class="badge">PROTOTYPE · #25</span>
+  <span class="spacer"></span>
+  <button id="drawerBtn">决议</button>
+</div>
+
+<div id="stage">
+
+  <!-- ===== 变体 A · 分区并置 ===== -->
+  <div class="variant A">
+    <div class="hero">
+      <div class="resume" data-resume="tavern">
+        <div class="lbl">继续游玩</div>
+        <div class="tt">坠星谷 · 酒馆之夜</div>
+        <div class="meta"><span class="chip up"><span class="dot"></span>新版次待升级</span><span>坠星谷 · rev 3</span><span>刚刚游玩</span></div>
+        <span class="go">▶</span>
+      </div>
+      <div class="actions">
+        <div class="act" data-newgame=""><div class="t">＋ 新建游戏</div><div class="d">基于已发布故事书开档</div></div>
+        <div class="act" data-import><div class="t">⇪ 导入存档</div><div class="d">选择 .sqlite 文件</div></div>
+      </div>
+    </div>
+
+    <div class="sec-h"><h2>我的故事书</h2><span class="cnt">4 本已发布</span><span class="more">进编辑器 →</span></div>
+    <div class="sb-grid" id="data-sbgrid"></div>
+
+    <div class="sec-h"><h2>最近存档</h2><span class="cnt">4 个</span><span class="more">按最近游玩排序</span></div>
+    <div class="save-list" id="data-savelist"></div>
+
+    <div class="foot">💾 存档管理（升级 / 新原点 / 分享）在游玩页抽屉内 — 本页仅作入口直达。</div>
+  </div>
+
+  <!-- ===== 变体 B · 卡片流混合 ===== -->
+  <div class="variant B">
+    <div class="big-resume" data-resume="tavern">
+      <div class="lbl">继续游玩 · 最近存档</div>
+      <div class="tt">坠星谷 · 酒馆之夜</div>
+      <div class="meta"><span class="chip up"><span class="dot"></span>新版次待升级</span><span>坠星谷 · rev 3</span><span>刚刚游玩</span></div>
+      <span class="go">▶</span>
+    </div>
+    <div class="feed" id="data-feed"></div>
+  </div>
+
+  <!-- ===== 变体 C · 侧栏分栏 ===== -->
+  <div class="variant C">
+    <div class="split">
+      <div class="rail">
+        <div class="seg"><h3>故事书</h3><div id="data-c-sbs"></div></div>
+        <div class="seg"><h3>存档</h3><div id="data-c-saves"></div></div>
+      </div>
+      <div class="work" id="data-c-work"></div>
+    </div>
+  </div>
+
+</div>
+
+<div id="switchbar">
+  <button class="sw-arrow" data-sw="-1">‹</button>
+  <div class="sw-label"><b id="swName">A · 分区并置</b><br><span id="swHint">动作带 + 两分区</span></div>
+  <button class="sw-arrow" data-sw="1">›</button>
+</div>
+
+<div id="modalBack"><div id="modal"></div></div>
+<div id="drawer">
+  <header>列表页设计 · 决议备忘 <button class="close" id="drawerClose">关闭</button></header>
+  <div class="body">
+    <h4>Q1 页面组织</h4><p><b>A 分区并置</b>：顶部动作带（继续游玩 / 新建 / 导入）+ 故事书网格 + 存档列表，自上而下三区。 <b>B 卡片流混合</b>：单一滚动流按时间混合两类卡片。 <b>C 侧栏分栏</b>：左导航两列表 + 右工作区详情。</p>
+    <h4>Q2 卡片内容与操作</h4><p>故事书卡 = 标题 / 版次 / 发布态 + 新建游戏 · 进编辑器。存档卡 = 标题 / 故事书名 / 时间 / 需升级角标 + 继续游玩 · 升级入口；管理操作（升级向导 / 新原点 / 分享）折叠或全部进游玩页抽屉。</p>
+    <h4>Q3 空态与引导</h4><p>无故事书 → 引导去编辑器新建；无存档 → 引导新建游戏 / 导入。</p>
+    <h4>Q4 与游玩页抽屉的关系</h4><p>本页是否只做入口直达（继续游玩 / 新建 / 导入），存档管理全部进游玩页抽屉（#21），还是从列表页留「管理」入口深链进抽屉？</p>
+    <h4>Q5 进入流程</h4><p>新建游戏 = 直接开档进游玩页（B）还是先选书 + 起名确认（A / C）？「继续游玩」对需升级存档 = 直达（B）还是先出提示中间态（C）？</p>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const body = document.body;
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+const VARS = [
+  { key:'A', name:'A · 分区并置', hint:'动作带 + 故事书网格 + 存档列表' },
+  { key:'B', name:'B · 卡片流混合', hint:'单一滚动流 · 混合两类卡片' },
+  { key:'C', name:'C · 侧栏分栏', hint:'左导航 + 右工作区' },
+];
+
+const SB = [
+  { id:'fellstar', name:'坠星谷', rev:4, released:true },
+  { id:'mist', name:'雾镇疑云', rev:2, released:true },
+  { id:'ash', name:'灰烬行者', rev:3, released:true },
+  { id:'north', name:'北境信使', rev:1, released:true },
+];
+const SAVES = [
+  { id:'tavern', name:'坠星谷 · 酒馆之夜', sb:'fellstar', emb:3, latest:4, up:true, when:'刚刚', imp:false },
+  { id:'north1', name:'北境信使 · 初雪', sb:'north', emb:1, latest:1, up:false, when:'刚刚', imp:true },
+  { id:'ash1', name:'灰烬行者', sb:'ash', emb:3, latest:3, up:false, when:'昨天', imp:false },
+  { id:'mist1', name:'雾镇疑云 · 调查档案', sb:'mist', emb:2, latest:2, up:false, when:'上周', imp:false },
+];
+const sbName = id => (SB.find(s => s.id === id) || {}).name || id;
+const DAYS = [
+  { label:'今天', ids:['tavern','north1'] },
+  { label:'昨天', ids:['ash1'] },
+  { label:'上周', ids:['mist1'] },
+];
+
+let toastTimer;
+function toast(html){
+  const t = $('toast');
+  t.innerHTML = html;
+  t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 2200);
+}
+
+/* ---------- 变体 A 渲染 ---------- */
+function renderA(){
+  $('data-sbgrid').innerHTML = SB.map(sb =>
+    '<div class="sb-card">'
+      + '<div class="row1"><span class="nm">' + esc(sb.name) + '</span><span class="chip">已发布 · rev ' + sb.rev + '</span></div>'
+      + '<div class="meta">' + esc(sb.name) + ' · 版次 ' + sb.rev + '</div>'
+      + '<div class="ops">'
+      + '<button class="btn primary small" data-newgame="' + sb.id + '">＋ 新建游戏</button>'
+      + '<button class="btn small" data-edit="' + sb.id + '">进编辑器</button>'
+      + '</div></div>').join('');
+  $('data-savelist').innerHTML = SAVES.map(s =>
+    '<div class="save-row"><div class="bd">'
+      + '<div class="nm">' + esc(s.name)
+      + (s.imp ? '<span class="chip imp">新导入</span>' : '')
+      + (s.up ? '<span class="chip up"><span class="dot"></span>新版次待升级</span>' : '')
+      + '</div>'
+      + '<div class="meta"><span>' + esc(sbName(s.sb)) + '</span><span>版次 ' + s.emb + (s.up ? ' → ' + s.latest : '') + '</span><span>' + esc(s.when) + '</span></div>'
+      + '</div>'
+      + '<div class="ops">'
+      + '<button class="btn small" data-goto-upgrade="' + s.id + '"' + (s.up ? '' : ' disabled') + '>升级</button>'
+      + '<button class="btn primary small" data-resume="' + s.id + '">继续游玩</button>'
+      + '</div></div>').join('');
+}
+
+/* ---------- 变体 B 渲染 ---------- */
+function renderB(){
+  const cards = [];
+  for (const day of DAYS){
+    cards.push('<div class="daymark">' + day.label + '</div>');
+    for (const id of day.ids){
+      const s = SAVES.find(x => x.id === id);
+      if (s) cards.push(saveCardB(s));
+    }
+  }
+  cards.push('<div class="daymark">我的故事书</div>');
+  for (const sb of SB) cards.push(storyCardB(sb));
+  $('data-feed').innerHTML = cards.join('');
+}
+function saveCardB(s){
+  return '<div class="card">'
+    + '<div class="ic" style="background:#6ea8ff">' + esc(s.name[0]) + '</div>'
+    + '<div class="bd"><div class="tt">' + esc(s.name)
+    + (s.imp ? '<span class="chip imp">新导入</span>' : '')
+    + (s.up ? '<span class="chip up"><span class="dot"></span>待升级</span>' : '')
+    + '</div><div class="meta"><span>' + esc(sbName(s.sb)) + '</span><span>版次 ' + s.emb + (s.up ? '→' + s.latest : '') + '</span></div></div>'
+    + '<div class="ops">'
+    + '<button class="btn small" data-goto-upgrade="' + s.id + '"' + (s.up ? '' : ' disabled') + '>升级</button>'
+    + '<button class="btn primary small" data-resume="' + s.id + '">继续游玩</button>'
+    + '</div></div>';
+}
+function storyCardB(sb){
+  return '<div class="card">'
+    + '<div class="ic" style="background:#4ade80">' + esc(sb.name[0]) + '</div>'
+    + '<div class="bd"><div class="tt">' + esc(sb.name) + '<span class="chip">已发布 · rev ' + sb.rev + '</span></div>'
+    + '<div class="meta"><span>故事书</span></div></div>'
+    + '<div class="ops">'
+    + '<button class="btn primary small" data-newgame="' + sb.id + '">新建游戏</button>'
+    + '<button class="btn small" data-edit="' + sb.id + '">进编辑器</button>'
+    + '</div></div>';
+}
+
+/* ---------- 变体 C 渲染 ---------- */
+let cSel = { kind:'save', id:'tavern' };
+function renderC(){
+  $('data-c-sbs').innerHTML = SB.map(sb =>
+    '<div class="rrow' + (cSel.kind==='sb' && cSel.id===sb.id ? ' sel' : '') + '" data-c-sb="' + sb.id + '">'
+      + '<span class="nm">' + esc(sb.name) + '</span><span class="rev">rev ' + sb.rev + '</span></div>').join('');
+  $('data-c-saves').innerHTML = SAVES.map(s =>
+    '<div class="rrow' + (cSel.kind==='save' && cSel.id===s.id ? ' sel' : '') + '" data-c-save="' + s.id + '">'
+      + '<span class="nm">' + esc(s.name) + '</span><span class="rev">' + (s.up ? '↑' : '') + esc(s.when) + '</span></div>').join('');
+  renderCWork();
+}
+function renderCWork(){
+  const w = $('data-c-work');
+  if (cSel.kind === 'sb'){
+    const sb = SB.find(x => x.id === cSel.id);
+    const hasSaves = SAVES.some(s => s.sb === sb.id);
+    w.innerHTML = '<div class="w-title">' + esc(sb.name) + '</div>'
+      + '<div class="w-sub"><span>故事书</span><span>已发布 · rev ' + sb.rev + '</span>'
+      + (hasSaves ? '<span>有存档</span>' : '<span class="muted">尚无存档</span>') + '</div>'
+      + '<div class="w-ops">'
+      + '<button class="btn primary" data-newgame="' + sb.id + '">＋ 基于此新建游戏</button>'
+      + '<button class="btn" data-edit="' + sb.id + '">进编辑器</button></div>'
+      + (hasSaves
+        ? '<div class="recent">' + SAVES.filter(s => s.sb === sb.id).map(s =>
+            '<div class="ri" data-resume="' + s.id + '"><span class="nm">' + esc(s.name) + '</span><span class="when">' + esc(s.when) + '</span></div>').join('') + '</div>'
+        : '<div class="w-empty">尚无存档 — 点「新建游戏」开档</div>');
+  } else {
+    const s = SAVES.find(x => x.id === cSel.id);
+    w.innerHTML = '<div class="w-title">' + esc(s.name) + '</div>'
+      + '<div class="w-sub"><span>' + esc(sbName(s.sb)) + '</span><span>版次 ' + s.emb + (s.up ? ' → ' + s.latest : '') + '</span><span>' + esc(s.when) + '</span>'
+      + (s.imp ? '<span class="chip imp">新导入</span>' : '') + '</div>'
+      + (s.up ? '<div class="up-alert"><div class="t">⚑ 故事书已发布新版次 ' + s.latest + '</div>'
+        + '<div class="d">存档基于版次 ' + s.emb + '。升级为两段式（dry-run 报告 → 确认执行，执行前自动备份）；可稍后再说。</div>'
+        + '<div class="ops"><button class="btn warnb small" data-goto-upgrade="' + s.id + '">查看迁移报告</button>'
+        + '<button class="btn small" data-resume="' + s.id + '">直接继续游玩</button></div></div>' : '')
+      + '<div class="w-ops">'
+      + '<button class="btn primary" data-resume="' + s.id + '">继续游玩</button>'
+      + '<button class="btn" data-manage="' + s.id + '">存档管理 → 游玩页抽屉</button></div>';
+  }
+}
+
+/* ---------- 弹窗：新建游戏 ---------- */
+function openNewGame(preselect){
+  const opts = SB.map(sb => '<option value="' + sb.id + '"' + (preselect===sb.id ? ' selected' : '') + '>' + esc(sb.name) + ' · rev ' + sb.rev + '</option>').join('');
+  $('modal').innerHTML = '<h3>新建游戏</h3>'
+    + '<div class="msub">基于已发布故事书的当前版次开档（#23/#24）。</div>'
+    + '<div class="field"><label>故事书</label><select id="m-sb">' + opts + '</select></div>'
+    + '<div class="field"><label>存档名称（可改）</label><input type="text" id="m-name" placeholder="例如：坠星谷 · 第一次冒险" value=""></div>'
+    + '<div class="m-ops"><button class="btn" data-close-modal>取消</button><button class="btn primary" data-confirm-new>开档并进入游玩</button></div>';
+  $('modalBack').classList.add('open');
+}
+function confirmNew(){
+  const sb = $('m-sb').value;
+  const name = $('m-name').value.trim() || sbName(sb);
+  $('modalBack').classList.remove('open');
+  toast('✔ 已开档 <span class="f">' + esc(name) + '</span> · 进入游玩页');
+}
+
+/* ---------- 事件 ---------- */
+document.addEventListener('click', e => {
+  const t = e.target.closest('[data-resume],[data-newgame],[data-edit],[data-import],[data-goto-upgrade],[data-manage],[data-c-sb],[data-c-save],[data-sw],[data-confirm-new],[data-close-modal],[data-close-drawer]');
+  if (!t) return;
+  const has = a => t.hasAttribute(a);
+  if (has('data-sw')) return switchVar(+t.dataset.sw);
+  if (has('data-resume')){
+    const s = SAVES.find(x => x.id === t.dataset.resume);
+    toast('▶ 继续游玩 <span class="f">' + esc(s.name) + '</span>');
+    return;
+  }
+  if (has('data-newgame')){
+    if (body.dataset.variant === 'B'){ // B 立场：即点即开、无确认弹窗
+      const sbId = t.dataset.newgame || null;
+      const name = sbId ? sbName(sbId) : '新冒险';
+      return toast('✔ 直接开档 <span class="f">' + esc(name) + '</span> · 进入游玩页（无确认）');
+    }
+    return openNewGame(t.dataset.newgame || null);
+  }
+  if (has('data-edit')) return toast('→ 进编辑器：' + esc(sbName(t.dataset.edit)));
+  if (has('data-import')) return toast('⇪ 选择 .sqlite 文件（能打开即通过）');
+  if (has('data-goto-upgrade')) return toast('⚑ 迁移报告（dry-run）· ' + esc(SAVES.find(s => s.id === t.dataset.gotoUpgrade).name));
+  if (has('data-manage')) return toast('→ 游玩页抽屉：升级 / 新原点 / 分享');
+  if (has('data-c-sb')){ cSel = { kind:'sb', id:t.dataset.cSb }; renderC(); return; }
+  if (has('data-c-save')){ cSel = { kind:'save', id:t.dataset.cSave }; renderC(); return; }
+  if (has('data-confirm-new')) return confirmNew();
+  if (has('data-close-modal')){ $('modalBack').classList.remove('open'); return; }
+  if (has('data-close-drawer')){ $('drawer').classList.remove('open'); return; }
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape'){ $('modalBack').classList.remove('open'); $('drawer').classList.remove('open'); }
+  if (e.key === 'ArrowLeft') switchVar(-1);
+  if (e.key === 'ArrowRight') switchVar(1);
+});
+$('drawerBtn').addEventListener('click', () => $('drawer').classList.add('open'));
+
+function switchVar(d){
+  const keys = VARS.map(v => v.key);
+  let i = keys.indexOf(body.dataset.variant);
+  i = (i + d + VARS.length) % VARS.length;
+  body.dataset.variant = VARS[i].key;
+  $('swName').textContent = VARS[i].name;
+  $('swHint').textContent = VARS[i].hint;
+}
+
+(function(){
+  const q = new URLSearchParams(location.search).get('variant');
+  if (q && VARS.some(v => v.key === q.toUpperCase())) body.dataset.variant = q.toUpperCase();
+  const v = VARS.find(x => x.key === body.dataset.variant);
+  $('swName').textContent = v.name;
+  $('swHint').textContent = v.hint;
+  renderA(); renderB(); renderC();
+})();
+
+</script>
+</body>
+</html>

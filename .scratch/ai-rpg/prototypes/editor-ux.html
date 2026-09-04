@@ -1,0 +1,789 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<!-- 本原型决议（wayfinder #07）：混合范式 — B 文档为主壳（实体=文档页+内嵌结构化块） / C AI 结对做冷启动与补全 / A 表单·表格专用于关系图·属性维度等纯结构化区。骨架用独立大纲式编辑器（场景树+goal/beat 卡片）。引用双轨：结构化字段下拉/选择 + 叙事正文 @提及，共享同一引用图 + 实时校验兜底。属性维度独立全局设置区，人物表单只消费。AI 生成采纳即定型、不留来源标记。编辑器侧提供显式「发布」（版本+1，语义归 #14 存档迁移）。 -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>故事书编辑器原型 · 坠星谷 — wayfinder #07</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#151a22; --panel2:#1b2230; --line:#262f3f;
+    --ink:#e8edf5; --muted:#8b97a8; --accent:#6ea8ff; --ok:#4ade80; --warn:#fbbf24; --err:#f87171;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14px;line-height:1.5;height:100vh;overflow:hidden}
+  #topbar{height:46px;display:flex;align-items:center;gap:14px;padding:0 16px;background:var(--panel);border-bottom:1px solid var(--line);position:relative;z-index:5}
+  #topbar .badge{font-size:11px;font-weight:700;letter-spacing:.5px;padding:3px 8px;border-radius:4px;background:rgba(255,255,255,.06);color:var(--muted);border:1px solid var(--line);white-space:nowrap}
+  #topbar .title{font-weight:700;white-space:nowrap}
+  #topbar .spacer{flex:1}
+  #topbar button{background:transparent;border:1px solid var(--line);color:var(--ink);padding:4px 10px;border-radius:6px;font-size:12px;cursor:pointer;font-family:var(--sans)}
+  #topbar button:hover{border-color:var(--accent)}
+  #view{position:absolute;top:46px;left:0;right:0;bottom:0;overflow:hidden}
+  .variant{display:none;height:100%}
+  body[data-variant="A"] .variant.A{display:flex}
+  body[data-variant="B"] .variant.B{display:flex}
+  body[data-variant="C"] .variant.C{display:flex}
+  #switchbar{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);z-index:50;display:flex;align-items:center;gap:8px;background:#0b0e14;border:1px solid #334155;border-radius:999px;padding:6px 12px;box-shadow:0 8px 30px rgba(0,0,0,.5)}
+  #switchbar .sw-arrow{width:30px;height:30px;border-radius:50%;border:1px solid #334155;background:transparent;color:var(--ink);font-size:16px;cursor:pointer;display:flex;align-items:center;justify-content:center}
+  #switchbar .sw-arrow:hover{border-color:var(--accent)}
+  #switchbar .sw-label{font-size:12px;color:var(--muted);min-width:190px;text-align:center}
+  #switchbar .sw-label b{color:var(--ink);font-size:13px}
+  #drawer{position:fixed;top:0;right:0;bottom:0;width:46vw;min-width:480px;background:#0a0d12;border-left:1px solid var(--line);z-index:60;transform:translateX(100%);transition:transform .18s ease;display:flex;flex-direction:column}
+  #drawer.open{transform:translateX(0)}
+  #drawer header{padding:12px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px}
+  #drawer pre{flex:1;overflow:auto;padding:14px 16px;font-family:var(--mono);font-size:12px;color:#a8f0c0;white-space:pre;line-height:1.55}
+  .A{flex-direction:column}
+  .A .atop{display:flex;align-items:center;gap:10px;height:44px;padding:0 14px;border-bottom:1px solid var(--line);background:var(--panel)}
+  .A .atop .crumb{color:var(--muted);font-size:12.5px}
+  .A .atop .crumb b{color:var(--ink)}
+  .A .atop input[type=search]{margin-left:auto;background:var(--panel2);border:1px solid var(--line);border-radius:6px;color:var(--ink);padding:5px 10px;font-size:12.5px;width:200px}
+  .A .abody{flex:1;display:flex;min-height:0}
+  .A .atree{width:230px;border-right:1px solid var(--line);overflow:auto;background:var(--panel);padding:8px 0}
+  .A .sec{padding:2px 0}
+  .A .sec>button.secname{width:100%;text-align:left;background:none;border:none;color:var(--muted);font-size:11px;font-weight:700;letter-spacing:.4px;padding:7px 14px;cursor:pointer;display:flex;justify-content:space-between;align-items:center}
+  .A .sec>button.secname:hover{color:var(--ink)}
+  .A .sec .cnt{color:var(--muted);background:rgba(255,255,255,.06);border-radius:99px;padding:0 7px;font-size:10.5px}
+  .A .node{display:flex;align-items:center;gap:8px;padding:5px 14px 5px 26px;cursor:pointer;font-size:13px;color:var(--ink);border-left:2px solid transparent}
+  .A .node:hover{background:rgba(255,255,255,.04)}
+  .A .node.sel{background:rgba(110,168,255,.12);border-left-color:var(--accent)}
+  .A .node .ty{width:16px;text-align:center;font-size:12px;color:var(--muted)}
+  .A .aform{flex:1;overflow:auto;padding:18px 26px;max-width:760px}
+  .A .fhead{display:flex;align-items:center;gap:12px;margin-bottom:4px}
+  .A .fhead h2{font-size:20px}
+  .A .fhead .ktag{font-size:11px;color:var(--muted);background:rgba(255,255,255,.06);padding:2px 8px;border-radius:4px}
+  .A .fhead .del{margin-left:auto;color:var(--muted);background:none;border:none;cursor:pointer;font-size:12px}
+  .A .fhead .del:hover{color:var(--err)}
+  .A .fsub{color:var(--muted);font-size:12.5px;margin-bottom:18px}
+  .A .fsec{margin:18px 0 6px;font-size:12px;font-weight:700;color:var(--muted);letter-spacing:.4px}
+  .A .frow{display:grid;grid-template-columns:140px 1fr;gap:10px 14px;align-items:start;padding:7px 0;border-bottom:1px dashed rgba(255,255,255,.05)}
+  .A .frow label{color:var(--muted);font-size:12.5px;padding-top:5px}
+  .A .frow input,.A .frow select,.A .frow textarea{background:var(--panel2);border:1px solid var(--line);border-radius:6px;color:var(--ink);padding:5px 9px;font-size:13px;font-family:var(--sans);width:100%}
+  .A .frow textarea{min-height:74px;resize:vertical;line-height:1.55}
+  .A .frow .hint{font-size:11px;color:var(--muted);margin-top:3px}
+  .A table.edges{width:100%;border-collapse:collapse;font-size:12.5px}
+  .A table.edges th{color:var(--muted);text-align:left;font-weight:600;padding:6px 8px;border-bottom:1px solid var(--line);font-size:11.5px}
+  .A table.edges td{padding:6px 8px;border-bottom:1px solid rgba(255,255,255,.04)}
+  .A table.edges .val{font-family:var(--mono)}
+  .A .addrow{display:flex;gap:8px;margin-top:10px}
+  .A .addrow select,.A .addrow input{background:var(--panel2);border:1px solid var(--line);border-radius:6px;color:var(--ink);padding:5px 9px;font-size:12.5px}
+  .A .addrow button{background:var(--accent);border:none;color:#08111f;font-weight:700;border-radius:6px;padding:5px 12px;cursor:pointer;font-size:12.5px}
+  .A .arail{width:260px;border-left:1px solid var(--line);overflow:auto;background:var(--panel);padding:12px 14px}
+  .A .railh{font-size:11px;font-weight:700;color:var(--muted);letter-spacing:.4px;margin:14px 0 8px}
+  .A .railh:first-child{margin-top:0}
+  .A .warnitem{display:flex;gap:8px;font-size:12px;padding:6px 8px;border-radius:6px;background:rgba(251,191,36,.07);border:1px solid rgba(251,191,36,.2);color:#fcd34d;margin-bottom:6px}
+  .A .okitem{display:flex;gap:8px;font-size:12px;padding:6px 8px;border-radius:6px;background:rgba(74,222,128,.06);border:1px solid rgba(74,222,128,.2);color:#86efac;margin-bottom:6px}
+  .A .refitem{font-size:12px;color:var(--ink);padding:5px 8px;border-radius:6px;background:var(--panel2);margin-bottom:6px}
+  .A .refitem small{display:block;color:var(--muted)}
+  .A .addbtn{background:none;border:1px dashed var(--line);color:var(--muted);border-radius:6px;padding:5px 10px;cursor:pointer;font-size:12px;width:100%;margin-top:4px}
+  .A .addbtn:hover{color:var(--accent);border-color:var(--accent)}
+  .B{flex-direction:row}
+  .B .bpagelist{width:216px;border-right:1px solid var(--line);background:var(--panel);overflow:auto;padding:10px 0}
+  .B .bgrp{font-size:11px;font-weight:700;color:var(--muted);letter-spacing:.5px;padding:10px 16px 4px}
+  .B .bpage{display:flex;align-items:center;gap:8px;padding:6px 16px;cursor:pointer;font-size:13px;color:var(--ink);border-left:2px solid transparent}
+  .B .bpage:hover{background:rgba(255,255,255,.04)}
+  .B .bpage.sel{background:rgba(255,255,255,.05);border-left-color:#e8b34b}
+  .B .bpage .ic{width:18px;text-align:center;font-size:12px;color:var(--muted)}
+  .B .bpage .n{color:var(--muted);margin-left:auto;font-size:11px}
+  .B .bdoc{flex:1;overflow:auto;padding:34px 0 60px}
+  .B .bdoc .page{max-width:680px;margin:0 auto;padding:0 28px}
+  .B .bdoc h1{font-size:28px;margin-bottom:4px;font-weight:800}
+  .B .bdoc .docmeta{color:var(--muted);font-size:12.5px;margin-bottom:22px;display:flex;gap:10px;flex-wrap:wrap}
+  .B .bdoc .docmeta .chip{background:rgba(255,255,255,.06);padding:2px 9px;border-radius:99px;font-size:11.5px}
+  .B .prose{font-family:Georgia,"Songti SC","Noto Serif SC",serif;font-size:15.5px;line-height:1.85;color:#dbe3ee;margin-bottom:20px}
+  .B .prose p{margin-bottom:14px}
+  .B .slashhint{font-size:12px;color:var(--muted);border:1px dashed var(--line);border-radius:8px;padding:10px 14px;margin:18px 0;text-align:center}
+  .B .slashhint kbd{background:rgba(255,255,255,.08);border-radius:4px;padding:1px 6px;font-family:var(--mono);font-size:11px}
+  .B .block{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin:14px 0;overflow:hidden}
+  .B .block .bhead{display:flex;align-items:center;gap:8px;padding:8px 14px;border-bottom:1px solid var(--line);font-size:11px;font-weight:700;color:var(--muted);letter-spacing:.4px}
+  .B .block .bhead .drag{color:#475569;letter-spacing:1px}
+  .B .block .bhead .r{margin-left:auto;font-weight:500;color:#475569}
+  .B .block .brow{display:flex;align-items:center;gap:10px;padding:6px 14px;font-size:13px;border-bottom:1px solid rgba(255,255,255,.04)}
+  .B .block .brow:last-child{border-bottom:none}
+  .B .block .brow .k{width:90px;color:var(--muted);font-size:12px}
+  .B .block .brow .v{flex:1}
+  .B .block .brow .bar{height:6px;border-radius:3px;background:#2a3550;position:relative;overflow:hidden;display:inline-block}
+  .B .block .brow .bar i{position:absolute;left:0;top:0;bottom:0;background:linear-gradient(90deg,#e8b34b,#f0c96a);border-radius:3px}
+  .B .mention{display:inline-flex;align-items:center;gap:4px;background:rgba(232,179,75,.14);border:1px solid rgba(232,179,75,.35);color:#f3d18b;border-radius:6px;padding:0 7px;font-size:13px;font-weight:600}
+  .B .cardrow{display:flex;gap:12px;flex-wrap:wrap;margin:10px 0}
+  .B .minicard{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px;flex:1;min-width:150px}
+  .B .minicard .t{font-weight:700;font-size:13.5px;margin-bottom:4px}
+  .B .minicard .d{color:var(--muted);font-size:12px}
+  .B .backlinks{margin-top:26px;border-top:1px solid var(--line);padding-top:12px;font-size:12px;color:var(--muted)}
+  .B .backlinks .bl{display:inline-block;background:var(--panel2);border:1px solid var(--line);border-radius:99px;padding:2px 10px;margin:4px 6px 0 0;font-size:12px;color:var(--ink)}
+  .C{flex-direction:row}
+  .C .cleft{width:320px;border-right:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;min-height:0}
+  .C .cchat{flex:1;overflow:auto;padding:14px}
+  .C .cmsg{font-size:13px;margin-bottom:12px;line-height:1.6}
+  .C .cmsg.user{text-align:right}
+  .C .cmsg.user .bubble{display:inline-block;background:#2b3a55;border-radius:12px 12px 3px 12px;padding:8px 12px;text-align:left}
+  .C .cmsg.ai .bubble{background:var(--panel2);border:1px solid var(--line);border-radius:12px 12px 12px 3px;padding:8px 12px}
+  .C .cmsg .who{font-size:10.5px;color:var(--muted);margin-bottom:3px;letter-spacing:.3px}
+  .C .cin{display:flex;gap:8px;padding:12px;border-top:1px solid var(--line)}
+  .C .cin input{flex:1;background:var(--panel2);border:1px solid var(--line);border-radius:8px;color:var(--ink);padding:8px 12px;font-size:13px}
+  .C .cin button{background:#a78bfa;border:none;color:#150b2e;font-weight:700;border-radius:8px;padding:8px 14px;cursor:pointer;font-size:13px}
+  .C .cright{flex:1;display:flex;flex-direction:column;min-width:0;overflow:auto}
+  .C .cprog{display:flex;align-items:center;gap:16px;padding:12px 18px;border-bottom:1px solid var(--line);background:var(--panel);flex-wrap:wrap}
+  .C .cprog .pg{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--muted)}
+  .C .cprog .pbar{width:70px;height:5px;border-radius:3px;background:#2a3550;position:relative;overflow:hidden}
+  .C .cprog .pbar i{position:absolute;left:0;top:0;bottom:0;background:#a78bfa;border-radius:3px}
+  .C .cprog .advice{margin-left:auto;font-size:12px;color:var(--warn)}
+  .C .ccards{flex:1;overflow:auto;padding:18px;display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px;align-content:start}
+  .C .gencard{background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden;display:flex;flex-direction:column}
+  .C .gencard.done{border-color:rgba(74,222,128,.4)}
+  .C .gencard .ghead{display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--line)}
+  .C .gencard .ghead .t{font-weight:700;font-size:14px}
+  .C .gencard .ghead .tag{margin-left:auto;font-size:10.5px;padding:2px 8px;border-radius:99px;background:rgba(255,255,255,.07);color:var(--muted)}
+  .C .gencard .ghead .tag.gen{background:rgba(167,139,250,.15);color:#c4b5fd}
+  .C .gencard .gbody{padding:12px 14px;font-size:13px;color:var(--ink);flex:1}
+  .C .gencard .gbody .row{display:flex;gap:8px;margin-bottom:7px;font-size:12.5px}
+  .C .gencard .gbody .row .k{color:var(--muted);min-width:66px}
+  .C .gencard .gactions{display:flex;gap:8px;padding:10px 14px;border-top:1px solid var(--line)}
+  .C .gencard .gactions button{border:1px solid var(--line);background:transparent;color:var(--ink);border-radius:7px;padding:6px 12px;font-size:12.5px;cursor:pointer}
+  .C .gencard .gactions .adopt{background:#4ade80;border-color:#4ade80;color:#08110b;font-weight:700}
+  .C .gencard .gactions button:hover{border-color:#a78bfa}
+  .C .csuggest{background:rgba(167,139,250,.07);border:1px solid rgba(167,139,250,.2);border-radius:10px;padding:10px 14px;margin:12px 18px;font-size:12.5px;color:#c4b5fd}
+  .C .csuggest b{color:#ddd6fe}
+  ::-webkit-scrollbar{width:9px;height:9px}
+  ::-webkit-scrollbar-thumb{background:#2a3550;border-radius:9px}
+  ::-webkit-scrollbar-track{background:transparent}
+</style>
+</head>
+<body data-variant="A">
+<div id="topbar">
+  <span class="badge">PROTOTYPE · 勿用于生产</span>
+  <span class="title">故事书编辑器 · 三范式对比</span>
+  <span class="spacer"></span>
+  <button id="btn-json">导出 JSON（当前状态）</button>
+</div>
+<div id="view"></div>
+<div id="switchbar">
+  <button class="sw-arrow" id="sw-prev" title="上一个变体">←</button>
+  <div class="sw-label"><b id="sw-name">A — 表单工作台</b><br>故事书编辑器原型 #07 · 坠星谷</div>
+  <button class="sw-arrow" id="sw-next" title="下一个变体">→</button>
+</div>
+<div id="drawer">
+  <header><b>当前故事书状态（模拟状态导出）</b><span style="flex:1"></span><button id="drawer-close">关闭</button></header>
+  <pre id="drawer-pre"></pre>
+</div>
+
+<script>
+"use strict";
+/* =====================================================================
+   PROTOTYPE · wayfinder #07 故事书编辑器设计
+   三个范式的对比原型：A 表单驱动 / B 类 Notion 文档 / C AI 结对创作。
+   数据取自「故事书数据模型」票（#01）的结论。
+   ===================================================================== */
+
+const S = {
+  meta:{title:"坠星谷",version:"0.3.0",author:"佚名",language:"zh-CN",
+    desc:"天穹裂隙倾泻「星烬」，谷中万物因之畸变与赋灵。玩家扮演拾烬人，在星烬枯竭前找到出路。"},
+  world:{
+    premise:"三百年前，天穹撕开一道裂隙，「星烬」如雪飘落。凡沾星烬之物皆得畸变或赋灵：灯草会发光，铁器会低语，死去的人偶尔会在月下站起。镇子依矿而生，如今矿脉将尽，裂隙却越裂越宽。",
+    tone:"灰暗奇幻 · 微光中的希望",
+    rules:["星烬既是货币也是施法材料，一次判定可燃烧星烬换取加值","拾烬人之间的口头约定优先于字面契约","裂隙教团以「重开裂隙」为终极目标"],
+    locations:[
+      {id:"loc-baiquan",name:"白泉镇",type:"小镇",desc:"坠星谷唯一的聚居地，白泉井是全镇生命线。",factions:["fa-shijin"]},
+      {id:"loc-liexi",name:"裂隙山口",type:"地标",desc:"天穹裂隙的正下方，星烬密度最高的禁区。",factions:["fa-liexi"]},
+      {id:"loc-kuang",name:"沉星矿坑",type:"矿场",desc:"已近枯竭的星烬矿坑，传闻坑底有「星核」。",factions:[]},
+      {id:"loc-shuangyu",name:"霜语林",type:"林地",desc:"入夜后树木会低语，误入者易迷失。",factions:[]}
+    ],
+    resources:[
+      {id:"res-xingjin",name:"星烬",desc:"星尘凝结的货币与施法材料。",initial:100},
+      {id:"res-tili",name:"体力",desc:"行动与战斗的消耗。",initial:80},
+      {id:"res-mana",name:"法力",desc:"施法消耗。",initial:60}
+    ]
+  },
+  dimensions:[
+    {key:"strength",label:"力量",type:"number",min:0,max:100},
+    {key:"agility",label:"敏捷",type:"number",min:0,max:100},
+    {key:"will",label:"意志",type:"number",min:0,max:100},
+    {key:"perception",label:"感知",type:"number",min:0,max:100},
+    {key:"constitution",label:"体质",type:"number",min:0,max:100},
+    {key:"alignment",label:"阵营",type:"enum",options:["守序","中立","混乱"]},
+    {key:"class",label:"职业",type:"text"}
+  ],
+  skeleton:{chapters:[
+    {id:"ch1",title:"第一章 · 余烬将熄",goal:"查明镇长失踪的真相，在星烬枯竭前找到出路",scenes:[
+      {id:"sc1",title:"白泉镇的夜",entry:"玩家在入夜后抵达白泉镇",exit:"获得阿彻的信任或发现镇长的线索",
+        goals:[{id:"g1",text:"让阿彻愿意开口"}],
+        beats:[
+          {id:"b1",title:"烛火熄灭",trigger:"玩家夜巡经过镇长家时",once:true,hint:"镇长家的蜡烛骤然熄灭，屋内传来压抑的低语——这是本场景的第一条线索。",done:false},
+          {id:"b2",title:"遇见阿彻",trigger:"玩家在钟楼下或酒馆遇见守夜人阿彻",once:true,hint:"阿彻态度冷淡，给玩家一个「信任」判定机会。",done:false},
+          {id:"b3",title:"星烬异象",trigger:"玩家主动观察裂隙方向",once:false,hint:"裂隙方向的天幕闪烁了一下，像心跳。",done:false}
+        ]}
+    ]}
+  ]},
+  characters:[
+    {id:"ch-ache",name:"阿彻",role:"守夜人",home:"loc-baiquan",faction:"fa-shijin",
+      background:"前矿工队长，星烬枯竭后转任守夜人。右眼在矿难中失明。",
+      personality:"冷静、多疑、寡言；只相信亲眼所见。",
+      attributes:{strength:55,agility:70,will:80,perception:85,constitution:60,alignment:"守序",class:"守夜人"}},
+    {id:"ch-mila",name:"米拉",role:"药师",home:"loc-baiquan",faction:"fa-shijin",
+      background:"白泉镇药师，擅长以星烬为药引。父亲死于矿难。",
+      personality:"温柔、固执；对镇民有强烈的保护欲。",
+      attributes:{strength:30,agility:50,will:75,perception:70,constitution:55,alignment:"中立",class:"药师"}},
+    {id:"ch-tiezhong",name:"铁鬃",role:"商队首领",home:"",faction:"",
+      background:"往来于坠星谷与山外的商队首领，消息灵通，两头通吃。",
+      personality:"圆滑、讲义气；只在利益与道义一致时可靠。",
+      attributes:{strength:80,agility:45,will:60,perception:65,constitution:85,alignment:"混乱",class:"商贾"}}
+  ],
+  skills:[
+    {id:"sk-xinghuo",name:"星火术",category:"法术",desc:"掷出一簇星烬点燃目标。",
+      cost:{resource:"res-mana",amount:10},cooldown:2,target:"单体",
+      check:{dim:"will",mode:"d20"},effect:"2d6 星烬伤害，施加「点燃」状态。",lua:false},
+    {id:"sk-baozha",name:"包扎",category:"技艺",desc:"以草料与绷带处理伤势。",
+      cost:null,cooldown:1,target:"自身或友方",
+      check:{dim:null,mode:"none"},effect:"恢复 1d4+体质修正 体力。",lua:true},
+    {id:"sk-qianmo",name:"缄默步伐",category:"技艺",desc:"在夜色与阴影中潜行。",
+      cost:null,cooldown:0,target:"自身",
+      check:{dim:"agility",mode:"d20"},effect:"潜行判定 +2；受光或受袭时失效。",lua:false}
+  ],
+  items:[
+    {id:"it-hufu",name:"余烬护符",type:"饰品",desc:"嵌着一粒星烬的铜护符，微微发热。",
+      quantity:1,properties:{佩戴:"微光",附魔:"星火术"},skills:["sk-xinghuo"]},
+    {id:"it-caoxue",name:"止血草",type:"消耗品",desc:"霜语林特产，捣碎敷用。",
+      quantity:5,properties:{},skills:["sk-baozha"]}
+  ],
+  factions:[
+    {id:"fa-shijin",name:"拾烬人协会",desc:"由矿工与拾荒者组成的互助组织，维系白泉镇的运转。",
+      goals:"在星烬枯竭前为镇子找到新的生计。",defaultAttitude:"友好"},
+    {id:"fa-liexi",name:"裂隙教团",desc:"崇拜裂隙，认为星烬是神赐，重开裂隙是救赎。",
+      goals:"扩大裂隙，迎回「天上的主人」。",defaultAttitude:"敌意"}
+  ],
+  relationships:[
+    {from:"ch-ache",to:"ch-mila",type:"信任",value:60},
+    {from:"ch-mila",to:"ch-ache",type:"牵挂",value:45},
+    {from:"ch-ache",to:"fa-liexi",type:"敌意",value:-55},
+    {from:"ch-mila",to:"fa-liexi",type:"敌意",value:-40},
+    {from:"ch-tiezhong",to:"fa-shijin",type:"同盟",value:30},
+    {from:"ch-tiezhong",to:"fa-liexi",type:"暧昧",value:15}
+  ]
+};
+
+/* ---------- helpers ---------- */
+const $ = id => document.getElementById(id);
+const byId = (id,list) => list.find(x=>x.id===id) || {name:"(未引用)",id};
+const relName = id => {
+  if(id.startsWith("ch-")) return byId(id,S.characters).name;
+  if(id.startsWith("fa-")) return byId(id,S.factions).name;
+  if(id.startsWith("loc-")) return byId(id,S.world.locations).name;
+  return id;
+};
+
+function render(){
+  const v = document.body.dataset.variant;
+  $("view").innerHTML = "";
+  if(v==="A") renderA();
+  if(v==="B") renderB();
+  if(v==="C") renderC();
+  $("sw-name").textContent = {A:"A — 表单工作台",B:"B — 文档工作台",C:"C — AI 结对创作"}[v];
+}
+
+/* =====================================================================
+   VARIANT A — 表单工作台（资料库模式）
+   ===================================================================== */
+let Astate = { sel:"ch-ache" };
+function treeNodes(){
+  return [
+    ["meta","信息",[{id:"meta",name:"故事书信息"}]],
+    ["world","世界",[{id:"world-premise",name:"设定与规则"},{id:"world-loc",name:"地点"},{id:"world-res",name:"资源"}]],
+    ["dim","属性维度",[{id:"dim",name:"全局属性"}]],
+    ["skel","骨架",[{id:"skel",name:"章节 / 场景"}]],
+    ["char","人物",S.characters],
+    ["skill","技能",S.skills],
+    ["item","物品",S.items],
+    ["fac","势力",S.factions],
+    ["rel","关系",[{id:"rel",name:"关系图"}]]
+  ];
+}
+function validation(entity){
+  const warns=[];
+  if(entity && entity.faction && !S.factions.find(f=>f.id===entity.faction))
+    warns.push("引用失效：势力不存在");
+  if(entity && entity.skills && entity.skills.some(s=>!S.skills.find(x=>x.id===s)))
+    warns.push("引用失效：技能不存在");
+  if(entity && entity.home && !S.world.locations.find(l=>l.id===entity.home))
+    warns.push("引用失效：地点不存在");
+  return warns;
+}
+function field(label,html,hint){
+  return '<div class="frow"><label>'+label+'</label><div>'+html+(hint?'<div class="hint">'+hint+'</div>':"")+'</div></div>';
+}
+function esc(s){ return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function drawA(){
+  const root=document.createElement("div"); root.className="variant A";
+  root.innerHTML=''+
+    '<div class="atop"><span class="crumb">坠星谷 <b id="acrumb"></b></span>'+
+    '<input type="search" placeholder="搜索 人物/技能/物品…" id="a-search">'+
+    '<span style="display:flex;align-items:center;gap:6px;font-size:12px;color:#86efac">● 已自动保存</span></div>'+
+    '<div class="abody"><div class="atree" id="a-tree"></div><div class="aform" id="a-form"></div><div class="arail" id="a-rail"></div></div>';
+  $("view").appendChild(root);
+  drawTree(); drawAForm(); drawRail();
+  $("a-search").addEventListener("input",e=>{ $("a-search").dataset.q=e.target.value; drawTree(); });
+}
+function drawTree(){
+  const tree=$("a-tree"); if(!tree) return; tree.innerHTML="";
+  const q=($("a-search")||{}).dataset?.q||"";
+  treeNodes().forEach(([sk,label,items])=>{
+    const sec=document.createElement("div"); sec.className="sec";
+    const hdr=document.createElement("button"); hdr.className="secname";
+    hdr.innerHTML='<span>'+label+'</span><span class="cnt">'+items.length+'</span>';
+    sec.appendChild(hdr);
+    items.forEach(it=>{
+      if(q && !(it.name||"").includes(q) && !(it.title||"").includes(q) && !(it.id||"").includes(q)) return;
+      const n=document.createElement("div"); n.className="node"+(Astate.sel===it.id?" sel":"");
+      const ic = sk==="char"?"👤":sk==="skill"?"✦":sk==="item"?"📦":sk==="fac"?"🏛️":sk==="world"?(it.id==="world-premise"?"📜":it.id==="world-loc"?"📍":"💎"):"•";
+      n.innerHTML='<span class="ty">'+ic+'</span><span>'+esc(it.name||it.title||it.id)+'</span>';
+      n.onclick=()=>{ Astate={sel:it.id,kind:sk}; drawTree(); drawAForm(); drawRail(); };
+      sec.appendChild(n);
+    });
+    tree.appendChild(sec);
+  });
+}
+function renderA(){
+  drawA();
+}
+function AformHTML(sel){
+  if(sel==="meta") return metaForm();
+  if(sel==="dim") return dimForm();
+  if(sel==="skel") return skelForm();
+  if(sel==="rel") return relForm();
+  if(sel==="world-premise") return premiseForm();
+  if(sel==="world-loc") return locListForm();
+  if(sel==="world-res") return resListForm();
+  if(sel.startsWith("ch-")) return charForm(sel);
+  if(sel.startsWith("sk-")) return skillForm(sel);
+  if(sel.startsWith("it-")) return itemForm(sel);
+  if(sel.startsWith("fa-")) return facForm(sel);
+  return "";
+}
+function drawAForm(){
+  $("a-form").innerHTML = AformHTML(Astate.sel||"ch-ache");
+  $("a-form").querySelectorAll("[data-meta]").forEach(i=>i.onchange=()=>{S.meta[i.dataset.meta]=i.value});
+  $("a-form").querySelectorAll("[data-char]").forEach(i=>i.onchange=()=>{byId(i.dataset.char,S.characters)[i.dataset.k]=i.value; drawRail();});
+  $("a-form").querySelectorAll("[data-skill]").forEach(i=>i.onchange=()=>{byId(i.dataset.skill,S.skills)[i.dataset.k]=i.value});
+  $("a-form").querySelectorAll("[data-item]").forEach(i=>{const it=byId(i.dataset.item,S.items); it[i.dataset.k]=i.value;});
+  $("a-form").querySelectorAll("[data-fac]").forEach(i=>i.onchange=()=>{byId(i.dataset.fac,S.factions)[i.dataset.k]=i.value});
+  const addsk=$("it-addskill");
+  if(addsk) addsk.onchange=()=>{ const v=addsk.value; if(v){ byId(Astate.sel,S.items).skills.push(v); drawAForm(); drawRail(); } };
+}
+function drawRail(){
+  const rail=$("a-rail"); if(!rail) return;
+  const sel=Astate.sel||"";
+  const isEntity = sel.startsWith("ch-")||sel.startsWith("sk-")||sel.startsWith("it-")||sel.startsWith("fa-");
+  const all=[...S.characters,...S.skills,...S.items,...S.factions];
+  const ent = isEntity ? byId(sel,all) : null;
+  const warns = ent?validation(ent):[];
+  let html='<div class="railh">引用完整性</div>';
+  if(!ent){ html+='<div class="okitem">✓ 容器 / 列表，无引用校验</div>'; }
+  else if(warns.length===0){ html+='<div class="okitem">✓ 所有引用有效</div>'; }
+  else warns.forEach(w=>html+='<div class="warnitem">⚠ '+esc(w)+'</div>');
+  html+='<div class="railh">被引用（谁在用它）</div>';
+  if(ent){
+    const refs=[];
+    S.skills.forEach(s=>{ if(s.cost&&s.cost.resource===sel) refs.push('技能「'+s.name+'」消耗此资源'); });
+    S.items.forEach(it=>{ if(it.skills.includes(sel)) refs.push('物品「'+it.name+'」引用此技能'); });
+    S.relationships.forEach(r=>{ if(r.from===sel||r.to===sel) refs.push('关系「'+relName(r.from)+' → '+relName(r.to)+'」'); });
+    S.characters.forEach(c=>{ if(c.faction===sel) refs.push('人物「'+c.name+'」隶属'); });
+    if(refs.length===0) html+='<div class="okitem">✓ 无引用</div>';
+    else refs.slice(0,6).forEach(r=>html+='<div class="refitem">↪ '+esc(r)+'</div>');
+  }
+  html+='<div class="railh">最近修改</div><div class="refitem"><small>刚刚</small>米拉 · 阵营 → 中立</div><div class="refitem"><small>8 分钟前</small>新增 beat · 星烬异象</div>';
+  rail.innerHTML=html;
+}
+function metaForm(){
+  $("acrumb").textContent="/ 信息";
+  return '<div class="fhead"><h2>坠星谷</h2><span class="ktag">故事书</span></div>'+
+    '<div class="fsub">故事书顶层信息。版本号在发布时 +1。</div><div class="fsec">META</div>'+
+    field("标题",'<input value="'+esc(S.meta.title)+'" data-meta="title">')+
+    field("版本",'<input value="'+esc(S.meta.version)+'" data-meta="version">')+
+    field("作者",'<input value="'+esc(S.meta.author)+'" data-meta="author">')+
+    field("语言",'<input value="'+esc(S.meta.language)+'" data-meta="language">')+
+    field("一句话简介",'<textarea data-meta="desc">'+esc(S.meta.desc)+'</textarea>')+
+    '<button class="addbtn" onclick="alert(\'原型：新建故事书\')">＋ 新建故事书</button>';
+}
+function dimForm(){
+  $("acrumb").textContent="/ 属性维度";
+  return '<div class="fhead"><h2>属性维度</h2><span class="ktag">全局定义</span></div>'+
+    '<div class="fsub">故事书全局定义；人物填值，判定只用「数值」型。新增维度会同步出现在所有人物表单。</div>'+
+    '<div class="fsec">维度列表</div>'+
+    '<table class="edges"><tr><th>键</th><th>标签</th><th>类型</th><th>范围/选项</th><th></th></tr>'+
+    S.dimensions.map(d=>'<tr><td><span class="val">'+d.key+'</span></td><td>'+d.label+'</td>'+
+      '<td>'+(d.type==="number"?"数值":d.type==="enum"?"枚举":"文本")+'</td>'+
+      '<td>'+(d.type==="number"?d.min+"–"+d.max:d.type==="enum"?d.options.join(" / "):"—")+'</td>'+
+      '<td><button class="del" onclick="delDim(\''+d.key+'\')">删</button></td></tr>').join("")+
+    '</table>'+
+    '<div class="addrow"><input placeholder="键 (strength)" id="dim-key" style="width:130px">'+
+    '<input placeholder="标签 (力量)" id="dim-label" style="width:110px">'+
+    '<select id="dim-type"><option value="number">数值</option><option value="enum">枚举</option><option value="text">文本</option></select>'+
+    '<button onclick="addDim()">添加维度</button></div>'+
+    '<div class="hint" style="margin-top:6px;font-size:11px;color:var(--muted)">维度被人物引用时不可删除（引擎端拒绝）——先改人物再删。</div>';
+}
+function skelForm(){
+  $("acrumb").textContent="/ 骨架";
+  const ch=S.skeleton.chapters[0]; const sc=ch.scenes[0];
+  return '<div class="fhead"><h2>'+esc(ch.title)+'</h2><span class="ktag">章节</span></div>'+
+    '<div class="fsub">章节目标驱动主线 AI；场景内的 goal / beat 定义关键事件与提示。</div>'+
+    field("章节目标",'<textarea>'+esc(ch.goal)+'</textarea>','主线 AI 以此判断「章节是否完成」。')+
+    '<div class="fsec">场景 · '+esc(sc.title)+'</div>'+
+    field("进入条件",'<textarea>'+esc(sc.entry)+'</textarea>')+
+    field("结束条件",'<textarea>'+esc(sc.exit)+'</textarea>')+
+    field("场景目标",'<textarea>'+esc(sc.goals.map(g=>g.text).join("；"))+'</textarea>')+
+    '<div class="fsec">BEATS（关键事件）</div>'+
+    '<table class="edges"><tr><th>事件</th><th>触发条件</th><th>一次性</th><th></th></tr>'+
+    sc.beats.map(b=>'<tr><td><b>'+esc(b.title)+'</b><div class="hint">提示：'+esc(b.hint)+'</div></td>'+
+      '<td>'+esc(b.trigger)+'</td><td>'+(b.once?"是":"否")+'</td>'+
+      '<td><button class="del" onclick="alert(\'原型：编辑/重排 beat\')">✎</button></td></tr>').join("")+
+    '</table><button class="addbtn" onclick="alert(\'原型：新增 beat\')">＋ 新增 beat</button>';
+}
+function premiseForm(){
+  $("acrumb").textContent="/ 设定";
+  return '<div class="fhead"><h2>世界设定</h2><span class="ktag">静态注入</span></div>'+
+    '<div class="fsub">叙事基调与通用规则，按「系统层 + 场景层」注入主线 AI 上下文。</div>'+
+    field("背景叙事 (premise)",'<textarea>'+esc(S.world.premise)+'</textarea>','注入系统提示，是 AI 不能自由发挥的边界。')+
+    field("基调",'<input value="'+esc(S.world.tone)+'">')+
+    field("通用规则",'<textarea>'+esc(S.world.rules.join("\n"))+'</textarea>','每条规则都会被引用进 prompt。')+
+    '<div class="fsec">地点（'+S.world.locations.length+'）</div>'+
+    '<table class="edges"><tr><th>地点</th><th>类型</th><th>一句话</th></tr>'+
+    S.world.locations.map(l=>'<tr><td><b>'+esc(l.name)+'</b></td><td>'+esc(l.type)+'</td><td>'+esc(l.desc)+'</td></tr>').join("")+
+    '</table><button class="addbtn" onclick="alert(\'原型：新增地点\')">＋ 新增地点</button>'+
+    '<div class="fsec">资源（'+S.world.resources.length+'）</div>'+
+    '<table class="edges"><tr><th>资源</th><th>说明</th><th>初始值</th></tr>'+
+    S.world.resources.map(r=>'<tr><td><b>'+esc(r.name)+'</b></td><td>'+esc(r.desc)+'</td><td class="val">'+r.initial+'</td></tr>').join("")+
+    '</table>';
+}
+function locListForm(){
+  $("acrumb").textContent="/ 地点";
+  return '<div class="fhead"><h2>地点</h2><span class="ktag">世界</span></div>'+
+    '<div class="fsub">共 '+S.world.locations.length+' 个地点。点击左侧地点进入编辑。</div>'+
+    '<table class="edges"><tr><th>地点</th><th>类型</th><th>描述</th></tr>'+
+    S.world.locations.map(l=>'<tr><td><b>'+esc(l.name)+'</b></td><td>'+esc(l.type)+'</td><td>'+esc(l.desc)+'</td></tr>').join("")+
+    '</table><button class="addbtn" onclick="alert(\'原型：新增地点\')">＋ 新增地点</button>';
+}
+function resListForm(){
+  $("acrumb").textContent="/ 资源";
+  return '<div class="fhead"><h2>资源</h2><span class="ktag">世界</span></div>'+
+    '<div class="fsub">可消耗量（货币/体力/法力等），被技能消耗引用。</div>'+
+    '<table class="edges"><tr><th>资源</th><th>说明</th><th>初始值</th></tr>'+
+    S.world.resources.map(r=>'<tr><td><b>'+esc(r.name)+'</b></td><td>'+esc(r.desc)+'</td><td class="val">'+r.initial+'</td></tr>').join("")+
+    '</table><button class="addbtn" onclick="alert(\'原型：新增资源\')">＋ 新增资源</button>';
+}
+function charForm(id){
+  const c=byId(id,S.characters); $("acrumb").textContent="/ 人物 / "+c.name;
+  const attrRows = S.dimensions.map(d=>{
+    const v=c.attributes[d.key]??"";
+    const inp = d.type==="number"
+      ? '<input type="number" value="'+esc(v)+'" onchange="setAttr(\''+c.id+'\',\''+d.key+'\',this.value)">'
+      : d.type==="enum"
+        ? '<select onchange="setAttr(\''+c.id+'\',\''+d.key+'\',this.value)">'+d.options.map(o=>'<option '+(o===v?"selected":"")+'>'+esc(o)+'</option>').join("")+'</select>'
+        : '<input value="'+esc(v)+'" onchange="setAttr(\''+c.id+'\',\''+d.key+'\',this.value)">';
+    return field(d.label, inp, d.type==="number"?"0–100 数值，判定可用":"");
+  }).join("");
+  return '<div class="fhead"><h2>'+esc(c.name)+'</h2><span class="ktag">人物（模板）</span>'+
+    '<button class="del" onclick="delChar(\''+c.id+'\')">删除</button></div>'+
+    '<div class="fsub">角色实例 = 本模板 + 运行时属性/位置/状态；此处只改模板。</div>'+
+    field("角色定位",'<input value="'+esc(c.role)+'" data-char="'+c.id+'" data-k="role">')+
+    field("背景",'<textarea data-char="'+c.id+'" data-k="background">'+esc(c.background)+'</textarea>','注入角色 AI 的系统提示。')+
+    field("性格",'<textarea data-char="'+c.id+'" data-k="personality">'+esc(c.personality)+'</textarea>')+
+    field("所属势力",'<select data-char="'+c.id+'" data-k="faction"><option value="">无</option>'+
+      S.factions.map(f=>'<option value="'+f.id+'" '+(f.id===c.faction?"selected":"")+'>'+esc(f.name)+'</option>').join("")+'</select>')+
+    '<div class="fsec">属性（维度由「属性维度」全局定义）</div>'+attrRows+
+    '<div class="fsec">持有物 / 关联</div><div class="refitem" style="margin:0">在「物品」「关系图」区为其配置；此处自动汇总。</div>';
+}
+function skillForm(id){
+  const s=byId(id,S.skills); $("acrumb").textContent="/ 技能 / "+s.name;
+  const costLabel = s.cost ? (S.world.resources.find(r=>r.id===s.cost.resource)?.name||"")+" × "+s.cost.amount : "无";
+  const dimLabel = s.check.dim ? (S.dimensions.find(d=>d.key===s.check.dim)?.label||s.check.dim) : "";
+  return '<div class="fhead"><h2>'+esc(s.name)+'</h2><span class="ktag">技能</span></div>'+
+    '<div class="fsub">声明式定义 + 可选 Lua 钩子；效果计算归引擎/Lua，AI 只决定「用不用」。</div>'+
+    field("分类",'<input value="'+esc(s.category)+'" data-skill="'+s.id+'" data-k="category">')+
+    field("描述",'<textarea data-skill="'+s.id+'" data-k="desc">'+esc(s.desc)+'</textarea>')+
+    field("消耗",'<input value="'+esc(costLabel)+'">')+
+    field("冷却",'<input type="number" value="'+s.cooldown+'" data-skill="'+s.id+'" data-k="cooldown">','单位：回合')+
+    field("目标",'<input value="'+esc(s.target)+'" data-skill="'+s.id+'" data-k="target">')+
+    field("判定",'<input value="'+esc(s.check.mode==="d20"?dimLabel+" · d20":"无（none）")+'">')+
+    field("效果",'<textarea data-skill="'+s.id+'" data-k="effect">'+esc(s.effect)+'</textarea>')+
+    field("Lua 钩子",'<input value="'+(s.lua?"启用（自定义效果）":"不启用（默认引擎结算）")+'">','钩子写法见「引擎职责边界」票。')+
+    '<button class="addbtn" onclick="alert(\'原型：新增技能\')">＋ 新增技能</button>';
+}
+function itemForm(id){
+  const it=byId(id,S.items); $("acrumb").textContent="/ 物品 / "+it.name;
+  const propsTxt = Object.entries(it.properties).map(([k,v])=>k+"："+v).join("\n");
+  return '<div class="fhead"><h2>'+esc(it.name)+'</h2><span class="ktag">物品</span></div>'+
+    '<div class="fsub">物品可引用技能成为「物品技能」——复用同一技能实体，不复制定义。</div>'+
+    field("类型",'<input value="'+esc(it.type)+'" data-item="'+it.id+'" data-k="type">')+
+    field("描述",'<textarea data-item="'+it.id+'" data-k="desc">'+esc(it.desc)+'</textarea>')+
+    field("数量",'<input type="number" value="'+it.quantity+'" data-item="'+it.id+'" data-k="quantity">')+
+    field("属性",'<textarea data-item="'+it.id+'" data-k="properties">'+esc(propsTxt)+'</textarea>')+
+    field("引用的技能",'<div>'+it.skills.map(s=>'<span class="mention" style="margin-right:6px">✦ '+esc(byId(s,S.skills).name)+'</span>').join("")+'</div>'+
+      '<select id="it-addskill" style="margin-top:6px"><option value="">＋ 添加技能引用…</option>'+
+      S.skills.filter(x=>!it.skills.includes(x.id)).map(x=>'<option value="'+x.id+'">'+esc(x.name)+'</option>').join("")+'</select>',
+      '物品技能复用技能实体——改一处，两处生效。');
+}
+function facForm(id){
+  const f=byId(id,S.factions); $("acrumb").textContent="/ 势力 / "+f.name;
+  return '<div class="fhead"><h2>'+esc(f.name)+'</h2><span class="ktag">势力</span></div>'+
+    field("描述",'<textarea data-fac="'+f.id+'" data-k="desc">'+esc(f.desc)+'</textarea>')+
+    field("目标",'<textarea data-fac="'+f.id+'" data-k="goals">'+esc(f.goals)+'</textarea>','驱动势力行动的默认立场。')+
+    field("默认态度",'<input value="'+esc(f.defaultAttitude)+'" data-fac="'+f.id+'" data-k="defaultAttitude">')+
+    '<div class="fsec">与势力有关的关系边</div>'+
+    '<table class="edges"><tr><th>主体</th><th>类型</th><th>强度</th></tr>'+
+    S.relationships.filter(r=>r.to===f.id||r.from===f.id).map(r=>'<tr><td>'+esc(relName(r.from)+" → "+relName(r.to))+'</td><td>'+esc(r.type)+'</td><td class="val">'+r.value+'</td></tr>').join("")+
+    '</table>';
+}
+function relForm(){
+  $("acrumb").textContent="/ 关系";
+  return '<div class="fhead"><h2>关系图</h2><span class="ktag">有向边</span></div>'+
+    '<div class="fsub">关系 = 有向边（主体 → 客体，类型 + 数值强度）；可连 人物/势力 两两之间。供角色 AI 判断「他对我如何」。</div>'+
+    '<div class="fsec">全部关系边</div>'+
+    '<table class="edges"><tr><th>主体</th><th>关系</th><th>客体</th><th>强度</th><th></th></tr>'+
+    S.relationships.map((r,i)=>'<tr><td>'+esc(relName(r.from))+'</td><td>'+esc(r.type)+'</td><td>'+esc(relName(r.to))+'</td>'+
+      '<td class="val">'+r.value+'</td><td><button class="del" onclick="delRel('+i+')">删</button></td></tr>').join("")+
+    '</table>'+
+    '<div class="addrow"><select id="rel-from"><option value="">主体…</option>'+
+      S.characters.map(c=>'<option value="'+c.id+'">👤 '+esc(c.name)+'</option>').join("")+
+      S.factions.map(f=>'<option value="'+f.id+'">🏛️ '+esc(f.name)+'</option>').join("")+'</select>'+
+      '<input id="rel-type" placeholder="类型（信任/敌意…）" style="width:110px">'+
+      '<select id="rel-to"><option value="">客体…</option>'+
+      S.characters.map(c=>'<option value="'+c.id+'">👤 '+esc(c.name)+'</option>').join("")+
+      S.factions.map(f=>'<option value="'+f.id+'">🏛️ '+esc(f.name)+'</option>').join("")+'</select>'+
+      '<input id="rel-value" type="number" value="0" style="width:60px">'+
+      '<button onclick="addRel()">添加</button></div>'+
+    '<div class="hint" style="margin-top:6px;font-size:11px;color:var(--muted)">强度范围 -100（敌）～ +100（亲）。删除端点会联动清理相关边。</div>';
+}
+/* A 全局动作 */
+window.addDim=()=>{
+  const k=$("dim-key").value.trim(), l=$("dim-label").value.trim(), t=$("dim-type").value;
+  if(!k||!l){ alert("原型：请填写键与标签"); return; }
+  const d={key:k,label:l,type:t};
+  if(t==="number"){ d.min=0; d.max=100; }
+  if(t==="enum"){ d.options=["选项A"]; }
+  S.dimensions.push(d);
+  S.characters.forEach(c=>{ c.attributes[k]= t==="text"?"":(t==="enum"?d.options[0]:50); });
+  drawTree(); drawAForm(); drawRail();
+};
+window.delDim=k=>{
+  const used=S.characters.some(c=>c.attributes[k]!==undefined);
+  if(used){ alert("原型：该维度已被人物引用，引擎端将拒绝删除——请先移除人物取值。"); return; }
+  S.dimensions=S.dimensions.filter(d=>d.key!==k); drawTree(); drawAForm();
+};
+window.setAttr=(cid,key,val)=>{ const c=byId(cid,S.characters); c.attributes[key]= Number.isNaN(+val)?val:+val; };
+window.delChar=id=>{ if(confirm("原型：删除人物？关联的关系边会一并清理。")){ S.characters=S.characters.filter(c=>c.id!==id); S.relationships=S.relationships.filter(r=>r.from!==id&&r.to!==id); Astate={sel:"char"}; drawTree(); drawAForm(); drawRail(); } };
+window.delRel=i=>{ S.relationships.splice(i,1); drawAForm(); drawRail(); };
+window.addRel=()=>{
+  const f=$("rel-from").value, t=$("rel-to").value, ty=$("rel-type").value.trim(), v=+$("rel-value").value;
+  if(!f||!t||!ty){ alert("原型：请填写主体、客体与关系类型"); return; }
+  S.relationships.push({from:f,to:t,type:ty,value:v}); drawAForm(); drawRail();
+};
+
+/* =====================================================================
+   VARIANT B — 文档工作台（类 Notion）
+   ===================================================================== */
+let Bstate = { page:"ch-ache" };
+function bpageIcon(k){ return {ch:"👤",sk:"✦",it:"📦",fa:"🏛️",loc:"📍",premise:"📜",skel:"🗂️",dim:"📐",rel:"🕸️"}[k]||"•"; }
+function bpages(){
+  return [
+    ["世界",[["premise","设定与规则"],["loc-baiquan","白泉镇",0],["loc-liexi","裂隙山口",0],["loc-kuang","沉星矿坑",0],["loc-shuangyu","霜语林",0]]],
+    ["骨架",[["skel","第一章 · 余烬将熄"]]],
+    ["人物",[["ch-ache","阿彻",2],["ch-mila","米拉",1],["ch-tiezhong","铁鬃",1]]],
+    ["技能",[["sk-xinghuo","星火术",0],["sk-baozha","包扎",0],["sk-qianmo","缄默步伐",0]]],
+    ["物品",[["it-hufu","余烬护符",0],["it-caoxue","止血草",0]]],
+    ["势力",[["fa-shijin","拾烬人协会",0],["fa-liexi","裂隙教团",0]]],
+    ["关系",[["rel","关系图"]]]
+  ];
+}
+function bMeta(parts){ return '<div class="docmeta">'+parts.map(p=>'<span class="chip">'+esc(p)+'</span>').join("")+'</div>'; }
+function bDocHTML(id){
+  if(id==="premise") return premiseDoc();
+  if(id==="skel") return skelDoc();
+  if(id==="rel") return relDoc();
+  if(id.startsWith("ch-")) return charDoc(byId(id,S.characters));
+  if(id.startsWith("sk-")) return skillDoc(byId(id,S.skills));
+  if(id.startsWith("it-")) return itemDoc(byId(id,S.items));
+  if(id.startsWith("fa-")) return facDoc(byId(id,S.factions));
+  if(id.startsWith("loc-")) return locDoc(byId(id,S.world.locations));
+  return "";
+}
+function premiseDoc(){
+  return '<h1>设定与规则</h1>'+bMeta(["世界","静态注入 · 系统层"])+
+    '<div class="prose"><p>'+esc(S.world.premise)+'</p>'+
+    '<p>这是一个<em>灰暗奇幻</em>的世界。星烬既是祝福也是诅咒，镇民在枯竭的恐惧与裂隙的诱惑之间摇摆。基调：<strong>'+esc(S.world.tone)+'</strong>。</p></div>'+
+    '<div class="block"><div class="bhead"><span class="drag">⠿</span> 通用规则 <span class="r">'+S.world.rules.length+' 条 · 全部注入主线 AI</span></div>'+
+    S.world.rules.map(r=>'<div class="brow"><span class="k">规则</span><span class="v">'+esc(r)+'</span></div>').join("")+'</div>'+
+    '<div class="slashhint">按 <kbd>/</kbd> 插入块：@提及人物 · 地点卡 · 规则块 · 章节骨架</div>';
+}
+function skelDoc(){
+  const ch=S.skeleton.chapters[0], sc=ch.scenes[0];
+  return '<h1>'+esc(ch.title)+'</h1>'+bMeta(["骨架","章节"])+
+    '<div class="prose"><p>章节目标：<strong>'+esc(ch.goal)+'</strong></p></div>'+
+    '<div class="block"><div class="bhead"><span class="drag">⠿</span> 场景 · '+esc(sc.title)+' <span class="r">进入 ⇄ 结束</span></div>'+
+    '<div class="brow"><span class="k">进入</span><span class="v">'+esc(sc.entry)+'</span></div>'+
+    '<div class="brow"><span class="k">结束</span><span class="v">'+esc(sc.exit)+'</span></div>'+
+    '<div class="brow"><span class="k">目标</span><span class="v">'+esc(sc.goals.map(g=>g.text).join("；"))+'</span></div></div>'+
+    '<div class="block"><div class="bhead"><span class="drag">⠿</span> Beats · 关键事件 <span class="r">触发条件 → 给主线 AI 的提示</span></div>'+
+    sc.beats.map(b=>'<div class="brow"><span class="k">'+(b.once?"一次性":"可重复")+'</span><span class="v"><strong>'+esc(b.title)+'</strong> — '+esc(b.trigger)+'<br><small style="color:var(--muted)">提示：'+esc(b.hint)+'</small></span></div>').join("")+
+    '</div>';
+}
+function relDoc(){
+  return '<h1>关系图</h1>'+bMeta(["有向边","人物/势力 两两"])+
+    '<div class="prose"><p>关系 = 有向边（主体 → 客体，类型 + 数值强度）。角色 AI 用「<strong>他对别人如何</strong>」来决定言行。</p></div>'+
+    '<div class="block"><div class="bhead"><span class="drag">⠿</span> 全部关系 <span class="r">'+S.relationships.length+' 条边</span></div>'+
+    S.relationships.map(r=>'<div class="brow"><span class="k">'+esc(relName(r.from)+" → "+relName(r.to))+'</span><span class="v">'+esc(r.type)+
+      '<span style="display:inline-block;width:70px;margin-left:10px"><span class="bar" style="width:100%"><i style="width:'+Math.min(100,(r.value+100)/2)+'%"></i></span></span>'+
+      '<span style="margin-left:6px">'+r.value+'</span></span></div>').join("")+'</div>';
+}
+function charDoc(c){
+  const rels = S.relationships.filter(r=>r.from===c.id||r.to===c.id);
+  return '<h1>'+esc(c.name)+'</h1>'+bMeta(["人物 · 模板","主页 · "+esc(relName(c.home||"")), c.faction?("隶属 "+esc(relName(c.faction))):"无势力"])+
+    '<div class="prose"><p>'+esc(c.background)+'</p><p>性格：<em>'+esc(c.personality)+'</em>。'+esc(c.role)+'</p></div>'+
+    '<div class="block"><div class="bhead"><span class="drag">⠿</span> 属性 <span class="r">维度由「属性维度」页全局定义</span></div>'+
+    S.dimensions.map(d=>'<div class="brow"><span class="k">'+esc(d.label)+'</span><span class="v">'+
+      (d.type==="number"
+        ? '<span class="bar" style="width:120px;vertical-align:middle"><i style="width:'+(c.attributes[d.key]||0)+'%"></i></span> <span style="margin-left:8px">'+(c.attributes[d.key]??"—")+'</span>'
+        : esc(c.attributes[d.key]??"—"))+'</span></div>').join("")+'</div>'+
+    '<div class="cardrow"><div class="minicard"><div class="t">'+esc(relName(c.home||"")||"—")+'</div><div class="d">常驻地点</div></div>'+
+    '<div class="minicard"><div class="t">'+esc(c.role)+'</div><div class="d">角色定位</div></div></div>'+
+    '<div class="block"><div class="bhead"><span class="drag">⠿</span> 关系 <span class="r">'+rels.length+' 条边</span></div>'+
+    (rels.length?rels.map(r=>'<div class="brow"><span class="k">'+(r.from===c.id?"→ 对":"← 来自")+' '+esc(relName(r.to))+'</span><span class="v">'+esc(r.type)+' <span>'+r.value+'</span></span></div>').join(""):'<div class="brow"><span class="k">—</span><span class="v">暂无关系边</span></div>')+'</div>'+
+    '<div class="backlinks"><span>反向链接</span><span class="bl">📄 第一章 · 余烬将熄（出场）</span><span class="bl">🏛️ 拾烬人协会</span></div>';
+}
+function skillDoc(s){
+  const dimLabel = s.check.dim ? (S.dimensions.find(d=>d.key===s.check.dim)?.label||s.check.dim) : "";
+  const costLabel = s.cost ? (S.world.resources.find(r=>r.id===s.cost.resource)?.name||"")+" × "+s.cost.amount : "无";
+  return '<h1>'+esc(s.name)+'</h1>'+bMeta(["技能 · "+esc(s.category),"声明式 + Lua 钩子"])+
+    '<div class="prose"><p>'+esc(s.desc)+'</p></div>'+
+    '<div class="block"><div class="bhead"><span class="drag">⠿</span> 定义</div>'+
+    '<div class="brow"><span class="k">消耗</span><span class="v">'+esc(costLabel)+'</span></div>'+
+    '<div class="brow"><span class="k">冷却</span><span class="v">'+s.cooldown+' 回合</span></div>'+
+    '<div class="brow"><span class="k">目标</span><span class="v">'+esc(s.target)+'</span></div>'+
+    '<div class="brow"><span class="k">判定</span><span class="v">'+esc(s.check.mode==="d20"?dimLabel+" · d20":"无（none）")+'</span></div>'+
+    '<div class="brow"><span class="k">效果</span><span class="v">'+esc(s.effect)+'</span></div>'+
+    '<div class="brow"><span class="k">Lua</span><span class="v">'+(s.lua?"启用自定义效果钩子":"默认引擎结算")+'</span></div></div>'+
+    '<div class="cardrow"><div class="minicard"><div class="t">'+S.items.filter(it=>it.skills.includes(s.id)).length+'</div><div class="d">被物品引用（物品技能）</div></div></div>';
+}
+function itemDoc(it){
+  return '<h1>'+esc(it.name)+'</h1>'+bMeta(["物品 · "+esc(it.type),"数量 ×"+it.quantity])+
+    '<div class="prose"><p>'+esc(it.desc)+'</p></div>'+
+    '<div class="block"><div class="bhead"><span class="drag">⠿</span> 属性与物品技能</div>'+
+    Object.entries(it.properties).map(([k,v])=>'<div class="brow"><span class="k">'+esc(k)+'</span><span class="v">'+esc(v)+'</span></div>').join("")+
+    '<div class="brow"><span class="k">物品技能</span><span class="v">'+it.skills.map(s=>'<span class="mention">✦ '+esc(byId(s,S.skills).name)+'</span>').join(" ")+'</span></div></div>'+
+    '<div class="backlinks"><span>反向链接</span><span class="bl">👤 阿彻（携带）</span></div>';
+}
+function facDoc(f){
+  const members=S.characters.filter(c=>c.faction===f.id);
+  return '<h1>'+esc(f.name)+'</h1>'+bMeta(["势力","默认态度："+esc(f.defaultAttitude)])+
+    '<div class="prose"><p>'+esc(f.desc)+'</p><p>目标：<strong>'+esc(f.goals)+'</strong></p></div>'+
+    '<div class="cardrow">'+(members.map(c=>'<div class="minicard"><div class="t">👤 '+esc(c.name)+'</div><div class="d">'+esc(c.role)+'</div></div>').join("")||'<div class="minicard"><div class="t">—</div><div class="d">暂无成员</div></div>')+'</div>'+
+    '<div class="backlinks"><span>反向链接</span><span class="bl">🕸️ 关系图（'+S.relationships.filter(r=>r.from===f.id||r.to===f.id).length+' 条边）</span></div>';
+}
+function locDoc(l){
+  return '<h1>'+esc(l.name)+'</h1>'+bMeta(["地点 · "+esc(l.type)])+
+    '<div class="prose"><p>'+esc(l.desc)+'</p></div>'+
+    '<div class="cardrow">'+(l.factions.map(f=>'<div class="minicard"><div class="t">🏛️ '+esc(relName(f))+'</div><div class="d">在此活动</div></div>').join("")||'<div class="minicard"><div class="t">—</div><div class="d">无势力据点</div></div>')+'</div>'+
+    '<div class="backlinks"><span>反向链接</span><span class="bl">👤 阿彻（常驻）</span></div>';
+}
+function renderB(){
+  const root=document.createElement("div"); root.className="variant B";
+  root.innerHTML='<div class="bpagelist" id="b-pages"></div><div class="bdoc"><div class="page" id="b-doc"></div></div>';
+  $("view").appendChild(root);
+  const pages=$("b-pages");
+  bpages().forEach(([grp,items])=>{
+    const g=document.createElement("div"); g.className="bgrp"; g.textContent=grp; pages.appendChild(g);
+    items.forEach(([id,name,extra])=>{
+      const p=document.createElement("div"); p.className="bpage"+(Bstate.page===id?" sel":"");
+      p.innerHTML='<span class="ic">'+bpageIcon(id.split("-")[0]||id)+'</span><span>'+esc(name)+'</span>'+(extra!==undefined?'<span class="n">'+extra+'</span>':"");
+      p.onclick=()=>{ Bstate.page=id; renderB(); };
+      pages.appendChild(p);
+    });
+  });
+  $("b-doc").innerHTML = bDocHTML(Bstate.page);
+}
+
+/* =====================================================================
+   VARIANT C — AI 结对创作
+   ===================================================================== */
+let Cstate = { chats:[], adopted:{} };
+function initC(){
+  Cstate.chats=[{who:"ai",text:'嗨，我是你的故事书共创伙伴。给我一个<strong>设定种子</strong>——一句话、一个意象、一个主角——我会先铺出世界、人物与骨架，你来审查和采纳。想让我直接按某个类型起稿也行。'}];
+  Cstate.adopted={};
+}
+function Cseed(){
+  return {
+    "sk-xinghuo":{title:"星火术",tag:"技能 · 生成",rows:[["分类","法术"],["消耗","法力 × 10"],["判定","意志 · d20"],["效果","2d6 星烬伤害 + 点燃"]],extra:"基于「星烬既是货币也是施法材料」自动补全了消耗与判定维度。"},
+    "ch-mila":{title:"米拉",tag:"人物 · 生成",rows:[["角色","药师"],["阵营","中立"],["性格","温柔、固执"],["关键点","父亲死于矿难"]],extra:"与白泉镇、拾烬人协会产生了双向关系建议。"},
+    "ch-ache":{title:"阿彻",tag:"人物 · 生成",rows:[["角色","守夜人"],["阵营","守序"],["感知","85"],["关键点","右眼失明，只信亲眼所见"]],extra:"已建议关系：阿彻 → 米拉（信任 60）。"}
+  };
+}
+function renderC(){
+  const root=document.createElement("div"); root.className="variant C";
+  const seed=Cseed();
+  root.innerHTML=''+
+    '<div class="cleft"><div class="cchat" id="c-chat"></div>'+
+    '<div class="cin"><input id="c-input" placeholder="继续铺设定，或要求调整…"><button id="c-send">生成</button></div></div>'+
+    '<div class="cright">'+
+    '<div class="cprog"><span class="pg">世界 <span class="pbar"><i style="width:70%"></i></span> 70%</span>'+
+    '<span class="pg">人物 <span class="pbar"><i style="width:50%"></i></span> 3/6</span>'+
+    '<span class="pg">骨架 <span class="pbar"><i style="width:40%"></i></span> 1/3 章</span>'+
+    '<span class="advice">建议下一步：生成「裂隙教团」的信徒角色</span></div>'+
+    '<div class="ccards" id="c-cards"></div>'+
+    '<div class="csuggest"><b>生成建议</b> · 基于已采纳内容，AI 建议补一个<b>裂隙教团</b>的中层信徒，并在「沉星矿坑」埋一条通往「星核」的线索。</div>'+
+    '</div>';
+  $("view").appendChild(root);
+  const chat=$("c-chat");
+  Cstate.chats.forEach(m=>{
+    const d=document.createElement("div"); d.className="cmsg "+m.who;
+    d.innerHTML='<div class="who">'+(m.who==="ai"?"共创伙伴":"我")+'</div><div class="bubble">'+m.text+'</div>';
+    chat.appendChild(d);
+  });
+  chat.scrollTop=chat.scrollHeight;
+  const cards=$("c-cards");
+  Object.entries(seed).forEach(([id,item])=>{
+    const done = !!Cstate.adopted[id];
+    const card=document.createElement("div"); card.className="gencard"+(done?" done":"");
+    card.innerHTML='<div class="ghead"><span class="t">'+esc(item.title)+'</span><span class="tag '+(done?"":"gen")+'">'+(done?"已采纳":"待审查 · 生成")+'</span></div>'+
+      '<div class="gbody">'+item.rows.map(r=>'<div class="row"><span class="k">'+esc(r[0])+'</span><span>'+esc(r[1])+'</span></div>').join("")+
+      '<div style="font-size:11.5px;color:var(--muted);margin-top:8px">'+esc(item.extra)+'</div></div>'+
+      '<div class="gactions">'+(done
+        ? '<button disabled style="opacity:.6">✓ 已写入故事书</button><button onclick="alert(\'原型：打开该实体编辑\')">✎ 手动微调</button>'
+        : '<button class="adopt" onclick="adoptCard(\''+id+'\')">✓ 采纳</button><button onclick="alert(\'原型：重新生成该卡片\')">↻ 重写</button><button onclick="alert(\'原型：打开卡片编辑器\')">✎ 编辑</button>')+'</div>';
+    cards.appendChild(card);
+  });
+  const inp=$("c-input");
+  inp.addEventListener("keydown",e=>{ if(e.key==="Enter") sendChat(); });
+  $("c-send").onclick=sendChat;
+}
+window.adoptCard=id=>{ Cstate.adopted[id]=true; renderC(); };
+function sendChat(){
+  const inp=$("c-input"); const v=inp.value.trim(); if(!v) return;
+  Cstate.chats.push({who:"user",text:v});
+  Cstate.chats.push({who:"ai",text:'好的，已据「'+esc(v)+'」生成 <strong>一组新卡片</strong>，请到右侧审查。要我沿着某个方向继续，就说一声。'});
+  inp.value="";
+  renderC();
+}
+initC();
+
+/* =====================================================================
+   SWITCHER + DRAWER
+   ===================================================================== */
+const VINFO={A:"A — 表单工作台",B:"B — 文档工作台",C:"C — AI 结对创作"};
+function setVariant(v){
+  if(!VINFO[v]) v="A";
+  const url=new URL(location.href); url.searchParams.set("variant",v); history.replaceState(null,"",url);
+  document.body.dataset.variant=v; render();
+}
+$("sw-prev").onclick=()=>setVariant({A:"C",B:"A",C:"B"}[document.body.dataset.variant]);
+$("sw-next").onclick=()=>setVariant({A:"B",B:"C",C:"A"}[document.body.dataset.variant]);
+document.addEventListener("keydown",e=>{
+  if(e.target.matches("input,textarea,select,[contenteditable]")) return;
+  if(e.key==="ArrowLeft") setVariant({A:"C",B:"A",C:"B"}[document.body.dataset.variant]);
+  if(e.key==="ArrowRight") setVariant({A:"B",B:"C",C:"A"}[document.body.dataset.variant]);
+});
+$("btn-json").onclick=()=>{ $("drawer-pre").textContent=JSON.stringify(S,null,2); $("drawer").classList.add("open"); };
+$("drawer-close").onclick=()=>$("drawer").classList.remove("open");
+
+setVariant(new URL(location.href).searchParams.get("variant")||"A");
+</script>
+</body>
+</html>
