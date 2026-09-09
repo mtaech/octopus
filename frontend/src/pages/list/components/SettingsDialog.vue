@@ -57,6 +57,22 @@ const expandedId = ref<string | null>(null)
 const adding = ref(false)
 const draft = ref<ProviderConfig>({ id: '', label: '', kind: 'openai', base_url: '', api_key: '', models: [] })
 const catalogPick = ref('')
+const catalogOpen = ref(false)
+const catalogQuery = ref('')
+const catalogFiltered = computed(() => {
+  const q = catalogQuery.value.trim().toLowerCase()
+  const list = q
+    ? MODEL_CATALOG.filter(p => p.id.toLowerCase().includes(q) || p.label.toLowerCase().includes(q))
+    : MODEL_CATALOG
+  return list.slice(0, 80)
+})
+function closeCatalogSoon() { window.setTimeout(() => { catalogOpen.value = false }, 150) }
+function selectCatalog(id: string) {
+  catalogPick.value = id
+  applyCatalog(id)
+  catalogQuery.value = MODEL_CATALOG.find(x => x.id === id)?.label ?? id
+  catalogOpen.value = false
+}
 
 watch(() => props.open, (v) => {
   if (v) {
@@ -128,6 +144,8 @@ function applyCatalog(id: string) {
 function startAdd() {
   draft.value = { id: '', label: '', kind: 'openai', base_url: '', api_key: '', models: [] }
   catalogPick.value = ''
+  catalogQuery.value = ''
+  catalogOpen.value = false
   adding.value = true
   expandedId.value = null
 }
@@ -280,14 +298,28 @@ async function save() { if (await store.save()) close() }
               <div class="mb-2.5 text-[12px] font-bold text-primary">新增供应商</div>
               <div class="mb-3 flex flex-col gap-1.5">
                 <span class="text-[11px] font-semibold text-muted-foreground">从目录选择（可选，自动填充名称 / 端点 / 模型）</span>
-                <Select :model-value="catalogPick" @update:model-value="(v) => { if (typeof v === 'string') { catalogPick = v; applyCatalog(v) } }">
-                  <SelectTrigger class="w-full"><SelectValue placeholder="选择一个已知供应商…" /></SelectTrigger>
-                  <SelectContent>
-                    <SelectGroup>
-                      <SelectItem v-for="cp in MODEL_CATALOG" :key="cp.id" :value="cp.id">{{ cp.label }} · {{ cp.models.length }} 个模型</SelectItem>
-                    </SelectGroup>
-                  </SelectContent>
-                </Select>
+                <div class="relative">
+                  <Input
+                    v-model="catalogQuery"
+                    placeholder="搜索供应商，如 deepseek / anthropic / openrouter…"
+                    class="h-9"
+                    @focus="catalogOpen = true"
+                    @blur="closeCatalogSoon"
+                  />
+                  <div v-if="catalogOpen" class="absolute inset-x-0 top-full z-50 mt-1 max-h-64 overflow-y-auto rounded-lg border border-border bg-popover p-1 shadow-lg shadow-black/40" @mousedown.prevent>
+                    <button
+                      v-for="cp in catalogFiltered"
+                      :key="cp.id"
+                      type="button"
+                      class="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-[12.5px] hover:bg-accent"
+                      @mousedown.prevent="selectCatalog(cp.id)"
+                    >
+                      <span class="truncate">{{ cp.label }}</span>
+                      <span class="ml-auto shrink-0 text-[11px] text-muted-foreground">{{ cp.models.length }} 个模型</span>
+                    </button>
+                    <div v-if="!catalogFiltered.length" class="px-2.5 py-3 text-center text-[11.5px] text-muted-foreground">没有匹配的供应商</div>
+                  </div>
+                </div>
               </div>
               <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <label class="flex flex-col gap-1.5">
