@@ -1,0 +1,20 @@
+[package]
+name = "octopus-api"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+octopus-types = { path = "../octopus-types" }
+octopus-engine = { path = "../octopus-engine" }
+octopus-ai = { path = "../octopus-ai" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }

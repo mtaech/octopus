@@ -1,0 +1,13 @@
+[package]
+name = "octopus-ai"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+octopus-types = { path = "../octopus-types" }
+octopus-engine = { path = "../octopus-engine" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

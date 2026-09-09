@@ -1,0 +1,13 @@
+[package]
+name = "octopus-bin"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+octopus-api = { path = "../octopus-api" }
+octopus-engine = { path = "../octopus-engine" }
+octopus-ai = { path = "../octopus-ai" }
+axum = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
