@@ -673,7 +673,7 @@ export function currentProjection(saveId: string): WorldProjection | null {
 
 const DEFAULT_CONFIG: AppConfig = {
   providers: [
-    { id: 'deepseek', label: 'DeepSeek', kind: 'deepseek', base_url: 'https://api.deepseek.com', api_key: '', models: catalogEntries('deepseek') },
+    { id: 'deepseek', label: 'DeepSeek', kind: 'openai-compatible', base_url: 'https://api.deepseek.com', api_key: '', models: catalogEntries('deepseek') },
     { id: 'openai', label: 'OpenAI', kind: 'openai', base_url: 'https://api.openai.com/v1', api_key: '', models: catalogEntries('openai') },
     { id: 'ollama', label: '本地 Ollama', kind: 'ollama', base_url: 'http://127.0.0.1:11434', api_key: '', models: [{ id: 'qwen2.5:7b', name: 'Qwen2.5 7B' }, { id: 'llama3.1:8b', name: 'Llama 3.1 8B' }] },
     { id: 'fastembed', label: '本地 Embedding', kind: 'openai-compatible', api_key: '', models: [{ id: 'bge-small-zh-v1.5', name: 'BGE Small ZH v1.5' }, { id: 'bge-m3', name: 'BGE M3' }] }
@@ -692,7 +692,9 @@ export function saveAppConfig(cfg: AppConfig): AppConfig { appConfig = JSON.pars
 export function testProvider(provider: ProviderConfig): ProviderTestResult {
   const p = provider
   if (!p) return { ok: false, message: '未找到该 Provider' }
-  const needKey = p.kind === 'openai' || p.kind === 'anthropic' || p.kind === 'deepseek'
+  const url = p.base_url ?? ''
+  const isLocal = /127\.0\.0\.1|localhost/.test(url)
+  const needKey = p.kind !== 'ollama' && !!url && !isLocal
   if (needKey && !p.api_key) return { ok: false, message: '未填写 API Key' }
   return { ok: true, message: '连通正常', latency_ms: Math.round(80 + seededRand(p.id) * 400) }
 }

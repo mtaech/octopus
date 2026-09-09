@@ -12,7 +12,7 @@ export const CATALOG_FETCHED_AT = '2026-09-09T15:07:40.761Z'
 export const PROVIDER_PRESETS: Record<string, { base_url: string; kind: ProviderKind }> = {
   "openai": { base_url: "https://api.openai.com/v1", kind: "openai" },
   "anthropic": { base_url: "https://api.anthropic.com", kind: "anthropic" },
-  "deepseek": { base_url: "https://api.deepseek.com", kind: "deepseek" },
+  "deepseek": { base_url: "https://api.deepseek.com", kind: "openai-compatible" },
   "google": { base_url: "https://generativelanguage.googleapis.com/v1beta", kind: "openai-compatible" },
   "google-vertex": { base_url: "", kind: "openai-compatible" },
   "groq": { base_url: "https://api.groq.com/openai/v1", kind: "openai-compatible" },

@@ -32,7 +32,6 @@ const ROLES: { key: RoleKey; label: string; desc: string }[] = [
 const KIND_DEFAULT_URL: Record<ProviderKind, string> = {
   openai: 'https://api.openai.com/v1',
   anthropic: 'https://api.anthropic.com',
-  deepseek: 'https://api.deepseek.com',
   ollama: 'http://127.0.0.1:11434',
   'openai-compatible': '',
 }
@@ -40,9 +39,8 @@ const KIND_DEFAULT_URL: Record<ProviderKind, string> = {
 const KINDS: { value: ProviderKind; label: string }[] = [
   { value: 'openai', label: 'OpenAI' },
   { value: 'anthropic', label: 'Anthropic' },
-  { value: 'deepseek', label: 'DeepSeek' },
   { value: 'ollama', label: 'Ollama（本地）' },
-  { value: 'openai-compatible', label: 'OpenAI 兼容端点' },
+  { value: 'openai-compatible', label: 'OpenAI 兼容端点（DeepSeek / Moonshot / Groq…）' },
 ]
 
 type SectionKey = 'roles' | 'providers' | 'budget' | 'about'
@@ -306,6 +304,7 @@ async function save() { if (await store.save()) close() }
                       </SelectGroup>
                     </SelectContent>
                   </Select>
+                  <span class="text-[10.5px] text-muted-foreground/70">类型 = 协议方言；厂商（DeepSeek / Moonshot 等）选「OpenAI 兼容端点」</span>
                 </label>
                 <label class="flex flex-col gap-1.5 sm:col-span-2">
                   <span class="text-[11px] font-semibold text-muted-foreground">Base URL</span>
@@ -360,7 +359,7 @@ async function save() { if (await store.save()) close() }
                 <div class="flex items-center justify-between gap-6 py-2.5">
                   <div class="min-w-0">
                     <div class="text-[13px] font-semibold">类型</div>
-                    <div class="mt-0.5 text-xs text-muted-foreground">决定协议与默认端点</div>
+                    <div class="mt-0.5 text-xs text-muted-foreground">协议方言；DeepSeek 等厂商选「OpenAI 兼容端点」</div>
                   </div>
                   <div class="w-72 shrink-0">
                     <Select :model-value="p.kind" @update:model-value="(v) => { if (typeof v === 'string') applyKind(p, v as ProviderKind) }">

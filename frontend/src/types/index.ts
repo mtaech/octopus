@@ -479,7 +479,8 @@ export interface MaintenanceRow { at: string; op: string; summary: string }
 
 // ---------- 应用配置 / AI Provider（#26） ----------
 
-export type ProviderKind = 'openai' | 'anthropic' | 'deepseek' | 'ollama' | 'openai-compatible'
+// 类型 = 协议方言（不是厂商）；DeepSeek/Moonshot/Groq 等走 openai-compatible
+export type ProviderKind = 'openai' | 'anthropic' | 'ollama' | 'openai-compatible'
 
 export interface ModelEntry { id: string; name?: string }
 
