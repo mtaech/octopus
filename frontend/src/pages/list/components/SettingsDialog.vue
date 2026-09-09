@@ -28,6 +28,15 @@ const ROLES: { key: RoleKey; label: string; desc: string }[] = [
   { key: 'embedding', label: 'Embedding', desc: '事件检索向量化（默认本地 bge-small-zh）' },
 ]
 
+/** 各协议类型的默认端点；选中类型时自动填入 Base URL */
+const KIND_DEFAULT_URL: Record<ProviderKind, string> = {
+  openai: 'https://api.openai.com/v1',
+  anthropic: 'https://api.anthropic.com',
+  deepseek: 'https://api.deepseek.com',
+  ollama: 'http://127.0.0.1:11434',
+  'openai-compatible': '',
+}
+
 const KINDS: { value: ProviderKind; label: string }[] = [
   { value: 'openai', label: 'OpenAI' },
   { value: 'anthropic', label: 'Anthropic' },
@@ -84,6 +93,16 @@ function autoFillFromModel(modelId: string, p: ProviderConfig) {
 }
 
 function toggle(id: string) { expandedId.value = expandedId.value === id ? null : id }
+
+/** 选中类型 → 自动填默认端点（若端点为空的或此前是自动填的） */
+function applyKind(p: ProviderConfig, kind: ProviderKind) {
+  p.kind = kind
+  const url = KIND_DEFAULT_URL[kind]
+  const autoUrls = Object.values(KIND_DEFAULT_URL)
+  const current = (p.base_url ?? '').trim()
+  if (url && (!current || autoUrls.includes(current))) p.base_url = url
+  if (!p.label.trim()) p.label = KINDS.find(k => k.value === kind)?.label ?? kind
+}
 
 function slugify(s: string): string {
   const base = s.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
@@ -279,7 +298,7 @@ async function save() { if (await store.save()) close() }
                 </label>
                 <label class="flex flex-col gap-1.5">
                   <span class="text-[11px] font-semibold text-muted-foreground">类型</span>
-                  <Select :model-value="draft.kind" @update:model-value="(v) => { if (typeof v === 'string') draft.kind = v as ProviderKind }">
+                  <Select :model-value="draft.kind" @update:model-value="(v) => { if (typeof v === 'string') applyKind(draft, v as ProviderKind) }">
                     <SelectTrigger class="w-full"><SelectValue /></SelectTrigger>
                     <SelectContent>
                       <SelectGroup>
@@ -338,6 +357,22 @@ async function save() { if (await store.save()) close() }
               </div>
 
               <div v-if="expandedId === p.id" class="divide-y divide-border/60 border-t border-border/60 px-3.5">
+                <div class="flex items-center justify-between gap-6 py-2.5">
+                  <div class="min-w-0">
+                    <div class="text-[13px] font-semibold">类型</div>
+                    <div class="mt-0.5 text-xs text-muted-foreground">决定协议与默认端点</div>
+                  </div>
+                  <div class="w-72 shrink-0">
+                    <Select :model-value="p.kind" @update:model-value="(v) => { if (typeof v === 'string') applyKind(p, v as ProviderKind) }">
+                      <SelectTrigger class="w-full"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectGroup>
+                          <SelectItem v-for="k in KINDS" :key="k.value" :value="k.value">{{ k.label }}</SelectItem>
+                        </SelectGroup>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
                 <div class="flex items-center justify-between gap-6 py-2.5">
                   <div class="min-w-0">
                     <div class="text-[13px] font-semibold">Base URL</div>
