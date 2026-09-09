@@ -5,6 +5,8 @@ import { computed, ref, watch } from 'vue'
 import { useSettingsStore } from '../stores/settings'
 import type { ProviderConfig, ProviderKind } from '@/types'
 import { MODEL_CATALOG, PROVIDER_PRESETS } from '@/api/model-catalog'
+import { catalogProvider, findModelProviders } from '@/api/model-catalog-utils'
+import ModelPicker from './ModelPicker.vue'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
@@ -47,7 +49,6 @@ const active = ref<SectionKey>('roles')
 const expandedId = ref<string | null>(null)
 const adding = ref(false)
 const draft = ref<ProviderConfig>({ id: '', label: '', kind: 'openai', base_url: '', api_key: '', models: [] })
-const draftModels = ref('')
 const catalogPick = ref('')
 
 watch(() => props.open, (v) => {
@@ -69,10 +70,18 @@ function onRoleProvider(key: RoleKey, providerId: string) {
   c.roles[key].provider_id = providerId
   c.roles[key].model = modelsOf(providerId)[0] ?? ''
 }
-function setModels(p: ProviderConfig, v: string) {
-  p.models = v.split(',').map(s => s.trim()).filter(Boolean)
+/** 选了模型但还没填端点时：按模型反查供应商，自动补 Base URL / 类型 / 名称 */
+function autoFillFromModel(modelId: string, p: ProviderConfig) {
+  if (p.base_url) return
+  const [pid] = findModelProviders(modelId)
+  if (!pid) return
+  const preset = PROVIDER_PRESETS[pid]
+  if (preset) {
+    p.base_url = preset.base_url
+    p.kind = preset.kind
+  }
+  if (!p.label) p.label = catalogProvider(pid)?.label ?? pid
 }
-function modelsText(p: ProviderConfig): string { return p.models.join(', ') }
 
 function toggle(id: string) { expandedId.value = expandedId.value === id ? null : id }
 
@@ -97,13 +106,10 @@ function applyCatalog(id: string) {
   draft.value.kind = (preset?.kind ?? 'openai-compatible') as ProviderKind
   draft.value.base_url = preset?.base_url ?? ''
   draft.value.models = p.models.map(m => m.id)
-  // 网关动辄数百个模型：超阈值时不把长串塞进输入框，保存时直接取数组
-  draftModels.value = p.models.length <= 60 ? p.models.map(m => m.id).join(', ') : ''
 }
 
 function startAdd() {
   draft.value = { id: '', label: '', kind: 'openai', base_url: '', api_key: '', models: [] }
-  draftModels.value = ''
   catalogPick.value = ''
   adding.value = true
   expandedId.value = null
@@ -116,9 +122,7 @@ function saveAdd() {
     ...draft.value,
     id: uniqueId(slugify(draft.value.label)),
     label: draft.value.label.trim(),
-    models: draftModels.value.trim()
-      ? draftModels.value.split(',').map(s => s.trim()).filter(Boolean)
-      : draft.value.models,
+    models: draft.value.models,
   }
   c.providers.push(p)
   adding.value = false
@@ -292,11 +296,15 @@ async function save() { if (await store.save()) close() }
                   <span class="text-[11px] font-semibold text-muted-foreground">API Key</span>
                   <Input v-model="draft.api_key" type="password" :placeholder="draft.kind === 'ollama' ? '（本地无需）' : 'sk-…'" class="h-9" />
                 </label>
-                <label class="flex flex-col gap-1.5 sm:col-span-2">
-                  <span class="text-[11px] font-semibold text-muted-foreground">模型清单（逗号分隔）</span>
-                  <Input v-model="draftModels" :placeholder="draft.models.length && !draftModels ? '已从目录导入 ' + draft.models.length + ' 个模型（可直接添加）' : 'deepseek-chat, deepseek-reasoner'" class="h-9" />
-                  <span v-if="draft.models.length && !draftModels" class="text-[11px] text-primary/80">已从目录导入 {{ draft.models.length }} 个模型，保存时一并写入。</span>
-                </label>
+                <div class="flex flex-col gap-1.5 sm:col-span-2">
+                  <span class="text-[11px] font-semibold text-muted-foreground">模型清单</span>
+                  <ModelPicker
+                    :model-value="draft.models"
+                    :provider-url="draft.base_url"
+                    @update:model-value="draft.models = $event"
+                    @pick="(m: string) => autoFillFromModel(m, draft)"
+                  />
+                </div>
               </div>
               <div class="mt-3 flex justify-end gap-2">
                 <Button size="sm" variant="ghost" @click="cancelAdd">取消</Button>
@@ -348,14 +356,17 @@ async function save() { if (await store.save()) close() }
                     <Input v-model="p.api_key" type="password" :placeholder="p.kind === 'ollama' ? '（本地无需）' : 'sk-…'" class="h-9" />
                   </div>
                 </div>
-                <div class="flex items-center justify-between gap-6 py-2.5">
+                <div class="flex flex-col gap-1.5 py-2.5">
                   <div class="min-w-0">
                     <div class="text-[13px] font-semibold">模型清单</div>
-                    <div class="mt-0.5 text-xs text-muted-foreground">逗号分隔，供角色分工下拉</div>
+                    <div class="mt-0.5 text-xs text-muted-foreground">供角色分工下拉选择</div>
                   </div>
-                  <div class="w-72 shrink-0">
-                    <Input :model-value="modelsText(p)" placeholder="gpt-4o, gpt-4o-mini" class="h-9" @update:model-value="setModels(p, String($event))" />
-                  </div>
+                  <ModelPicker
+                    :model-value="p.models"
+                    :provider-url="p.base_url"
+                    @update:model-value="p.models = $event"
+                    @pick="(m: string) => autoFillFromModel(m, p)"
+                  />
                 </div>
               </div>
             </div>
