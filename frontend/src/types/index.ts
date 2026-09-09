@@ -481,6 +481,8 @@ export interface MaintenanceRow { at: string; op: string; summary: string }
 
 export type ProviderKind = 'openai' | 'anthropic' | 'deepseek' | 'ollama' | 'openai-compatible'
 
+export interface ModelEntry { id: string; name?: string }
+
 export interface ProviderConfig {
   id: string
   label: string
@@ -488,8 +490,8 @@ export interface ProviderConfig {
   base_url?: string
   /** 真实后端存本地配置文件（0600），日志脱敏；此处仅原型展示 */
   api_key?: string
-  /** 可选模型清单 */
-  models: string[]
+  /** 可选模型清单（id + 展示名） */
+  models: ModelEntry[]
 }
 
 export interface RoleConfig {

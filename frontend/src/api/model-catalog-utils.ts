@@ -1,6 +1,6 @@
 // 模型目录的查询/反查工具（基于 model-catalog.ts 的静态快照）。
 import { MODEL_CATALOG, PROVIDER_PRESETS } from './model-catalog'
-import type { CatalogProvider } from '@/types'
+import type { CatalogProvider, ModelEntry } from '@/types'
 
 const providerById = new Map<string, CatalogProvider>(MODEL_CATALOG.map(p => [p.id, p]))
 
@@ -30,6 +30,11 @@ export function catalogProvider(id: string): CatalogProvider | undefined {
 
 export function catalogModels(id: string): string[] {
   return providerById.get(id)?.models.map(m => m.id) ?? []
+}
+
+/** 目录里某供应商的模型条目（id + 展示名），用于「恢复默认模型」 */
+export function catalogEntries(id: string): ModelEntry[] {
+  return providerById.get(id)?.models.map(m => ({ id: m.id, name: m.name })) ?? []
 }
 
 export function findModelProviders(modelId: string): string[] {

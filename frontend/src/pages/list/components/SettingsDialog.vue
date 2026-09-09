@@ -3,9 +3,9 @@
 // 供应商支持「列表 / 展开编辑 / 新增 / 删除」；密钥仅存本地配置文件（0600）。
 import { computed, ref, watch } from 'vue'
 import { useSettingsStore } from '../stores/settings'
-import type { ProviderConfig, ProviderKind } from '@/types'
+import type { ModelEntry, ProviderConfig, ProviderKind } from '@/types'
 import { MODEL_CATALOG, PROVIDER_PRESETS } from '@/api/model-catalog'
-import { catalogProvider, findModelProviders } from '@/api/model-catalog-utils'
+import { catalogEntries, catalogProvider, findModelProviders } from '@/api/model-catalog-utils'
 import ModelPicker from './ModelPicker.vue'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -70,14 +70,14 @@ watch(() => props.open, (v) => {
 })
 
 const config = computed(() => store.config)
-function modelsOf(providerId: string): string[] {
+function modelsOf(providerId: string): ModelEntry[] {
   return config.value?.providers.find(p => p.id === providerId)?.models ?? []
 }
 function onRoleProvider(key: RoleKey, providerId: string) {
   const c = config.value
   if (!c) return
   c.roles[key].provider_id = providerId
-  c.roles[key].model = modelsOf(providerId)[0] ?? ''
+  c.roles[key].model = modelsOf(providerId)[0]?.id ?? ''
 }
 /** 选了模型但还没填端点时：按模型反查供应商，自动补 Base URL / 类型 / 名称 */
 function autoFillFromModel(modelId: string, p: ProviderConfig) {
@@ -124,7 +124,7 @@ function applyCatalog(id: string) {
   draft.value.label = p.label
   draft.value.kind = (preset?.kind ?? 'openai-compatible') as ProviderKind
   draft.value.base_url = preset?.base_url ?? ''
-  draft.value.models = p.models.map(m => m.id)
+  draft.value.models = catalogEntries(p.id)
 }
 
 function startAdd() {
@@ -156,7 +156,7 @@ function removeProvider(p: ProviderConfig) {
   ;(['story', 'character', 'embedding'] as RoleKey[]).forEach(k => {
     if (c.roles[k].provider_id === p.id) {
       c.roles[k].provider_id = fallback
-      c.roles[k].model = modelsOf(fallback)[0] ?? ''
+      c.roles[k].model = modelsOf(fallback)[0]?.id ?? ''
     }
   })
   if (expandedId.value === p.id) expandedId.value = null
@@ -235,7 +235,7 @@ async function save() { if (await store.save()) close() }
                       <SelectTrigger class="w-full"><SelectValue placeholder="选择模型" /></SelectTrigger>
                       <SelectContent>
                         <SelectGroup>
-                          <SelectItem v-for="m in modelsOf(config.roles[r.key].provider_id)" :key="m" :value="m">{{ m }}</SelectItem>
+                          <SelectItem v-for="m in modelsOf(config.roles[r.key].provider_id)" :key="m.id" :value="m.id">{{ m.name || m.id }}</SelectItem>
                         </SelectGroup>
                       </SelectContent>
                     </Select>
