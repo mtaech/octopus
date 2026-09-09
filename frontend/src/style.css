@@ -9,6 +9,9 @@
    语义 token 名来自 shadcn-vue 规范；值是我们定制的夜行手记色板。 */
 
 :root {
+  /* 让原生控件（滚动条、表单、日期选择器等）走深色 */
+  color-scheme: dark;
+
   /* —— 底色阶：暖墨黑 —— */
   --background: #141210;
   --foreground: #ece6da;
@@ -115,5 +118,30 @@
   * { @apply border-border outline-ring/50; }
   body {
     @apply bg-background text-foreground;
+  }
+
+  /* —— 主题滚动条：细、无亮色轨道、悬停转琥珀 ——
+     先 color-scheme: dark 让原生滚动条走深色（Firefox/Chromium），
+     再用 WebKit 伪元素精修；不引入任何滚动条库。 */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: color-mix(in oklab, var(--muted-foreground) 30%, transparent) transparent;
+  }
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track,
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background-color: color-mix(in oklab, var(--muted-foreground) 30%, transparent);
+    border-radius: 9999px;
+    border: 3px solid transparent;
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: color-mix(in oklab, var(--primary) 70%, transparent);
   }
 }
