@@ -1,9 +1,9 @@
 <script setup lang="ts">
-// 设置 · AI Provider（#26）：左分区导航 + 右「标签/说明 + 控件」行版式。
-// 密钥仅存本地配置文件（0600），日志脱敏；此处为原型交互。
+// 设置 · AI Provider（#26）：左分区导航 + 右行式配置。
+// 供应商支持「列表 / 展开编辑 / 新增 / 删除」；密钥仅存本地配置文件（0600）。
 import { computed, ref, watch } from 'vue'
 import { useSettingsStore } from '../stores/settings'
-import type { ProviderConfig } from '@/types'
+import type { ProviderConfig, ProviderKind } from '@/types'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
@@ -11,7 +11,7 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, Di
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import {
   IconSettings, IconRobot, IconPlugConnected, IconCoin, IconInfoCircle,
-  IconCircleCheck, IconAlertTriangle, IconLoader2,
+  IconCircleCheck, IconAlertTriangle, IconLoader2, IconPlus, IconTrash, IconChevronRight,
 } from '@tabler/icons-vue'
 
 const props = defineProps<{ open: boolean }>()
@@ -25,6 +25,14 @@ const ROLES: { key: RoleKey; label: string; desc: string }[] = [
   { key: 'embedding', label: 'Embedding', desc: '事件检索向量化（默认本地 bge-small-zh）' },
 ]
 
+const KINDS: { value: ProviderKind; label: string }[] = [
+  { value: 'openai', label: 'OpenAI' },
+  { value: 'anthropic', label: 'Anthropic' },
+  { value: 'deepseek', label: 'DeepSeek' },
+  { value: 'ollama', label: 'Ollama（本地）' },
+  { value: 'openai-compatible', label: 'OpenAI 兼容端点' },
+]
+
 type SectionKey = 'roles' | 'providers' | 'budget' | 'about'
 const NAV: { key: SectionKey; label: string; icon: unknown }[] = [
   { key: 'roles', label: '模型分工', icon: IconRobot },
@@ -34,9 +42,17 @@ const NAV: { key: SectionKey; label: string; icon: unknown }[] = [
 ]
 const active = ref<SectionKey>('roles')
 
+// 供应商：展开态 / 新增态
+const expandedId = ref<string | null>(null)
+const adding = ref(false)
+const draft = ref<ProviderConfig>({ id: '', label: '', kind: 'openai', base_url: '', api_key: '', models: [] })
+const draftModels = ref('')
+
 watch(() => props.open, (v) => {
   if (v) {
     active.value = 'roles'
+    adding.value = false
+    expandedId.value = null
     void store.load()
   }
 })
@@ -55,6 +71,55 @@ function setModels(p: ProviderConfig, v: string) {
   p.models = v.split(',').map(s => s.trim()).filter(Boolean)
 }
 function modelsText(p: ProviderConfig): string { return p.models.join(', ') }
+
+function toggle(id: string) { expandedId.value = expandedId.value === id ? null : id }
+
+function slugify(s: string): string {
+  const base = s.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+  return base || 'p-' + Date.now().toString(36)
+}
+function uniqueId(base: string): string {
+  const taken = new Set((config.value?.providers ?? []).map(p => p.id))
+  if (!taken.has(base)) return base
+  let i = 2
+  while (taken.has(`${base}-${i}`)) i++
+  return `${base}-${i}`
+}
+
+function startAdd() {
+  draft.value = { id: '', label: '', kind: 'openai', base_url: '', api_key: '', models: [] }
+  draftModels.value = ''
+  adding.value = true
+  expandedId.value = null
+}
+function cancelAdd() { adding.value = false }
+function saveAdd() {
+  const c = config.value
+  if (!c || !draft.value.label.trim()) return
+  const p: ProviderConfig = {
+    ...draft.value,
+    id: uniqueId(slugify(draft.value.label)),
+    label: draft.value.label.trim(),
+    models: draftModels.value.split(',').map(s => s.trim()).filter(Boolean),
+  }
+  c.providers.push(p)
+  adding.value = false
+  expandedId.value = p.id
+}
+function removeProvider(p: ProviderConfig) {
+  const c = config.value
+  if (!c) return
+  if (!window.confirm(`删除供应商「${p.label}」？引用了它的模型分工将回退到第一个供应商。`)) return
+  c.providers = c.providers.filter(x => x.id !== p.id)
+  const fallback = c.providers[0]?.id ?? ''
+  ;(['story', 'character', 'embedding'] as RoleKey[]).forEach(k => {
+    if (c.roles[k].provider_id === p.id) {
+      c.roles[k].provider_id = fallback
+      c.roles[k].model = modelsOf(fallback)[0] ?? ''
+    }
+  })
+  if (expandedId.value === p.id) expandedId.value = null
+}
 
 function close() { if (!store.saving) emit('update:open', false) }
 async function save() { if (await store.save()) close() }
@@ -162,20 +227,79 @@ async function save() { if (await store.save()) close() }
 
           <!-- —— 供应商 —— -->
           <template v-else-if="active === 'providers'">
-            <p class="mb-4 text-xs leading-relaxed text-muted-foreground">
-              API Key 保存于本地配置文件（0600），日志与错误信息中一律脱敏；支持环境变量覆盖。
-            </p>
-            <section v-for="p in config.providers" :key="p.id" class="mb-5 last:mb-0">
-              <div class="mb-1.5 flex items-center gap-2">
-                <h3 class="text-[11px] font-bold tracking-[0.14em] text-muted-foreground uppercase">{{ p.label }}</h3>
-                <Badge variant="outline" class="font-mono text-[10px]">{{ p.kind }}</Badge>
-                <Button size="xs" variant="outline" class="ml-auto" :disabled="store.tests[p.id]?.testing" @click="store.test(p)">
+            <div class="mb-3 flex items-start justify-between gap-3">
+              <p class="max-w-md text-xs leading-relaxed text-muted-foreground">
+                API Key 保存于本地配置文件（0600），日志脱敏；支持环境变量覆盖。
+              </p>
+              <Button size="sm" class="shrink-0" :disabled="adding" @click="startAdd">
+                <IconPlus data-icon="inline-start" />添加供应商
+              </Button>
+            </div>
+
+            <!-- 新增表单 -->
+            <div v-if="adding" class="mb-3 rounded-xl border border-primary/40 bg-primary/5 p-3.5">
+              <div class="mb-2.5 text-[12px] font-bold text-primary">新增供应商</div>
+              <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <label class="flex flex-col gap-1.5">
+                  <span class="text-[11px] font-semibold text-muted-foreground">名称</span>
+                  <Input v-model="draft.label" placeholder="例如 DeepSeek / 本地 Ollama" class="h-9" />
+                </label>
+                <label class="flex flex-col gap-1.5">
+                  <span class="text-[11px] font-semibold text-muted-foreground">类型</span>
+                  <Select :model-value="draft.kind" @update:model-value="(v) => { if (typeof v === 'string') draft.kind = v as ProviderKind }">
+                    <SelectTrigger class="w-full"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectGroup>
+                        <SelectItem v-for="k in KINDS" :key="k.value" :value="k.value">{{ k.label }}</SelectItem>
+                      </SelectGroup>
+                    </SelectContent>
+                  </Select>
+                </label>
+                <label class="flex flex-col gap-1.5 sm:col-span-2">
+                  <span class="text-[11px] font-semibold text-muted-foreground">Base URL</span>
+                  <Input v-model="draft.base_url" placeholder="https://…" class="h-9" />
+                </label>
+                <label class="flex flex-col gap-1.5 sm:col-span-2">
+                  <span class="text-[11px] font-semibold text-muted-foreground">API Key</span>
+                  <Input v-model="draft.api_key" type="password" :placeholder="draft.kind === 'ollama' ? '（本地无需）' : 'sk-…'" class="h-9" />
+                </label>
+                <label class="flex flex-col gap-1.5 sm:col-span-2">
+                  <span class="text-[11px] font-semibold text-muted-foreground">模型清单（逗号分隔）</span>
+                  <Input v-model="draftModels" placeholder="deepseek-chat, deepseek-reasoner" class="h-9" />
+                </label>
+              </div>
+              <div class="mt-3 flex justify-end gap-2">
+                <Button size="sm" variant="ghost" @click="cancelAdd">取消</Button>
+                <Button size="sm" :disabled="!draft.label.trim()" @click="saveAdd">添加</Button>
+              </div>
+            </div>
+
+            <!-- 供应商列表 -->
+            <div v-for="p in config.providers" :key="p.id" class="mb-2.5 overflow-hidden rounded-xl border border-border bg-card/40">
+              <div class="flex items-center gap-2 px-3.5 py-2.5">
+                <button type="button" class="flex min-w-0 flex-1 items-center gap-2 text-left" @click="toggle(p.id)">
+                  <IconChevronRight aria-hidden="true" class="size-3.5 shrink-0 text-muted-foreground transition-transform" :class="expandedId === p.id ? 'rotate-90' : ''" />
+                  <span class="shrink-0 text-[13px] font-semibold">{{ p.label }}</span>
+                  <Badge variant="outline" class="shrink-0 font-mono text-[10px]">{{ p.kind }}</Badge>
+                  <span class="truncate text-xs text-muted-foreground">{{ p.base_url }}</span>
+                </button>
+                <Button size="xs" variant="outline" :disabled="store.tests[p.id]?.testing" @click="store.test(p)">
                   <IconLoader2 v-if="store.tests[p.id]?.testing" data-icon="inline-start" class="animate-spin" />
                   <IconPlugConnected v-else data-icon="inline-start" />
                   测试
                 </Button>
+                <Button size="icon-xs" variant="ghost" class="text-muted-foreground hover:text-destructive" title="删除供应商" @click="removeProvider(p)">
+                  <IconTrash />
+                </Button>
               </div>
-              <div class="divide-y divide-border/60 rounded-xl border border-border bg-card/40 px-3.5">
+
+              <div v-if="store.tests[p.id] && !store.tests[p.id].testing" class="flex items-center gap-1.5 border-t border-border/60 px-3.5 py-1.5 text-xs" :class="store.tests[p.id].ok ? 'text-success' : 'text-destructive'">
+                <IconCircleCheck v-if="store.tests[p.id].ok" class="size-3.5" />
+                <IconAlertTriangle v-else class="size-3.5" />
+                {{ store.tests[p.id].message }}<template v-if="store.tests[p.id].latency_ms"> · {{ store.tests[p.id].latency_ms }}ms</template>
+              </div>
+
+              <div v-if="expandedId === p.id" class="divide-y divide-border/60 border-t border-border/60 px-3.5">
                 <div class="flex items-center justify-between gap-6 py-2.5">
                   <div class="min-w-0">
                     <div class="text-[13px] font-semibold">Base URL</div>
@@ -204,12 +328,11 @@ async function save() { if (await store.save()) close() }
                   </div>
                 </div>
               </div>
-              <div v-if="store.tests[p.id] && !store.tests[p.id].testing" class="mt-1.5 flex items-center gap-1.5 text-xs" :class="store.tests[p.id].ok ? 'text-success' : 'text-destructive'">
-                <IconCircleCheck v-if="store.tests[p.id].ok" class="size-3.5" />
-                <IconAlertTriangle v-else class="size-3.5" />
-                {{ store.tests[p.id].message }}<template v-if="store.tests[p.id].latency_ms"> · {{ store.tests[p.id].latency_ms }}ms</template>
-              </div>
-            </section>
+            </div>
+
+            <div v-if="!config.providers.length" class="rounded-xl border border-dashed border-border px-4 py-8 text-center text-xs text-muted-foreground">
+              还没有供应商，点右上角「添加供应商」。
+            </div>
           </template>
 
           <!-- —— 成本护栏 —— -->
