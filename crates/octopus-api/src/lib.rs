@@ -3,6 +3,7 @@
 //! 组合根：注入 SqliteStore（#27 单库）与 AiProvider（ai crate）。
 
 pub mod error;
+pub mod providers;
 
 use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
@@ -190,6 +191,7 @@ fn fnv1a(s: &str) -> u64 {
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/health", get(health))
+        .route("/api/providers/probe", post(providers::probe_models))
         .route("/api/storybooks", get(list_storybooks))
         .route("/api/storybooks/{id}", get(get_storybook))
         .route("/api/saves", get(list_saves).post(create_save))

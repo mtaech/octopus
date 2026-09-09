@@ -7,11 +7,11 @@ import type {
   Storybook, SaveListItem, SaveDetail, StorybookListItem, StorybookDocument,
   ValidateResult, ValidationIssue, CharacterInstance, WorldProjection, PlayEvent,
   UpgradeReport, Disposition, PairSuggestion, PhaseStage, StateDelta,
-  CondExpr, HistoryPage, SaveSettings, MaintenanceRow, AppConfig, ProviderTestResult, ProviderConfig
+  CondExpr, HistoryPage, SaveSettings, MaintenanceRow, AppConfig, ProviderTestResult, ProviderConfig, ProbeResult
 } from '@/types'
 import { uid } from '@/types'
 import { storybookFallingStar, storybookMist, storybookAsh, storybookDraft } from '../seed'
-import { catalogEntries } from '../model-catalog-utils'
+import { catalogEntries, detectProviderByUrl } from '../model-catalog-utils'
 
 // ---------- 小工具 ----------
 
@@ -689,6 +689,19 @@ let appConfig: AppConfig = structuredClone(DEFAULT_CONFIG)
 
 export function getAppConfig(): AppConfig { return structuredClone(appConfig) }
 export function saveAppConfig(cfg: AppConfig): AppConfig { appConfig = JSON.parse(JSON.stringify(cfg)) as AppConfig; return structuredClone(appConfig) }
+/** 模型探测（mock：按 Base URL 识别目录供应商并返回其模型；真后端会 GET {base_url}/models） */
+export function probeProviderModels(p: Pick<ProviderConfig, 'base_url' | 'api_key' | 'kind'>): ProbeResult {
+  const url = (p.base_url ?? '').trim()
+  if (!url) throw { code: 'empty_base_url', message: '请先填写 Base URL' }
+  const isLocal = /127\.0\.0\.1|localhost/.test(url)
+  const needKey = p.kind !== 'ollama' && !isLocal
+  if (needKey && !p.api_key) throw { code: 'missing_api_key', message: '探测需要 API Key' }
+  const pid = detectProviderByUrl(url)
+  const entries = pid ? catalogEntries(pid) : []
+  if (!entries.length) throw { code: 'probe_empty', message: '未能从该端点探测到模型（原型：仅识别目录内供应商）' }
+  return { models: entries, source: url.replace(/\/$/, '') + '/models' }
+}
+
 export function testProvider(provider: ProviderConfig): ProviderTestResult {
   const p = provider
   if (!p) return { ok: false, message: '未找到该 Provider' }

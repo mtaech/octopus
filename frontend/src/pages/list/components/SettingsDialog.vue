@@ -318,7 +318,7 @@ async function save() { if (await store.save()) close() }
                   <span class="text-[11px] font-semibold text-muted-foreground">模型清单</span>
                   <ModelPicker
                     :model-value="draft.models"
-                    :provider-url="draft.base_url"
+                    :provider="draft"
                     @update:model-value="draft.models = $event"
                     @pick="(m: string) => autoFillFromModel(m, draft)"
                   />
@@ -397,7 +397,7 @@ async function save() { if (await store.save()) close() }
                   </div>
                   <ModelPicker
                     :model-value="p.models"
-                    :provider-url="p.base_url"
+                    :provider="p"
                     @update:model-value="p.models = $event"
                     @pick="(m: string) => autoFillFromModel(m, p)"
                   />

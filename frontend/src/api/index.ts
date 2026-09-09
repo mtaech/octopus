@@ -7,7 +7,7 @@ import type {
   Storybook, SaveListItem, SaveDetail, StorybookListItem, StorybookDocument,
   ValidateResult, ValidationIssue, UpgradeReport, Disposition,
   PairSuggestion, WorldProjection, PlayEvent, StreamStatus, PhaseStage,
-  HistoryPage, SaveSettings, MaintenanceRow, AppConfig, ProviderTestResult, ProviderConfig
+  HistoryPage, SaveSettings, MaintenanceRow, AppConfig, ProviderTestResult, ProviderConfig, ProbeResult
 } from '@/types'
 import * as mock from './mock/backend'
 import { delay } from './mock/backend'
@@ -149,6 +149,11 @@ export function saveAppConfig(config: AppConfig): Promise<AppConfig> {
 }
 export function testProvider(provider: ProviderConfig): Promise<ProviderTestResult> {
   return net(run(async () => mock.testProvider(provider)), 400 + Math.random() * 400)
+}
+
+/** 探测模型：GET {base_url}/models（真后端执行，避免浏览器暴露 key） */
+export function probeProviderModels(provider: Pick<ProviderConfig, 'base_url' | 'api_key' | 'kind'>): Promise<ProbeResult> {
+  return net(run(async () => mock.probeProviderModels(provider)), 700 + Math.random() * 500)
 }
 
 // ================= 结对（#23 ④，编辑器 C 范式） =================
