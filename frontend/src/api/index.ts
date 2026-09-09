@@ -7,7 +7,7 @@ import type {
   Storybook, SaveListItem, SaveDetail, StorybookListItem, StorybookDocument,
   ValidateResult, ValidationIssue, UpgradeReport, Disposition,
   PairSuggestion, WorldProjection, PlayEvent, StreamStatus, PhaseStage,
-  HistoryPage, SaveSettings, MaintenanceRow
+  HistoryPage, SaveSettings, MaintenanceRow, AppConfig, ProviderTestResult, ProviderConfig
 } from '@/types'
 import * as mock from './mock/backend'
 import { delay } from './mock/backend'
@@ -137,6 +137,18 @@ export function newOrigin(saveId: string): Promise<{ detail: SaveDetail; archive
 /** 切换受控角色（#24 修订：状态类元指令直调） */
 export function switchCharacter(saveId: string, characterId: string): Promise<void> {
   return net(run(async () => { mock.switchCharacter(saveId, characterId) }), 100)
+}
+
+// ================= 应用配置（#26 AI Provider） =================
+
+export function getAppConfig(): Promise<AppConfig> {
+  return net(run(async () => mock.getAppConfig()))
+}
+export function saveAppConfig(config: AppConfig): Promise<AppConfig> {
+  return net(run(async () => mock.saveAppConfig(config)), 220)
+}
+export function testProvider(provider: ProviderConfig): Promise<ProviderTestResult> {
+  return net(run(async () => mock.testProvider(provider)), 400 + Math.random() * 400)
 }
 
 // ================= 结对（#23 ④，编辑器 C 范式） =================

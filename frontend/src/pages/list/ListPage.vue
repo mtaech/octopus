@@ -14,6 +14,7 @@ import NewGameDialog from './components/NewGameDialog.vue'
 import { relativeTime } from './utils/relativeTime'
 import StorybookCard from './components/StorybookCard.vue'
 import SaveCard from './components/SaveCard.vue'
+import SettingsDialog from './components/SettingsDialog.vue'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Card } from '@/components/ui/card'
@@ -29,6 +30,7 @@ import {
   IconPlayerPlayFilled,
   IconPlus,
   IconRefresh,
+  IconSettings,
   IconSparkles,
   IconUpload,
 } from '@tabler/icons-vue'
@@ -40,6 +42,7 @@ const { storybooks, saves, loading, loaded, error, recentSave } = storeToRefs(st
 
 // ---- 新建游戏弹窗状态 ----
 const dialogOpen = ref(false)
+const settingsOpen = ref(false)
 const dialogPreselect = ref<string | null>(null)
 const creating = ref(false)
 
@@ -129,6 +132,10 @@ function goCreateNew() {
         <Badge variant="outline" class="hidden gap-1 border-border/70 bg-muted/30 font-normal text-muted-foreground sm:inline-flex">
           列表 · 故事书与存档
         </Badge>
+        <div class="flex-1"></div>
+        <Button variant="ghost" size="icon-sm" title="设置 · AI Provider" @click="settingsOpen = true">
+          <IconSettings />
+        </Button>
       </div>
     </header>
 
@@ -335,6 +342,8 @@ function goCreateNew() {
     </main>
 
     <input ref="fileInput" type="file" accept=".sqlite" class="hidden" @change="onImportChange" />
+
+    <SettingsDialog v-model:open="settingsOpen" />
 
     <NewGameDialog
       v-model:open="dialogOpen"

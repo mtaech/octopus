@@ -477,6 +477,46 @@ export interface SaveSettings { auto_confirm: boolean }
 /** 维护历史（#21 / #14 修订） */
 export interface MaintenanceRow { at: string; op: string; summary: string }
 
+// ---------- 应用配置 / AI Provider（#26） ----------
+
+export type ProviderKind = 'openai' | 'anthropic' | 'deepseek' | 'ollama' | 'openai-compatible'
+
+export interface ProviderConfig {
+  id: string
+  label: string
+  kind: ProviderKind
+  base_url?: string
+  /** 真实后端存本地配置文件（0600），日志脱敏；此处仅原型展示 */
+  api_key?: string
+  /** 可选模型清单 */
+  models: string[]
+}
+
+export interface RoleConfig {
+  provider_id: string
+  model: string
+  temperature?: number
+  max_tokens?: number
+}
+
+/** 三类模型分工各自可配（#26 ③） */
+export interface AppConfig {
+  providers: ProviderConfig[]
+  roles: {
+    story: RoleConfig
+    character: RoleConfig
+    embedding: RoleConfig
+  }
+  /** 成本护栏：每回合 token 上限，0 = 不限（#26 ⑤） */
+  turn_token_budget?: number
+}
+
+export interface ProviderTestResult {
+  ok: boolean
+  message: string
+  latency_ms?: number
+}
+
 // ---------- 通用工具类型 ----------
 
 export interface Listener<T> {

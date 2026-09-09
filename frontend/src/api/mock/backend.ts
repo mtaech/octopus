@@ -7,7 +7,7 @@ import type {
   Storybook, SaveListItem, SaveDetail, StorybookListItem, StorybookDocument,
   ValidateResult, ValidationIssue, CharacterInstance, WorldProjection, PlayEvent,
   UpgradeReport, Disposition, PairSuggestion, PhaseStage, StateDelta,
-  CondExpr, HistoryPage, SaveSettings, MaintenanceRow
+  CondExpr, HistoryPage, SaveSettings, MaintenanceRow, AppConfig, ProviderTestResult, ProviderConfig
 } from '@/types'
 import { uid } from '@/types'
 import { storybookFallingStar, storybookMist, storybookAsh, storybookDraft } from '../seed'
@@ -666,6 +666,34 @@ export function currentProjection(saveId: string): WorldProjection | null {
   if (!r) return null
   r.projection.seq = r.seq
   return r.projection
+}
+
+// ---------- 应用配置（#26 AI Provider 配置与凭据管理） ----------
+
+const DEFAULT_CONFIG: AppConfig = {
+  providers: [
+    { id: 'deepseek', label: 'DeepSeek', kind: 'deepseek', base_url: 'https://api.deepseek.com', api_key: '', models: ['deepseek-chat', 'deepseek-reasoner'] },
+    { id: 'openai', label: 'OpenAI', kind: 'openai', base_url: 'https://api.openai.com/v1', api_key: '', models: ['gpt-4o', 'gpt-4o-mini'] },
+    { id: 'ollama', label: '本地 Ollama', kind: 'ollama', base_url: 'http://127.0.0.1:11434', api_key: '', models: ['qwen2.5:7b', 'llama3.1:8b'] },
+    { id: 'fastembed', label: '本地 Embedding', kind: 'openai-compatible', api_key: '', models: ['bge-small-zh-v1.5', 'bge-m3'] }
+  ],
+  roles: {
+    story: { provider_id: 'deepseek', model: 'deepseek-chat', temperature: 0.8, max_tokens: 4096 },
+    character: { provider_id: 'deepseek', model: 'deepseek-chat', temperature: 0.7, max_tokens: 2048 },
+    embedding: { provider_id: 'fastembed', model: 'bge-small-zh-v1.5' }
+  },
+  turn_token_budget: 0
+}
+let appConfig: AppConfig = structuredClone(DEFAULT_CONFIG)
+
+export function getAppConfig(): AppConfig { return structuredClone(appConfig) }
+export function saveAppConfig(cfg: AppConfig): AppConfig { appConfig = JSON.parse(JSON.stringify(cfg)) as AppConfig; return structuredClone(appConfig) }
+export function testProvider(provider: ProviderConfig): ProviderTestResult {
+  const p = provider
+  if (!p) return { ok: false, message: '未找到该 Provider' }
+  const needKey = p.kind === 'openai' || p.kind === 'anthropic' || p.kind === 'deepseek'
+  if (needKey && !p.api_key) return { ok: false, message: '未填写 API Key' }
+  return { ok: true, message: '连通正常', latency_ms: Math.round(80 + seededRand(p.id) * 400) }
 }
 
 // ---------- 初始化 ----------
