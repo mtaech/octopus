@@ -517,6 +517,10 @@ export interface ProviderTestResult {
   latency_ms?: number
 }
 
+/** 模型目录（来源 https://pi.dev/models 的快照） */
+export interface CatalogModel { id: string; name: string }
+export interface CatalogProvider { id: string; label: string; models: CatalogModel[] }
+
 // ---------- 通用工具类型 ----------
 
 export interface Listener<T> {

@@ -4,6 +4,7 @@
 import { computed, ref, watch } from 'vue'
 import { useSettingsStore } from '../stores/settings'
 import type { ProviderConfig, ProviderKind } from '@/types'
+import { MODEL_CATALOG, PROVIDER_PRESETS } from '@/api/model-catalog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
@@ -47,6 +48,7 @@ const expandedId = ref<string | null>(null)
 const adding = ref(false)
 const draft = ref<ProviderConfig>({ id: '', label: '', kind: 'openai', base_url: '', api_key: '', models: [] })
 const draftModels = ref('')
+const catalogPick = ref('')
 
 watch(() => props.open, (v) => {
   if (v) {
@@ -86,9 +88,23 @@ function uniqueId(base: string): string {
   return `${base}-${i}`
 }
 
+/** 从目录选择供应商：预填名称 / 类型 / 端点 / 模型清单 */
+function applyCatalog(id: string) {
+  const p = MODEL_CATALOG.find(x => x.id === id)
+  if (!p) return
+  const preset = PROVIDER_PRESETS[id]
+  draft.value.label = p.label
+  draft.value.kind = (preset?.kind ?? 'openai-compatible') as ProviderKind
+  draft.value.base_url = preset?.base_url ?? ''
+  draft.value.models = p.models.map(m => m.id)
+  // 网关动辄数百个模型：超阈值时不把长串塞进输入框，保存时直接取数组
+  draftModels.value = p.models.length <= 60 ? p.models.map(m => m.id).join(', ') : ''
+}
+
 function startAdd() {
   draft.value = { id: '', label: '', kind: 'openai', base_url: '', api_key: '', models: [] }
   draftModels.value = ''
+  catalogPick.value = ''
   adding.value = true
   expandedId.value = null
 }
@@ -100,7 +116,9 @@ function saveAdd() {
     ...draft.value,
     id: uniqueId(slugify(draft.value.label)),
     label: draft.value.label.trim(),
-    models: draftModels.value.split(',').map(s => s.trim()).filter(Boolean),
+    models: draftModels.value.trim()
+      ? draftModels.value.split(',').map(s => s.trim()).filter(Boolean)
+      : draft.value.models,
   }
   c.providers.push(p)
   adding.value = false
@@ -239,6 +257,17 @@ async function save() { if (await store.save()) close() }
             <!-- 新增表单 -->
             <div v-if="adding" class="mb-3 rounded-xl border border-primary/40 bg-primary/5 p-3.5">
               <div class="mb-2.5 text-[12px] font-bold text-primary">新增供应商</div>
+              <div class="mb-3 flex flex-col gap-1.5">
+                <span class="text-[11px] font-semibold text-muted-foreground">从目录选择（可选，自动填充名称 / 端点 / 模型）</span>
+                <Select :model-value="catalogPick" @update:model-value="(v) => { if (typeof v === 'string') { catalogPick = v; applyCatalog(v) } }">
+                  <SelectTrigger class="w-full"><SelectValue placeholder="选择一个已知供应商…" /></SelectTrigger>
+                  <SelectContent>
+                    <SelectGroup>
+                      <SelectItem v-for="cp in MODEL_CATALOG" :key="cp.id" :value="cp.id">{{ cp.label }} · {{ cp.models.length }} 个模型</SelectItem>
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
+              </div>
               <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <label class="flex flex-col gap-1.5">
                   <span class="text-[11px] font-semibold text-muted-foreground">名称</span>
@@ -265,7 +294,8 @@ async function save() { if (await store.save()) close() }
                 </label>
                 <label class="flex flex-col gap-1.5 sm:col-span-2">
                   <span class="text-[11px] font-semibold text-muted-foreground">模型清单（逗号分隔）</span>
-                  <Input v-model="draftModels" placeholder="deepseek-chat, deepseek-reasoner" class="h-9" />
+                  <Input v-model="draftModels" :placeholder="draft.models.length && !draftModels ? '已从目录导入 ' + draft.models.length + ' 个模型（可直接添加）' : 'deepseek-chat, deepseek-reasoner'" class="h-9" />
+                  <span v-if="draft.models.length && !draftModels" class="text-[11px] text-primary/80">已从目录导入 {{ draft.models.length }} 个模型，保存时一并写入。</span>
                 </label>
               </div>
               <div class="mt-3 flex justify-end gap-2">
