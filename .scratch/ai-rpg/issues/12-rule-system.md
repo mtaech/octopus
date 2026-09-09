@@ -53,3 +53,13 @@ Status: resolved
 - 每次判定与效果中的骰子表达式求值消耗 RNG 值，命令日志记录 `rng_consume` 条目（含 count + values 数组）。
 - 重放时直接使用命令日志中已记录的随机值，跳过 RNG 调用，保证确定可复现。
 - v1 持续时间单位：turns（该角色回合开始时 tick）和 scenes（场景切换时到期）。
+
+---
+
+## 修订（设计复审 2026-09-09）
+
+- 判定器命名统一为 `world.check`（原 `world.rules.check`）。
+- 对抗（`opposed`）由 `check` 意图的 `opponent_id` / `target_value` 表达（#04）。
+- 判定器引用的属性 / 资源 / 技能等字符串统一走 #01 声明区校验。
+
+详见 [决策记录](../decision-log-design-pass.md)。

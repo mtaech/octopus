@@ -44,3 +44,14 @@ Blocked by: 18
 - 原型：**[prototypes/save-manager.html](../prototypes/save-manager.html)**（三变体对比保留，默认 B）。
 - CONTEXT.md 新增术语：**遗留区 (Legacy Zone)**、**维护历史 (Maintenance History)**。
 - 无新开票；回滚/分支玩家侧时间轴 UI 保持雾区（已记入地图 Not yet specified）。
+
+---
+
+## 修订（设计复审 2026-09-09）
+
+- **新原点 = 玩家侧 v1 功能**（#24 去掉 dev 门控）；回滚/分支仍为 dev 工具。
+- 维护历史从 #24 的 `GET /api/saves/:id/maintenance` 读取。
+- 导出 = 抽单存档为独立 `.sqlite` 包；导入分配新 `save_id`；升级前自动备份 = 导出包。
+- 抽屉补删除 / 重命名入口（管理操作仍不进列表卡）。
+
+详见 [决策记录](../decision-log-design-pass.md)。

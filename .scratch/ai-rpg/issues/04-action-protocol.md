@@ -14,7 +14,7 @@ Blocked by: 01, 02, 03
 ⑤ 单回合内多次工具调用的循环边界与令牌预算。
 ## Answer
 
-### (1) Intent type taxonomy (five categories)
+### (1) Intent type taxonomy (six categories)
 
 | Category | Intents | Engine behavior |
 |----------|---------|-----------------|
@@ -23,6 +23,7 @@ Blocked by: 01, 02, 03
 | Mechanical | check | Engine rolls dice + applies modifiers + returns success level |
 | Query | query_world / query_character / query_relationships | Read-only, no command produced |
 | Meta | switch_character / save / intervene | Player-only, AI cannot initiate |
+| Progression | advance_scene | Validate goal / abandon -> switch scene (see #13) |
 
 ### (2) Intent schema: discriminator union, one function per type
 
@@ -108,3 +109,17 @@ Character AI calls run in parallel. Story AI runs before Character AI.
 ### (9) Idempotent deduplication
 
 Engine maintains per-round intent_id set. Duplicate id returns cached ResolutionResult. Set cleared at end of round.
+
+---
+
+## 修订（设计复审 2026-09-09）
+
+- 五类 → **六类**：新增 Progression（`advance_scene`，见 #13）。
+- `interact` 保留，`object_id` 指向 #01 的 `objects` 实体。
+- `check` 增加 `opponent_id` / `target_value`（`mode = opposed` 时必填）。
+- `finish_turn` = 工具调用循环终止信号，**不算意图**、不校验、不进日志。
+- Narrative（speak/narrate/emote）进命令日志且**权威**（与 #06 的「叙事非权威」冲突按此收敛，见决策记录第 1 条）。
+- 状态类 Meta（switch_character/save/免确认/新原点）由 UI 直调结构化端点（#24），AI 仍不能发起；`intervene` 走 meta 文本并记入命令日志。
+- `ResolutionResult` 的 `outcome`/`triggered_events` 同步进 #17 事件载荷。
+
+详见 [决策记录](../decision-log-design-pass.md)。

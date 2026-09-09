@@ -61,3 +61,13 @@ editor 页（路由 /storybook/:id/edit，单路由 + 内部视图态）
 ### 解锁 / 新增
 
 - 前端契约已定 → 解锁「编辑器后端 API 设计」（#07 待办交圈：CRUD / 草稿保存 / 引用校验 / 发布端点），另立新票。
+
+---
+
+## 修订（设计复审 2026-09-09）
+
+- `document` 组件存储格式 = **Markdown**。
+- 新增 `objects` 编辑与声明区（flags/events/relationship_types/target_types）编辑与校验。
+- 校验含注册表引用完整性。
+
+详见 [决策记录](../decision-log-design-pass.md)。

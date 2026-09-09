@@ -37,3 +37,16 @@ Status: resolved
 - 技能是单一 Skill 实体；「物品技能」= 物品引用同一 Skill（载体是物品）。
 - 关系 = 有向边，可连 人物/势力 两两之间；type（好感/敌意/同盟/亲属/…）+ value（数值强度）。
 - 静态 vs 运行时：故事书只存模板；角色实例 = 人物模板 + 当前属性/位置/状态；物品栏 = 物品模板 + 数量/实例态；关系值可偏离初始。
+
+---
+
+## 修订（设计复审 2026-09-09）
+
+- 顶层 JSON 补 `attribute_dimensions`（全局属性维度，人物只消费）。
+- 判定器命名统一为 `world.check`（原 `world.rules.check`），对齐 ts-rs 生成类型。
+- 人物模板新增 `kind: "pc" | "npc"`。
+- 新增 `objects` 实体（id/name/description/actions[]，可挂技能与条件），`interact` 意图引用它。
+- 新增声明区 `flags` / `events` / `relationship_types` / `target_types`，供引用校验（Lua 兜底可绕过）。
+- 叙事字段存储格式 = Markdown。
+
+详见 [决策记录](../decision-log-design-pass.md)。

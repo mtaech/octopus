@@ -5,6 +5,8 @@ Status: resolved
 Assignee: agent
 Blocked by: 08, 17
 
+> **修订（设计复审 2026-09-09）**：v1 范围收窄为 **CSS token 换肤 + 内置三模板**；插件 API（h() 渲染树 / 生命周期 / DOM 逃生舱 / manifest 渲染入口）降级 **v1.1**。详见文末修订块与 [决策记录](../decision-log-design-pass.md)。
+
 ## Question
 
 游玩界面已是多模板（#08），需要拍板：玩家 / 创作者如何自定义、扩展演出模板。会话内已定基调（待本票决议落账）：
@@ -50,4 +52,13 @@ Blocked by: 08, 17
 - 模板根目录 = 应用数据目录 `templates/`（全局、对所有存档生效），游玩页进入时扫描注册；改文件后手动「重新加载模板」按钮（开发期可自动监听），v1 不自动热替换。
 - id 冲突 = 后加载者忽略并报错；插件不得与内置同 id（内置 id 保留前缀）；manifest `version` 仅展示、不做依赖解析。
 - 模板与存档**完全解耦**（存档不记录模板依赖，呈现层非权威）；模板缺失 / 加载异常 / 单事件出错 → 回退内置聊天流，不阻塞游玩。「导出模板包（zip）」v1 不做、留口（已挂地图 Not yet specified）。
+
+---
+
+## 修订（设计复审 2026-09-09）
+
+- **v1 范围收窄为 CSS token 换肤 + 内置三模板**；插件 API（h() 渲染树、生命周期、DOM 逃生舱、manifest 渲染入口）**降级 v1.1**，已移入 `map.md` 的 Not yet specified。
+- manifest 在 v1 仅承载 token 面 + 布局声明，供换肤设置面板渲染。
+
+详见 [决策记录](../decision-log-design-pass.md)。
 

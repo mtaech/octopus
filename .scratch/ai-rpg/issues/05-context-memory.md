@@ -62,5 +62,16 @@ Blocked by: 03, 04
 
 ### 技术选型
 
-- **向量检索**：DuckDB 原生向量扩展（ARRAY 类型 + 距离函数），内嵌部署，与 SQLite 存档统一在一个 DuckDB 文件中（DuckDB 可 attach SQLite），无需额外向量数据库。
+- **向量检索**：DuckDB 原生向量扩展（ARRAY 类型 + 距离函数），**独立 DuckDB 文件**（app 数据目录，派生可重建），不 attach SQLite；权威库为应用级单库 SQLite（#27）。
 - **Embedding 模型**：待定——需单独调研（与 Provider 可插拔策略一致，选型另开 research 票）。
+
+---
+
+## 修订（设计复审 2026-09-09）
+
+- 向量索引改为**独立 DuckDB 文件**（app 数据目录、派生可重建），不再 attach SQLite；权威库是应用级单库 SQLite（#27）。
+- 关键词检索统一 **SQLite FTS5**（终结与 #06 的分歧）。
+- token 预算：8K/4K 为**默认值**，按 provider/模型可配置。
+- Embedding 模型选型已由 #15 落定（bge-small-zh-v1.5，512d）。
+
+详见 [决策记录](../decision-log-design-pass.md)。

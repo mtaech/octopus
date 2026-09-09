@@ -7,7 +7,7 @@ Blocked by: 03, 04, 06, 17, 20
 
 ## Question
 
-定义游玩页后端 API 的形态。机制层面已定（#03 核心游戏循环：玩家输入→主线 AI 意图→角色 AI 意图→引擎结算→流式输出、角色/元指令双通道；#04 动作协议：六类意图 + 四阶段管线 + intent_id 幂等；#06 状态持久化：命令日志 + 快照、SQLite 一存档一文件、回滚/分支；#17 引擎→UI 事件协议：SSE 包络 + 确认门 HTTP POST 往返 + GET /state 水合 + seq 水位线；#20 Rust 模块：octopus-api 装配 EventSink→SSE、注入 Storage/AiProvider，session 回合循环在 engine），需要拍板：
+定义游玩页后端 API 的形态。机制层面已定（#03 核心游戏循环：玩家输入→主线 AI 意图→角色 AI 意图→引擎结算→流式输出、角色/元指令双通道；#04 动作协议：六类意图 + 四阶段管线 + intent_id 幂等；#06 状态持久化：命令日志 + 快照、应用级单库 SQLite、回滚/分支；#17 引擎→UI 事件协议：SSE 包络 + 确认门 HTTP POST 往返 + GET /state 水合 + seq 水位线；#20 Rust 模块：octopus-api 装配 EventSink→SSE、注入 Storage/AiProvider，session 回合循环在 engine），需要拍板：
 
 ① 会话生命周期与端点划分：游玩会话的 REST 形态——显式 session 资源（创建/销毁）还是隐式（加载存档即会话、按存档寻址）？新建游戏（基于故事书已发布版次开档）与读取存档的端点；回合输入与回合内 SSE 流的组织（单 POST 触发 + 回合流 vs 其他）；确认门 POST 的路径与载荷（#17 已定机制与超时语义，路径/载荷未定）。
 
@@ -37,7 +37,7 @@ Blocked by: 03, 04, 06, 17, 20
 - **升级**（#14 两段式 + #21 抽屉）：
   - `POST /api/saves/:id/upgrade/dry-run` → 迁移报告（引用变更 / 人物消失分组，#14 引擎按需 diff 内嵌旧模板 vs 目标新模板）。
   - `POST /api/saves/:id/upgrade { dispositions: [{ character_id, disposition: freeze|departure }] }` → 自动备份 → 执行 → 维护历史落账 → 引发的世界变更以特殊命令进日志；未提供全部人物裁决 → 422（#21「未裁决完禁用确认」）。
-- **新原点 / 回滚分支**：dev-gated 端点 `POST /api/saves/:id/origin`、`POST /api/saves/:id/branch { from_seq }`（dev 开关门控，不进 v1 抽屉 UI，#21）；便于 #20 api 层测试与 dev 工具驱动。
+- **新原点 / 回滚分支**：`POST /api/saves/:id/origin`（**玩家侧 v1**，进抽屉，#21）、`POST /api/saves/:id/branch { from_seq }`（dev-gated）；便于 #20 api 层测试与 dev 工具驱动。
 - **导出 / 导入**（#21 交互落地）：导出 `GET /api/saves/:id/export` → 单文件 .sqlite 下载；导入 `POST /api/saves/import`（multipart）→ 能打开即通过，返回带「新导入」标记的 save meta。
 
 ### ③ 列表页数据源
@@ -57,4 +57,19 @@ Blocked by: 03, 04, 06, 17, 20
 
 - 解锁「列表页（故事书 / 存档入口）UI 规格」——数据源（③）已定，另立新票。
 - 雾区清理：列表页 UI 规格从 Not yet specified 毕业。
+
+---
+
+## 修订（设计复审 2026-09-09）
+
+- 开档 `POST /api/saves` 增加 `title` 与 `controlled_character_id`（默认第一个 PC）。
+- 新增 `PATCH /api/saves/:id`（重命名）、`DELETE /api/saves/:id`、`GET /api/saves/:id/maintenance`、`PUT /api/saves/:id/settings { auto_confirm }`。
+- 新增 `GET /api/saves/:id/history?from_seq&limit`（叙事历史分页，见决策记录第 1 条）。
+- 新增状态类元指令端点（如 `POST /api/saves/:id/character` 切换受控角色）；叙事类元指令走 `POST /rounds { channel: "meta" }`。
+- **新原点去掉 dev 门控**（玩家侧 v1）；`branch` 仍 dev-gated。
+- 导出 = 抽单存档为独立 `.sqlite` 包；导入分配新 `save_id`。
+- `POST /rounds` 增加 `request_id` 幂等；非 idle 提交返回 `409 round_in_progress`。
+- 安全边界：只绑 `127.0.0.1`、无鉴权、导入加大小/结构上限。
+
+详见 [决策记录](../decision-log-design-pass.md)。
 

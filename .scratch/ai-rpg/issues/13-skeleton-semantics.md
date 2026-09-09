@@ -55,3 +55,13 @@ Blocked by: 04
 
 - goal/beat 的「已达成/已触发」提示只注入主线 AI，角色 AI 不接收（#05 所见即所知 + #04 scope 受限）。
 - 术语：goal = 目标、beat = 节拍，已入 CONTEXT.md。
+
+---
+
+## 修订（设计复审 2026-09-09）
+
+- 引擎内部事件 `scene_change` 与 #17 演出流事件 `scene` **统一命名**。
+- 条件谓词引用的 flag / event 走 #01 声明区校验。
+- `advance_scene` 已补入 #04 第六类意图（Progression）。
+
+详见 [决策记录](../decision-log-design-pass.md)。

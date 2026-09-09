@@ -33,9 +33,9 @@ Blocked by: 03, 04, 08, 11
 | | `emote` | `{ content, emotion?, gesture? }`（content=动作描述，标签供模板加样式） |
 | 机制 | `pending` | `{ action_id, intent_id, actor, description, impact?, timeout_ms }` |
 | | `check_result` | `{ intent_id, actor, attribute, expr?, rolls?, mod, total, target, margin, result, level }`——`expr`/`rolls` 为判定器骰子表达式与点数（无骰判定缺省），`margin` = total − target；`level ∈ {great, success, barely, fail}`（按 #12 差值阈值分档，自定义 Lua 判定同样归一化、level 恒由引擎分档；#08 原型的 ok/part/crit/fail 为样式映射，不入 schema） |
-| | `resolution` | `{ intent_id, status: ok\|rejected, rejection_code?, narrative?, state_changes }`——被驳回意图的反馈同样走 resolution（演出流为派生视图，玩家需要看到驳回原因；#06「驳回只进 debug 流」指命令日志） |
+| | `resolution` | `{ intent_id, status: ok\|rejected, rejection_code?, narrative?, outcome?, triggered_events?, state_changes }`——被驳回意图的反馈同样走 resolution（演出流为派生视图，玩家需要看到驳回原因；#06「驳回只进 debug 流」指命令日志） |
 | 状态 | `state_update` | `{ changes: [delta...] }`，只承载非结算来源变更（目标达成提示/节拍触发/场景切换） |
-| | snapshot | 全量水合，独立 `GET /state`（REST 拉取，非流事件）；带 `seq` 水位线，前端丢弃 `seq ≤ watermark` 的流内事件 |
+| | ~~snapshot~~ | 已移出事件表：状态水合走 REST `GET /state`；叙事历史走 `GET /history`（#24） |
 | 控制 | `phase` | `{ stage: story_thinking\|character_thinking\|resolving\|waiting_confirm, detail? }` |
 | | `round_start` | `{ round, input: { channel: character\|meta, text } }`——回显玩家输入，流自包含（重连/回放可重建） |
 | | `round_end` | `{ round }` |
@@ -69,4 +69,15 @@ Blocked by: 03, 04, 08, 11
 ### 解锁
 
 本票决议解锁「前端应用结构与模块划分」「演出模板的自定义与扩展机制」「Rust 模块划分与测试策略」三张被阻塞的票。
+
+---
+
+## 修订（设计复审 2026-09-09）
+
+- 新增**历史读取**：`GET /api/saves/:id/history`（分页）；刷新 / 重连 / 换模板据此回读叙事，`GET /state` 仍只水合、不回放事件。
+- `resolution` 补 `outcome` / `triggered_events`（对齐 #04）。
+- 事件表移除 `snapshot` 行（它是 REST `GET /state`，非流事件）。
+- 免确认开关落到 #24 的**存档级**设置端点（`meta.auto_confirm`）。
+
+详见 [决策记录](../decision-log-design-pass.md)。
 

@@ -56,3 +56,12 @@ types crate 共享类型 derive TS，构建时生成 `frontend/src/generated/typ
 
 本票决议落地引擎/后端工程结构；未开新票，Not yet specified 无毕业项。
 
+---
+
+## 修订（设计复审 2026-09-09）
+
+- 前端类型由 **ts-rs 生成**，`frontend/src/types/index.ts` 只做 re-export（决策记录第 11 条）。
+- 存储层 = **单库 SQLite + 独立 DuckDB 文件**（#27）；`duckdb` 仍属 engine。
+
+详见 [决策记录](../decision-log-design-pass.md)。
+
