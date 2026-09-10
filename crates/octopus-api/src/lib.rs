@@ -19,10 +19,12 @@ use futures::Stream;
 use octopus_engine::{
     AiProvider, EngineError, EventSink, Session, SqliteStore, StorybookRow, WorldState,
 };
+#[allow(unused_imports)]
+use octopus_types::ApiErrorBody;
 use octopus_types::{
-    ApiErrorBody, CharacterInstance, ConfirmRequest, CreateSaveRequest, CreateStorybookRequest,
+    CharacterInstance, ConfirmRequest, CreateSaveRequest, CreateStorybookRequest,
     EventEnvelope, HistoryPage, IssueSeverity, MaintenanceRow, ProjectionMeta, PublishRequest,
-    RoundInput, SaveDetail, SaveDraftRequest, SaveListItem, SaveSettings, SkeletonProgress,
+    RoundInput, SaveDetail, SaveDraftRequest, SaveListItem, SavePackage, SaveSettings, SkeletonProgress,
     StorybookDocument, SubmitRoundRequest, ValidateResult, ValidationIssue,
 };
 use serde::{Deserialize, Serialize};
@@ -579,26 +581,28 @@ async fn new_origin(
     Ok(Json(json!({ "ok": true, "archived_count": 0 })))
 }
 
-async fn export_save() -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(ApiErrorBody {
-            code: "not_implemented".into(),
-            message: "导出单存档包待实现（#27）".into(),
-            detail: None,
-        }),
-    )
+async fn export_save(
+    State(app): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let pkg = app.store().export_save_package(&id).await?;
+    let filename = format!("{id}.octopus.json");
+    let headers = [
+        (axum::http::header::CONTENT_TYPE, "application/json".to_string()),
+        (
+            axum::http::header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        ),
+    ];
+    Ok((headers, Json(pkg)))
 }
 
-async fn import_save() -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(ApiErrorBody {
-            code: "not_implemented".into(),
-            message: "导入待实现（#27）".into(),
-            detail: None,
-        }),
-    )
+async fn import_save(
+    State(app): State<Arc<AppState>>,
+    Json(pkg): Json<SavePackage>,
+) -> Result<(StatusCode, Json<SaveListItem>), ApiError> {
+    let item = app.store().import_save_package(&pkg).await?;
+    Ok((StatusCode::CREATED, Json(item)))
 }
 
 // ============================================================
@@ -915,6 +919,57 @@ mod tests {
         let result2: ValidateResult = res2.json().await.unwrap();
         assert!(!result2.valid);
         assert!(result2.issues.iter().any(|i| i.code == "missing_id"));
+    }
+
+    #[tokio::test]
+    async fn test_api_export_and_import_save() {
+        let (base_url, _state) = spawn_app().await;
+        let client = reqwest::Client::new();
+
+        // 1. 开档
+        let create_res = client
+            .post(format!("{base_url}/api/saves"))
+            .json(&CreateSaveRequest {
+                storybook_id: "sb-fallingstar".to_string(),
+                title: Some("待导出存档".to_string()),
+                controlled_character_id: None,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(create_res.status(), StatusCode::CREATED);
+        let save_detail: SaveDetail = create_res.json().await.unwrap();
+        let save_id = save_detail.item.id;
+
+        // 2. 导出
+        let export_res = client
+            .get(format!("{base_url}/api/saves/{save_id}/export"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(export_res.status(), StatusCode::OK);
+        let content_disp = export_res
+            .headers()
+            .get("content-disposition")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(content_disp.contains(&format!("{save_id}.octopus.json")));
+        let pkg: SavePackage = export_res.json().await.unwrap();
+        assert_eq!(pkg.format, "octopus-save-package");
+        assert_eq!(pkg.save.item.title, "待导出存档");
+
+        // 3. 导入（产生新记录）
+        let import_res = client
+            .post(format!("{base_url}/api/saves/import"))
+            .json(&pkg)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(import_res.status(), StatusCode::CREATED);
+        let imported_item: SaveListItem = import_res.json().await.unwrap();
+        assert_eq!(imported_item.imported, Some(true));
+        assert!(imported_item.title.contains("(导入)"));
     }
 }
 

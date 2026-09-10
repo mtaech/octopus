@@ -134,7 +134,7 @@ function fmt(iso: string) { return fmtTime(iso) }
               </Button>
             </div>
             <p class="mt-2 text-[11px] leading-relaxed text-muted-foreground/70">
-              导出为单文件 .sqlite 包（内嵌冻结模板 + 存档历史），便于异地同步备份与归档。
+              导出为跨数据库自包含存档包（.octopus.json），内嵌冻结故事书与完整命令日志，便于异地备份与迁移。
             </p>
           </div>
 

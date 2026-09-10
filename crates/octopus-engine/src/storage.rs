@@ -8,7 +8,9 @@ use sea_orm::{
 };
 use serde_json::Value;
 
-use octopus_types::{MaintenanceRow, SaveDetail, SaveListItem};
+use octopus_types::{
+    ArchivedCommandRecord, CommandRecord, MaintenanceRow, SaveDetail, SaveListItem, SavePackage,
+};
 use migration::{Migrator, MigratorTrait};
 
 use crate::{entities, error::EngineError, seed::seed_storybooks};
@@ -523,6 +525,188 @@ impl SqliteStore {
             .collect();
         Ok(list)
     }
+
+    // ---------- 通用自包含存档包（#27 / 跨数据库导出与导入） ----------
+
+    pub async fn export_save_package(&self, save_id: &str) -> Result<SavePackage, EngineError> {
+        let save_detail = self
+            .get_save(save_id)
+            .await?
+            .ok_or_else(|| EngineError::SaveNotFound(save_id.to_string()))?;
+
+        let command_models = entities::command::Entity::find()
+            .filter(entities::command::Column::SaveId.eq(save_id.to_string()))
+            .order_by_asc(entities::command::Column::Seq)
+            .all(&self.db)
+            .await?;
+
+        let commands = command_models
+            .into_iter()
+            .map(|m| CommandRecord {
+                seq: m.seq,
+                round: m.round,
+                kind: m.kind,
+                payload: serde_json::from_str(&m.payload_json).unwrap_or(Value::Null),
+                ts: m.ts,
+            })
+            .collect();
+
+        let archived_models = entities::archived_command::Entity::find()
+            .filter(entities::archived_command::Column::SaveId.eq(save_id.to_string()))
+            .order_by_asc(entities::archived_command::Column::Seq)
+            .all(&self.db)
+            .await?;
+
+        let archived_commands = archived_models
+            .into_iter()
+            .map(|m| ArchivedCommandRecord {
+                origin_seq: m.origin_seq,
+                seq: m.seq,
+                round: m.round,
+                kind: m.kind,
+                payload: serde_json::from_str(&m.payload_json).unwrap_or(Value::Null),
+                ts: m.ts,
+            })
+            .collect();
+
+        let maintenance_models = entities::maintenance::Entity::find()
+            .filter(entities::maintenance::Column::SaveId.eq(save_id.to_string()))
+            .order_by_asc(entities::maintenance::Column::Id)
+            .all(&self.db)
+            .await?;
+
+        let maintenance = maintenance_models
+            .into_iter()
+            .map(|m| MaintenanceRow {
+                at: m.at,
+                op: m.op,
+                summary: m.summary,
+            })
+            .collect();
+
+        Ok(SavePackage {
+            format: "octopus-save-package".to_string(),
+            version: 1,
+            exported_at: now_iso(),
+            save: save_detail,
+            commands,
+            archived_commands,
+            maintenance,
+        })
+    }
+
+    pub async fn import_save_package(&self, pkg: &SavePackage) -> Result<SaveListItem, EngineError> {
+        if pkg.format != "octopus-save-package" {
+            return Err(EngineError::Internal("无效的存档包格式，缺少 octopus-save-package 标识".to_string()));
+        }
+
+        let exists = self.get_save(&pkg.save.item.id).await?.is_some();
+        let (new_id, new_title) = if exists {
+            (
+                format!("sv-{}", uuid::Uuid::new_v4().simple()),
+                format!("{} (导入)", pkg.save.item.title),
+            )
+        } else {
+            (pkg.save.item.id.clone(), pkg.save.item.title.clone())
+        };
+
+        let mut detail = pkg.save.clone();
+        detail.item.id = new_id.clone();
+        detail.item.title = new_title;
+        detail.item.imported = Some(true);
+        let now = now_iso();
+        detail.item.updated_at = now.clone();
+
+        let pkg_commands = pkg.commands.clone();
+        let pkg_archived = pkg.archived_commands.clone();
+        let pkg_maintenance = pkg.maintenance.clone();
+        let detail_to_save = detail.clone();
+
+        self.db
+            .transaction::<_, (), EngineError>(|txn| {
+                let save_id = new_id.clone();
+                let storybook_json =
+                    serde_json::to_string(&detail_to_save.storybook).unwrap_or_else(|_| "{}".to_string());
+                Box::pin(async move {
+                    let save_active = entities::save::ActiveModel {
+                        id: Set(detail_to_save.item.id.clone()),
+                        title: Set(detail_to_save.item.title.clone()),
+                        storybook_id: Set(detail_to_save.item.storybook_id.clone()),
+                        storybook_title: Set(detail_to_save.item.storybook_title.clone()),
+                        embedded_revision: Set(detail_to_save.item.embedded_revision as i64),
+                        latest_revision: Set(detail_to_save.item.latest_revision as i64),
+                        needs_upgrade: Set(detail_to_save.item.needs_upgrade),
+                        imported: Set(true),
+                        storybook_json: Set(storybook_json),
+                        auto_confirm: Set(false),
+                        created_at: Set(detail_to_save.item.created_at.clone()),
+                        updated_at: Set(now.clone()),
+                        last_played_at: Set(detail_to_save.item.last_played_at.clone()),
+                    };
+                    save_active.insert(txn).await?;
+
+                    for cmd in pkg_commands {
+                        let payload_json = serde_json::to_string(&cmd.payload)
+                            .unwrap_or_else(|_| "{}".to_string());
+                        let cmd_active = entities::command::ActiveModel {
+                            id: sea_orm::ActiveValue::NotSet,
+                            save_id: Set(save_id.clone()),
+                            seq: Set(cmd.seq),
+                            round: Set(cmd.round),
+                            kind: Set(cmd.kind),
+                            payload_json: Set(payload_json),
+                            ts: Set(cmd.ts),
+                        };
+                        cmd_active.insert(txn).await?;
+                    }
+
+                    for arch in pkg_archived {
+                        let payload_json = serde_json::to_string(&arch.payload)
+                            .unwrap_or_else(|_| "{}".to_string());
+                        let arch_active = entities::archived_command::ActiveModel {
+                            id: sea_orm::ActiveValue::NotSet,
+                            save_id: Set(save_id.clone()),
+                            origin_seq: Set(arch.origin_seq),
+                            seq: Set(arch.seq),
+                            round: Set(arch.round),
+                            kind: Set(arch.kind),
+                            payload_json: Set(payload_json),
+                            ts: Set(arch.ts),
+                        };
+                        arch_active.insert(txn).await?;
+                    }
+
+                    for m in pkg_maintenance {
+                        let m_active = entities::maintenance::ActiveModel {
+                            id: sea_orm::ActiveValue::NotSet,
+                            save_id: Set(save_id.clone()),
+                            at: Set(m.at),
+                            op: Set(m.op),
+                            summary: Set(m.summary),
+                        };
+                        m_active.insert(txn).await?;
+                    }
+
+                    let import_m = entities::maintenance::ActiveModel {
+                        id: sea_orm::ActiveValue::NotSet,
+                        save_id: Set(save_id.clone()),
+                        at: Set(now.clone()),
+                        op: Set("导入存档".to_string()),
+                        summary: Set("自自包含存档包导入".to_string()),
+                    };
+                    import_m.insert(txn).await?;
+
+                    Ok(())
+                })
+            })
+            .await
+            .map_err(|e| match e {
+                sea_orm::TransactionError::Connection(db_err) => EngineError::from(db_err),
+                sea_orm::TransactionError::Transaction(engine_err) => engine_err,
+            })?;
+
+        Ok(detail.item)
+    }
 }
 
 #[cfg(test)]
@@ -699,5 +883,60 @@ mod tests {
 
         assert!(store.delete_save("save-1").await.unwrap());
         assert!(store.get_save("save-1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_export_and_import_save_package() {
+        let store1 = SqliteStore::open_in_memory().await.unwrap();
+        let detail = SaveDetail {
+            item: SaveListItem {
+                id: "sv-test-pkg".to_string(),
+                title: "通用存档包测试".to_string(),
+                storybook_id: "sb-1".to_string(),
+                storybook_title: "测试故事书".to_string(),
+                embedded_revision: 1,
+                latest_revision: 1,
+                needs_upgrade: false,
+                imported: Some(false),
+                created_at: now_iso(),
+                updated_at: now_iso(),
+                last_played_at: now_iso(),
+            },
+            storybook: json!({ "meta": { "title": "测试故事书" } }),
+        };
+        store1.insert_save(&detail, false).await.unwrap();
+        store1
+            .append_command("sv-test-pkg", 1, 1, "round_start", "{\"input\":\"hello\"}")
+            .await
+            .unwrap();
+        store1
+            .append_maintenance("sv-test-pkg", "手动存档", "快照备份")
+            .await
+            .unwrap();
+
+        // 导出
+        let pkg = store1.export_save_package("sv-test-pkg").await.unwrap();
+        assert_eq!(pkg.format, "octopus-save-package");
+        assert_eq!(pkg.version, 1);
+        assert_eq!(pkg.save.item.title, "通用存档包测试");
+        assert_eq!(pkg.commands.len(), 1);
+        assert_eq!(pkg.commands[0].kind, "round_start");
+        assert_eq!(pkg.maintenance.len(), 1);
+
+        // 导入到全新实例 store2
+        let store2 = SqliteStore::open_in_memory().await.unwrap();
+        let imported_item = store2.import_save_package(&pkg).await.unwrap();
+        assert_eq!(imported_item.id, "sv-test-pkg");
+        assert_eq!(imported_item.imported, Some(true));
+
+        let fetched = store2.get_save("sv-test-pkg").await.unwrap().unwrap();
+        assert_eq!(fetched.item.title, "通用存档包测试");
+        let m2 = store2.list_maintenance("sv-test-pkg").await.unwrap();
+        assert_eq!(m2.len(), 2); // 原维护记录 + 导入操作记录
+
+        // 再次导入到 store2 -> 触发碰撞改名
+        let imported_again = store2.import_save_package(&pkg).await.unwrap();
+        assert_ne!(imported_again.id, "sv-test-pkg");
+        assert!(imported_again.title.contains("(导入)"));
     }
 }

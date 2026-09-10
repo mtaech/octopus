@@ -4,7 +4,7 @@
 //       通过 URL ?mock=1 或 localStorage['octopus:force_mock']='1' 可随时切回 Mock。
 // ============================================================
 import type {
-  Storybook, SaveListItem, SaveDetail, StorybookListItem, StorybookDocument,
+  Storybook, SaveListItem, SaveDetail, SavePackage, StorybookListItem, StorybookDocument,
   ValidateResult, ValidationIssue, UpgradeReport, Disposition,
   PairSuggestion, WorldProjection, PlayEvent, StreamStatus, PhaseStage,
   HistoryPage, SaveSettings, MaintenanceRow, AppConfig, ProviderTestResult, ProviderConfig, ProbeResult
@@ -243,17 +243,39 @@ export function manualSave(saveId: string): Promise<SaveListItem> {
   return fetchJson<SaveListItem>(`/api/saves/${encodeURIComponent(saveId)}/save`, { method: 'POST' })
 }
 
-export function importSave(fileName: string): Promise<SaveListItem> {
-  return net(run(async () => mock.importSaveFile(fileName)), 400)
+export async function importSave(pkgOrFileName: SavePackage | string): Promise<SaveListItem> {
+  if (isMockMode()) {
+    const title = typeof pkgOrFileName === 'string' ? pkgOrFileName : pkgOrFileName.save.title
+    return net(run(async () => mock.importSaveFile(title)), 400)
+  }
+  if (typeof pkgOrFileName === 'string') {
+    throw new Error('导入存档需传入 SavePackage 数据对象')
+  }
+  return fetchJson<SaveListItem>('/api/saves/import', {
+    method: 'POST',
+    body: JSON.stringify(pkgOrFileName),
+  })
 }
 
-export function exportSave(saveId: string): Promise<{ filename: string; blob: Blob }> {
-  return net(run(async () => {
-    const s = mock.getSave(saveId)
-    if (!s) throw mkErr('NOT_FOUND', '存档不存在')
-    const blob = new Blob([JSON.stringify({ save: { id: s.id, storybook: s.storybook.meta.title, revision: s.embedded_revision }, exported: true })], { type: 'application/octet-stream' })
-    return { filename: s.id + '.sqlite', blob }
-  }), 200)
+export async function exportSave(saveId: string): Promise<{ filename: string; blob: Blob }> {
+  if (isMockMode()) {
+    return net(run(async () => {
+      const s = mock.getSave(saveId)
+      if (!s) throw mkErr('NOT_FOUND', '存档不存在')
+      const blob = new Blob([JSON.stringify({ format: 'octopus-save-package', version: 1, exported_at: new Date().toISOString(), save: s, commands: [], archived_commands: [], maintenance: [] })], { type: 'application/json' })
+      return { filename: s.id + '.octopus.json', blob }
+    }), 200)
+  }
+  const res = await fetch(`/api/saves/${encodeURIComponent(saveId)}/export`)
+  if (!res.ok) {
+    const err = await res.json().catch(() => null)
+    throw new Error(err?.message ?? '导出失败')
+  }
+  const blob = await res.blob()
+  const contentDisp = res.headers.get('content-disposition')
+  const match = contentDisp?.match(/filename="?([^"]+)"?/)
+  const filename = match?.[1] ?? `${saveId}.octopus.json`
+  return { filename, blob }
 }
 
 /** 叙事历史分页（#17/#24 修订）：进页 / 重连 / 换模板回读故事 */

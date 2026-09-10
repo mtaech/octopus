@@ -6,7 +6,7 @@ import { computed, ref } from 'vue'
 import {
   listStorybooks, listSaves, createSave, importSave
 } from '@/api'
-import type { SaveListItem, StorybookListItem } from '@/types'
+import type { SaveListItem, SavePackage, StorybookListItem } from '@/types'
 
 export const useListStore = defineStore('list', () => {
   const storybooks = ref<StorybookListItem[]>([])
@@ -43,9 +43,9 @@ export const useListStore = defineStore('list', () => {
     return detail.id
   }
 
-  /** 导入存档：传文件名即可，mock 返回带 imported 标记的存档 */
-  async function importFromFile(fileName: string): Promise<SaveListItem> {
-    const item = await importSave(fileName)
+  /** 导入存档：支持通用 SavePackage 或 mock 文件名 */
+  async function importFromFile(pkgOrName: SavePackage | string): Promise<SaveListItem> {
+    const item = await importSave(pkgOrName)
     await load()
     return item
   }

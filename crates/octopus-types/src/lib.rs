@@ -393,7 +393,7 @@ pub struct WorldProjection {
 // 存档（#24 / #21）
 // ============================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
 #[ts(export)]
 pub struct SaveListItem {
     pub id: String,
@@ -410,7 +410,7 @@ pub struct SaveListItem {
     pub last_played_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
 #[ts(export)]
 pub struct SaveDetail {
     #[serde(flatten)]
@@ -434,7 +434,7 @@ pub struct SaveSettings {
     pub auto_confirm: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
 #[ts(export)]
 pub struct MaintenanceRow {
     pub at: String,
@@ -572,4 +572,43 @@ pub struct StorybookListItem {
     pub published: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+}
+
+// ============================================================
+// 通用自包含存档包（#27 / 跨数据库导出与导入）
+// ============================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+#[ts(export)]
+pub struct CommandRecord {
+    pub seq: i64,
+    pub round: i64,
+    pub kind: String,
+    #[ts(type = "unknown")]
+    pub payload: Value,
+    pub ts: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+#[ts(export)]
+pub struct ArchivedCommandRecord {
+    pub origin_seq: i64,
+    pub seq: i64,
+    pub round: i64,
+    pub kind: String,
+    #[ts(type = "unknown")]
+    pub payload: Value,
+    pub ts: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+#[ts(export)]
+pub struct SavePackage {
+    pub format: String,
+    pub version: u32,
+    pub exported_at: String,
+    pub save: SaveDetail,
+    pub commands: Vec<CommandRecord>,
+    pub archived_commands: Vec<ArchivedCommandRecord>,
+    pub maintenance: Vec<MaintenanceRow>,
 }

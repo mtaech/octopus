@@ -93,7 +93,9 @@ async function onImportChange(evt: Event) {
   if (!file) return
   importing.value = true
   try {
-    const item = await store.importFromFile(file.name)
+    const text = await file.text()
+    const pkg = JSON.parse(text)
+    const item = await store.importFromFile(pkg)
     toast('ok', `已导入「${item.title}」`)
   } catch (e) {
     toast('error', e instanceof Error ? e.message : String(e))
@@ -257,7 +259,7 @@ function goCreateNew() {
               </span>
               <h2 class="mt-1 font-serif text-2xl font-semibold tracking-wide text-foreground sm:text-[1.7rem]">还没有存档</h2>
               <p class="mt-1.5 max-w-[52ch] text-sm leading-relaxed text-muted-foreground">
-                从下方已发布故事书「新建游戏」开启一段新史诗，或「导入」已有的 .sqlite 存档继续。
+                从下方已发布故事书「新建游戏」开启一段新史诗，或「导入」自包含存档包继续。
               </p>
             </div>
           </Card>
@@ -285,7 +287,7 @@ function goCreateNew() {
                 <IconUpload aria-hidden="true" class="size-4.5" />
               </span>
               <span class="mt-1 text-sm font-semibold text-foreground">导入存档</span>
-              <span class="text-xs leading-relaxed text-muted-foreground">选择 .sqlite 文件</span>
+              <span class="text-xs leading-relaxed text-muted-foreground">选择 .octopus.json / .json 文件</span>
             </button>
           </div>
         </section>
@@ -337,7 +339,7 @@ function goCreateNew() {
             <EmptyContent>
               <IconBook2 aria-hidden="true" class="size-7 text-muted-foreground/60" />
               <EmptyDescription class="max-w-md text-sm leading-relaxed">
-                还没有存档。从上方故事书「新建游戏」开始一段新冒险，或导入一个 .sqlite 存档继续。
+                还没有存档。从上方故事书「新建游戏」开始一段新冒险，或导入自包含存档包继续。
               </EmptyDescription>
               <div class="flex flex-wrap items-center justify-center gap-2.5 pt-2">
                 <Button size="sm" @click="openNewGame()">
@@ -364,7 +366,7 @@ function goCreateNew() {
       </template>
     </main>
 
-    <input ref="fileInput" type="file" accept=".sqlite" class="hidden" @change="onImportChange" />
+    <input ref="fileInput" type="file" accept=".json,.octopus.json" class="hidden" @change="onImportChange" />
 
     <SettingsDialog v-model:open="settingsOpen" />
 

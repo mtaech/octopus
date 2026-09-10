@@ -93,7 +93,7 @@ export const useDrawerStore = defineStore('playDrawer', () => {
     }
   }
 
-  /** 导出单文件 .sqlite 下载（#21 ④） */
+  /** 导出通用自包含存档包（.octopus.json）下载（#21 ④ / #27） */
   async function doExport() {
     const play = usePlayStore()
     if (!play.saveId) return
