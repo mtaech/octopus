@@ -8,7 +8,7 @@ import { relativeTime } from '../utils/relativeTime'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Card } from '@/components/ui/card'
-import { IconBook2, IconClock, IconPlayerPlay, IconSparkles } from '@tabler/icons-vue'
+import { IconBook2, IconClock, IconDeviceGamepad2, IconPlayerPlay, IconSparkles } from '@tabler/icons-vue'
 
 const props = defineProps<{ save: SaveListItem }>()
 defineEmits<{ (e: 'resume', saveId: string): void }>()
@@ -32,6 +32,10 @@ const tint = computed(() => {
         <h3 class="truncate font-serif text-[15.5px] font-semibold text-card-foreground transition-colors group-hover:text-primary" :title="save.title">
           {{ save.title }}
         </h3>
+        <Badge v-if="save.is_sandbox || save.title.startsWith('【沙箱试玩】')" class="gap-1 border-primary/40 bg-primary/10 text-primary text-[11px]">
+          <IconDeviceGamepad2 aria-hidden="true" class="size-3" />
+          沙箱
+        </Badge>
         <Badge v-if="save.imported" class="gap-1 border-success/40 bg-success/10 text-success text-[11px]">
           <IconSparkles aria-hidden="true" class="size-3" />
           新导入

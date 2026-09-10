@@ -4,4 +4,4 @@ export type SaveDetail = {
 /**
  * 内嵌冻结故事书（#14）；当前里程碑以 JSON 直存。
  */
-storybook: unknown, id: string, title: string, storybook_id: string, storybook_title: string, embedded_revision: number, latest_revision: number, needs_upgrade: boolean, imported: boolean | null, created_at: string, updated_at: string, last_played_at: string, };
+storybook: unknown, id: string, title: string, storybook_id: string, storybook_title: string, embedded_revision: number, latest_revision: number, needs_upgrade: boolean, imported: boolean | null, is_sandbox: boolean | null, created_at: string, updated_at: string, last_played_at: string, };

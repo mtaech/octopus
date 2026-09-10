@@ -12,6 +12,7 @@ pub struct Model {
     pub latest_revision: i64,
     pub needs_upgrade: bool,
     pub imported: bool,
+    pub is_sandbox: bool,
     #[sea_orm(column_type = "Text")]
     pub storybook_json: String,
     pub auto_confirm: bool,

@@ -2,7 +2,7 @@
 // A 表单工作台 —— 实体 tab 容器
 // #22 模块树：A = 世界/骨架/人物/技能/物品/物件/势力/关系/声明/维度设置 一级 tab
 // 骨架 tab = SkeletonView；其余 = 各面板组件
-import { ref, type Component } from 'vue'
+import { computed, ref, type Component } from 'vue'
 import { useEditorStore } from '../../stores/editor'
 import WorldPanel from './WorldPanel.vue'
 import DimensionsPanel from './DimensionsPanel.vue'
@@ -31,7 +31,10 @@ const A_TABS: { key: string; label: string; icon: Component; comp: string }[] = 
   { key: 'dimensions', label: '维度设置', icon: IconSettings, comp: 'dimensions' }
 ]
 
-const active = ref('world')
+const active = computed<string>({
+  get: () => editor.activeTab,
+  set: (v: string) => { editor.activeTab = v },
+})
 
 const countOf = (key: string): number => {
   const d = editor.draft

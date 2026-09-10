@@ -11,6 +11,7 @@ import WorkspaceA from './components/workspace-a/WorkspaceA.vue'
 import PairC from './paradigms/pair-c/PairC.vue'
 import DocumentB from './paradigms/document-b/DocumentB.vue'
 import ValidationDock from './components/refs/ValidationDock.vue'
+import PlaytestDialog from './components/PlaytestDialog.vue'
 import { Button } from '@/components/ui/button'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Badge } from '@/components/ui/badge'
@@ -24,6 +25,7 @@ import {
   IconLayoutGrid,
   IconSparkles,
   IconFileText,
+  IconPlayerPlay,
 } from '@tabler/icons-vue'
 
 const route = useRoute()
@@ -67,6 +69,20 @@ const pubBlockMsg = computed(() => {
 
 async function onPublish(): Promise<void> {
   await editor.publish()
+}
+
+const playtestDialogOpen = ref(false)
+
+function openPlaytestDialog(): void {
+  playtestDialogOpen.value = true
+}
+
+async function onPlaytestConfirm(payload: { title?: string; controlledCharacterId?: string }): Promise<void> {
+  const saveId = await editor.playtest(payload.title, payload.controlledCharacterId)
+  if (saveId) {
+    playtestDialogOpen.value = false
+    void router.push('/play/' + saveId)
+  }
 }
 
 function goBack(): void {
@@ -153,6 +169,22 @@ onUnmounted(() => {
 
       <div class="h-4 w-px bg-border/60" />
 
+      <!-- 沙箱试玩按钮 -->
+      <Button
+        variant="outline"
+        size="sm"
+        :disabled="editor.publishing || editor.playtesting"
+        title="直接使用当前草稿开档试玩，验证设定"
+        class="gap-1.5 font-medium border-primary/40 text-primary hover:bg-primary/10 transition-all duration-200"
+        @click="openPlaytestDialog"
+      >
+        <IconLoader2 v-if="editor.playtesting" class="size-4 animate-spin" />
+        <IconPlayerPlay v-else data-icon="inline-start" class="size-4" />
+        <span>沙箱试玩</span>
+      </Button>
+
+      <div class="h-4 w-px bg-border/60" />
+
       <!-- 发布按钮 -->
       <Button
         size="sm"
@@ -208,5 +240,17 @@ onUnmounted(() => {
       </div>
       <ValidationDock v-if="editor.draft" />
     </div>
+
+    <!-- ============ 沙箱试玩弹窗 ============ -->
+    <PlaytestDialog
+      :open="playtestDialogOpen"
+      :storybook-title="editor.draft?.meta.title ?? ''"
+      :characters="editor.draft?.characters ?? []"
+      :error-count="errorCount"
+      :warning-count="editor.issues.filter(i => i.severity === 'warning').length"
+      :busy="editor.playtesting"
+      @update:open="playtestDialogOpen = $event"
+      @confirm="onPlaytestConfirm"
+    />
   </div>
 </template>

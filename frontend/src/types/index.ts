@@ -311,6 +311,8 @@ export interface SaveListItem {
   needs_upgrade: boolean
   /** 导入存档标记（#21 ④） */
   imported?: boolean
+  /** 沙箱试玩标记（草稿态试玩） */
+  is_sandbox?: boolean
   created_at: string
   updated_at: string
   last_played_at: string
@@ -539,3 +541,4 @@ export function uid(prefix = 'id'): string {
 }
 
 export type { SavePackage } from './generated/SavePackage'
+export type { PlaytestRequest } from './generated/PlaytestRequest'

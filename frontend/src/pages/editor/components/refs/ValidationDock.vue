@@ -4,7 +4,7 @@ import { computed, ref, watch } from 'vue'
 import { useEditorStore } from '../../stores/editor'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { IconChevronsLeft, IconChevronsRight, IconCircleCheck, IconAlertTriangle, IconAlertCircle } from '@tabler/icons-vue'
+import { IconChevronsLeft, IconChevronsRight, IconCircleCheck, IconAlertTriangle, IconAlertCircle, IconRefresh } from '@tabler/icons-vue'
 
 const editor = useEditorStore()
 const open = ref(true)
@@ -24,7 +24,7 @@ function displayTarget(t?: string): string {
 <template>
   <aside
     class="flex shrink-0 flex-col border-l border-border bg-background/70 transition-[width] duration-200"
-    :class="open ? 'w-72' : 'w-11'"
+    :class="open ? 'w-80' : 'w-11'"
   >
     <!-- 折叠头（整条可点） -->
     <header
@@ -40,7 +40,14 @@ function displayTarget(t?: string): string {
           <IconCircleCheck />
           无问题
         </Badge>
-        <IconChevronsRight class="ml-auto text-muted-foreground/50" />
+        <div class="ml-auto flex items-center gap-1" @click.stop>
+          <Button variant="ghost" size="icon-xs" title="立即重新校验" @click="editor.runValidate()">
+            <IconRefresh class="size-3.5 text-muted-foreground/70 hover:text-foreground" />
+          </Button>
+          <Button variant="ghost" size="icon-xs" title="收起面板" @click="open = false">
+            <IconChevronsRight class="size-3.5 text-muted-foreground/50" />
+          </Button>
+        </div>
       </template>
       <template v-else>
         <IconChevronsLeft class="text-muted-foreground/70" />
@@ -50,22 +57,29 @@ function displayTarget(t?: string): string {
 
     <div v-show="open" class="min-h-0 flex-1 overflow-y-auto p-3">
       <div v-if="!errIssues.length && !warnIssues.length" class="text-xs leading-5 text-success">
-        <p>校验通过，草稿结构完整，可发布。</p>
-        <p class="mt-1 text-muted-foreground/70">错误（error）会阻挡发布；警告（warning）仅提示。</p>
+        <p>校验通过，草稿结构完整，可安全发布或开启沙箱试玩。</p>
+        <p class="mt-1 text-muted-foreground/70">错误（error）会阻挡发布与试玩；警告（warning）仅供参考。</p>
       </div>
 
       <div v-if="errIssues.length" class="mb-3">
-        <div class="mb-1.5 text-[11px] font-bold tracking-wider text-muted-foreground">错误 · 阻挡发布</div>
+        <div class="mb-1.5 flex items-center justify-between text-[11px] font-bold tracking-wider text-muted-foreground">
+          <span>错误 · 阻挡发布与试玩</span>
+          <span class="text-[10px] font-normal text-muted-foreground/70">点击可定位</span>
+        </div>
         <div
           v-for="(iss, i) in errIssues"
           :key="'e' + i"
-          class="mb-1.5 rounded-md border border-destructive/30 bg-destructive/5 px-2.5 py-2 text-xs leading-5 text-destructive"
+          class="mb-1.5 cursor-pointer rounded-md border border-destructive/30 bg-destructive/5 px-2.5 py-2 text-xs leading-5 text-destructive transition-all duration-150 hover:border-destructive/60 hover:bg-destructive/10 hover:shadow-xs"
+          title="点击定位到对应编辑项"
+          @click="editor.navigateToIssue(iss)"
         >
           <div class="flex gap-2">
             <IconAlertCircle class="mt-0.5 size-3.5 shrink-0" />
             <div class="min-w-0">
-              <div class="break-words">{{ iss.message }}</div>
-              <div v-if="iss.target" class="mt-0.5 font-mono text-[10px] opacity-80">@ {{ displayTarget(iss.target) }}</div>
+              <div class="break-words font-medium">{{ iss.message }}</div>
+              <div v-if="iss.target" class="mt-0.5 font-mono text-[10px] opacity-80 underline underline-offset-2">
+                @ {{ displayTarget(iss.target) }}
+              </div>
               <div v-if="iss.related_refs?.length" class="mt-1 flex flex-wrap gap-1">
                 <span v-for="(r, j) in iss.related_refs" :key="j" class="rounded-full border border-border bg-muted/40 px-2 py-px text-[10px] text-muted-foreground">
                   {{ r.label ?? r.id }}
@@ -77,17 +91,24 @@ function displayTarget(t?: string): string {
       </div>
 
       <div v-if="warnIssues.length">
-        <div class="mb-1.5 text-[11px] font-bold tracking-wider text-muted-foreground">警告 · 仅提示</div>
+        <div class="mb-1.5 flex items-center justify-between text-[11px] font-bold tracking-wider text-muted-foreground">
+          <span>警告 · 仅提示</span>
+          <span class="text-[10px] font-normal text-muted-foreground/70">点击可定位</span>
+        </div>
         <div
           v-for="(iss, i) in warnIssues"
           :key="'w' + i"
-          class="mb-1.5 rounded-md border border-warning/25 bg-warning/5 px-2.5 py-2 text-xs leading-5 text-warning"
+          class="mb-1.5 cursor-pointer rounded-md border border-warning/25 bg-warning/5 px-2.5 py-2 text-xs leading-5 text-warning transition-all duration-150 hover:border-warning/50 hover:bg-warning/10 hover:shadow-xs"
+          title="点击定位到对应编辑项"
+          @click="editor.navigateToIssue(iss)"
         >
           <div class="flex gap-2">
             <IconAlertTriangle class="mt-0.5 size-3.5 shrink-0" />
             <div class="min-w-0">
               <div class="break-words">{{ iss.message }}</div>
-              <div v-if="iss.target" class="mt-0.5 font-mono text-[10px] opacity-75">@ {{ displayTarget(iss.target) }}</div>
+              <div v-if="iss.target" class="mt-0.5 font-mono text-[10px] opacity-75 underline underline-offset-2">
+                @ {{ displayTarget(iss.target) }}
+              </div>
             </div>
           </div>
         </div>

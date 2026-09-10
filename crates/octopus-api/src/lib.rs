@@ -23,7 +23,7 @@ use octopus_engine::{
 use octopus_types::ApiErrorBody;
 use octopus_types::{
     CharacterInstance, ConfirmRequest, CreateSaveRequest, CreateStorybookRequest,
-    EventEnvelope, HistoryPage, IssueSeverity, MaintenanceRow, ProjectionMeta, PublishRequest,
+    EventEnvelope, HistoryPage, IssueSeverity, MaintenanceRow, PlaytestRequest, ProjectionMeta, PublishRequest,
     RoundInput, SaveDetail, SaveDraftRequest, SaveListItem, SavePackage, SaveSettings, SkeletonProgress,
     StorybookDocument, SubmitRoundRequest, ValidateResult, ValidationIssue,
 };
@@ -205,6 +205,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(get_storybook).put(save_storybook_draft).delete(delete_storybook),
         )
         .route("/api/storybooks/{id}/publish", post(publish_storybook))
+        .route("/api/storybooks/{id}/sandbox", post(playtest_storybook))
         .route("/api/validate", post(validate_endpoint))
         .route("/api/saves", get(list_saves).post(create_save))
         .route(
@@ -376,26 +377,51 @@ async fn create_save(
         .get_storybook(&req.storybook_id)
         .await?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "storybook_not_found", "故事书不存在"))?;
-    let released = sb
-        .released
-        .clone()
-        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "storybook_unpublished", "故事书尚未发布"))?;
+    let is_sandbox = req.is_sandbox.unwrap_or(false);
+    let (storybook_content, revision) = if is_sandbox {
+        let issues = octopus_engine::validate_storybook(&sb.draft);
+        if issues.iter().any(|i| matches!(i.severity, IssueSeverity::Error)) {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "validation_failed",
+                "草稿存在阻断性错误，无法开始沙箱试玩",
+            )
+            .with_detail(serde_json::json!({ "issues": issues })));
+        }
+        (sb.draft.clone(), sb.revision)
+    } else {
+        let released = sb
+            .released
+            .clone()
+            .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "storybook_unpublished", "故事书尚未发布"))?;
+        (released, sb.revision)
+    };
     let now = octopus_engine::storage::now_iso();
-    let id = format!("sv-{}", uuid::Uuid::new_v4().simple());
+    let id = if is_sandbox {
+        format!("sv-sbx-{}", uuid::Uuid::new_v4().simple())
+    } else {
+        format!("sv-{}", uuid::Uuid::new_v4().simple())
+    };
+    let default_title = if is_sandbox {
+        format!("【沙箱试玩】{}", sb.title)
+    } else {
+        sb.title.clone()
+    };
     let item = SaveListItem {
         id: id.clone(),
-        title: req.title.unwrap_or_else(|| sb.title.clone()),
+        title: req.title.unwrap_or(default_title),
         storybook_id: sb.id.clone(),
         storybook_title: sb.title.clone(),
-        embedded_revision: sb.revision,
+        embedded_revision: revision,
         latest_revision: sb.revision,
         needs_upgrade: false,
         imported: Some(false),
+        is_sandbox: Some(is_sandbox),
         created_at: now.clone(),
         updated_at: now.clone(),
         last_played_at: now,
     };
-    let mut detail = SaveDetail { item, storybook: released };
+    let mut detail = SaveDetail { item, storybook: storybook_content };
     if let Some(cid) = &req.controlled_character_id {
         if let Some(arr) = detail.storybook.get_mut("characters").and_then(|v| v.as_array_mut()) {
             for c in arr {
@@ -406,13 +432,30 @@ async fn create_save(
         }
     }
     app.store().insert_save(&detail, false).await?;
-    // 会话建立时再按 controlled_character_id 覆盖（见 session_for 的默认第一个 PC）
     if let Some(cid) = &req.controlled_character_id {
         let session = app.session_for(&id).await?;
         let _ = session.switch_character(cid);
     }
     detail.item.imported = Some(false);
+    detail.item.is_sandbox = Some(is_sandbox);
     Ok((StatusCode::CREATED, Json(detail)))
+}
+
+async fn playtest_storybook(
+    State(app): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<PlaytestRequest>,
+) -> Result<(StatusCode, Json<SaveDetail>), ApiError> {
+    create_save(
+        State(app),
+        Json(CreateSaveRequest {
+            storybook_id: id,
+            title: req.title,
+            controlled_character_id: req.controlled_character_id,
+            is_sandbox: Some(true),
+        }),
+    )
+    .await
 }
 
 async fn get_save(
@@ -933,6 +976,7 @@ mod tests {
                 storybook_id: "sb-fallingstar".to_string(),
                 title: Some("待导出存档".to_string()),
                 controlled_character_id: None,
+                is_sandbox: None,
             })
             .send()
             .await
@@ -970,6 +1014,80 @@ mod tests {
         let imported_item: SaveListItem = import_res.json().await.unwrap();
         assert_eq!(imported_item.imported, Some(true));
         assert!(imported_item.title.contains("(导入)"));
+    }
+
+    #[tokio::test]
+    async fn test_api_playtest_sandbox() {
+        let (base_url, _state) = spawn_app().await;
+        let client = reqwest::Client::new();
+
+        // 1. 新建未发布的草稿
+        let create_res = client
+            .post(format!("{base_url}/api/storybooks"))
+            .json(&CreateStorybookRequest {
+                title: Some("测试沙箱书".to_string()),
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(create_res.status(), StatusCode::CREATED);
+        let doc: StorybookDocument = create_res.json().await.unwrap();
+        assert!(!doc.published);
+
+        // 2. 尝试常规开档 -> 409 未发布
+        let fail_save = client
+            .post(format!("{base_url}/api/saves"))
+            .json(&CreateSaveRequest {
+                storybook_id: doc.id.clone(),
+                title: None,
+                controlled_character_id: None,
+                is_sandbox: None,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(fail_save.status(), StatusCode::CONFLICT);
+
+        // 3. 沙箱开档（未发布但草稿结构有效）-> 201 成功
+        let sbx_res = client
+            .post(format!("{base_url}/api/storybooks/{}/sandbox", doc.id))
+            .json(&PlaytestRequest {
+                title: None,
+                controlled_character_id: None,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(sbx_res.status(), StatusCode::CREATED);
+        let sbx_detail: SaveDetail = sbx_res.json().await.unwrap();
+        assert_eq!(sbx_detail.item.is_sandbox, Some(true));
+        assert!(sbx_detail.item.title.starts_with("【沙箱试玩】"));
+
+        // 4. 将草稿改坏（破坏 meta.title）后保存
+        let mut broken_draft = doc.draft.clone();
+        broken_draft["meta"]["title"] = json!("");
+        let save_draft_res = client
+            .put(format!("{base_url}/api/storybooks/{}", doc.id))
+            .json(&SaveDraftRequest {
+                draft: broken_draft,
+                base_version: doc.draft_version,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(save_draft_res.status(), StatusCode::OK);
+
+        // 5. 损坏草稿进行沙箱开档 -> 422 阻断
+        let broken_sbx = client
+            .post(format!("{base_url}/api/storybooks/{}/sandbox", doc.id))
+            .json(&PlaytestRequest {
+                title: None,
+                controlled_character_id: None,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(broken_sbx.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 }
 

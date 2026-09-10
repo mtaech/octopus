@@ -405,6 +405,8 @@ pub struct SaveListItem {
     pub needs_upgrade: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub imported: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_sandbox: Option<bool>,
     pub created_at: String,
     pub updated_at: String,
     pub last_played_at: String,
@@ -446,6 +448,17 @@ pub struct MaintenanceRow {
 #[ts(export)]
 pub struct CreateSaveRequest {
     pub storybook_id: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub controlled_character_id: Option<String>,
+    #[serde(default)]
+    pub is_sandbox: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PlaytestRequest {
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]

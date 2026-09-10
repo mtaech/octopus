@@ -344,6 +344,7 @@ impl SqliteStore {
             latest_revision: Set(d.item.latest_revision as i64),
             needs_upgrade: Set(d.item.needs_upgrade),
             imported: Set(d.item.imported.unwrap_or(false)),
+            is_sandbox: Set(d.item.is_sandbox.unwrap_or(false)),
             storybook_json: Set(storybook_json),
             auto_confirm: Set(auto_confirm),
             created_at: Set(d.item.created_at.clone()),
@@ -370,6 +371,7 @@ impl SqliteStore {
                 latest_revision: m.latest_revision as u32,
                 needs_upgrade: m.needs_upgrade,
                 imported: Some(m.imported),
+                is_sandbox: Some(m.is_sandbox),
                 created_at: m.created_at,
                 updated_at: m.updated_at,
                 last_played_at: m.last_played_at,
@@ -393,6 +395,7 @@ impl SqliteStore {
                 latest_revision: m.latest_revision as u32,
                 needs_upgrade: m.needs_upgrade,
                 imported: Some(m.imported),
+                is_sandbox: Some(m.is_sandbox),
                 created_at: m.created_at,
                 updated_at: m.updated_at,
                 last_played_at: m.last_played_at,
@@ -420,6 +423,7 @@ impl SqliteStore {
                 latest_revision: updated.latest_revision as u32,
                 needs_upgrade: updated.needs_upgrade,
                 imported: Some(updated.imported),
+                is_sandbox: Some(updated.is_sandbox),
                 created_at: updated.created_at,
                 updated_at: updated.updated_at,
                 last_played_at: updated.last_played_at,
@@ -637,6 +641,7 @@ impl SqliteStore {
                         latest_revision: Set(detail_to_save.item.latest_revision as i64),
                         needs_upgrade: Set(detail_to_save.item.needs_upgrade),
                         imported: Set(true),
+                        is_sandbox: Set(detail_to_save.item.is_sandbox.unwrap_or(false)),
                         storybook_json: Set(storybook_json),
                         auto_confirm: Set(false),
                         created_at: Set(detail_to_save.item.created_at.clone()),
@@ -857,6 +862,7 @@ mod tests {
                 latest_revision: 1,
                 needs_upgrade: false,
                 imported: Some(false),
+                is_sandbox: Some(false),
                 created_at: now_iso(),
                 updated_at: now_iso(),
                 last_played_at: now_iso(),
@@ -867,6 +873,7 @@ mod tests {
         store.insert_save(&detail, true).await.unwrap();
         let fetched = store.get_save("save-1").await.unwrap().unwrap();
         assert_eq!(fetched.item.title, "测试存档");
+        assert_eq!(fetched.item.is_sandbox, Some(false));
         assert_eq!(store.get_auto_confirm("save-1").await.unwrap(), Some(true));
 
         store.set_auto_confirm("save-1", false).await.unwrap();
@@ -874,6 +881,7 @@ mod tests {
 
         let renamed = store.rename_save("save-1", "新存档名").await.unwrap().unwrap();
         assert_eq!(renamed.title, "新存档名");
+        assert_eq!(renamed.is_sandbox, Some(false));
 
         store.append_command("save-1", 1, 1, "test", "{}").await.unwrap();
         store.append_maintenance("save-1", "手动存档", "已保存").await.unwrap();
@@ -898,6 +906,7 @@ mod tests {
                 latest_revision: 1,
                 needs_upgrade: false,
                 imported: Some(false),
+                is_sandbox: Some(true),
                 created_at: now_iso(),
                 updated_at: now_iso(),
                 last_played_at: now_iso(),

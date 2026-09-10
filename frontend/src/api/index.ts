@@ -123,7 +123,7 @@ export function listStorybooks(releasedOnly = false): Promise<StorybookListItem[
   if (isMockMode()) {
     return net(mock.listStorybooks(releasedOnly))
   }
-  return fetchJson<StorybookListItem[]>('/api/storybooks')
+  return fetchJson<StorybookListItem[]>(`/api/storybooks?released_only=${releasedOnly}`)
 }
 
 export function getStorybook(id: string): Promise<StorybookDocument> {
@@ -178,6 +178,24 @@ export function publishDraft(
       body: JSON.stringify({ base_version: baseVersion }),
     }
   )
+}
+
+export function playtestStorybook(
+  id: string,
+  req?: { title?: string; controlledCharacterId?: string }
+): Promise<SaveDetail> {
+  if (isMockMode()) {
+    return net(run(async () => {
+      return mock.createSave(id, req?.title, req?.controlledCharacterId).detail
+    }), 200)
+  }
+  return fetchJson<SaveDetail>(`/api/storybooks/${encodeURIComponent(id)}/sandbox`, {
+    method: 'POST',
+    body: JSON.stringify({
+      title: req?.title,
+      controlled_character_id: req?.controlledCharacterId,
+    }),
+  })
 }
 
 export function validateStorybook(sb: Storybook): Promise<ValidateResult> {

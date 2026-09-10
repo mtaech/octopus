@@ -5,7 +5,7 @@
 // ============================================================
 import { defineStore } from 'pinia'
 import { ref, watch } from 'vue'
-import { createStorybookDraft, getStorybook, publishDraft, saveDraft, toast, validateStorybook } from '@/api'
+import { createStorybookDraft, getStorybook, playtestStorybook, publishDraft, saveDraft, toast, validateStorybook } from '@/api'
 import type { PairSuggestion, Storybook, StorybookDocument, ValidationIssue } from '@/types'
 import { uid } from '@/types'
 
@@ -84,9 +84,12 @@ export const useEditorStore = defineStore('editor', () => {
   const loading = ref(false)
   const saving = ref(false)
   const publishing = ref(false)
+  const playtesting = ref(false)
   const loadError = ref<string | null>(null)
   const conflict = ref(false)
   const paradigm = ref<Paradigm>(restoreParadigm())
+  const activeTab = ref('world')
+  const activeEntityId = ref<string | null>(null)
 
   // 内部：抑制 dirty 的赋值（load / create / publish 元信息同步）
   // 用计数器而非布尔：deep watch 默认 pre flush 在微任务里跑，布尔会在同步块后被复位 → 误判；
@@ -265,6 +268,96 @@ export const useEditorStore = defineStore('editor', () => {
     }
   }
 
+  // ---------- 沙箱试玩（Playground：未发布草稿即开即玩） ----------
+  async function playtest(title?: string, controlledCharacterId?: string): Promise<string | null> {
+    const id = docId.value
+    if (!id || playtesting.value) return null
+    playtesting.value = true
+    try {
+      if (dirty.value) {
+        const ok = await save()
+        if (!ok) return null
+      }
+      if (conflict.value) {
+        toast('warn', '试玩中止：请先解决草稿版本冲突')
+        return null
+      }
+      if (errorCount() > 0) {
+        const first = issues.value.find(i => i.severity === 'error')
+        toast('error', '草稿存在阻断性错误，无法开始试玩：' + (first?.message ?? ''))
+        return null
+      }
+      const saveDetail = await playtestStorybook(id, { title, controlledCharacterId })
+      toast('ok', `沙箱存档「${saveDetail.title}」已就绪，进入试玩`)
+      return saveDetail.id
+    } catch (e) {
+      const code = (e as { code?: string })?.code
+      const msg = (e as Error)?.message ?? String(e)
+      if (code === 'VALIDATION_FAILED') {
+        const detail = (e as { detail?: { issues?: ValidationIssue[] } })?.detail
+        if (detail?.issues) replaceIssues(detail.issues)
+        const errs = detail?.issues?.filter(i => i.severity === 'error') ?? []
+        toast('error', '试玩被校验拦下：' + (errs[0]?.message ?? '存在错误级问题'))
+      } else {
+        toast('error', '进入沙箱试玩失败：' + msg)
+      }
+      return null
+    } finally {
+      playtesting.value = false
+    }
+  }
+
+  // ---------- 校验问题定位联动 ----------
+  function navigateToIssue(iss: ValidationIssue): void {
+    if (paradigm.value !== 'A') {
+      setParadigm('A')
+    }
+    if (!iss.target) return
+    const [kind, targetId] = iss.target.split(':')
+    switch (kind) {
+      case 'character':
+        activeTab.value = 'characters'
+        break
+      case 'location':
+      case 'resource':
+        activeTab.value = 'world'
+        break
+      case 'skill':
+        activeTab.value = 'skills'
+        break
+      case 'item':
+        activeTab.value = 'items'
+        break
+      case 'object':
+        activeTab.value = 'objects'
+        break
+      case 'faction':
+        activeTab.value = 'factions'
+        break
+      case 'relationship':
+        activeTab.value = 'relationships'
+        break
+      case 'dimension':
+        activeTab.value = 'dimensions'
+        break
+      case 'chapter':
+      case 'scene':
+      case 'goal':
+      case 'beat':
+      case 'skeleton':
+        activeTab.value = 'skeleton'
+        break
+      case 'meta':
+        activeTab.value = 'world'
+        break
+      default:
+        break
+    }
+    if (targetId) {
+      activeEntityId.value = targetId
+    }
+  }
+
   // ---------- 冲突解决（#23 ③ 乐观并发） ----------
   /** 丢弃本地，重载服务端版 */
   async function conflictReload(): Promise<void> {
@@ -379,8 +472,9 @@ export const useEditorStore = defineStore('editor', () => {
 
   return {
     docId, draft, baseVersion, revision, published, releasedAt, updatedAt,
-    dirty, issues, saved, loading, saving, publishing, loadError, conflict, paradigm,
-    load, createNew, save, publish, setParadigm, runValidate, scheduleValidate,
+    dirty, issues, saved, loading, saving, publishing, playtesting, loadError, conflict, paradigm,
+    activeTab, activeEntityId,
+    load, createNew, save, publish, playtest, navigateToIssue, setParadigm, runValidate, scheduleValidate,
     conflictReload, conflictOverwrite, applySuggestion, errorCount, warningCount, dispose
   }
 })

@@ -30,6 +30,8 @@ import {
   IconMessageDots,
   IconFileText,
   IconSparkles,
+  IconDeviceGamepad2,
+  IconPencil,
 } from '@tabler/icons-vue'
 
 const route = useRoute()
@@ -66,6 +68,14 @@ const saveTitle = computed(() => store.projection?.meta.save_title ?? '')
 const showBanner = computed(() => needsUpgrade.value && !drawer.bannerDismissed)
 const autoConfirm = computed(() => store.autoConfirm)
 const phaseChip = computed(() => store.phaseLabel)
+const isSandbox = computed(() => Boolean(store.detail?.is_sandbox || store.detail?.title?.startsWith('【沙箱试玩】')))
+const storybookId = computed(() => store.detail?.storybook_id)
+
+function goEditStorybook() {
+  if (storybookId.value) {
+    void router.push(`/storybook/${storybookId.value}/edit`)
+  }
+}
 
 // ---------- 免确认开关：直调存档级设置端点（#24 修订，状态类元指令结构化） ----------
 const togglingConfirm = ref(false)
@@ -140,6 +150,24 @@ function goBack() { void router.push('/') }
       <span v-if="phaseChip" class="inline-flex items-center gap-1.5 rounded-full border border-warning/45 bg-warning/15 px-2.5 py-0.5 text-[11px] font-bold whitespace-nowrap text-warning shadow-2xs">
         <span class="size-1.5 animate-pulse rounded-full bg-warning"></span>{{ phaseChip }}
       </span>
+
+      <!-- 沙箱试玩徽标与返回编辑器入口 -->
+      <span v-if="isSandbox" class="inline-flex items-center gap-1.5 rounded-full border border-primary/45 bg-primary/15 px-2.5 py-0.5 text-[11px] font-bold whitespace-nowrap text-primary shadow-2xs">
+        <IconDeviceGamepad2 class="size-3.5" />
+        <span>沙箱试玩</span>
+      </span>
+
+      <Button
+        v-if="isSandbox && storybookId"
+        variant="ghost"
+        size="sm"
+        class="h-7 gap-1 text-xs text-primary hover:bg-primary/10"
+        title="返回当前故事书编辑器继续调整设定"
+        @click="goEditStorybook"
+      >
+        <IconPencil class="size-3.5" />
+        <span>返回编辑器</span>
+      </Button>
 
       <div class="flex-1"></div>
 
