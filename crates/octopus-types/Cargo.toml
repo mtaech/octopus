@@ -6,4 +6,5 @@ edition.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+ts-rs = "12.0.1"
 uuid = { workspace = true }

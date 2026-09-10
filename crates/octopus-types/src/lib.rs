@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use ts_rs::TS;
 
 pub type Seq = u64;
 
@@ -12,13 +13,15 @@ pub type Seq = u64;
 // 演出流事件（#17 包络 + 类型表）
 // ============================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
 pub struct ActorRef {
     pub id: String,
     pub name: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum PhaseStage {
     Idle,
@@ -28,7 +31,8 @@ pub enum PhaseStage {
     WaitingConfirm,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum SuccessLevel {
     Great,
@@ -37,7 +41,8 @@ pub enum SuccessLevel {
     Fail,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum SystemLevel {
     Info,
@@ -45,30 +50,35 @@ pub enum SystemLevel {
     Error,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum RoundChannel {
     Character,
     Meta,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct RoundInput {
     pub channel: RoundChannel,
     pub text: String,
 }
 
 /// 共享状态增量（#17）：resolution 与 state_update 共用。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct StateDelta {
     pub domain: DeltaDomain,
     pub entity_id: String,
     pub field: String,
     pub op: DeltaOp,
+    #[ts(type = "unknown")]
     pub value: Value,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum DeltaDomain {
     Character,
@@ -80,7 +90,8 @@ pub enum DeltaDomain {
     Flag,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum DeltaOp {
     Set,
@@ -88,7 +99,8 @@ pub enum DeltaOp {
     Remove,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum PlayEvent {
     Scene(ScenePayload),
@@ -105,7 +117,8 @@ pub enum PlayEvent {
     System(SystemPayload),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct EventEnvelope {
     pub id: String,
     pub seq: Seq,
@@ -119,7 +132,8 @@ pub struct EventEnvelope {
     pub event: PlayEvent,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct ScenePayload {
     pub scene_id: String,
     pub title: String,
@@ -128,21 +142,24 @@ pub struct ScenePayload {
     pub present: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct NarratePayload {
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scene_ref: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct DialoguePayload {
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audience: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct EmotePayload {
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -151,7 +168,8 @@ pub struct EmotePayload {
     pub gesture: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct PendingPayload {
     pub action_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -163,7 +181,8 @@ pub struct PendingPayload {
     pub timeout_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct CheckResultPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub intent_id: Option<String>,
@@ -183,7 +202,8 @@ pub struct CheckResultPayload {
     pub opponent: Option<ActorRef>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct ResolutionPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub intent_id: Option<String>,
@@ -199,36 +219,42 @@ pub struct ResolutionPayload {
     pub state_changes: Vec<StateDelta>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum ResolutionStatus {
     Ok,
     Rejected,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct StateUpdatePayload {
     pub changes: Vec<StateDelta>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct PhasePayload {
     pub stage: PhaseStage,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct RoundStartPayload {
     pub input: RoundInput,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct RoundEndPayload {
     pub round: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct SystemPayload {
     pub level: SystemLevel,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -240,14 +266,16 @@ pub struct SystemPayload {
 // 意图（#04 动作协议，v1 最小集）
 // ============================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct IntentEnvelope {
     pub intent_id: String,
     #[serde(flatten)]
     pub intent: Intent,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Intent {
     Narrate { content: String },
@@ -264,7 +292,8 @@ pub enum Intent {
 }
 
 /// 六种驳回码（#04 校验阶段）+ 玩家取消。
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum RejectionCode {
     ActorNotFound,
@@ -294,13 +323,16 @@ impl RejectionCode {
 // 状态投影（#06 ① / #17 GET /state）
 // ============================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct CharacterInstance {
     pub instance_id: String,
     pub template_id: String,
     pub name: String,
     pub kind: String,
+    #[ts(type = "Record<string, unknown>")]
     pub attributes: serde_json::Map<String, Value>,
+    #[ts(type = "Record<string, unknown>")]
     pub resources: serde_json::Map<String, Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location_id: Option<String>,
@@ -308,7 +340,8 @@ pub struct CharacterInstance {
     pub statuses: Vec<StatusInstance>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct StatusInstance {
     pub id: String,
     pub name: String,
@@ -318,14 +351,18 @@ pub struct StatusInstance {
     pub scenes_left: Option<i32>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct SkeletonProgress {
+    #[ts(type = "Record<string, unknown>")]
     pub goals: serde_json::Map<String, Value>,
+    #[ts(type = "Record<string, unknown>")]
     pub beats: serde_json::Map<String, Value>,
     pub abandoned_scenes: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct ProjectionMeta {
     pub save_id: String,
     pub save_title: String,
@@ -335,15 +372,19 @@ pub struct ProjectionMeta {
     pub auto_confirm: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct WorldProjection {
     pub seq: Seq,
     pub scene_id: String,
     pub scene_title: String,
+    #[ts(type = "Record<string, unknown>")]
     pub characters: serde_json::Map<String, Value>,
     pub controlled: Vec<String>,
+    #[ts(type = "Record<string, unknown>")]
     pub flags: serde_json::Map<String, Value>,
     pub progress: SkeletonProgress,
+    #[ts(type = "Array<unknown>")]
     pub locations: Vec<Value>,
     pub meta: ProjectionMeta,
 }
@@ -352,7 +393,8 @@ pub struct WorldProjection {
 // 存档（#24 / #21）
 // ============================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct SaveListItem {
     pub id: String,
     pub title: String,
@@ -368,33 +410,40 @@ pub struct SaveListItem {
     pub last_played_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct SaveDetail {
     #[serde(flatten)]
     pub item: SaveListItem,
     /// 内嵌冻结故事书（#14）；当前里程碑以 JSON 直存。
+    #[ts(type = "unknown")]
     pub storybook: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct HistoryPage {
     pub events: Vec<EventEnvelope>,
+    #[serde(rename = "hasMore", alias = "has_more")]
     pub has_more: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct SaveSettings {
     pub auto_confirm: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct MaintenanceRow {
     pub at: String,
     pub op: String,
     pub summary: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct CreateSaveRequest {
     pub storybook_id: String,
     #[serde(default)]
@@ -403,7 +452,8 @@ pub struct CreateSaveRequest {
     pub controlled_character_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct SubmitRoundRequest {
     pub channel: RoundChannel,
     pub text: String,
@@ -411,13 +461,15 @@ pub struct SubmitRoundRequest {
     pub request_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct ConfirmRequest {
     pub action_id: String,
     pub decision: ConfirmDecision,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfirmDecision {
     Confirm,
@@ -428,10 +480,12 @@ pub enum ConfirmDecision {
 // 统一错误信封（#23）
 // ============================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct ApiErrorBody {
     pub code: String,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(type = "Record<string, unknown> | null")]
     pub detail: Option<Value>,
 }

@@ -1,7 +1,7 @@
 // ============================================================
 // Octopus 前端 API 层 —— 页面唯一的数据入口（#23/#24 契约面）
-// 现在：内存 Mock 后端（api/mock/backend.ts）
-// 将来：换真 axum 后端 = 改本文件内部实现，签名不变，页面零改动。
+// 模式：优先直连真实 axum 后端（/api 经 Vite 代理转发到 127.0.0.1:8787）；
+//       通过 URL ?mock=1 或 localStorage['octopus:force_mock']='1' 可随时切回 Mock。
 // ============================================================
 import type {
   Storybook, SaveListItem, SaveDetail, StorybookListItem, StorybookDocument,
@@ -40,6 +40,77 @@ async function run<T>(fn: () => T | Promise<T>): Promise<T> {
   try { return await fn() } catch (e) { throw wrapErr(e) }
 }
 
+// ---- 运行模式判断 ----
+export function isMockMode(): boolean {
+  if (typeof window === 'undefined') return true
+  const params = new URLSearchParams(window.location.search)
+  if (params.get('mock') === '1') return true
+  if (localStorage.getItem('octopus:force_mock') === '1') return true
+  return false
+}
+
+export function setMockMode(forceMock: boolean): void {
+  if (forceMock) {
+    localStorage.setItem('octopus:force_mock', '1')
+  } else {
+    localStorage.removeItem('octopus:force_mock')
+  }
+  window.location.reload()
+}
+
+// ---- HTTP 工具函数 ----
+async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
+  let res: Response
+  try {
+    res = await fetch(url, {
+      ...init,
+      headers: {
+        'Content-Type': 'application/json',
+        ...init?.headers,
+      },
+    })
+  } catch (e) {
+    throw mkErr('NETWORK_ERROR', `无法连接到服务器 (${(e as Error).message})`)
+  }
+
+  if (!res.ok) {
+    let errBody: { code?: string; message?: string; detail?: Record<string, unknown> } | undefined
+    try {
+      errBody = await res.json()
+    } catch {}
+    const code = errBody?.code ?? `HTTP_${res.status}`
+    const msg = errBody?.message ?? res.statusText ?? '请求失败'
+    throw mkErr(code, msg, errBody?.detail)
+  }
+
+  return res.json() as Promise<T>
+}
+
+async function fetchNoContent(url: string, init?: RequestInit): Promise<void> {
+  let res: Response
+  try {
+    res = await fetch(url, {
+      ...init,
+      headers: {
+        'Content-Type': 'application/json',
+        ...init?.headers,
+      },
+    })
+  } catch (e) {
+    throw mkErr('NETWORK_ERROR', `无法连接到服务器 (${(e as Error).message})`)
+  }
+
+  if (!res.ok) {
+    let errBody: { code?: string; message?: string; detail?: Record<string, unknown> } | undefined
+    try {
+      errBody = await res.json()
+    } catch {}
+    const code = errBody?.code ?? `HTTP_${res.status}`
+    const msg = errBody?.message ?? res.statusText ?? '请求失败'
+    throw mkErr(code, msg, errBody?.detail)
+  }
+}
+
 // ---- 模拟网络延迟 ----
 const NET = 60
 function net<T>(p: Promise<T> | T, ms = NET + Math.random() * 90): Promise<T> {
@@ -49,24 +120,38 @@ function net<T>(p: Promise<T> | T, ms = NET + Math.random() * 90): Promise<T> {
 // ================= 故事书（#23） =================
 
 export function listStorybooks(releasedOnly = false): Promise<StorybookListItem[]> {
-  return net(mock.listStorybooks(releasedOnly))
+  if (isMockMode()) {
+    return net(mock.listStorybooks(releasedOnly))
+  }
+  return fetchJson<StorybookListItem[]>('/api/storybooks')
 }
+
 export function getStorybook(id: string): Promise<StorybookDocument> {
-  return net(run(async () => {
-    const d = mock.getStorybook(id)
-    if (!d) throw mkErr('NOT_FOUND', '故事书不存在')
-    return d
-  }))
+  if (isMockMode()) {
+    return net(run(async () => {
+      const d = mock.getStorybook(id)
+      if (!d) throw mkErr('NOT_FOUND', '故事书不存在')
+      return d
+    }))
+  }
+  return fetchJson<StorybookDocument>(`/api/storybooks/${encodeURIComponent(id)}`)
 }
+
 export function createStorybookDraft(title?: string): Promise<StorybookDocument> {
+  // 后端故事书草稿接口待 #23 接入，此处暂走 mock
   return net(run(async () => mock.createStorybookDraft(title)))
 }
+
 export function saveDraft(id: string, draft: Storybook, baseVersion: number): Promise<{ doc: StorybookDocument; issues: ValidationIssue[] }> {
+  // 后端草稿保存待 #23 接入，此处暂走 mock
   return net(run(async () => mock.saveDraft(id, draft, baseVersion)))
 }
+
 export function publishDraft(id: string, baseVersion: number): Promise<{ doc: StorybookDocument; issues: ValidationIssue[] }> {
+  // 后端发布待 #23 接入，此处暂走 mock
   return net(run(async () => mock.publishDraft(id, baseVersion)), 220)
 }
+
 export function validateStorybook(sb: Storybook): Promise<ValidateResult> {
   return net(mock.validate(sb), 30)
 }
@@ -74,18 +159,37 @@ export function validateStorybook(sb: Storybook): Promise<ValidateResult> {
 // ================= 存档（#24） =================
 
 export function listSaves(): Promise<SaveListItem[]> {
-  return net(mock.listSaves())
+  if (isMockMode()) {
+    return net(mock.listSaves())
+  }
+  return fetchJson<SaveListItem[]>('/api/saves')
 }
+
 export function getSave(id: string): Promise<SaveDetail> {
-  return net(run(async () => {
-    const s = mock.getSave(id)
-    if (!s) throw mkErr('NOT_FOUND', '存档不存在')
-    return s
-  }))
+  if (isMockMode()) {
+    return net(run(async () => {
+      const s = mock.getSave(id)
+      if (!s) throw mkErr('NOT_FOUND', '存档不存在')
+      return s
+    }))
+  }
+  return fetchJson<SaveDetail>(`/api/saves/${encodeURIComponent(id)}`)
 }
+
 export function createSave(storybookId: string, title?: string, controlledCharacterId?: string): Promise<SaveDetail> {
-  return net(run(async () => mock.createSave(storybookId, title, controlledCharacterId).detail), 260)
+  if (isMockMode()) {
+    return net(run(async () => mock.createSave(storybookId, title, controlledCharacterId).detail), 260)
+  }
+  return fetchJson<SaveDetail>('/api/saves', {
+    method: 'POST',
+    body: JSON.stringify({
+      storybook_id: storybookId,
+      title,
+      controlled_character_id: controlledCharacterId
+    })
+  })
 }
+
 export function upgradeDryRun(saveId: string): Promise<UpgradeReport> {
   return net(run(async () => {
     const r = mock.upgradeDryRun(saveId)
@@ -93,15 +197,22 @@ export function upgradeDryRun(saveId: string): Promise<UpgradeReport> {
     return r
   }), 300)
 }
+
 export function upgradeExecute(saveId: string, dispositions: { character_id: string; disposition: Disposition }[]): Promise<{ detail: SaveDetail; backupName: string }> {
   return net(run(async () => mock.upgradeExecute(saveId, dispositions)), 500)
 }
+
 export function manualSave(saveId: string): Promise<SaveListItem> {
-  return net(mock.manualSave(saveId), 180)
+  if (isMockMode()) {
+    return net(mock.manualSave(saveId), 180)
+  }
+  return fetchJson<SaveListItem>(`/api/saves/${encodeURIComponent(saveId)}/save`, { method: 'POST' })
 }
+
 export function importSave(fileName: string): Promise<SaveListItem> {
   return net(run(async () => mock.importSaveFile(fileName)), 400)
 }
+
 export function exportSave(saveId: string): Promise<{ filename: string; blob: Blob }> {
   return net(run(async () => {
     const s = mock.getSave(saveId)
@@ -112,31 +223,85 @@ export function exportSave(saveId: string): Promise<{ filename: string; blob: Bl
 }
 
 /** 叙事历史分页（#17/#24 修订）：进页 / 重连 / 换模板回读故事 */
-export function getHistory(saveId: string, beforeSeq?: number, limit = 50): Promise<HistoryPage> {
-  return net(run(async () => mock.getHistory(saveId, beforeSeq, limit)))
+export async function getHistory(saveId: string, beforeSeq?: number, limit = 50): Promise<HistoryPage> {
+  if (isMockMode()) {
+    return net(run(async () => mock.getHistory(saveId, beforeSeq, limit)))
+  }
+  const q = new URLSearchParams()
+  if (beforeSeq !== undefined) q.set('before_seq', String(beforeSeq))
+  q.set('limit', String(limit))
+  const raw = await fetchJson<{ events: PlayEvent[]; has_more?: boolean; hasMore?: boolean }>(
+    `/api/saves/${encodeURIComponent(saveId)}/history?${q.toString()}`
+  )
+  return {
+    events: raw.events,
+    hasMore: raw.hasMore ?? raw.has_more ?? false,
+  }
 }
+
 export function renameSave(saveId: string, title: string): Promise<SaveListItem> {
-  return net(run(async () => mock.renameSave(saveId, title)), 120)
+  if (isMockMode()) {
+    return net(run(async () => mock.renameSave(saveId, title)), 120)
+  }
+  return fetchJson<SaveListItem>(`/api/saves/${encodeURIComponent(saveId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ title })
+  })
 }
+
 export function deleteSave(saveId: string): Promise<void> {
-  return net(run(async () => { mock.deleteSave(saveId) }), 180)
+  if (isMockMode()) {
+    return net(run(async () => { mock.deleteSave(saveId) }), 180)
+  }
+  return fetchNoContent(`/api/saves/${encodeURIComponent(saveId)}`, { method: 'DELETE' })
 }
+
 export function getMaintenance(saveId: string): Promise<MaintenanceRow[]> {
-  return net(run(async () => mock.getMaintenance(saveId)))
+  if (isMockMode()) {
+    return net(run(async () => mock.getMaintenance(saveId)))
+  }
+  return fetchJson<MaintenanceRow[]>(`/api/saves/${encodeURIComponent(saveId)}/maintenance`)
 }
+
 export function getSaveSettings(saveId: string): Promise<SaveSettings> {
-  return net(run(async () => mock.getSaveSettings(saveId)))
+  if (isMockMode()) {
+    return net(run(async () => mock.getSaveSettings(saveId)))
+  }
+  return fetchJson<SaveSettings>(`/api/saves/${encodeURIComponent(saveId)}/settings`)
 }
+
 export function setSaveSettings(saveId: string, settings: SaveSettings): Promise<SaveSettings> {
-  return net(run(async () => mock.setSaveSettings(saveId, settings)), 120)
+  if (isMockMode()) {
+    return net(run(async () => mock.setSaveSettings(saveId, settings)), 120)
+  }
+  return fetchJson<SaveSettings>(`/api/saves/${encodeURIComponent(saveId)}/settings`, {
+    method: 'PUT',
+    body: JSON.stringify(settings)
+  })
 }
+
 /** 新原点（#24 修订：玩家侧 v1） */
-export function newOrigin(saveId: string): Promise<{ detail: SaveDetail; archivedCount: number }> {
-  return net(run(async () => mock.newOrigin(saveId)), 320)
+export async function newOrigin(saveId: string): Promise<{ detail: SaveDetail; archivedCount: number }> {
+  if (isMockMode()) {
+    return net(run(async () => mock.newOrigin(saveId)), 320)
+  }
+  const res = await fetchJson<{ ok: boolean; archived_count?: number }>(
+    `/api/saves/${encodeURIComponent(saveId)}/origin`,
+    { method: 'POST' }
+  )
+  const detail = await getSave(saveId)
+  return { detail, archivedCount: res.archived_count ?? 0 }
 }
+
 /** 切换受控角色（#24 修订：状态类元指令直调） */
 export function switchCharacter(saveId: string, characterId: string): Promise<void> {
-  return net(run(async () => { mock.switchCharacter(saveId, characterId) }), 100)
+  if (isMockMode()) {
+    return net(run(async () => { mock.switchCharacter(saveId, characterId) }), 100)
+  }
+  return fetchNoContent(`/api/saves/${encodeURIComponent(saveId)}/character`, {
+    method: 'POST',
+    body: JSON.stringify({ character_id: characterId })
+  })
 }
 
 // ================= 应用配置（#26 AI Provider） =================
@@ -144,16 +309,24 @@ export function switchCharacter(saveId: string, characterId: string): Promise<vo
 export function getAppConfig(): Promise<AppConfig> {
   return net(run(async () => mock.getAppConfig()))
 }
+
 export function saveAppConfig(config: AppConfig): Promise<AppConfig> {
   return net(run(async () => mock.saveAppConfig(config)), 220)
 }
+
 export function testProvider(provider: ProviderConfig): Promise<ProviderTestResult> {
   return net(run(async () => mock.testProvider(provider)), 400 + Math.random() * 400)
 }
 
 /** 探测模型：GET {base_url}/models（真后端执行，避免浏览器暴露 key） */
 export function probeProviderModels(provider: Pick<ProviderConfig, 'base_url' | 'api_key' | 'kind'>): Promise<ProbeResult> {
-  return net(run(async () => mock.probeProviderModels(provider)), 700 + Math.random() * 500)
+  if (isMockMode()) {
+    return net(run(async () => mock.probeProviderModels(provider)), 700 + Math.random() * 500)
+  }
+  return fetchJson<ProbeResult>('/api/providers/probe', {
+    method: 'POST',
+    body: JSON.stringify(provider)
+  })
 }
 
 // ================= 结对（#23 ④，编辑器 C 范式） =================
@@ -168,24 +341,78 @@ export function pairChat(messages: { role: 'user' | 'assistant'; content: string
 // ================= 游玩（#24/#17） =================
 
 export function hydrate(saveId: string): Promise<WorldProjection> {
-  return net(run(async () => {
-    const p = mock.currentProjection(saveId)
-    if (!p) throw mkErr('NOT_FOUND', '存档不存在')
-    return p
-  }))
+  if (isMockMode()) {
+    return net(run(async () => {
+      const p = mock.currentProjection(saveId)
+      if (!p) throw mkErr('NOT_FOUND', '存档不存在')
+      return p
+    }))
+  }
+  return fetchJson<WorldProjection>(`/api/saves/${encodeURIComponent(saveId)}/state`)
 }
-export interface RoundSubmitHandle { onEvent: (e: PlayEvent) => void; onProgress?: (p: { stage: PhaseStage; detail?: string }) => void }
-export function submitRound(saveId: string, channel: 'character' | 'meta', text: string, requestId: string, h: RoundSubmitHandle): Promise<void> {
-  return mock.submitRound(saveId, channel, text, requestId, h.onProgress).then(() => {})
-}
-export function subscribe(saveId: string, sink: (e: PlayEvent) => void): () => void {
-  return mock.subscribe(saveId, sink)
-}
-export function confirmAction(saveId: string, roundId: number, actionId: string, decision: 'confirm' | 'cancel'): Promise<void> {
-  return net(run(async () => { await mock.confirmAction(saveId, roundId, actionId, decision) }), 120)
-}
-export function setAutoConfirm(v: boolean): void { mock.setAutoConfirmDefault(v) }
-export function streamStatus(): StreamStatus { return 'open' }
 
-// 确保种子初始化（真实场景由后端启动时完成）
+export interface RoundSubmitHandle { onEvent: (e: PlayEvent) => void; onProgress?: (p: { stage: PhaseStage; detail?: string }) => void }
+
+export async function submitRound(
+  saveId: string,
+  channel: 'character' | 'meta',
+  text: string,
+  requestId: string,
+  h: RoundSubmitHandle
+): Promise<void> {
+  if (isMockMode()) {
+    return mock.submitRound(saveId, channel, text, requestId, h.onProgress).then(() => {})
+  }
+  await fetchNoContent(`/api/saves/${encodeURIComponent(saveId)}/rounds`, {
+    method: 'POST',
+    body: JSON.stringify({ channel, text, request_id: requestId })
+  })
+}
+
+export function subscribe(saveId: string, sink: (e: PlayEvent) => void): () => void {
+  if (isMockMode()) {
+    return mock.subscribe(saveId, sink)
+  }
+  const es = new EventSource(`/api/saves/${encodeURIComponent(saveId)}/stream`)
+  es.addEventListener('play', (ev) => {
+    try {
+      const parsed = JSON.parse(ev.data) as PlayEvent
+      sink(parsed)
+    } catch (err) {
+      console.warn('解析 SSE 演出流事件失败', err)
+    }
+  })
+  es.onerror = (err) => {
+    console.warn('SSE 演出流连接异常/重连中', err)
+  }
+  return () => {
+    es.close()
+  }
+}
+
+export async function confirmAction(
+  saveId: string,
+  roundId: number,
+  actionId: string,
+  decision: 'confirm' | 'cancel'
+): Promise<void> {
+  if (isMockMode()) {
+    await mock.confirmAction(saveId, roundId, actionId, decision)
+    return
+  }
+  await fetchNoContent(`/api/saves/${encodeURIComponent(saveId)}/rounds/${roundId}/confirmation`, {
+    method: 'POST',
+    body: JSON.stringify({ action_id: actionId, decision })
+  })
+}
+
+export function setAutoConfirm(v: boolean): void {
+  mock.setAutoConfirmDefault(v)
+}
+
+export function streamStatus(): StreamStatus {
+  return 'open'
+}
+
+// 确保种子初始化（供 mock 模式随时可用）
 mock.ensureSeeded()
