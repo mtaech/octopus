@@ -17,14 +17,15 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::Stream;
 use octopus_engine::{
-    AiProvider, EngineError, EventSink, Session, SqliteStore, WorldState,
+    AiProvider, EngineError, EventSink, Session, SqliteStore, StorybookRow, WorldState,
 };
 use octopus_types::{
-    ApiErrorBody, CharacterInstance, ConfirmRequest, CreateSaveRequest, EventEnvelope,
-    HistoryPage, MaintenanceRow, ProjectionMeta, RoundInput, SaveDetail, SaveListItem, SaveSettings,
-    SkeletonProgress, SubmitRoundRequest,
+    ApiErrorBody, CharacterInstance, ConfirmRequest, CreateSaveRequest, CreateStorybookRequest,
+    EventEnvelope, HistoryPage, IssueSeverity, MaintenanceRow, ProjectionMeta, PublishRequest,
+    RoundInput, SaveDetail, SaveDraftRequest, SaveListItem, SaveSettings, SkeletonProgress,
+    StorybookDocument, SubmitRoundRequest, ValidateResult, ValidationIssue,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
@@ -192,8 +193,16 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/providers/probe", post(providers::probe_models))
-        .route("/api/storybooks", get(list_storybooks))
-        .route("/api/storybooks/{id}", get(get_storybook))
+        .route(
+            "/api/storybooks",
+            get(list_storybooks).post(create_storybook_draft),
+        )
+        .route(
+            "/api/storybooks/{id}",
+            get(get_storybook).put(save_storybook_draft).delete(delete_storybook),
+        )
+        .route("/api/storybooks/{id}/publish", post(publish_storybook))
+        .route("/api/validate", post(validate_endpoint))
         .route("/api/saves", get(list_saves).post(create_save))
         .route(
             "/api/saves/{id}",
@@ -226,28 +235,127 @@ async fn health() -> Json<Value> {
     Json(json!({ "ok": true, "service": "octopus-api" }))
 }
 
-async fn list_storybooks(State(app): State<Arc<AppState>>) -> Result<Json<Vec<Value>>, ApiError> {
-    Ok(Json(app.store().list_storybooks(true)?))
+fn row_to_doc(row: StorybookRow) -> StorybookDocument {
+    StorybookDocument {
+        id: row.id,
+        revision: row.revision,
+        draft_version: row.draft_version,
+        updated_at: row.updated_at,
+        released_at: row.released_at,
+        published: row.published,
+        draft: row.draft,
+        released: row.released,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorybookMutationResponse {
+    pub doc: StorybookDocument,
+    pub issues: Vec<ValidationIssue>,
+}
+
+#[derive(Deserialize, Default)]
+struct ListStorybooksQuery {
+    released_only: Option<bool>,
+}
+
+async fn list_storybooks(
+    State(app): State<Arc<AppState>>,
+    Query(q): Query<ListStorybooksQuery>,
+) -> Result<Json<Vec<Value>>, ApiError> {
+    let released_only = q.released_only.unwrap_or(true);
+    Ok(Json(app.store().list_storybooks(released_only)?))
 }
 
 async fn get_storybook(
     State(app): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<StorybookDocument>, ApiError> {
     let row = app
         .store()
         .get_storybook(&id)?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "storybook_not_found", "故事书不存在"))?;
-    Ok(Json(json!({
-        "id": row.id,
-        "revision": row.revision,
-        "draft_version": row.draft_version,
-        "updated_at": row.updated_at,
-        "released_at": row.released_at,
-        "published": row.published,
-        "draft": row.draft,
-        "released": row.released,
-    })))
+    Ok(Json(row_to_doc(row)))
+}
+
+async fn create_storybook_draft(
+    State(app): State<Arc<AppState>>,
+    Json(req): Json<CreateStorybookRequest>,
+) -> Result<(StatusCode, Json<StorybookDocument>), ApiError> {
+    let initial = json!({
+        "schema_version": 1,
+        "meta": {
+            "title": req.title.as_deref().unwrap_or("未命名故事书"),
+        },
+        "world": { "premise": "", "locations": [], "resources": [] },
+        "attribute_dimensions": [],
+        "skeleton": [],
+        "characters": [],
+        "skills": [],
+        "items": [],
+        "objects": [],
+        "factions": [],
+        "relationships": [],
+        "flags": [],
+        "events": [],
+        "relationship_types": [],
+        "target_types": [],
+    });
+    let row = app.store().create_storybook_draft(req.title.as_deref(), &initial)?;
+    Ok((StatusCode::CREATED, Json(row_to_doc(row))))
+}
+
+async fn save_storybook_draft(
+    State(app): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<SaveDraftRequest>,
+) -> Result<Json<StorybookMutationResponse>, ApiError> {
+    let row = app.store().save_draft(&id, &req.draft, req.base_version)?;
+    let issues = octopus_engine::validate_storybook(&req.draft);
+    Ok(Json(StorybookMutationResponse {
+        doc: row_to_doc(row),
+        issues,
+    }))
+}
+
+async fn publish_storybook(
+    State(app): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<PublishRequest>,
+) -> Result<Json<StorybookMutationResponse>, ApiError> {
+    let row = app
+        .store()
+        .get_storybook(&id)?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "storybook_not_found", "故事书不存在"))?;
+    let issues = octopus_engine::validate_storybook(&row.draft);
+    if issues.iter().any(|i| matches!(i.severity, IssueSeverity::Error)) {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "validation_failed",
+            "故事书存在阻断性错误，无法发布",
+        )
+        .with_detail(serde_json::json!({ "issues": issues })));
+    }
+    let row = app.store().publish_storybook(&id, req.base_version)?;
+    Ok(Json(StorybookMutationResponse {
+        doc: row_to_doc(row),
+        issues,
+    }))
+}
+
+async fn delete_storybook(
+    State(app): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    if app.store().delete_storybook(&id)? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::new(StatusCode::NOT_FOUND, "storybook_not_found", "故事书不存在"))
+    }
+}
+
+async fn validate_endpoint(Json(body): Json<Value>) -> Json<ValidateResult> {
+    Json(octopus_engine::validate_storybook_result(&body))
 }
 
 async fn list_saves(State(app): State<Arc<AppState>>) -> Result<Json<Vec<SaveListItem>>, ApiError> {
@@ -511,3 +619,294 @@ async fn stream(
     });
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use octopus_ai::ScriptedProvider;
+    use serde_json::json;
+
+    async fn spawn_app() -> (String, Arc<AppState>) {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let ai = Arc::new(ScriptedProvider);
+        let state = AppState::new(store, ai);
+        let app = router(state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        (format!("http://{addr}"), state)
+    }
+
+    #[tokio::test]
+    async fn test_api_create_get_delete_storybook() {
+        let (base_url, _state) = spawn_app().await;
+        let client = reqwest::Client::new();
+
+        // 1. 创建故事书草稿
+        let create_req = CreateStorybookRequest {
+            title: Some("魔法森林".to_string()),
+        };
+        let res = client
+            .post(format!("{base_url}/api/storybooks"))
+            .json(&create_req)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let doc: StorybookDocument = res.json().await.unwrap();
+        assert!(doc.id.starts_with("sb-"));
+        assert_eq!(doc.revision, 0);
+        assert_eq!(doc.draft_version, 1);
+        assert!(!doc.published);
+        assert_eq!(doc.draft["meta"]["title"], "魔法森林");
+
+        // 2. 获取故事书
+        let res = client
+            .get(format!("{base_url}/api/storybooks/{}", doc.id))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let fetched: StorybookDocument = res.json().await.unwrap();
+        assert_eq!(fetched.id, doc.id);
+        assert_eq!(fetched.draft_version, 1);
+
+        // 3. 删除故事书
+        let res = client
+            .delete(format!("{base_url}/api/storybooks/{}", doc.id))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        // 再次删除 -> 404
+        let res = client
+            .delete(format!("{base_url}/api/storybooks/{}", doc.id))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        // 获取已删除故事书 -> 404
+        let res = client
+            .get(format!("{base_url}/api/storybooks/{}", doc.id))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_api_save_draft_optimistic_locking_and_idempotency() {
+        let (base_url, _state) = spawn_app().await;
+        let client = reqwest::Client::new();
+
+        // 创建草稿
+        let res = client
+            .post(format!("{base_url}/api/storybooks"))
+            .json(&CreateStorybookRequest {
+                title: Some("迷雾古堡".to_string()),
+            })
+            .send()
+            .await
+            .unwrap();
+        let doc: StorybookDocument = res.json().await.unwrap();
+        assert_eq!(doc.draft_version, 1);
+
+        // 保存新草稿 (base_version = 1)
+        let updated_draft = json!({
+            "meta": { "title": "迷雾古堡·修缮版" },
+            "world": { "premise": "古老的城堡沉睡在浓雾中" }
+        });
+        let save_req = SaveDraftRequest {
+            draft: updated_draft.clone(),
+            base_version: 1,
+        };
+        let res = client
+            .put(format!("{base_url}/api/storybooks/{}", doc.id))
+            .json(&save_req)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let mutation: StorybookMutationResponse = res.json().await.unwrap();
+        assert_eq!(mutation.doc.draft_version, 2);
+        assert_eq!(mutation.doc.draft, updated_draft);
+
+        // 内容幂等性：传入完全相同的 draft，版本不 bump
+        let res = client
+            .put(format!("{base_url}/api/storybooks/{}", doc.id))
+            .json(&SaveDraftRequest {
+                draft: updated_draft.clone(),
+                base_version: 2,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let idemp: StorybookMutationResponse = res.json().await.unwrap();
+        assert_eq!(idemp.doc.draft_version, 2);
+
+        // 乐观锁冲突：使用旧版本 base_version = 1 提交新内容
+        let conflict_draft = json!({
+            "meta": { "title": "冲突分支修改" }
+        });
+        let res = client
+            .put(format!("{base_url}/api/storybooks/{}", doc.id))
+            .json(&SaveDraftRequest {
+                draft: conflict_draft,
+                base_version: 1,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let err: ApiErrorBody = res.json().await.unwrap();
+        assert_eq!(err.code, "draft_conflict");
+        assert_eq!(err.detail.unwrap()["current_draft_version"], 2);
+    }
+
+    #[tokio::test]
+    async fn test_api_publish_storybook() {
+        let (base_url, _state) = spawn_app().await;
+        let client = reqwest::Client::new();
+
+        // 创建草稿 (draft_version = 1)
+        let res = client
+            .post(format!("{base_url}/api/storybooks"))
+            .json(&CreateStorybookRequest {
+                title: Some("发布测试".to_string()),
+            })
+            .send()
+            .await
+            .unwrap();
+        let doc: StorybookDocument = res.json().await.unwrap();
+
+        // 错误 base_version 发布 -> 409
+        let res = client
+            .post(format!("{base_url}/api/storybooks/{}/publish", doc.id))
+            .json(&PublishRequest { base_version: 999 })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+
+        // 保存一个包含阻断性错误的草稿（例如 meta.title 为空）
+        let invalid_draft = json!({
+            "schema_version": 1,
+            "meta": { "id": doc.id, "title": "" }
+        });
+        let res = client
+            .put(format!("{base_url}/api/storybooks/{}", doc.id))
+            .json(&SaveDraftRequest {
+                draft: invalid_draft,
+                base_version: 1,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // 尝试发布存在阻断性错误的故事书 -> 422 Unprocessable Entity
+        let res = client
+            .post(format!("{base_url}/api/storybooks/{}/publish", doc.id))
+            .json(&PublishRequest { base_version: 2 })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let err: ApiErrorBody = res.json().await.unwrap();
+        assert_eq!(err.code, "validation_failed");
+        assert!(err.detail.unwrap()["issues"].as_array().unwrap().len() > 0);
+
+        // 修复草稿中的错误
+        let valid_draft = json!({
+            "schema_version": 1,
+            "meta": { "id": doc.id, "title": "已修复标题" }
+        });
+        let res = client
+            .put(format!("{base_url}/api/storybooks/{}", doc.id))
+            .json(&SaveDraftRequest {
+                draft: valid_draft,
+                base_version: 2,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // 正确发布 (当前 draft_version = 3)
+        let res = client
+            .post(format!("{base_url}/api/storybooks/{}/publish", doc.id))
+            .json(&PublishRequest { base_version: 3 })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let pub_resp: StorybookMutationResponse = res.json().await.unwrap();
+        assert_eq!(pub_resp.doc.revision, 1);
+        assert_eq!(pub_resp.doc.draft_version, 4);
+        assert!(pub_resp.doc.published);
+        assert!(pub_resp.doc.released_at.is_some());
+        assert_eq!(pub_resp.doc.released, Some(pub_resp.doc.draft.clone()));
+
+        // 再次发布同一 base_version -> 409
+        let res = client
+            .post(format!("{base_url}/api/storybooks/{}/publish", doc.id))
+            .json(&PublishRequest { base_version: 3 })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+
+        // 发布不存在的故事书 -> 404
+        let res = client
+            .post(format!("{base_url}/api/storybooks/sb-nonexistent/publish"))
+            .json(&PublishRequest { base_version: 1 })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_api_validate_endpoint() {
+        let (base_url, _state) = spawn_app().await;
+        let client = reqwest::Client::new();
+
+        // 有效故事书
+        let res = client
+            .post(format!("{base_url}/api/validate"))
+            .json(&json!({
+                "schema_version": 1,
+                "meta": { "id": "sb-test", "title": "测试验证" }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let result: ValidateResult = res.json().await.unwrap();
+        assert!(result.valid);
+        assert!(result.issues.is_empty());
+
+        // 无效故事书（缺少 meta.id）
+        let res2 = client
+            .post(format!("{base_url}/api/validate"))
+            .json(&json!({
+                "schema_version": 1,
+                "meta": { "title": "缺少ID" }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res2.status(), StatusCode::OK);
+        let result2: ValidateResult = res2.json().await.unwrap();
+        assert!(!result2.valid);
+        assert!(result2.issues.iter().any(|i| i.code == "missing_id"));
+    }
+}
+

@@ -10,6 +10,7 @@ pub mod seed;
 pub mod session;
 pub mod state;
 pub mod storage;
+pub mod validate;
 
 pub use error::EngineError;
 pub use ports::{AiProvider, EmbeddingBackend, EventSink, TurnContext};
@@ -17,3 +18,4 @@ pub use rng::DeterministicRng;
 pub use session::Session;
 pub use state::WorldState;
 pub use storage::{SqliteStore, StorybookRow};
+pub use validate::{validate_storybook, validate_storybook_result};

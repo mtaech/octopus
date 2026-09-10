@@ -14,6 +14,11 @@ pub enum EngineError {
     EmptyInput,
     #[error("冲突: {0}")]
     Conflict(String),
+    #[error("草稿版本冲突，当前版本为 {current_draft_version}")]
+    DraftConflict {
+        current_draft_version: u32,
+        updated_at: String,
+    },
     #[error("AI 调用失败: {0}")]
     Ai(String),
     #[error("存储错误: {0}")]

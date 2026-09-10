@@ -489,3 +489,87 @@ pub struct ApiErrorBody {
     #[ts(type = "Record<string, unknown> | null")]
     pub detail: Option<Value>,
 }
+
+// ============================================================
+// 校验与故事书 API（#01 / #23）
+// ============================================================
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueSeverity {
+    Error,
+    Warning,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ValidationIssue {
+    pub severity: IssueSeverity,
+    pub code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub related_refs: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ValidateResult {
+    pub valid: bool,
+    pub issues: Vec<ValidationIssue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct CreateStorybookRequest {
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SaveDraftRequest {
+    #[ts(type = "unknown")]
+    pub draft: Value,
+    pub base_version: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PublishRequest {
+    pub base_version: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct StorybookDocument {
+    pub id: String,
+    pub revision: u32,
+    pub draft_version: u32,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub released_at: Option<String>,
+    pub published: bool,
+    #[ts(type = "unknown")]
+    pub draft: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(type = "unknown")]
+    pub released: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct StorybookListItem {
+    pub id: String,
+    pub title: String,
+    pub revision: u32,
+    pub draft_version: u32,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub released_at: Option<String>,
+    pub published: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}

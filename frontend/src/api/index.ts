@@ -138,22 +138,56 @@ export function getStorybook(id: string): Promise<StorybookDocument> {
 }
 
 export function createStorybookDraft(title?: string): Promise<StorybookDocument> {
-  // 后端故事书草稿接口待 #23 接入，此处暂走 mock
-  return net(run(async () => mock.createStorybookDraft(title)))
+  if (isMockMode()) {
+    return net(run(async () => mock.createStorybookDraft(title)))
+  }
+  return fetchJson<StorybookDocument>('/api/storybooks', {
+    method: 'POST',
+    body: JSON.stringify({ title }),
+  })
 }
 
-export function saveDraft(id: string, draft: Storybook, baseVersion: number): Promise<{ doc: StorybookDocument; issues: ValidationIssue[] }> {
-  // 后端草稿保存待 #23 接入，此处暂走 mock
-  return net(run(async () => mock.saveDraft(id, draft, baseVersion)))
+export function saveDraft(
+  id: string,
+  draft: Storybook,
+  baseVersion: number
+): Promise<{ doc: StorybookDocument; issues: ValidationIssue[] }> {
+  if (isMockMode()) {
+    return net(run(async () => mock.saveDraft(id, draft, baseVersion)))
+  }
+  return fetchJson<{ doc: StorybookDocument; issues: ValidationIssue[] }>(
+    `/api/storybooks/${encodeURIComponent(id)}`,
+    {
+      method: 'PUT',
+      body: JSON.stringify({ draft, base_version: baseVersion }),
+    }
+  )
 }
 
-export function publishDraft(id: string, baseVersion: number): Promise<{ doc: StorybookDocument; issues: ValidationIssue[] }> {
-  // 后端发布待 #23 接入，此处暂走 mock
-  return net(run(async () => mock.publishDraft(id, baseVersion)), 220)
+export function publishDraft(
+  id: string,
+  baseVersion: number
+): Promise<{ doc: StorybookDocument; issues: ValidationIssue[] }> {
+  if (isMockMode()) {
+    return net(run(async () => mock.publishDraft(id, baseVersion)), 220)
+  }
+  return fetchJson<{ doc: StorybookDocument; issues: ValidationIssue[] }>(
+    `/api/storybooks/${encodeURIComponent(id)}/publish`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ base_version: baseVersion }),
+    }
+  )
 }
 
 export function validateStorybook(sb: Storybook): Promise<ValidateResult> {
-  return net(mock.validate(sb), 30)
+  if (isMockMode()) {
+    return net(mock.validate(sb), 30)
+  }
+  return fetchJson<ValidateResult>('/api/validate', {
+    method: 'POST',
+    body: JSON.stringify(sb),
+  })
 }
 
 // ================= 存档（#24） =================
