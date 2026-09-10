@@ -1,15 +1,17 @@
 //! 存储层（#27 应用级单库 SQLite）：故事书 / 存档 / 命令日志 / 维护历史同库。
-//! 向量索引为独立 DuckDB 文件（派生可重建），本里程碑暂未接入。
-
-use std::sync::{Mutex, MutexGuard};
+//! 基于 SeaORM 实现全异步存储与自动建表（auto table creation）。
 
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, Database, DatabaseConnection,
+    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Schema, Set,
+    TransactionTrait,
+};
 use serde_json::Value;
 
 use octopus_types::{MaintenanceRow, SaveDetail, SaveListItem};
 
-use crate::{error::EngineError, seed::seed_storybooks};
+use crate::{entities, error::EngineError, seed::seed_storybooks};
 
 pub fn now_iso() -> String {
     Utc::now().to_rfc3339()
@@ -28,169 +30,146 @@ pub struct StorybookRow {
     pub released: Option<Value>,
 }
 
+pub fn normalize_sqlite_url(path: &str) -> String {
+    if path == ":memory:" || path == "sqlite::memory:" {
+        "sqlite::memory:?cache=shared".to_string()
+    } else if path.starts_with("sqlite:") {
+        path.to_string()
+    } else if path.starts_with('/') {
+        format!("sqlite://{path}?mode=rwc")
+    } else {
+        format!("sqlite:{path}?mode=rwc")
+    }
+}
+
+#[derive(Clone)]
 pub struct SqliteStore {
-    conn: Mutex<Connection>,
+    db: DatabaseConnection,
 }
 
 impl SqliteStore {
-    pub fn open(path: &str) -> Result<Self, EngineError> {
-        let store = Self { conn: Mutex::new(Connection::open(path)?) };
-        store.init_schema()?;
-        store.seed_if_empty()?;
+    pub async fn open(path: &str) -> Result<Self, EngineError> {
+        let url = normalize_sqlite_url(path);
+        let mut opt = sea_orm::ConnectOptions::new(url);
+        opt.max_connections(5);
+        let db = Database::connect(opt).await?;
+        Self::auto_create_tables(&db).await?;
+        let store = Self { db };
+        store.seed_if_empty().await?;
         Ok(store)
     }
 
     /// 仅内存（测试 / 冒烟用）。
-    pub fn open_in_memory() -> Result<Self, EngineError> {
-        let store = Self { conn: Mutex::new(Connection::open_in_memory()?) };
-        store.init_schema()?;
-        store.seed_if_empty()?;
+    pub async fn open_in_memory() -> Result<Self, EngineError> {
+        let mut opt = sea_orm::ConnectOptions::new("sqlite::memory:?cache=shared");
+        opt.max_connections(1);
+        let db = Database::connect(opt).await?;
+        Self::auto_create_tables(&db).await?;
+        let store = Self { db };
+        store.seed_if_empty().await?;
         Ok(store)
     }
 
-    fn conn(&self) -> MutexGuard<'_, Connection> {
-        self.conn.lock().expect("sqlite mutex poisoned")
+    pub fn conn(&self) -> &DatabaseConnection {
+        &self.db
     }
 
-    fn init_schema(&self) -> Result<(), EngineError> {
-        self.conn().execute_batch(
-            r#"
-            PRAGMA journal_mode = WAL;
-            CREATE TABLE IF NOT EXISTS storybooks (
-                id            TEXT PRIMARY KEY,
-                title         TEXT NOT NULL,
-                draft_json    TEXT NOT NULL,
-                released_json TEXT,
-                revision      INTEGER NOT NULL DEFAULT 0,
-                draft_version INTEGER NOT NULL DEFAULT 0,
-                updated_at    TEXT NOT NULL,
-                released_at   TEXT
-            );
-            CREATE TABLE IF NOT EXISTS saves (
-                id                TEXT PRIMARY KEY,
-                title             TEXT NOT NULL,
-                storybook_id      TEXT NOT NULL,
-                storybook_title   TEXT NOT NULL,
-                embedded_revision INTEGER NOT NULL,
-                latest_revision   INTEGER NOT NULL,
-                needs_upgrade     INTEGER NOT NULL DEFAULT 0,
-                imported          INTEGER NOT NULL DEFAULT 0,
-                storybook_json    TEXT NOT NULL,
-                auto_confirm      INTEGER NOT NULL DEFAULT 0,
-                created_at        TEXT NOT NULL,
-                updated_at        TEXT NOT NULL,
-                last_played_at    TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS commands (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                save_id      TEXT NOT NULL,
-                seq          INTEGER NOT NULL,
-                round        INTEGER NOT NULL,
-                kind         TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                ts           TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_commands_save_seq ON commands(save_id, seq);
-            CREATE TABLE IF NOT EXISTS archived_commands (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                save_id      TEXT NOT NULL,
-                origin_seq   INTEGER NOT NULL,
-                seq          INTEGER NOT NULL,
-                round        INTEGER NOT NULL,
-                kind         TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                ts           TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS maintenance (
-                id      INTEGER PRIMARY KEY AUTOINCREMENT,
-                save_id TEXT NOT NULL,
-                at      TEXT NOT NULL,
-                op      TEXT NOT NULL,
-                summary TEXT NOT NULL
-            );
-            "#,
-        )?;
+    pub async fn auto_create_tables(db: &DatabaseConnection) -> Result<(), EngineError> {
+        let backend = db.get_database_backend();
+        let schema = Schema::new(backend);
+
+        let tables = vec![
+            schema.create_table_from_entity(entities::storybook::Entity).if_not_exists().to_owned(),
+            schema.create_table_from_entity(entities::save::Entity).if_not_exists().to_owned(),
+            schema.create_table_from_entity(entities::command::Entity).if_not_exists().to_owned(),
+            schema.create_table_from_entity(entities::archived_command::Entity).if_not_exists().to_owned(),
+            schema.create_table_from_entity(entities::maintenance::Entity).if_not_exists().to_owned(),
+        ];
+
+        for stmt in tables {
+            db.execute(backend.build(&stmt)).await?;
+        }
+
+        let idx_stmt = sea_orm::sea_query::Index::create()
+            .name("idx_commands_save_seq")
+            .table(entities::command::Entity)
+            .col(entities::command::Column::SaveId)
+            .col(entities::command::Column::Seq)
+            .if_not_exists()
+            .to_owned();
+        db.execute(backend.build(&idx_stmt)).await?;
+
         Ok(())
     }
 
-    fn seed_if_empty(&self) -> Result<(), EngineError> {
-        let count: i64 = self
-            .conn()
-            .query_row("SELECT COUNT(*) FROM storybooks", [], |r| r.get(0))?;
+    async fn seed_if_empty(&self) -> Result<(), EngineError> {
+        let count = entities::storybook::Entity::find().count(&self.db).await?;
         if count > 0 {
             return Ok(());
         }
         let now = now_iso();
-        let conn = self.conn();
         for sb in seed_storybooks() {
             let json = serde_json::to_string(&sb.json)?;
-            conn.execute(
-                "INSERT INTO storybooks (id,title,draft_json,released_json,revision,draft_version,updated_at,released_at)
-                 VALUES (?1,?2,?3,?3,?4,?4,?5,?5)",
-                params![sb.id, sb.title, json, sb.revision as i64, now],
-            )?;
+            let active = entities::storybook::ActiveModel {
+                id: Set(sb.id),
+                title: Set(sb.title),
+                draft_json: Set(json.clone()),
+                released_json: Set(Some(json)),
+                revision: Set(sb.revision as i64),
+                draft_version: Set(sb.revision as i64),
+                updated_at: Set(now.clone()),
+                released_at: Set(Some(now.clone())),
+            };
+            active.insert(&self.db).await?;
         }
         Ok(())
     }
 
     // ---------- 故事书 ----------
 
-    pub fn list_storybooks(&self, released_only: bool) -> Result<Vec<Value>, EngineError> {
-        let conn = self.conn();
-        let sql = if released_only {
-            "SELECT id,title,revision,draft_version,updated_at,released_at FROM storybooks WHERE released_json IS NOT NULL ORDER BY updated_at DESC"
-        } else {
-            "SELECT id,title,revision,draft_version,updated_at,released_at FROM storybooks ORDER BY updated_at DESC"
-        };
-        let mut stmt = conn.prepare(sql)?;
-        let rows = stmt
-            .query_map([], |r| {
-                let released_at: Option<String> = r.get(5)?;
-                Ok(serde_json::json!({
-                    "id": r.get::<_, String>(0)?,
-                    "title": r.get::<_, String>(1)?,
-                    "revision": r.get::<_, i64>(2)?,
-                    "draft_version": r.get::<_, i64>(3)?,
-                    "updated_at": r.get::<_, String>(4)?,
-                    "released_at": released_at,
-                    "published": released_at.is_some(),
+    pub async fn list_storybooks(&self, released_only: bool) -> Result<Vec<Value>, EngineError> {
+        let mut query = entities::storybook::Entity::find()
+            .order_by_desc(entities::storybook::Column::UpdatedAt);
+        if released_only {
+            query = query.filter(entities::storybook::Column::ReleasedJson.is_not_null());
+        }
+        let rows = query.all(&self.db).await?;
+        let result = rows
+            .into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.id,
+                    "title": r.title,
+                    "revision": r.revision,
+                    "draft_version": r.draft_version,
+                    "updated_at": r.updated_at,
+                    "released_at": r.released_at,
+                    "published": r.released_at.is_some(),
                     "description": Value::Null,
-                }))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+                })
+            })
+            .collect();
+        Ok(result)
     }
 
-    fn map_storybook_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StorybookRow> {
-        let draft_json: String = r.get(6)?;
-        let released_json: Option<String> = r.get(7)?;
-        Ok(StorybookRow {
-            id: r.get(0)?,
-            title: r.get(1)?,
-            revision: r.get::<_, i64>(2)? as u32,
-            draft_version: r.get::<_, i64>(3)? as u32,
-            updated_at: r.get(4)?,
-            released_at: r.get(5)?,
-            published: released_json.is_some(),
-            draft: serde_json::from_str(&draft_json).unwrap_or(Value::Null),
-            released: released_json.as_deref().and_then(|s| serde_json::from_str(s).ok()),
-        })
+    pub async fn get_storybook(&self, id: &str) -> Result<Option<StorybookRow>, EngineError> {
+        let model = entities::storybook::Entity::find_by_id(id.to_string())
+            .one(&self.db)
+            .await?;
+        Ok(model.map(|r| StorybookRow {
+            id: r.id,
+            title: r.title,
+            revision: r.revision as u32,
+            draft_version: r.draft_version as u32,
+            updated_at: r.updated_at,
+            released_at: r.released_at,
+            published: r.released_json.is_some(),
+            draft: serde_json::from_str(&r.draft_json).unwrap_or(Value::Null),
+            released: r.released_json.as_deref().and_then(|s| serde_json::from_str(s).ok()),
+        }))
     }
 
-    pub fn get_storybook(&self, id: &str) -> Result<Option<StorybookRow>, EngineError> {
-        let conn = self.conn();
-        let row = conn
-            .query_row(
-                "SELECT id,title,revision,draft_version,updated_at,released_at,draft_json,released_json
-                 FROM storybooks WHERE id = ?1",
-                params![id],
-                Self::map_storybook_row,
-            )
-            .optional()?;
-        Ok(row)
-    }
-
-    pub fn create_storybook_draft(
+    pub async fn create_storybook_draft(
         &self,
         title: Option<&str>,
         initial: &Value,
@@ -224,12 +203,17 @@ impl SqliteStore {
 
         let draft_json = serde_json::to_string(&draft)?;
         let now = now_iso();
-        let conn = self.conn();
-        conn.execute(
-            "INSERT INTO storybooks (id,title,draft_json,released_json,revision,draft_version,updated_at,released_at)
-             VALUES (?1,?2,?3,NULL,0,1,?4,NULL)",
-            params![id, resolved_title, draft_json, now],
-        )?;
+        let active = entities::storybook::ActiveModel {
+            id: Set(id.clone()),
+            title: Set(resolved_title.clone()),
+            draft_json: Set(draft_json),
+            released_json: Set(None),
+            revision: Set(0),
+            draft_version: Set(1),
+            updated_at: Set(now.clone()),
+            released_at: Set(None),
+        };
+        active.insert(&self.db).await?;
 
         Ok(StorybookRow {
             id,
@@ -244,14 +228,15 @@ impl SqliteStore {
         })
     }
 
-    pub fn save_draft(
+    pub async fn save_draft(
         &self,
         id: &str,
         draft: &Value,
         base_version: u32,
     ) -> Result<StorybookRow, EngineError> {
         let current = self
-            .get_storybook(id)?
+            .get_storybook(id)
+            .await?
             .ok_or_else(|| EngineError::StorybookNotFound(id.to_string()))?;
 
         if current.draft == *draft {
@@ -277,11 +262,17 @@ impl SqliteStore {
         let now = now_iso();
         let draft_json = serde_json::to_string(draft)?;
 
-        let conn = self.conn();
-        conn.execute(
-            "UPDATE storybooks SET draft_json = ?2, draft_version = ?3, title = ?4, updated_at = ?5 WHERE id = ?1",
-            params![id, draft_json, new_draft_version as i64, new_title, now],
-        )?;
+        let model = entities::storybook::Entity::find_by_id(id.to_string())
+            .one(&self.db)
+            .await?
+            .ok_or_else(|| EngineError::StorybookNotFound(id.to_string()))?;
+
+        let mut active: entities::storybook::ActiveModel = model.into();
+        active.draft_json = Set(draft_json);
+        active.draft_version = Set(new_draft_version as i64);
+        active.title = Set(new_title.clone());
+        active.updated_at = Set(now.clone());
+        active.update(&self.db).await?;
 
         Ok(StorybookRow {
             id: current.id,
@@ -296,183 +287,212 @@ impl SqliteStore {
         })
     }
 
-    pub fn publish_storybook(&self, id: &str, base_version: u32) -> Result<StorybookRow, EngineError> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
+    pub async fn publish_storybook(&self, id: &str, base_version: u32) -> Result<StorybookRow, EngineError> {
+        let target_id = id.to_string();
+        let result = self
+            .db
+            .transaction::<_, StorybookRow, EngineError>(|txn| {
+                Box::pin(async move {
+                    let model = entities::storybook::Entity::find_by_id(target_id.clone())
+                        .one(txn)
+                        .await?
+                        .ok_or_else(|| EngineError::StorybookNotFound(target_id.clone()))?;
 
-        let current = tx
-            .query_row(
-                "SELECT id,title,revision,draft_version,updated_at,released_at,draft_json,released_json
-                 FROM storybooks WHERE id = ?1",
-                params![id],
-                Self::map_storybook_row,
-            )
-            .optional()?;
+                    if (model.draft_version as u32) != base_version {
+                        return Err(EngineError::DraftConflict {
+                            current_draft_version: model.draft_version as u32,
+                            updated_at: model.updated_at,
+                        });
+                    }
 
-        let current = current.ok_or_else(|| EngineError::StorybookNotFound(id.to_string()))?;
+                    let new_revision = model.revision + 1;
+                    let new_draft_version = model.draft_version + 1;
+                    let now = now_iso();
+                    let draft_val: Value = serde_json::from_str(&model.draft_json).unwrap_or(Value::Null);
 
-        if current.draft_version != base_version {
-            return Err(EngineError::DraftConflict {
-                current_draft_version: current.draft_version,
-                updated_at: current.updated_at,
-            });
-        }
+                    let mut active: entities::storybook::ActiveModel = model.into();
+                    let draft_content = active.draft_json.as_ref().clone();
+                    active.released_json = Set(Some(draft_content));
+                    active.revision = Set(new_revision);
+                    active.draft_version = Set(new_draft_version);
+                    active.released_at = Set(Some(now.clone()));
+                    active.updated_at = Set(now.clone());
+                    let updated = active.update(txn).await?;
 
-        let new_revision = current.revision + 1;
-        let new_draft_version = current.draft_version + 1;
-        let now = now_iso();
+                    Ok(StorybookRow {
+                        id: updated.id,
+                        title: updated.title,
+                        revision: updated.revision as u32,
+                        draft_version: updated.draft_version as u32,
+                        updated_at: updated.updated_at,
+                        released_at: updated.released_at,
+                        published: true,
+                        draft: draft_val.clone(),
+                        released: Some(draft_val),
+                    })
+                })
+            })
+            .await
+            .map_err(|e| match e {
+                sea_orm::TransactionError::Connection(db_err) => EngineError::from(db_err),
+                sea_orm::TransactionError::Transaction(engine_err) => engine_err,
+            })?;
 
-        tx.execute(
-            "UPDATE storybooks
-             SET released_json = draft_json,
-                 revision = ?2,
-                 draft_version = ?3,
-                 released_at = ?4,
-                 updated_at = ?4
-             WHERE id = ?1",
-            params![id, new_revision as i64, new_draft_version as i64, now],
-        )?;
-
-        tx.commit()?;
-
-        Ok(StorybookRow {
-            id: current.id,
-            title: current.title,
-            revision: new_revision,
-            draft_version: new_draft_version,
-            updated_at: now.clone(),
-            released_at: Some(now),
-            published: true,
-            draft: current.draft.clone(),
-            released: Some(current.draft),
-        })
+        Ok(result)
     }
 
-    pub fn delete_storybook(&self, id: &str) -> Result<bool, EngineError> {
-        let conn = self.conn();
-        let n = conn.execute("DELETE FROM storybooks WHERE id = ?1", params![id])?;
-        Ok(n > 0)
+    pub async fn delete_storybook(&self, id: &str) -> Result<bool, EngineError> {
+        let res = entities::storybook::Entity::delete_by_id(id.to_string())
+            .exec(&self.db)
+            .await?;
+        Ok(res.rows_affected > 0)
     }
 
     // ---------- 存档 ----------
 
-    pub fn insert_save(&self, d: &SaveDetail, auto_confirm: bool) -> Result<(), EngineError> {
-        let conn = self.conn();
+    pub async fn insert_save(&self, d: &SaveDetail, auto_confirm: bool) -> Result<(), EngineError> {
         let storybook_json = serde_json::to_string(&d.storybook)?;
-        conn.execute(
-            "INSERT INTO saves (id,title,storybook_id,storybook_title,embedded_revision,latest_revision,
-                                needs_upgrade,imported,storybook_json,auto_confirm,created_at,updated_at,last_played_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
-            params![
-                d.item.id, d.item.title, d.item.storybook_id, d.item.storybook_title,
-                d.item.embedded_revision as i64, d.item.latest_revision as i64,
-                d.item.needs_upgrade as i64, d.item.imported.unwrap_or(false) as i64,
-                storybook_json, auto_confirm as i64,
-                d.item.created_at, d.item.updated_at, d.item.last_played_at
-            ],
-        )?;
+        let active = entities::save::ActiveModel {
+            id: Set(d.item.id.clone()),
+            title: Set(d.item.title.clone()),
+            storybook_id: Set(d.item.storybook_id.clone()),
+            storybook_title: Set(d.item.storybook_title.clone()),
+            embedded_revision: Set(d.item.embedded_revision as i64),
+            latest_revision: Set(d.item.latest_revision as i64),
+            needs_upgrade: Set(d.item.needs_upgrade),
+            imported: Set(d.item.imported.unwrap_or(false)),
+            storybook_json: Set(storybook_json),
+            auto_confirm: Set(auto_confirm),
+            created_at: Set(d.item.created_at.clone()),
+            updated_at: Set(d.item.updated_at.clone()),
+            last_played_at: Set(d.item.last_played_at.clone()),
+        };
+        active.insert(&self.db).await?;
         Ok(())
     }
 
-    fn row_to_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<SaveListItem> {
-        Ok(SaveListItem {
-            id: r.get(0)?,
-            title: r.get(1)?,
-            storybook_id: r.get(2)?,
-            storybook_title: r.get(3)?,
-            embedded_revision: r.get::<_, i64>(4)? as u32,
-            latest_revision: r.get::<_, i64>(5)? as u32,
-            needs_upgrade: r.get::<_, i64>(6)? != 0,
-            imported: Some(r.get::<_, i64>(7)? != 0),
-            created_at: r.get(8)?,
-            updated_at: r.get(9)?,
-            last_played_at: r.get(10)?,
-        })
+    pub async fn list_saves(&self) -> Result<Vec<SaveListItem>, EngineError> {
+        let rows = entities::save::Entity::find()
+            .order_by_desc(entities::save::Column::LastPlayedAt)
+            .all(&self.db)
+            .await?;
+        let list = rows
+            .into_iter()
+            .map(|m| SaveListItem {
+                id: m.id,
+                title: m.title,
+                storybook_id: m.storybook_id,
+                storybook_title: m.storybook_title,
+                embedded_revision: m.embedded_revision as u32,
+                latest_revision: m.latest_revision as u32,
+                needs_upgrade: m.needs_upgrade,
+                imported: Some(m.imported),
+                created_at: m.created_at,
+                updated_at: m.updated_at,
+                last_played_at: m.last_played_at,
+            })
+            .collect();
+        Ok(list)
     }
 
-    pub fn list_saves(&self) -> Result<Vec<SaveListItem>, EngineError> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT id,title,storybook_id,storybook_title,embedded_revision,latest_revision,
-                    needs_upgrade,imported,created_at,updated_at,last_played_at
-             FROM saves ORDER BY last_played_at DESC",
-        )?;
-        let rows = stmt
-            .query_map([], |r| Self::row_to_item(r))?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+    pub async fn get_save(&self, id: &str) -> Result<Option<SaveDetail>, EngineError> {
+        let model = entities::save::Entity::find_by_id(id.to_string())
+            .one(&self.db)
+            .await?;
+        Ok(model.map(|m| {
+            let storybook: Value = serde_json::from_str(&m.storybook_json).unwrap_or(Value::Null);
+            let item = SaveListItem {
+                id: m.id,
+                title: m.title,
+                storybook_id: m.storybook_id,
+                storybook_title: m.storybook_title,
+                embedded_revision: m.embedded_revision as u32,
+                latest_revision: m.latest_revision as u32,
+                needs_upgrade: m.needs_upgrade,
+                imported: Some(m.imported),
+                created_at: m.created_at,
+                updated_at: m.updated_at,
+                last_played_at: m.last_played_at,
+            };
+            SaveDetail { item, storybook }
+        }))
     }
 
-    pub fn get_save(&self, id: &str) -> Result<Option<SaveDetail>, EngineError> {
-        let conn = self.conn();
-        let row = conn
-            .query_row(
-                "SELECT id,title,storybook_id,storybook_title,embedded_revision,latest_revision,
-                        needs_upgrade,imported,created_at,updated_at,last_played_at,storybook_json
-                 FROM saves WHERE id = ?1",
-                params![id],
-                |r| {
-                    let item = Self::row_to_item(r)?;
-                    let storybook_json: String = r.get(11)?;
-                    Ok(SaveDetail {
-                        item,
-                        storybook: serde_json::from_str(&storybook_json).unwrap_or(Value::Null),
-                    })
-                },
-            )
-            .optional()?;
-        Ok(row)
-    }
-
-    pub fn rename_save(&self, id: &str, title: &str) -> Result<Option<SaveListItem>, EngineError> {
-        let now = now_iso();
-        {
-            let conn = self.conn();
-            conn.execute(
-                "UPDATE saves SET title = ?2, updated_at = ?3 WHERE id = ?1",
-                params![id, title, now],
-            )?;
+    pub async fn rename_save(&self, id: &str, title: &str) -> Result<Option<SaveListItem>, EngineError> {
+        let model = entities::save::Entity::find_by_id(id.to_string())
+            .one(&self.db)
+            .await?;
+        if let Some(m) = model {
+            let now = now_iso();
+            let mut active: entities::save::ActiveModel = m.into();
+            active.title = Set(title.to_string());
+            active.updated_at = Set(now);
+            let updated = active.update(&self.db).await?;
+            Ok(Some(SaveListItem {
+                id: updated.id,
+                title: updated.title,
+                storybook_id: updated.storybook_id,
+                storybook_title: updated.storybook_title,
+                embedded_revision: updated.embedded_revision as u32,
+                latest_revision: updated.latest_revision as u32,
+                needs_upgrade: updated.needs_upgrade,
+                imported: Some(updated.imported),
+                created_at: updated.created_at,
+                updated_at: updated.updated_at,
+                last_played_at: updated.last_played_at,
+            }))
+        } else {
+            Ok(None)
         }
-        Ok(self.list_saves()?.into_iter().find(|s| s.id == id))
     }
 
-    pub fn delete_save(&self, id: &str) -> Result<bool, EngineError> {
-        let conn = self.conn();
-        let n = conn.execute("DELETE FROM saves WHERE id = ?1", params![id])?;
-        conn.execute("DELETE FROM commands WHERE save_id = ?1", params![id])?;
-        conn.execute("DELETE FROM maintenance WHERE save_id = ?1", params![id])?;
-        Ok(n > 0)
+    pub async fn delete_save(&self, id: &str) -> Result<bool, EngineError> {
+        let save_id = id.to_string();
+        let res = entities::save::Entity::delete_by_id(save_id.clone())
+            .exec(&self.db)
+            .await?;
+        entities::command::Entity::delete_many()
+            .filter(entities::command::Column::SaveId.eq(save_id.clone()))
+            .exec(&self.db)
+            .await?;
+        entities::maintenance::Entity::delete_many()
+            .filter(entities::maintenance::Column::SaveId.eq(save_id))
+            .exec(&self.db)
+            .await?;
+        Ok(res.rows_affected > 0)
     }
 
-    pub fn get_auto_confirm(&self, id: &str) -> Result<Option<bool>, EngineError> {
-        let conn = self.conn();
-        let v: Option<i64> = conn
-            .query_row("SELECT auto_confirm FROM saves WHERE id = ?1", params![id], |r| r.get(0))
-            .optional()?;
-        Ok(v.map(|x| x != 0))
+    pub async fn get_auto_confirm(&self, id: &str) -> Result<Option<bool>, EngineError> {
+        let model = entities::save::Entity::find_by_id(id.to_string())
+            .one(&self.db)
+            .await?;
+        Ok(model.map(|m| m.auto_confirm))
     }
 
-    pub fn set_auto_confirm(&self, id: &str, v: bool) -> Result<(), EngineError> {
-        let conn = self.conn();
-        conn.execute(
-            "UPDATE saves SET auto_confirm = ?2, updated_at = ?3 WHERE id = ?1",
-            params![id, v as i64, now_iso()],
-        )?;
+    pub async fn set_auto_confirm(&self, id: &str, v: bool) -> Result<(), EngineError> {
+        if let Some(m) = entities::save::Entity::find_by_id(id.to_string()).one(&self.db).await? {
+            let mut active: entities::save::ActiveModel = m.into();
+            active.auto_confirm = Set(v);
+            active.updated_at = Set(now_iso());
+            active.update(&self.db).await?;
+        }
         Ok(())
     }
 
-    pub fn touch_save(&self, id: &str) -> Result<(), EngineError> {
-        let conn = self.conn();
-        conn.execute(
-            "UPDATE saves SET updated_at = ?2, last_played_at = ?2 WHERE id = ?1",
-            params![id, now_iso()],
-        )?;
+    pub async fn touch_save(&self, id: &str) -> Result<(), EngineError> {
+        if let Some(m) = entities::save::Entity::find_by_id(id.to_string()).one(&self.db).await? {
+            let now = now_iso();
+            let mut active: entities::save::ActiveModel = m.into();
+            active.updated_at = Set(now.clone());
+            active.last_played_at = Set(now);
+            active.update(&self.db).await?;
+        }
         Ok(())
     }
 
     // ---------- 命令日志 / 维护历史 ----------
 
-    pub fn append_command(
+    pub async fn append_command(
         &self,
         save_id: &str,
         seq: i64,
@@ -480,34 +500,47 @@ impl SqliteStore {
         kind: &str,
         payload_json: &str,
     ) -> Result<(), EngineError> {
-        let conn = self.conn();
-        conn.execute(
-            "INSERT INTO commands (save_id,seq,round,kind,payload_json,ts) VALUES (?1,?2,?3,?4,?5,?6)",
-            params![save_id, seq, round, kind, payload_json, now_iso()],
-        )?;
+        let active = entities::command::ActiveModel {
+            id: sea_orm::ActiveValue::NotSet,
+            save_id: Set(save_id.to_string()),
+            seq: Set(seq),
+            round: Set(round),
+            kind: Set(kind.to_string()),
+            payload_json: Set(payload_json.to_string()),
+            ts: Set(now_iso()),
+        };
+        active.insert(&self.db).await?;
         Ok(())
     }
 
-    pub fn append_maintenance(&self, save_id: &str, op: &str, summary: &str) -> Result<(), EngineError> {
-        let conn = self.conn();
-        conn.execute(
-            "INSERT INTO maintenance (save_id,at,op,summary) VALUES (?1,?2,?3,?4)",
-            params![save_id, now_iso(), op, summary],
-        )?;
+    pub async fn append_maintenance(&self, save_id: &str, op: &str, summary: &str) -> Result<(), EngineError> {
+        let active = entities::maintenance::ActiveModel {
+            id: sea_orm::ActiveValue::NotSet,
+            save_id: Set(save_id.to_string()),
+            at: Set(now_iso()),
+            op: Set(op.to_string()),
+            summary: Set(summary.to_string()),
+        };
+        active.insert(&self.db).await?;
         Ok(())
     }
 
-    pub fn list_maintenance(&self, save_id: &str) -> Result<Vec<MaintenanceRow>, EngineError> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT at,op,summary FROM maintenance WHERE save_id = ?1 ORDER BY id DESC LIMIT 100",
-        )?;
-        let rows = stmt
-            .query_map(params![save_id], |r| {
-                Ok(MaintenanceRow { at: r.get(0)?, op: r.get(1)?, summary: r.get(2)? })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+    pub async fn list_maintenance(&self, save_id: &str) -> Result<Vec<MaintenanceRow>, EngineError> {
+        let rows = entities::maintenance::Entity::find()
+            .filter(entities::maintenance::Column::SaveId.eq(save_id.to_string()))
+            .order_by_desc(entities::maintenance::Column::Id)
+            .limit(100)
+            .all(&self.db)
+            .await?;
+        let list = rows
+            .into_iter()
+            .map(|m| MaintenanceRow {
+                at: m.at,
+                op: m.op,
+                summary: m.summary,
+            })
+            .collect();
+        Ok(list)
     }
 }
 
@@ -516,14 +549,14 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
-    fn test_create_and_save_draft() {
-        let store = SqliteStore::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn test_create_and_save_draft() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
         let initial = json!({
             "meta": { "title": "初始标题" },
             "world": { "premise": "世界设定" }
         });
-        let row = store.create_storybook_draft(None, &initial).unwrap();
+        let row = store.create_storybook_draft(None, &initial).await.unwrap();
         assert!(row.id.starts_with("sb-"));
         assert_eq!(row.title, "初始标题");
         assert_eq!(row.revision, 0);
@@ -537,54 +570,54 @@ mod tests {
             "meta": { "title": "修改后标题" },
             "world": { "premise": "新世界设定" }
         });
-        let saved = store.save_draft(&row.id, &updated_draft, 1).unwrap();
+        let saved = store.save_draft(&row.id, &updated_draft, 1).await.unwrap();
         assert_eq!(saved.draft_version, 2);
         assert_eq!(saved.title, "修改后标题");
         assert_eq!(saved.draft, updated_draft);
         assert_eq!(saved.revision, 0);
 
         // 重新获取验证
-        let fetched = store.get_storybook(&row.id).unwrap().unwrap();
+        let fetched = store.get_storybook(&row.id).await.unwrap().unwrap();
         assert_eq!(fetched.draft_version, 2);
         assert_eq!(fetched.title, "修改后标题");
         assert_eq!(fetched.draft, updated_draft);
     }
 
-    #[test]
-    fn test_content_idempotency() {
-        let store = SqliteStore::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn test_content_idempotency() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
         let initial = json!({
             "meta": { "title": "幂等测试" },
             "content": 123
         });
-        let row = store.create_storybook_draft(None, &initial).unwrap();
+        let row = store.create_storybook_draft(None, &initial).await.unwrap();
         assert_eq!(row.draft_version, 1);
         let updated_at = row.updated_at.clone();
 
         // 传入相同内容保存：no-op，不 bump draft_version，返回当前行
-        let saved = store.save_draft(&row.id, &row.draft, 1).unwrap();
+        let saved = store.save_draft(&row.id, &row.draft, 1).await.unwrap();
         assert_eq!(saved.draft_version, 1);
         assert_eq!(saved.updated_at, updated_at);
 
         // 哪怕 base_version 是旧的/不同的，由于内容完全一致，依旧是 no-op 幂等返回
-        let saved2 = store.save_draft(&row.id, &row.draft, 999).unwrap();
+        let saved2 = store.save_draft(&row.id, &row.draft, 999).await.unwrap();
         assert_eq!(saved2.draft_version, 1);
     }
 
-    #[test]
-    fn test_optimistic_locking_conflict() {
-        let store = SqliteStore::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn test_optimistic_locking_conflict() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
         let initial = json!({ "meta": { "title": "锁测试" } });
-        let row = store.create_storybook_draft(None, &initial).unwrap();
+        let row = store.create_storybook_draft(None, &initial).await.unwrap();
 
         // 客户端 A 更新成功，version 变为 2
         let draft_a = json!({ "meta": { "title": "A的修改" } });
-        let saved_a = store.save_draft(&row.id, &draft_a, 1).unwrap();
+        let saved_a = store.save_draft(&row.id, &draft_a, 1).await.unwrap();
         assert_eq!(saved_a.draft_version, 2);
 
         // 客户端 B 仍基于 version 1 提交修改 -> 冲突 409
         let draft_b = json!({ "meta": { "title": "B的修改" } });
-        let err = store.save_draft(&row.id, &draft_b, 1).unwrap_err();
+        let err = store.save_draft(&row.id, &draft_b, 1).await.unwrap_err();
         match err {
             EngineError::DraftConflict { current_draft_version, updated_at } => {
                 assert_eq!(current_draft_version, 2);
@@ -594,26 +627,26 @@ mod tests {
         }
 
         // 验证草稿内容未被 B 的修改覆盖
-        let current = store.get_storybook(&row.id).unwrap().unwrap();
+        let current = store.get_storybook(&row.id).await.unwrap().unwrap();
         assert_eq!(current.draft_version, 2);
         assert_eq!(current.title, "A的修改");
     }
 
-    #[test]
-    fn test_atomic_publishing() {
-        let store = SqliteStore::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn test_atomic_publishing() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
         let initial = json!({ "meta": { "title": "发布测试" } });
-        let row = store.create_storybook_draft(None, &initial).unwrap();
+        let row = store.create_storybook_draft(None, &initial).await.unwrap();
         assert_eq!(row.revision, 0);
         assert_eq!(row.draft_version, 1);
         assert!(!row.published);
 
         // 使用错误的 base_version 发布 -> 冲突
-        let err = store.publish_storybook(&row.id, 999).unwrap_err();
+        let err = store.publish_storybook(&row.id, 999).await.unwrap_err();
         assert!(matches!(err, EngineError::DraftConflict { current_draft_version: 1, .. }));
 
         // 正确发布
-        let pub_row = store.publish_storybook(&row.id, 1).unwrap();
+        let pub_row = store.publish_storybook(&row.id, 1).await.unwrap();
         assert_eq!(pub_row.revision, 1);
         assert_eq!(pub_row.draft_version, 2);
         assert!(pub_row.published);
@@ -621,26 +654,69 @@ mod tests {
         assert_eq!(pub_row.released.as_ref(), Some(&pub_row.draft));
 
         // 再次发布同一 base_version 失败（已更新到 2）
-        let err2 = store.publish_storybook(&row.id, 1).unwrap_err();
+        let err2 = store.publish_storybook(&row.id, 1).await.unwrap_err();
         assert!(matches!(err2, EngineError::DraftConflict { current_draft_version: 2, .. }));
 
         // 发布后从 DB 获取验证
-        let fetched = store.get_storybook(&row.id).unwrap().unwrap();
+        let fetched = store.get_storybook(&row.id).await.unwrap().unwrap();
         assert_eq!(fetched.revision, 1);
         assert_eq!(fetched.draft_version, 2);
         assert!(fetched.published);
         assert_eq!(fetched.released, Some(fetched.draft));
     }
 
-    #[test]
-    fn test_delete_storybook() {
-        let store = SqliteStore::open_in_memory().unwrap();
-        let row = store.create_storybook_draft(Some("待删除"), &json!({})).unwrap();
-        assert!(store.get_storybook(&row.id).unwrap().is_some());
+    #[tokio::test]
+    async fn test_delete_storybook() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let row = store.create_storybook_draft(Some("待删除"), &json!({})).await.unwrap();
+        assert!(store.get_storybook(&row.id).await.unwrap().is_some());
 
-        assert!(store.delete_storybook(&row.id).unwrap());
-        assert!(!store.delete_storybook(&row.id).unwrap());
-        assert!(store.get_storybook(&row.id).unwrap().is_none());
+        assert!(store.delete_storybook(&row.id).await.unwrap());
+        assert!(!store.delete_storybook(&row.id).await.unwrap());
+        assert!(store.get_storybook(&row.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_saves_and_commands_lifecycle() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let saves = store.list_saves().await.unwrap();
+        assert_eq!(saves.len(), 0);
+
+        let detail = SaveDetail {
+            item: SaveListItem {
+                id: "save-1".to_string(),
+                title: "测试存档".to_string(),
+                storybook_id: "sb-1".to_string(),
+                storybook_title: "故事书1".to_string(),
+                embedded_revision: 1,
+                latest_revision: 1,
+                needs_upgrade: false,
+                imported: Some(false),
+                created_at: now_iso(),
+                updated_at: now_iso(),
+                last_played_at: now_iso(),
+            },
+            storybook: json!({ "meta": { "title": "故事书1" } }),
+        };
+
+        store.insert_save(&detail, true).await.unwrap();
+        let fetched = store.get_save("save-1").await.unwrap().unwrap();
+        assert_eq!(fetched.item.title, "测试存档");
+        assert_eq!(store.get_auto_confirm("save-1").await.unwrap(), Some(true));
+
+        store.set_auto_confirm("save-1", false).await.unwrap();
+        assert_eq!(store.get_auto_confirm("save-1").await.unwrap(), Some(false));
+
+        let renamed = store.rename_save("save-1", "新存档名").await.unwrap().unwrap();
+        assert_eq!(renamed.title, "新存档名");
+
+        store.append_command("save-1", 1, 1, "test", "{}").await.unwrap();
+        store.append_maintenance("save-1", "手动存档", "已保存").await.unwrap();
+        let m = store.list_maintenance("save-1").await.unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].op, "手动存档");
+
+        assert!(store.delete_save("save-1").await.unwrap());
+        assert!(store.get_save("save-1").await.unwrap().is_none());
     }
 }
-

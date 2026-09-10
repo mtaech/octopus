@@ -27,8 +27,9 @@ pub enum EngineError {
     Internal(String),
 }
 
-impl From<rusqlite::Error> for EngineError {
-    fn from(e: rusqlite::Error) -> Self {
+
+impl From<sea_orm::DbErr> for EngineError {
+    fn from(e: sea_orm::DbErr) -> Self {
         Self::Storage(e.to_string())
     }
 }

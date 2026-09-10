@@ -69,15 +69,16 @@ impl AppState {
     }
 
     /// 惰性建立会话（内存状态 + 事件日志 + 广播出口）。
-    pub fn session_for(&self, save_id: &str) -> Result<Arc<Session>, EngineError> {
+    pub async fn session_for(&self, save_id: &str) -> Result<Arc<Session>, EngineError> {
         if let Some(s) = self.sessions.lock().expect("sessions poisoned").get(save_id) {
             return Ok(s.clone());
         }
         let save = self
             .store
-            .get_save(save_id)?
+            .get_save(save_id)
+            .await?
             .ok_or_else(|| EngineError::SaveNotFound(save_id.to_string()))?;
-        let auto_confirm = self.store.get_auto_confirm(save_id)?.unwrap_or(false);
+        let auto_confirm = self.store.get_auto_confirm(save_id).await?.unwrap_or(false);
         let (tx, _rx) = broadcast::channel(1024);
         let sink = Arc::new(BroadcastSink { tx: tx.clone() });
         let state = build_state(&save);
@@ -264,7 +265,7 @@ async fn list_storybooks(
     Query(q): Query<ListStorybooksQuery>,
 ) -> Result<Json<Vec<Value>>, ApiError> {
     let released_only = q.released_only.unwrap_or(true);
-    Ok(Json(app.store().list_storybooks(released_only)?))
+    Ok(Json(app.store().list_storybooks(released_only).await?))
 }
 
 async fn get_storybook(
@@ -273,7 +274,8 @@ async fn get_storybook(
 ) -> Result<Json<StorybookDocument>, ApiError> {
     let row = app
         .store()
-        .get_storybook(&id)?
+        .get_storybook(&id)
+        .await?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "storybook_not_found", "故事书不存在"))?;
     Ok(Json(row_to_doc(row)))
 }
@@ -301,7 +303,7 @@ async fn create_storybook_draft(
         "relationship_types": [],
         "target_types": [],
     });
-    let row = app.store().create_storybook_draft(req.title.as_deref(), &initial)?;
+    let row = app.store().create_storybook_draft(req.title.as_deref(), &initial).await?;
     Ok((StatusCode::CREATED, Json(row_to_doc(row))))
 }
 
@@ -310,7 +312,7 @@ async fn save_storybook_draft(
     Path(id): Path<String>,
     Json(req): Json<SaveDraftRequest>,
 ) -> Result<Json<StorybookMutationResponse>, ApiError> {
-    let row = app.store().save_draft(&id, &req.draft, req.base_version)?;
+    let row = app.store().save_draft(&id, &req.draft, req.base_version).await?;
     let issues = octopus_engine::validate_storybook(&req.draft);
     Ok(Json(StorybookMutationResponse {
         doc: row_to_doc(row),
@@ -325,7 +327,8 @@ async fn publish_storybook(
 ) -> Result<Json<StorybookMutationResponse>, ApiError> {
     let row = app
         .store()
-        .get_storybook(&id)?
+        .get_storybook(&id)
+        .await?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "storybook_not_found", "故事书不存在"))?;
     let issues = octopus_engine::validate_storybook(&row.draft);
     if issues.iter().any(|i| matches!(i.severity, IssueSeverity::Error)) {
@@ -336,7 +339,7 @@ async fn publish_storybook(
         )
         .with_detail(serde_json::json!({ "issues": issues })));
     }
-    let row = app.store().publish_storybook(&id, req.base_version)?;
+    let row = app.store().publish_storybook(&id, req.base_version).await?;
     Ok(Json(StorybookMutationResponse {
         doc: row_to_doc(row),
         issues,
@@ -347,7 +350,7 @@ async fn delete_storybook(
     State(app): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    if app.store().delete_storybook(&id)? {
+    if app.store().delete_storybook(&id).await? {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::new(StatusCode::NOT_FOUND, "storybook_not_found", "故事书不存在"))
@@ -359,7 +362,7 @@ async fn validate_endpoint(Json(body): Json<Value>) -> Json<ValidateResult> {
 }
 
 async fn list_saves(State(app): State<Arc<AppState>>) -> Result<Json<Vec<SaveListItem>>, ApiError> {
-    Ok(Json(app.store().list_saves()?))
+    Ok(Json(app.store().list_saves().await?))
 }
 
 async fn create_save(
@@ -368,7 +371,8 @@ async fn create_save(
 ) -> Result<(StatusCode, Json<SaveDetail>), ApiError> {
     let sb = app
         .store()
-        .get_storybook(&req.storybook_id)?
+        .get_storybook(&req.storybook_id)
+        .await?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "storybook_not_found", "故事书不存在"))?;
     let released = sb
         .released
@@ -399,10 +403,10 @@ async fn create_save(
             }
         }
     }
-    app.store().insert_save(&detail, false)?;
+    app.store().insert_save(&detail, false).await?;
     // 会话建立时再按 controlled_character_id 覆盖（见 session_for 的默认第一个 PC）
     if let Some(cid) = &req.controlled_character_id {
-        let session = app.session_for(&id)?;
+        let session = app.session_for(&id).await?;
         let _ = session.switch_character(cid);
     }
     detail.item.imported = Some(false);
@@ -415,7 +419,8 @@ async fn get_save(
 ) -> Result<Json<SaveDetail>, ApiError> {
     let save = app
         .store()
-        .get_save(&id)?
+        .get_save(&id)
+        .await?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "save_not_found", "存档不存在"))?;
     Ok(Json(save))
 }
@@ -435,7 +440,8 @@ async fn rename_save(
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "empty_title", "标题不能为空"));
     }
     app.store()
-        .rename_save(&id, title)?
+        .rename_save(&id, title)
+        .await?
         .map(Json)
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "save_not_found", "存档不存在"))
 }
@@ -444,7 +450,7 @@ async fn delete_save(
     State(app): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    if app.store().delete_save(&id)? {
+    if app.store().delete_save(&id).await? {
         app.drop_session(&id);
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -456,8 +462,8 @@ async fn get_state(
     State(app): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<octopus_types::WorldProjection>, ApiError> {
-    let session = app.session_for(&id)?;
-    app.store().touch_save(&id)?;
+    let session = app.session_for(&id).await?;
+    app.store().touch_save(&id).await?;
     Ok(Json(session.projection()))
 }
 
@@ -472,7 +478,7 @@ async fn get_history(
     Path(id): Path<String>,
     Query(q): Query<HistoryQuery>,
 ) -> Result<Json<HistoryPage>, ApiError> {
-    let session = app.session_for(&id)?;
+    let session = app.session_for(&id).await?;
     Ok(Json(session.history(q.before_seq, q.limit.unwrap_or(50).min(200))))
 }
 
@@ -481,7 +487,7 @@ async fn submit_round(
     Path(id): Path<String>,
     Json(req): Json<SubmitRoundRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let session = app.session_for(&id)?;
+    let session = app.session_for(&id).await?;
     let input = RoundInput { channel: req.channel, text: req.text };
     let request_id = req.request_id;
     let sid = id.clone();
@@ -499,7 +505,7 @@ async fn confirm_round(
     Path((id, _round_id)): Path<(String, u32)>,
     Json(req): Json<ConfirmRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let session = app.session_for(&id)?;
+    let session = app.session_for(&id).await?;
     session.confirm(&req.action_id, req.decision)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -508,7 +514,7 @@ async fn list_maintenance(
     State(app): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<MaintenanceRow>>, ApiError> {
-    Ok(Json(app.store().list_maintenance(&id)?))
+    Ok(Json(app.store().list_maintenance(&id).await?))
 }
 
 async fn get_settings(
@@ -517,7 +523,8 @@ async fn get_settings(
 ) -> Result<Json<SaveSettings>, ApiError> {
     let v = app
         .store()
-        .get_auto_confirm(&id)?
+        .get_auto_confirm(&id)
+        .await?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "save_not_found", "存档不存在"))?;
     Ok(Json(SaveSettings { auto_confirm: v }))
 }
@@ -527,8 +534,8 @@ async fn put_settings(
     Path(id): Path<String>,
     Json(body): Json<SaveSettings>,
 ) -> Result<Json<SaveSettings>, ApiError> {
-    app.store().set_auto_confirm(&id, body.auto_confirm)?;
-    if let Ok(session) = app.session_for(&id) {
+    app.store().set_auto_confirm(&id, body.auto_confirm).await?;
+    if let Ok(session) = app.session_for(&id).await {
         session.set_auto_confirm(body.auto_confirm);
     }
     Ok(Json(body))
@@ -544,7 +551,7 @@ async fn switch_character(
     Path(id): Path<String>,
     Json(body): Json<SwitchCharacterBody>,
 ) -> Result<StatusCode, ApiError> {
-    let session = app.session_for(&id)?;
+    let session = app.session_for(&id).await?;
     session.switch_character(&body.character_id)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -553,10 +560,11 @@ async fn manual_save(
     State(app): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<SaveListItem>, ApiError> {
-    app.store().touch_save(&id)?;
-    app.store().append_maintenance(&id, "手动存档", "快照已写入（保留 5 份）")?;
+    app.store().touch_save(&id).await?;
+    app.store().append_maintenance(&id, "手动存档", "快照已写入（保留 5 份）").await?;
     app.store()
-        .list_saves()?
+        .list_saves()
+        .await?
         .into_iter()
         .find(|s| s.id == id)
         .map(Json)
@@ -567,7 +575,7 @@ async fn new_origin(
     State(app): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    app.store().append_maintenance(&id, "压缩为新原点", "以当前状态为新起点；旧日志归档只读")?;
+    app.store().append_maintenance(&id, "压缩为新原点", "以当前状态为新起点；旧日志归档只读").await?;
     Ok(Json(json!({ "ok": true, "archived_count": 0 })))
 }
 
@@ -601,7 +609,7 @@ async fn stream(
     State(app): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    let _ = app.session_for(&id)?;
+    let _ = app.session_for(&id).await?;
     let tx = app
         .senders
         .lock()
@@ -627,7 +635,7 @@ mod tests {
     use serde_json::json;
 
     async fn spawn_app() -> (String, Arc<AppState>) {
-        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let store = Arc::new(SqliteStore::open_in_memory().await.unwrap());
         let ai = Arc::new(ScriptedProvider);
         let state = AppState::new(store, ai);
         let app = router(state.clone());

@@ -18,7 +18,7 @@ async fn main() {
     let db_path = std::env::var("OCTOPUS_DB").unwrap_or_else(|_| "octopus.db".to_string());
     let addr = std::env::var("OCTOPUS_ADDR").unwrap_or_else(|_| "127.0.0.1:8787".to_string());
 
-    let store = Arc::new(SqliteStore::open(&db_path).expect("打开单库失败"));
+    let store = Arc::new(SqliteStore::open(&db_path).await.expect("打开单库失败"));
     let ai = Arc::new(ScriptedProvider);
     let app = router(AppState::new(store, ai));
 

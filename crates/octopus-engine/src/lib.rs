@@ -3,6 +3,7 @@
 //! 依赖纪律（#20 ②）：`state`、`rng` 为叶子；`command`/`session` 为编排；
 //! `storage` 为适配层；外部 IO 与 LLM 一律走 `ports`。
 
+pub mod entities;
 pub mod error;
 pub mod ports;
 pub mod rng;

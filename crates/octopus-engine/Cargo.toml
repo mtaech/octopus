@@ -11,6 +11,6 @@ uuid = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
-rusqlite = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
+sea-orm = { workspace = true }
