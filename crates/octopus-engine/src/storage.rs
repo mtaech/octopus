@@ -3,13 +3,13 @@
 
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, Database, DatabaseConnection,
-    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Schema, Set,
-    TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Database, DatabaseConnection, EntityTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use serde_json::Value;
 
 use octopus_types::{MaintenanceRow, SaveDetail, SaveListItem};
+use migration::{Migrator, MigratorTrait};
 
 use crate::{entities, error::EngineError, seed::seed_storybooks};
 
@@ -53,7 +53,7 @@ impl SqliteStore {
         let mut opt = sea_orm::ConnectOptions::new(url);
         opt.max_connections(5);
         let db = Database::connect(opt).await?;
-        Self::auto_create_tables(&db).await?;
+        Self::run_migrations(&db).await?;
         let store = Self { db };
         store.seed_if_empty().await?;
         Ok(store)
@@ -64,7 +64,7 @@ impl SqliteStore {
         let mut opt = sea_orm::ConnectOptions::new("sqlite::memory:?cache=shared");
         opt.max_connections(1);
         let db = Database::connect(opt).await?;
-        Self::auto_create_tables(&db).await?;
+        Self::run_migrations(&db).await?;
         let store = Self { db };
         store.seed_if_empty().await?;
         Ok(store)
@@ -74,32 +74,13 @@ impl SqliteStore {
         &self.db
     }
 
-    pub async fn auto_create_tables(db: &DatabaseConnection) -> Result<(), EngineError> {
-        let backend = db.get_database_backend();
-        let schema = Schema::new(backend);
-
-        let tables = vec![
-            schema.create_table_from_entity(entities::storybook::Entity).if_not_exists().to_owned(),
-            schema.create_table_from_entity(entities::save::Entity).if_not_exists().to_owned(),
-            schema.create_table_from_entity(entities::command::Entity).if_not_exists().to_owned(),
-            schema.create_table_from_entity(entities::archived_command::Entity).if_not_exists().to_owned(),
-            schema.create_table_from_entity(entities::maintenance::Entity).if_not_exists().to_owned(),
-        ];
-
-        for stmt in tables {
-            db.execute(backend.build(&stmt)).await?;
-        }
-
-        let idx_stmt = sea_orm::sea_query::Index::create()
-            .name("idx_commands_save_seq")
-            .table(entities::command::Entity)
-            .col(entities::command::Column::SaveId)
-            .col(entities::command::Column::Seq)
-            .if_not_exists()
-            .to_owned();
-        db.execute(backend.build(&idx_stmt)).await?;
-
+    pub async fn run_migrations(db: &DatabaseConnection) -> Result<(), EngineError> {
+        Migrator::up(db, None).await?;
         Ok(())
+    }
+
+    pub async fn auto_create_tables(db: &DatabaseConnection) -> Result<(), EngineError> {
+        Self::run_migrations(db).await
     }
 
     async fn seed_if_empty(&self) -> Result<(), EngineError> {

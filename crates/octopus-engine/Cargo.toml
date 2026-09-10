@@ -14,3 +14,4 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 sea-orm = { workspace = true }
+migration = { path = "../../migration" }
