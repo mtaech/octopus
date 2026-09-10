@@ -55,11 +55,18 @@ const countOf = (key: string): number => {
 <template>
   <div class="flex h-full min-h-0 flex-col">
     <Tabs v-model="active" class="flex min-h-0 flex-1 flex-col">
-      <TabsList variant="line" class="h-10 w-full shrink-0 justify-start overflow-x-auto rounded-none border-b border-border px-2.5">
-        <TabsTrigger v-for="t in A_TABS" :key="t.key" :value="t.key" class="h-10 flex-none gap-1.5 rounded-none px-3 text-[13px]">
-          <component :is="t.icon" />
+      <TabsList variant="line" class="h-11 w-full shrink-0 justify-start overflow-x-auto rounded-none border-b border-border/80 bg-card/40 px-3 py-0 backdrop-blur-xs">
+        <TabsTrigger
+          v-for="t in A_TABS"
+          :key="t.key"
+          :value="t.key"
+          class="group h-11 flex-none gap-2 rounded-none px-3.5 text-[13px] font-medium transition-colors"
+        >
+          <component :is="t.icon" class="size-4 shrink-0 transition-transform group-hover:scale-110" />
           <span>{{ t.label }}</span>
-          <span class="text-[10px] font-normal text-muted-foreground/70">{{ countOf(t.key) }}</span>
+          <span class="rounded-full bg-muted/60 px-1.5 py-0.5 text-[10.5px] font-mono font-normal text-muted-foreground/80 transition-colors group-data-[state=active]:bg-primary/20 group-data-[state=active]:text-primary">
+            {{ countOf(t.key) }}
+          </span>
         </TabsTrigger>
       </TabsList>
 

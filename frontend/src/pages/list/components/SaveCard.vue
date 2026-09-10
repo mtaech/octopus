@@ -8,7 +8,7 @@ import { relativeTime } from '../utils/relativeTime'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Card } from '@/components/ui/card'
-import { IconBook2, IconPlayerPlay, IconSparkles } from '@tabler/icons-vue'
+import { IconBook2, IconClock, IconPlayerPlay, IconSparkles } from '@tabler/icons-vue'
 
 const props = defineProps<{ save: SaveListItem }>()
 defineEmits<{ (e: 'resume', saveId: string): void }>()
@@ -23,40 +23,48 @@ const tint = computed(() => {
 </script>
 
 <template>
-  <Card class="group flex-row items-center gap-0 overflow-hidden rounded-xl border-border/80 p-0 transition-all duration-300 hover:-translate-y-0.5 hover:border-primary/40 hover:shadow-[0_10px_30px_-8px_rgba(0,0,0,0.55)]">
+  <Card class="group flex-row items-center gap-0 overflow-hidden rounded-xl border-border/75 bg-card/80 p-0 backdrop-blur-sm transition-all duration-300 hover:-translate-y-0.5 hover:border-primary/50 hover:bg-card hover:shadow-[0_12px_32px_-8px_rgba(0,0,0,0.65)]">
     <!-- 左侧色带 -->
-    <div aria-hidden="true" class="w-1 flex-none self-stretch" :style="{ background: tint }" />
+    <div aria-hidden="true" class="w-1.5 flex-none self-stretch transition-all duration-300 group-hover:w-2" :style="{ background: tint }" />
     <!-- 内容列 -->
-    <div class="min-w-0 flex-1 px-5 py-4">
+    <div class="min-w-0 flex-1 px-5 py-3.5">
       <div class="flex flex-wrap items-center gap-2">
-        <h3 class="truncate font-serif text-[15px] font-semibold text-card-foreground" :title="save.title">
+        <h3 class="truncate font-serif text-[15.5px] font-semibold text-card-foreground transition-colors group-hover:text-primary" :title="save.title">
           {{ save.title }}
         </h3>
-        <Badge v-if="save.imported" class="gap-1 border-success/40 bg-success/10 text-success">
+        <Badge v-if="save.imported" class="gap-1 border-success/40 bg-success/10 text-success text-[11px]">
           <IconSparkles aria-hidden="true" class="size-3" />
           新导入
         </Badge>
-        <Badge v-if="save.needs_upgrade" class="gap-1 border-warning/40 bg-warning/10 text-warning">
+        <Badge v-if="save.needs_upgrade" class="gap-1 border-warning/40 bg-warning/10 text-warning text-[11px]">
           新版次待升级
         </Badge>
       </div>
-      <p class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
-        <span class="inline-flex items-center gap-1.5">
+      <p class="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+        <span class="inline-flex items-center gap-1.5 text-muted-foreground/90">
           <IconBook2 aria-hidden="true" class="size-3.5 text-muted-foreground/60" />
           {{ save.storybook_title }}
         </span>
-        <span class="text-muted-foreground/50">·</span>
-        <span>
-          版次 {{ save.embedded_revision }}<template v-if="save.needs_upgrade"> → <span class="text-warning">{{ save.latest_revision }}</span></template>
+        <span class="text-muted-foreground/40">·</span>
+        <span class="font-mono">
+          版次 {{ save.embedded_revision }}<template v-if="save.needs_upgrade"> → <span class="text-warning font-semibold">{{ save.latest_revision }}</span></template>
         </span>
-        <span class="text-muted-foreground/50">·</span>
-        <span>{{ relativeTime(save.last_played_at) }}</span>
+        <span class="text-muted-foreground/40">·</span>
+        <span class="inline-flex items-center gap-1">
+          <IconClock aria-hidden="true" class="size-3 text-muted-foreground/60" />
+          {{ relativeTime(save.last_played_at) }}
+        </span>
       </p>
     </div>
     <!-- 操作列 -->
-    <div class="flex-none py-4 pr-5">
-      <Button size="sm" class="transition-all duration-300 group-hover:bg-primary group-hover:text-primary-foreground" variant="outline" @click="$emit('resume', save.id)">
-        <IconPlayerPlay data-icon="inline-start" />
+    <div class="flex-none py-3.5 pr-5">
+      <Button
+        size="sm"
+        class="gap-1.5 font-medium transition-all duration-300 group-hover:bg-primary group-hover:text-primary-foreground group-hover:shadow-md group-hover:shadow-primary/20"
+        variant="outline"
+        @click="$emit('resume', save.id)"
+      >
+        <IconPlayerPlay data-icon="inline-start" class="size-3.5" />
         继续游玩
       </Button>
     </div>

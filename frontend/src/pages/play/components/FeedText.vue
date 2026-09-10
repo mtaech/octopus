@@ -30,35 +30,46 @@ function onTap() {
     <!-- dialogue：演员头像 + 气泡（B 模板自带说话人列时隐藏名字） -->
     <template v-if="entry.type === 'dialogue'">
       <div v-if="showSpeaker" class="mb-1 ml-1 flex items-center gap-2">
-        <Avatar size="sm" style="width:20px;height:20px">
+        <Avatar size="sm" class="size-5 ring-1 ring-border/80">
           <AvatarFallback class="text-[9px] font-extrabold" :class="tint">{{ entry.actorName ? initial(entry.actorName) : '?' }}</AvatarFallback>
         </Avatar>
-        <span class="text-[11.5px] font-bold text-muted-foreground">{{ entry.actorName ?? '角色' }}</span>
+        <span class="text-[12px] font-semibold text-foreground/90">{{ entry.actorName ?? '角色' }}</span>
       </div>
       <button
-        class="text-foreground bg-secondary hover:bg-secondary/70 cursor-pointer self-start max-w-[78%] rounded-2xl border-l-[3px] px-3.5 py-2.5 text-left text-[14px] leading-relaxed"
-        :class="[bubbleAccent, { 'outline-dashed outline-1 -outline-offset-1 outline-info/40': isStreaming }]"
+        type="button"
+        class="text-foreground bg-card/90 hover:bg-card/100 cursor-pointer self-start max-w-[82%] rounded-2xl rounded-tl-xs border border-border/75 border-l-[3.5px] px-4 py-2.5 text-left text-[14px] leading-relaxed shadow-xs transition-colors backdrop-blur-xs"
+        :class="[bubbleAccent, { 'ring-1 ring-primary/40': isStreaming }]"
         @click="onTap"
       >
-        <span v-if="isStreaming" class="text-primary animate-pulse">▎</span>{{ shown }}
-        <span v-if="isStreaming" class="ml-2 text-[10px] text-muted-foreground/60">点击跳过</span>
+        <span>{{ shown }}</span>
+        <span v-if="isStreaming" class="ml-1 inline-block text-primary font-bold animate-pulse">▎</span>
+        <span v-if="isStreaming" class="ml-2 text-[10px] text-muted-foreground/50 tracking-wider">点击快进</span>
       </button>
     </template>
+
     <!-- narrate：旁白窄行（A 居中窄行 / B 纸面段左对齐） -->
     <button
       v-else-if="entry.type === 'narrate'"
-      class="text-muted-foreground cursor-pointer self-center max-w-[86%] px-1.5 py-0.5 text-center text-[13.5px] italic leading-relaxed"
-      :class="{ '!self-stretch !max-w-none !text-left !not-italic': !showSpeaker, 'outline-dashed outline-1 -outline-offset-1 outline-info/40': isStreaming }"
+      type="button"
+      class="text-muted-foreground/90 cursor-pointer self-center max-w-[88%] px-3 py-1.5 text-center font-serif text-[14px] italic leading-relaxed tracking-wide transition-colors hover:text-foreground"
+      :class="{ '!self-stretch !max-w-none !text-left !not-italic font-sans': !showSpeaker, 'ring-1 ring-primary/30 rounded-lg': isStreaming }"
       @click="onTap"
-    >{{ shown }}<span v-if="isStreaming" class="text-primary animate-pulse">▎</span></button>
+    >
+      <span>{{ shown }}</span>
+      <span v-if="isStreaming" class="ml-1 inline-block text-primary font-bold animate-pulse">▎</span>
+    </button>
+
     <!-- emote：斜体神态行 -->
     <button
       v-else
-      class="text-warning cursor-pointer self-center max-w-[86%] px-1.5 py-0.5 text-center text-[13.5px] italic leading-relaxed"
-      :class="{ '!self-stretch !max-w-none !text-left': !showSpeaker, 'outline-dashed outline-1 -outline-offset-1 outline-info/40': isStreaming }"
+      type="button"
+      class="text-warning/90 cursor-pointer self-center max-w-[88%] px-3 py-1.5 text-center font-serif text-[13.5px] italic leading-relaxed transition-colors hover:text-warning"
+      :class="{ '!self-stretch !max-w-none !text-left font-sans': !showSpeaker, 'ring-1 ring-warning/30 rounded-lg': isStreaming }"
       @click="onTap"
     >
-      <span v-if="entry.emotion" class="text-warning/80 mr-1.5 inline-flex items-center rounded-full border border-warning/40 px-1.5 text-[10.5px] not-italic">{{ entry.emotion }}</span>{{ shown }}<span v-if="isStreaming" class="text-primary animate-pulse">▎</span>
+      <span v-if="entry.emotion" class="text-warning/80 mr-1.5 inline-flex items-center rounded-full border border-warning/40 bg-warning/10 px-2 py-0.2 text-[10.5px] not-italic font-sans">{{ entry.emotion }}</span>
+      <span>{{ shown }}</span>
+      <span v-if="isStreaming" class="ml-1 inline-block text-primary font-bold animate-pulse">▎</span>
     </button>
   </div>
 </template>

@@ -3,6 +3,7 @@
 import { computed } from 'vue'
 import { usePlayStore } from '../stores/play'
 import ActorCard from './ActorCard.vue'
+import { IconUsers } from '@tabler/icons-vue'
 
 const store = usePlayStore()
 const controlledId = computed(() => store.controlledId)
@@ -15,10 +16,13 @@ function onSwitch(id: string) { void store.switchTo(id) }
 </script>
 
 <template>
-  <aside class="w-[264px] shrink-0 overflow-y-auto border-l border-border bg-card p-3">
-    <div class="mb-2.5 flex items-center gap-1.5">
-      <span class="text-xs font-extrabold tracking-widest text-muted-foreground">在场角色</span>
-      <span class="rounded-full border border-border bg-muted px-1.5 text-[10.5px]">{{ panelActors.length }}</span>
+  <aside class="w-[280px] shrink-0 overflow-y-auto border-l border-border/80 bg-card/50 p-3 backdrop-blur-sm">
+    <div class="mb-3 flex items-center justify-between px-0.5">
+      <div class="flex items-center gap-1.5 text-[11px] font-extrabold tracking-[1.5px] text-muted-foreground uppercase">
+        <IconUsers class="size-3.5 text-primary" />
+        <span>在场角色</span>
+      </div>
+      <span class="font-mono rounded-full border border-border/80 bg-muted/60 px-2 py-0.5 text-[10.5px] font-bold text-muted-foreground">{{ panelActors.length }}</span>
     </div>
     <div class="flex flex-col gap-2.5">
       <ActorCard

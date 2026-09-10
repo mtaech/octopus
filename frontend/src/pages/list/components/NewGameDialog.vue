@@ -14,7 +14,7 @@ import {
 import {
   Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select'
-import { IconBook2, IconPlayerPlay, IconSparkles } from '@tabler/icons-vue'
+import { IconBook2, IconLoader2, IconPlayerPlay, IconSparkles, IconUser } from '@tabler/icons-vue'
 
 const props = defineProps<{
   open: boolean
@@ -76,71 +76,86 @@ function confirm() {
 
 <template>
   <Dialog :open="open" @update:open="(v: boolean) => close()">
-    <DialogContent class="sm:max-w-md" :show-close-button="!busy">
+    <DialogContent class="sm:max-w-md border-border/80 bg-card/95 backdrop-blur-md" :show-close-button="!busy">
       <DialogHeader>
-        <DialogTitle class="flex items-center gap-2 font-serif text-xl">
-          <IconSparkles aria-hidden="true" class="size-5 text-primary" />
+        <DialogTitle class="flex items-center gap-2 font-serif text-xl text-foreground">
+          <div class="flex size-7 items-center justify-center rounded-lg bg-primary/15 text-primary border border-primary/25">
+            <IconSparkles aria-hidden="true" class="size-4" />
+          </div>
           新建游戏
         </DialogTitle>
-        <DialogDescription>
+        <DialogDescription class="text-xs text-muted-foreground/85">
           基于一本已发布故事书的当前版次开档，进入后即开始游玩。
         </DialogDescription>
       </DialogHeader>
 
       <template v-if="storybooks.length">
-        <div class="flex flex-col gap-2">
-          <Label for="ng-sb" class="text-xs font-semibold text-muted-foreground">故事书</Label>
-          <Select :model-value="selectedId" :disabled="busy" @update:model-value="(value) => { if (typeof value === 'string') { selectedId = value; pickStorybook() } }">
-            <SelectTrigger id="ng-sb" class="w-full">
-              <SelectValue placeholder="选择一本已发布故事书" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectGroup>
-                <SelectItem v-for="sb in storybooks" :key="sb.id" :value="sb.id">
-                  <span class="inline-flex items-center gap-2">
-                    <IconBook2 aria-hidden="true" class="size-4 text-muted-foreground" />
-                    {{ sb.title }}
-                    <span class="text-muted-foreground">· 版次 {{ sb.revision }}</span>
-                  </span>
-                </SelectItem>
-              </SelectGroup>
-            </SelectContent>
-          </Select>
-        </div>
+        <div class="flex flex-col gap-4 py-1">
+          <div class="flex flex-col gap-2">
+            <Label for="ng-sb" class="text-xs font-semibold text-muted-foreground">故事书设定</Label>
+            <Select :model-value="selectedId" :disabled="busy" @update:model-value="(value) => { if (typeof value === 'string') { selectedId = value; pickStorybook() } }">
+              <SelectTrigger id="ng-sb" class="w-full">
+                <SelectValue placeholder="选择一本已发布故事书" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  <SelectItem v-for="sb in storybooks" :key="sb.id" :value="sb.id">
+                    <span class="inline-flex items-center gap-2">
+                      <IconBook2 aria-hidden="true" class="size-4 text-primary/80" />
+                      {{ sb.title }}
+                      <span class="text-xs text-muted-foreground font-mono">· rev {{ sb.revision }}</span>
+                    </span>
+                  </SelectItem>
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+            <p v-if="selectedBook?.description" class="text-[11.5px] text-muted-foreground/75 line-clamp-1 pl-0.5">
+              {{ selectedBook.description }}
+            </p>
+          </div>
 
-        <div class="flex flex-col gap-2">
-          <Label for="ng-name" class="text-xs font-semibold text-muted-foreground">存档名称（可改）</Label>
-          <Input
-            id="ng-name"
-            v-model="name"
-            type="text"
-            :placeholder="selectedBook?.title ?? '给这次冒险起个名字'"
-            :disabled="busy"
-            @keyup.enter="confirm"
-          />
-        </div>
+          <div class="flex flex-col gap-2">
+            <Label for="ng-name" class="text-xs font-semibold text-muted-foreground">存档名称</Label>
+            <Input
+              id="ng-name"
+              v-model="name"
+              type="text"
+              :placeholder="selectedBook?.title ?? '给这次冒险起个名字'"
+              :disabled="busy"
+              @keyup.enter="confirm"
+            />
+          </div>
 
-        <div v-if="pcs.length" class="flex flex-col gap-2">
-          <Label for="ng-pc" class="text-xs font-semibold text-muted-foreground">主角（受控角色）</Label>
-          <Select :model-value="controlledId" :disabled="busy" @update:model-value="(value) => { if (typeof value === 'string') controlledId = value }">
-            <SelectTrigger id="ng-pc" class="w-full">
-              <SelectValue placeholder="选择一位主角" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectGroup>
-                <SelectItem v-for="pc in pcs" :key="pc.id" :value="pc.id">{{ pc.name }}</SelectItem>
-              </SelectGroup>
-            </SelectContent>
-          </Select>
-          <p class="text-[11px] text-muted-foreground/70">进入游戏后也可随时切换受控角色。</p>
+          <div v-if="pcs.length" class="flex flex-col gap-2">
+            <div class="flex items-center justify-between">
+              <Label for="ng-pc" class="text-xs font-semibold text-muted-foreground">主角（受控角色）</Label>
+              <span class="text-[11px] text-muted-foreground/70">游戏中可随时切换</span>
+            </div>
+            <Select :model-value="controlledId" :disabled="busy" @update:model-value="(value) => { if (typeof value === 'string') controlledId = value }">
+              <SelectTrigger id="ng-pc" class="w-full">
+                <SelectValue placeholder="选择一位主角" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  <SelectItem v-for="pc in pcs" :key="pc.id" :value="pc.id">
+                    <span class="inline-flex items-center gap-2">
+                      <IconUser aria-hidden="true" class="size-3.5 text-muted-foreground" />
+                      {{ pc.name }}
+                    </span>
+                  </SelectItem>
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+          </div>
         </div>
       </template>
 
-      <DialogFooter class="gap-2 sm:justify-end">
+      <DialogFooter class="gap-2 sm:justify-end pt-2">
         <Button variant="ghost" :disabled="busy" @click="close">取消</Button>
-        <Button :disabled="busy || !selectedBook" @click="confirm">
-          <IconPlayerPlay data-icon="inline-start" />
-          {{ busy ? '开档中…' : '开档并进入游玩' }}
+        <Button :disabled="busy || !selectedBook" class="shadow-sm transition-all" @click="confirm">
+          <IconLoader2 v-if="busy" data-icon="inline-start" class="size-4 animate-spin" />
+          <IconPlayerPlay v-else data-icon="inline-start" class="size-4" />
+          {{ busy ? '开档中…' : '开档并开始游玩' }}
         </Button>
       </DialogFooter>
     </DialogContent>

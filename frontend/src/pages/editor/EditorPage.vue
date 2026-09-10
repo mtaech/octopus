@@ -14,7 +14,17 @@ import ValidationDock from './components/refs/ValidationDock.vue'
 import { Button } from '@/components/ui/button'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Badge } from '@/components/ui/badge'
-import { IconArrowLeft, IconX, IconCircleDot, IconRocket } from '@tabler/icons-vue'
+import {
+  IconArrowLeft,
+  IconX,
+  IconCircleDot,
+  IconRocket,
+  IconCheck,
+  IconLoader2,
+  IconLayoutGrid,
+  IconSparkles,
+  IconFileText,
+} from '@tabler/icons-vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -31,6 +41,12 @@ const paradigmModel = computed<Paradigm>({
   set: (v: Paradigm) => editor.setParadigm(v),
 })
 const showIntro = computed(() => isNew.value && booted.value && pair.showWelcome() && editor.paradigm === 'C')
+
+const paradigmIcons: Record<Paradigm, any> = {
+  A: IconLayoutGrid,
+  C: IconSparkles,
+  B: IconFileText,
+}
 
 // 保存态文案
 const saveLabel = computed(() => {
@@ -89,44 +105,67 @@ onUnmounted(() => {
 <template>
   <div class="flex h-full min-h-0 flex-col bg-background">
     <!-- ============ 应用顶栏 ============ -->
-    <header class="flex h-12 flex-none items-center gap-3 border-b border-border bg-card/60 px-3">
-      <Button variant="ghost" size="sm" class="gap-1 text-muted-foreground" @click="goBack">
-        <IconArrowLeft data-icon="inline-start" />
-        列表
+    <header class="flex h-13 flex-none items-center gap-3 border-b border-border/80 bg-card/85 px-3.5 backdrop-blur-md">
+      <Button variant="ghost" size="sm" class="gap-1.5 text-xs text-muted-foreground hover:text-foreground" @click="goBack">
+        <IconArrowLeft data-icon="inline-start" class="size-4" />
+        <span class="font-medium">故事书列表</span>
       </Button>
 
-      <div class="flex min-w-0 items-center gap-2">
-        <span class="truncate text-sm font-bold text-foreground">{{ editor.draft?.meta.title ?? '…' }}</span>
-        <IconCircleDot v-if="editor.dirty" class="size-2.5 shrink-0 text-warning" title="有未保存改动" />
-        <Badge v-if="isNew" variant="outline" class="border-warning/40 text-[10px] text-warning">新草稿</Badge>
-        <Badge v-if="editor.published" variant="outline" class="border-success/40 text-[10px] text-success">rev {{ editor.revision }}</Badge>
-        <Badge v-else-if="editor.draft" variant="secondary" class="text-[10px]">未发布 · rev {{ editor.revision }}</Badge>
+      <div class="h-4 w-px bg-border/60" />
+
+      <div class="flex min-w-0 items-center gap-2.5">
+        <span class="truncate font-serif text-[15px] font-bold tracking-wide text-foreground" :title="editor.draft?.meta.title ?? ''">
+          {{ editor.draft?.meta.title ?? '加载中…' }}
+        </span>
+        <span v-if="editor.dirty" class="inline-flex items-center gap-1 text-[11px] font-semibold text-warning" title="有未保存改动">
+          <span class="size-2 rounded-full bg-warning animate-pulse shadow-[0_0_8px_var(--warning)]" />
+        </span>
+        <Badge v-if="isNew" variant="outline" class="border-warning/45 bg-warning/10 text-[10.5px] text-warning">新草稿</Badge>
+        <Badge v-if="editor.published" variant="outline" class="border-success/45 bg-success/10 font-mono text-[10.5px] text-success">rev {{ editor.revision }}</Badge>
+        <Badge v-else-if="editor.draft" variant="secondary" class="font-mono text-[10.5px] text-muted-foreground">未发布 · rev {{ editor.revision }}</Badge>
       </div>
 
-      <span class="hidden text-xs whitespace-nowrap text-muted-foreground/60 lg:inline">{{ saveLabel }}</span>
+      <!-- 自动保存状态指示 -->
+      <div class="hidden items-center gap-1.5 pl-2 text-xs text-muted-foreground/75 lg:inline-flex">
+        <IconLoader2 v-if="editor.saving" class="size-3.5 animate-spin text-primary" />
+        <IconCircleDot v-else-if="editor.dirty" class="size-3 text-warning" />
+        <IconCheck v-else class="size-3.5 text-success/80" />
+        <span>{{ saveLabel }}</span>
+      </div>
 
       <!-- 范式切换（A / C / B 视图态按钮组） -->
       <nav class="ml-auto flex items-center" aria-label="编辑范式">
         <Tabs :model-value="paradigmModel" @update:model-value="paradigmModel = ($event as Paradigm)">
-          <TabsList class="gap-1 border border-border/60 bg-background/60 p-0.5">
-            <TabsTrigger v-for="p in PARADIGMS" :key="p.key" :value="p.key" class="h-7 rounded-md px-3 text-xs" :title="p.label + '：' + p.hint">
-              {{ p.short }}
+          <TabsList class="h-8 gap-0.5 rounded-lg border border-border/80 bg-background/80 p-0.5 shadow-inner">
+            <TabsTrigger
+              v-for="p in PARADIGMS"
+              :key="p.key"
+              :value="p.key"
+              class="h-7 gap-1.5 rounded-md px-3 text-xs font-medium transition-all"
+              :title="p.label + '：' + p.hint"
+            >
+              <component :is="paradigmIcons[p.key]" class="size-3.5" />
+              <span>{{ p.label }}</span>
             </TabsTrigger>
           </TabsList>
         </Tabs>
       </nav>
 
+      <div class="h-4 w-px bg-border/60" />
+
+      <!-- 发布按钮 -->
       <Button
-        variant="default"
         size="sm"
         :disabled="errorCount > 0 || editor.publishing"
         :title="pubBlockMsg || '发布当前草稿为新版次'"
-        class="gap-1.5"
+        class="gap-1.5 font-semibold transition-all duration-200"
+        :class="errorCount === 0 && !editor.publishing ? 'bg-gradient-to-r from-primary to-amber-500 hover:from-amber-500 hover:to-primary text-primary-foreground shadow-sm shadow-primary/30 hover:shadow-md hover:shadow-primary/40' : ''"
         @click="onPublish"
       >
-        <IconRocket data-icon="inline-start" />
+        <IconLoader2 v-if="editor.publishing" class="size-4 animate-spin" />
+        <IconRocket v-else data-icon="inline-start" class="size-4" />
         <span v-if="editor.publishing">发布中…</span>
-        <template v-else>发布{{ editor.dirty ? ' ●' : '' }}</template>
+        <template v-else>发布新版次{{ editor.dirty ? ' ●' : '' }}</template>
       </Button>
     </header>
 

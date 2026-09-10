@@ -37,46 +37,56 @@ const tint = computed(() => {
 </script>
 
 <template>
-  <Card class="group relative gap-0 overflow-hidden rounded-2xl border-border/80 p-0 pl-4 transition-all duration-300 hover:-translate-y-1 hover:border-primary/40 hover:shadow-[0_14px_40px_-10px_rgba(0,0,0,0.65)]">
-    <!-- 左侧书脊色带：绝对定位钉在卡片左缘，不受内部布局影响 -->
+  <Card class="group relative gap-0 overflow-hidden rounded-2xl border-border/75 bg-card/90 p-0 pl-4 backdrop-blur-sm transition-all duration-300 hover:-translate-y-1 hover:border-primary/50 hover:bg-card hover:shadow-[0_16px_40px_-10px_rgba(0,0,0,0.75)] focus-within:ring-2 focus-within:ring-ring/50">
+    <!-- 左侧精装书脊色带：带微光与渐变 -->
     <div
       aria-hidden="true"
-      class="absolute top-0 bottom-0 left-0 w-1.5 rounded-l-2xl"
+      class="absolute top-0 bottom-0 left-0 w-2 rounded-l-2xl transition-all duration-300 group-hover:w-2.5"
       :style="{ background: `linear-gradient(180deg, ${tint.from}, ${tint.to})` }"
     />
 
+    <!-- 卡片内层微光边框 -->
+    <div aria-hidden="true" class="pointer-events-none absolute inset-0 rounded-2xl ring-1 ring-inset ring-white/[0.04]" />
+
     <CardHeader class="gap-2.5 px-5 pt-5 pb-3">
-      <div class="flex items-start gap-3">
+      <div class="flex items-start gap-3.5">
+        <!-- 典籍首字印鉴 -->
         <span
           aria-hidden="true"
-          class="inline-flex size-9 flex-none items-center justify-center rounded-lg font-serif text-lg font-bold text-white/90 shadow-inner"
+          class="inline-flex size-10 flex-none items-center justify-center rounded-xl font-serif text-lg font-bold text-white shadow-md ring-1 ring-white/10 transition-transform duration-300 group-hover:scale-105"
           :style="{ background: `linear-gradient(135deg, ${tint.from}, ${tint.to})` }"
         >
           {{ glyph }}
         </span>
-        <CardTitle class="min-w-0 flex-1 truncate pt-1 font-serif text-[17px] leading-snug font-semibold tracking-wide" :title="storybook.title">
-          {{ storybook.title }}
-        </CardTitle>
+        <div class="min-w-0 flex-1 pt-0.5">
+          <CardTitle class="truncate font-serif text-[17.5px] leading-snug font-semibold tracking-wide text-foreground transition-colors group-hover:text-primary" :title="storybook.title">
+            {{ storybook.title }}
+          </CardTitle>
+          <div class="mt-1 flex items-center gap-2 text-xs text-muted-foreground">
+            <span class="inline-flex items-center gap-1">
+              <span class="size-1.5 rounded-full bg-success/80 shadow-[0_0_6px_var(--success)]" />
+              已发布
+            </span>
+            <span class="text-muted-foreground/40">·</span>
+            <span>版次 {{ storybook.revision }}</span>
+          </div>
+        </div>
       </div>
-      <p v-if="storybook.description" class="line-clamp-2 pl-12 text-[13px] leading-relaxed text-muted-foreground">
+      <p v-if="storybook.description" class="line-clamp-2 pl-[3.35rem] text-[13px] leading-relaxed text-muted-foreground/85">
         {{ storybook.description }}
       </p>
     </CardHeader>
 
-    <div class="flex items-center justify-between gap-3 px-5 pt-1 pb-5 pl-12">
-      <div class="flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs text-muted-foreground">
-        <Badge class="gap-1 border-success/40 bg-success/10 text-success">
-          <IconCircleCheck aria-hidden="true" class="size-3" />
-          已发布
-        </Badge>
-        <span>版次 {{ storybook.revision }}</span>
-      </div>
+    <div class="flex items-center justify-between gap-3 px-5 pt-1.5 pb-5 pl-[3.35rem]">
+      <Badge variant="outline" class="gap-1 border-border/70 bg-muted/40 font-mono text-[11px] text-muted-foreground/75">
+        rev {{ storybook.revision }}
+      </Badge>
       <CardFooter class="gap-2 p-0">
-        <Button size="sm" @click="$emit('new-game', storybook.id)">
+        <Button size="sm" class="font-medium shadow-sm transition-all duration-200 group-hover:shadow-primary/20" @click="$emit('new-game', storybook.id)">
           <IconBook2 data-icon="inline-start" />
           新建游戏
         </Button>
-        <Button size="sm" variant="ghost" class="text-muted-foreground hover:text-foreground" @click="$emit('edit', storybook.id)">
+        <Button size="sm" variant="ghost" class="text-muted-foreground hover:bg-accent/70 hover:text-foreground" @click="$emit('edit', storybook.id)">
           <IconPencil data-icon="inline-start" />
           进编辑器
         </Button>

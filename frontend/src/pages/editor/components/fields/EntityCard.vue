@@ -24,32 +24,34 @@ const badgeCls = props.tone === 'ok' ? 'text-success border-success/40' : props.
 </script>
 
 <template>
-  <Card class="gap-0 rounded-lg border-border/60 py-0 shadow-none ring-0">
-    <header class="flex items-center gap-2.5 px-3.5 py-2">
-      <component :is="icon" v-if="icon" class="size-4 shrink-0 text-primary/90" />
+  <Card class="gap-0 overflow-hidden rounded-xl border border-border/75 bg-card/75 py-0 shadow-xs backdrop-blur-xs transition-all duration-200 hover:border-border">
+    <header class="flex items-center gap-2.5 px-4 py-2.5 bg-muted/25 border-b border-border/40">
+      <div v-if="icon" class="flex size-7 items-center justify-center rounded-lg bg-primary/10 text-primary border border-primary/20 shrink-0">
+        <component :is="icon" class="size-3.5" />
+      </div>
       <div class="min-w-0 flex-1">
         <div class="truncate text-[13.5px] leading-5 font-semibold text-foreground">{{ title }}</div>
-        <div v-if="sub" class="truncate text-[11px] leading-4 text-muted-foreground/70">{{ sub }}</div>
+        <div v-if="sub" class="truncate text-[11px] leading-4 text-muted-foreground/75">{{ sub }}</div>
       </div>
-      <Badge v-if="meta" variant="outline" class="shrink-0 border-border/60 text-[11px] font-normal" :class="badgeCls">{{ meta }}</Badge>
-      <div class="flex shrink-0 items-center gap-0.5">
-        <Button v-if="hasBody" variant="ghost" size="sm" class="h-6 px-2 text-xs font-normal text-muted-foreground" @click="collapsed = !collapsed">
-          <component :is="collapsed ? IconChevronDown : IconChevronUp" data-icon="inline-start" />
+      <Badge v-if="meta" variant="outline" class="shrink-0 border-border/70 text-[11px] font-normal" :class="badgeCls">{{ meta }}</Badge>
+      <div class="flex shrink-0 items-center gap-1">
+        <Button v-if="hasBody" variant="ghost" size="sm" class="h-6 px-2 text-xs font-normal text-muted-foreground hover:text-foreground" @click="collapsed = !collapsed">
+          <component :is="collapsed ? IconChevronDown : IconChevronUp" data-icon="inline-start" class="size-3.5" />
           {{ collapsed ? '展开' : '收起' }}
         </Button>
         <Button
           variant="ghost"
-          size="icon-sm"
-          class="size-7 text-destructive hover:bg-destructive/10 hover:text-destructive"
+          size="icon-xs"
+          class="size-6 text-muted-foreground/60 hover:bg-destructive/10 hover:text-destructive transition-colors"
           title="删除"
-          aria-label="删除 {{ title }}"
+          :aria-label="'删除 ' + title"
           @click="emit('remove')"
         >
-          <IconTrash />
+          <IconTrash class="size-3.5" />
         </Button>
       </div>
     </header>
-    <div v-show="!collapsed" class="px-2.5 pb-2.5">
+    <div v-show="!collapsed" class="px-4 py-3 space-y-2.5">
       <slot />
     </div>
   </Card>

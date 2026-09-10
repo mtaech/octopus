@@ -205,11 +205,11 @@ async function save() { if (await store.save()) close() }
             v-for="n in NAV"
             :key="n.key"
             type="button"
-            class="flex shrink-0 items-center gap-2 rounded-lg px-3 py-2 text-left text-[13px] font-medium transition-colors sm:w-full"
-            :class="active === n.key ? 'bg-accent text-foreground' : 'text-muted-foreground hover:bg-accent/50 hover:text-foreground'"
+            class="flex shrink-0 items-center gap-2.5 rounded-lg px-3 py-2.5 text-left text-[13px] font-medium transition-all sm:w-full cursor-pointer"
+            :class="active === n.key ? 'bg-primary/12 text-primary font-semibold shadow-xs' : 'text-muted-foreground hover:bg-accent/60 hover:text-foreground'"
             @click="active = n.key"
           >
-            <component :is="n.icon" aria-hidden="true" class="size-4" :class="active === n.key ? 'text-primary' : ''" />
+            <component :is="n.icon" aria-hidden="true" class="size-4" :class="active === n.key ? 'text-primary' : 'text-muted-foreground/70'" />
             {{ n.label }}
           </button>
         </nav>

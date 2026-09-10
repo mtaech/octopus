@@ -21,7 +21,16 @@ import { Switch } from '@/components/ui/switch'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Alert, AlertAction, AlertDescription } from '@/components/ui/alert'
 import { Separator } from '@/components/ui/separator'
-import { IconArrowLeft, IconDeviceFloppy, IconPlayerPlay, IconX, IconAlertTriangle, IconRefresh } from '@tabler/icons-vue'
+import {
+  IconArrowLeft,
+  IconDeviceFloppy,
+  IconX,
+  IconAlertTriangle,
+  IconRefresh,
+  IconMessageDots,
+  IconFileText,
+  IconSparkles,
+} from '@tabler/icons-vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -31,10 +40,10 @@ const drawer = useDrawerStore()
 // ---------- 模板偏好（#08 ① localStorage 记忆，默认 A） ----------
 type TplId = 'A' | 'B' | 'C'
 const TPL_KEY = 'octopus.play.template'
-const TEMPLATES: { id: TplId; label: string; short: string; desc: string }[] = [
-  { id: 'A', label: '聊天流', short: 'IM', desc: '对话气泡' },
-  { id: 'B', label: '剧本式', short: 'SCR', desc: '纸面脚本' },
-  { id: 'C', label: '沉浸式', short: 'VN', desc: '逐行演出' }
+const TEMPLATES: { id: TplId; label: string; short: string; desc: string; icon: any }[] = [
+  { id: 'A', label: '聊天流', short: 'IM', desc: '对话气泡', icon: IconMessageDots },
+  { id: 'B', label: '剧本式', short: 'SCR', desc: '纸面脚本', icon: IconFileText },
+  { id: 'C', label: '沉浸式', short: 'VN', desc: '逐行演出', icon: IconSparkles }
 ]
 const tpl = ref<TplId>('A')
 function pickTpl(id: TplId) {
@@ -111,19 +120,24 @@ function goBack() { void router.push('/') }
 <template>
   <div class="flex h-screen flex-col overflow-hidden bg-background text-foreground">
     <!-- ============ 顶栏 ============ -->
-    <header class="z-20 flex h-11 shrink-0 items-center gap-2 border-b border-border bg-card px-3">
-      <Button variant="ghost" size="icon-sm" title="返回故事书列表" @click="goBack()">
-        <IconArrowLeft />
+    <header class="z-20 flex h-13 shrink-0 items-center gap-2.5 border-b border-border/80 bg-card/85 px-3.5 backdrop-blur-md">
+      <Button variant="ghost" size="icon-sm" class="size-8 text-muted-foreground hover:text-foreground" title="返回故事书列表" @click="goBack()">
+        <IconArrowLeft class="size-4" />
       </Button>
 
+      <div class="h-4 w-px bg-border/60" />
+
       <div class="flex min-w-0 flex-col leading-tight">
-        <span class="max-w-56 truncate text-[13.5px] font-extrabold" :title="saveTitle">{{ saveTitle || '存档' }}</span>
-        <span class="text-[11px] text-muted-foreground whitespace-nowrap">{{ storybookTitle }} · 版次 {{ rev ?? '–' }}</span>
+        <span class="max-w-64 truncate font-serif text-[14px] font-bold text-foreground" :title="saveTitle">{{ saveTitle || '存档' }}</span>
+        <span class="text-[11px] text-muted-foreground/80 whitespace-nowrap">{{ storybookTitle }} · rev {{ rev ?? '–' }}</span>
       </div>
-      <span class="max-w-48 truncate text-xs text-muted-foreground">{{ sceneTitle }}</span>
+
+      <span v-if="sceneTitle" class="hidden max-w-56 truncate rounded-full border border-border/70 bg-muted/40 px-2.5 py-0.5 text-xs text-muted-foreground sm:inline-block">
+        {{ sceneTitle }}
+      </span>
 
       <!-- 管线阶段徽标（#08 Q6） -->
-      <span v-if="phaseChip" class="inline-flex items-center gap-1.5 rounded-full border border-warning/40 bg-warning/10 px-2.5 py-0.5 text-[11px] font-bold whitespace-nowrap text-warning">
+      <span v-if="phaseChip" class="inline-flex items-center gap-1.5 rounded-full border border-warning/45 bg-warning/15 px-2.5 py-0.5 text-[11px] font-bold whitespace-nowrap text-warning shadow-2xs">
         <span class="size-1.5 animate-pulse rounded-full bg-warning"></span>{{ phaseChip }}
       </span>
 
@@ -131,37 +145,45 @@ function goBack() { void router.push('/') }
 
       <!-- 🎭 模板切换（segmented Tabs） -->
       <Tabs :model-value="tpl" @update:model-value="(v: unknown) => pickTpl(v as TplId)">
-        <TabsList class="h-7 rounded-md">
-          <TabsTrigger v-for="t in TEMPLATES" :key="t.id" :value="t.id" class="h-6 gap-1 px-2 text-xs" :title="t.label + ' · ' + t.desc">
-            <IconPlayerPlay v-if="t.id === 'A'" class="size-3" />{{ t.label }}
+        <TabsList class="h-8 gap-0.5 rounded-lg border border-border/80 bg-background/80 p-0.5 shadow-inner">
+          <TabsTrigger v-for="t in TEMPLATES" :key="t.id" :value="t.id" class="h-7 gap-1.5 px-2.5 text-xs font-medium" :title="t.label + ' · ' + t.desc">
+            <component :is="t.icon" class="size-3.5" />
+            <span>{{ t.label }}</span>
           </TabsTrigger>
         </TabsList>
       </Tabs>
 
-      <Separator orientation="vertical" class="h-5" />
+      <Separator orientation="vertical" class="h-5 bg-border/60" />
 
       <!-- 免确认开关（引擎侧：点击发 /免确认 元指令） -->
-      <label class="flex cursor-pointer items-center gap-1.5 text-xs" title="免确认：存档级设置，直接调用引擎端点">
+      <label class="flex cursor-pointer items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors" title="免确认：存档级设置，直接调用引擎端点">
         <Switch size="sm" :model-value="autoConfirm" :disabled="store.busy || togglingConfirm" @update:model-value="toggleAutoConfirm" />
-        <span class="whitespace-nowrap">免确认：{{ autoConfirm ? '开' : '关' }}</span>
+        <span class="whitespace-nowrap text-[11.5px]">免确认: {{ autoConfirm ? '开' : '关' }}</span>
       </label>
 
       <!-- 存档抽屉 -->
-      <Button variant="outline" size="sm" class="relative" :class="{ 'border-warning/60 text-warning': needsUpgrade }" @click="drawer.openDrawer()">
-        <IconDeviceFloppy data-icon="inline-start" />存档
+      <Button
+        variant="outline"
+        size="sm"
+        class="relative gap-1.5 font-medium shadow-xs"
+        :class="{ 'border-warning/60 text-warning bg-warning/10': needsUpgrade }"
+        @click="drawer.openDrawer()"
+      >
+        <IconDeviceFloppy data-icon="inline-start" class="size-3.5" />
+        <span>存档</span>
         <span v-if="needsUpgrade" class="absolute -top-1 -right-1 size-2 rounded-full border-2 border-card bg-warning" title="有可升级的新版次"></span>
       </Button>
     </header>
 
     <!-- ============ 需升级横幅（可关，#21 ② 打开存档提示、不自动） ============ -->
-    <Alert v-if="showBanner" class="relative rounded-none border-x-0 border-t-0 border-warning/30 bg-warning/10 py-2 pr-14 text-warning" variant="default">
-      <IconAlertTriangle class="text-warning" />
+    <Alert v-if="showBanner" class="relative rounded-none border-x-0 border-t-0 border-warning/35 bg-warning/10 py-2.5 pr-14 text-warning" variant="default">
+      <IconAlertTriangle class="text-warning size-4" />
       <AlertDescription class="flex items-center gap-3 text-[12.5px]">
         <span>故事书已发布新版次 {{ store.detail?.latest_revision ?? '' }}（当前 rev {{ rev }}）</span>
-        <Button size="xs" variant="outline" class="h-6 border-warning/40 text-warning" @click="drawer.openDrawer(); drawer.enterUpgrade()">查看迁移报告</Button>
+        <Button size="xs" variant="outline" class="h-6 border-warning/45 text-warning hover:bg-warning/20" @click="drawer.openDrawer(); drawer.enterUpgrade()">查看迁移报告</Button>
       </AlertDescription>
-      <AlertAction class="top-1.5 right-2">
-        <Button variant="ghost" size="icon-xs" class="text-warning/80" @click="drawer.dismissBanner()"><IconX /></Button>
+      <AlertAction class="top-2 right-2.5">
+        <Button variant="ghost" size="icon-xs" class="text-warning/80 hover:bg-warning/20 hover:text-warning" @click="drawer.dismissBanner()"><IconX class="size-3.5" /></Button>
       </AlertAction>
     </Alert>
 

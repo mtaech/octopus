@@ -6,6 +6,12 @@ import { computed } from 'vue'
 import type { CheckResultPayload } from '@/types'
 import { LEVEL_META, initial } from '../utils'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
+import {
+  IconSparkles,
+  IconCircleCheck,
+  IconAlertTriangle,
+  IconX,
+} from '@tabler/icons-vue'
 
 const props = defineProps<{ payload: CheckResultPayload }>()
 
@@ -18,44 +24,57 @@ const sign = (n: number) => (n > 0 ? '+' + n : String(n))
 
 /** level → 语义态：色类 + 底（淡） */
 const LV = {
-  great:   { text: 'text-success',   ring: 'border-success/40 bg-success/10',   chip: 'bg-success/15' },
-  success: { text: 'text-primary',   ring: 'border-primary/35 bg-primary/10',   chip: 'bg-primary/15' },
-  barely:  { text: 'text-warning',   ring: 'border-warning/45 bg-warning/10',   chip: 'bg-warning/15' },
-  fail:    { text: 'text-destructive', ring: 'border-destructive/45 bg-destructive/10', chip: 'bg-destructive/15' }
+  great:   { text: 'text-success',   ring: 'border-success/50 bg-success/10',   chip: 'bg-success/20 text-success', icon: IconSparkles },
+  success: { text: 'text-primary',   ring: 'border-primary/45 bg-primary/10',   chip: 'bg-primary/20 text-primary', icon: IconCircleCheck },
+  barely:  { text: 'text-warning',   ring: 'border-warning/50 bg-warning/10',   chip: 'bg-warning/20 text-warning', icon: IconAlertTriangle },
+  fail:    { text: 'text-destructive', ring: 'border-destructive/50 bg-destructive/10', chip: 'bg-destructive/20 text-destructive', icon: IconX }
 } as const
 const lv = computed(() => LV[level.value])
 </script>
 
 <template>
-  <div class="w-full rounded-xl border px-4 py-3 text-[13px]" :class="lv.ring">
-    <div class="flex items-center gap-2.5">
-      <Avatar class="size-7">
-        <AvatarFallback class="text-xs font-extrabold" :class="lv.chip + ' ' + lv.text">{{ initial(payload.actor.name) }}</AvatarFallback>
+  <div class="w-full rounded-2xl border px-4.5 py-3.5 text-[13px] shadow-xs backdrop-blur-xs transition-all" :class="lv.ring">
+    <div class="flex items-center gap-3">
+      <Avatar class="size-7.5 ring-1 ring-border/80">
+        <AvatarFallback class="text-xs font-bold" :class="lv.chip">{{ initial(payload.actor.name) }}</AvatarFallback>
       </Avatar>
       <div class="min-w-0 flex-1">
-        <div class="font-bold leading-tight">{{ payload.actor.name }} · {{ payload.attribute }}</div>
-        <div class="text-[10.5px] text-muted-foreground">判定</div>
+        <div class="font-bold leading-tight text-foreground">{{ payload.actor.name }} · {{ payload.attribute }}</div>
+        <div class="text-[11px] text-muted-foreground/75 font-medium">机制判定</div>
       </div>
-      <span class="text-xs font-extrabold tracking-wide" :class="lv.text">{{ levelLabel }}</span>
+      <div class="flex items-center gap-1.5 rounded-full px-2.5 py-1 border" :class="[lv.ring, lv.text]">
+        <component :is="lv.icon" class="size-3.5" />
+        <span class="text-xs font-extrabold tracking-wide">{{ levelLabel }}</span>
+      </div>
     </div>
 
-    <div class="mt-2.5 flex flex-wrap items-center gap-2">
-      <span v-if="exprText" class="font-mono text-xs text-muted-foreground">{{ exprText }}</span>
-      <span v-if="rollDice.length" class="inline-flex items-center gap-1.5">
+    <!-- 掷骰结果行 -->
+    <div class="mt-3 flex flex-wrap items-center gap-2.5 rounded-xl bg-card/60 px-3 py-2 border border-border/60">
+      <span v-if="exprText" class="font-mono text-xs text-muted-foreground/85 font-medium">{{ exprText }}</span>
+      <div v-if="rollDice.length" class="inline-flex items-center gap-1.5">
         <template v-for="(r, i) in rollDice" :key="i">
-          <span class="bg-primary text-primary-foreground font-mono flex size-7 items-center justify-center rounded-lg border border-primary/60 font-extrabold text-[14px]">{{ r }}</span>
-          <span v-if="i < rollDice.length - 1" class="text-muted-foreground">+</span>
+          <span class="bg-primary text-primary-foreground font-mono flex size-7.5 items-center justify-center rounded-lg font-black text-[14.5px] shadow-sm shadow-black/40 ring-1 ring-white/15">
+            {{ r }}
+          </span>
+          <span v-if="i < rollDice.length - 1" class="text-muted-foreground/60 text-xs">+</span>
         </template>
-      </span>
-      <span class="text-xs text-muted-foreground">修正 {{ sign(payload.mod) }}</span>
-      <span class="text-muted-foreground">=</span>
+      </div>
+      <span class="text-xs text-muted-foreground font-medium">修正 {{ sign(payload.mod) }}</span>
+      <span class="text-muted-foreground/60 font-mono">=</span>
       <span class="font-mono text-lg font-black text-foreground">{{ payload.total }}</span>
-      <span class="text-xs text-muted-foreground">目标 {{ payload.target }}（{{ levelHint }}）</span>
+      <span class="text-xs text-muted-foreground ml-auto">目标 {{ payload.target }}（{{ levelHint }}）</span>
     </div>
 
-    <div class="mt-1.5 flex items-center gap-3 border-t border-dashed border-border/60 pt-1.5">
-      <span class="text-[11.5px] font-bold" :class="payload.result ? 'text-success' : 'text-destructive'">{{ payload.result ? '达成' : '未达成' }}</span>
-      <span class="font-mono text-[11.5px] text-muted-foreground">差值 {{ sign(payload.margin) }}</span>
+    <!-- 最终达成度 -->
+    <div class="mt-2 flex items-center justify-between border-t border-border/50 pt-2 text-xs">
+      <div class="flex items-center gap-2">
+        <span class="font-bold" :class="payload.result ? 'text-success' : 'text-destructive'">
+          {{ payload.result ? '✓ 判定达成' : '✗ 判定失败' }}
+        </span>
+      </div>
+      <span class="font-mono text-[11.5px] text-muted-foreground">
+        差值: {{ sign(payload.margin) }}
+      </span>
     </div>
   </div>
 </template>
