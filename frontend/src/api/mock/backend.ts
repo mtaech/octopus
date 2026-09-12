@@ -7,7 +7,8 @@ import type {
   Storybook, SaveListItem, SaveDetail, StorybookListItem, StorybookDocument,
   ValidateResult, ValidationIssue, CharacterInstance, WorldProjection, PlayEvent,
   UpgradeReport, Disposition, PairSuggestion, PhaseStage, StateDelta,
-  CondExpr, HistoryPage, SaveSettings, MaintenanceRow, AppConfig, ProviderTestResult, ProviderConfig, ProbeResult
+  CondExpr, HistoryPage, SaveSettings, MaintenanceRow, AppConfig, ProviderTestResult, ProviderConfig, ProbeResult,
+  EntityRef, FocusEntity
 } from '@/types'
 import { uid } from '@/types'
 import { storybookFallingStar, storybookMist, storybookAsh, storybookDraft } from '../seed'
@@ -59,8 +60,11 @@ function validateStorybook(sb: Storybook): ValidationIssue[] {
       if (!dimKeys.has(k)) issues.push({ severity: 'error', code: 'unknown_dim', target: `character:${c.id}`, message: `人物「${c.name}」引用了未定义的属性维度 "${k}"` })
     }
   })
+  // 人物物品栏引用物品（#01）
+  sb.characters.forEach(c => (c.inventory ?? []).forEach(e => { if (!itemIds.has(e.id)) issues.push({ severity: 'error', code: 'dangling_ref', target: `character:${c.id}`, message: `人物「${c.name}」的背包引用了不存在的物品 "${e.id}"` }) }))
   // 引用完整性：技能/物品/人物/地点/势力
   sb.items.forEach(it => (it.skills ?? []).forEach(sid => { if (!skillIds.has(sid)) issues.push({ severity: 'error', code: 'dangling_ref', target: `item:${it.id}`, message: `物品「${it.name}」引用了不存在的技能 "${sid}"`, related_refs: [] }) }))
+  sb.characters.forEach(c => (c.skills ?? []).forEach(sid => { if (!skillIds.has(sid)) issues.push({ severity: 'error', code: 'dangling_ref', target: `character:${c.id}`, message: `人物「${c.name}」引用了不存在的技能 "${sid}"`, related_refs: [] }) }))
   sb.relationships.forEach(rel => {
     const fromOk = rel.from_kind === 'faction' ? facIds.has(rel.from_id) : charIds.has(rel.from_id)
     const toOk = rel.to_kind === 'faction' ? facIds.has(rel.to_id) : charIds.has(rel.to_id)
@@ -75,6 +79,10 @@ function validateStorybook(sb: Storybook): ValidationIssue[] {
       sc.goals.forEach(g => { if (!g.text?.trim()) issues.push({ severity: 'warning', code: 'empty_goal', target: `goal:${g.id}`, message: '存在没有文本的目标' }) })
     })
   })
+  // 故事开头（#29）：有场景但没写开头 → 警告
+  if (sb.skeleton.some(ch => (ch.scenes ?? []).length) && !sb.world.opening?.trim()) {
+    issues.push({ severity: 'warning', code: 'missing_opening', target: 'world.opening', message: '故事书没有「故事开头」——开档时将以世界前提（premise）作为开场旁白' })
+  }
   // 人物/技能/物品空名
   ;(['characters', 'skills', 'items', 'factions'] as const).forEach(kind => {
     sb[kind].forEach((e: { id: string; name: string }) => { if (!e.name?.trim()) issues.push({ severity: 'warning', code: 'empty_name', target: `${kind.slice(0, -1)}:${e.id}`, message: '有实体缺少名称' }) })
@@ -84,12 +92,15 @@ function validateStorybook(sb: Storybook): ValidationIssue[] {
   const eventKeys = new Set((sb.events ?? []).map(d => d.key))
   const relTypeKeys = new Set((sb.relationship_types ?? []).map(d => d.key))
   const targetKeys = new Set((sb.target_types ?? []).map(d => d.key))
+  const statusKeys = new Set((sb.statuses ?? []).map(s => s.id))
   ;(sb.objects ?? []).forEach(o => {
     if (o.location_id && !locIds.has(o.location_id)) issues.push({ severity: 'warning', code: 'dangling_ref', target: `object:${o.id}`, message: `物件「${o.name}」指向不存在的地点` })
     ;(o.skills ?? []).forEach(sid => { if (!skillIds.has(sid)) issues.push({ severity: 'error', code: 'dangling_ref', target: `object:${o.id}`, message: `物件「${o.name}」引用了不存在的技能 "${sid}"` }) })
   })
   sb.relationships.forEach(rel => { if (relTypeKeys.size && !relTypeKeys.has(rel.type)) issues.push({ severity: 'warning', code: 'undeclared_type', target: `relationship:${rel.id}`, message: `关系类型 "${rel.type}" 未在声明区定义` }) })
   sb.skills.forEach(sk => { if (sk.target && targetKeys.size && !targetKeys.has(sk.target)) issues.push({ severity: 'warning', code: 'undeclared_target', target: `skill:${sk.id}`, message: `技能「${sk.name}」的目标类型 "${sk.target}" 未在声明区定义` }) })
+  ;(sb.statuses ?? []).forEach((s, i) => { if (!s.id?.trim()) issues.push({ severity: 'error', code: 'missing_id', target: `status[${i}]`, message: '状态缺少 id' }); if (!s.name?.trim()) issues.push({ severity: 'warning', code: 'empty_name', target: `status:${s.id}`, message: '状态缺少名称' }) })
+  sb.skills.forEach(sk => (sk.effect?.status ?? []).forEach(sid => { if (!statusKeys.has(sid)) issues.push({ severity: 'error', code: 'dangling_status_ref', target: `skill:${sk.id}`, message: `技能「${sk.name}」引用了未声明的状态 "${sid}"` }) }))
   const walkCond = (c: CondExpr | null | undefined, target: string): void => {
     if (!c) return
     if (c.op === 'flag_set') { if (flagKeys.size && !flagKeys.has(c.flag)) issues.push({ severity: 'warning', code: 'undeclared_flag', target, message: `条件引用了未声明的 flag "${c.flag}"` }) }
@@ -98,9 +109,36 @@ function validateStorybook(sb: Storybook): ValidationIssue[] {
   }
   sb.skeleton.forEach(ch => ch.scenes.forEach(sc => {
     sc.goals.forEach(g => walkCond(g.condition, `goal:${g.id}`))
-    sc.beats.forEach(b => walkCond(b.condition, `beat:${b.id}`))
+    sc.triggers.forEach(t => walkCond(t.condition, `trigger:${t.id}`))
   }))
   sb.skills.forEach(sk => (sk.effect?.triggers ?? []).forEach(t => { if (eventKeys.size && !eventKeys.has(t.event)) issues.push({ severity: 'warning', code: 'undeclared_event', target: `skill:${sk.id}`, message: `触发事件 "${t.event}" 未在声明区定义` }) }))
+
+  // Lua 静态预检（#23）：mock 无 Lua 解释器，只做越权 API 扫描（语法由引擎侧校验）
+  const LUA_FORBIDDEN = ['io.', 'os.', 'package.', 'debug.', 'require', 'dofile', 'loadfile', 'math.random', 'collectgarbage', 'coroutine.']
+  const checkLua = (target: string, source?: string) => {
+    if (!source?.trim()) return
+    const hit = LUA_FORBIDDEN.find(t => source.includes(t))
+    if (hit) issues.push({ severity: 'error', code: 'lua_forbidden_api', target, message: `Lua 使用了白名单之外的 API：${hit}` })
+  }
+  const walkCondLua = (cond: unknown, target: string): void => {
+    if (Array.isArray(cond)) { cond.forEach(c => walkCondLua(c, target)); return }
+    if (!cond || typeof cond !== 'object') return
+    const c = cond as { op?: string; script?: string; children?: unknown[]; child?: unknown }
+    if (c.op === 'lua' && typeof c.script === 'string') checkLua(target, c.script)
+    c.children?.forEach(x => walkCondLua(x, target))
+    if (c.child) walkCondLua(c.child, target)
+  }
+  sb.skills.forEach(sk => {
+    checkLua(`skill:${sk.id}`, sk.lua)
+    const ck = sk.check
+    if (ck && typeof ck === 'object' && 'lua' in ck) checkLua(`skill:${sk.id}`, ck.lua)
+  })
+  const worldCheck = sb.world.check
+  if (worldCheck && typeof worldCheck === 'object') checkLua('world.check', worldCheck.lua)
+  sb.skeleton.forEach(ch => ch.scenes.forEach(sc => {
+    sc.goals.forEach(g => walkCondLua(g.condition, `goal:${g.id}`))
+    sc.triggers.forEach(t => walkCondLua(t.condition, `trigger:${t.id}`))
+  }))
 
   return issues
 }
@@ -127,6 +165,12 @@ interface SaveRow {
   latestText: string
   aiBusy: boolean
   autoConfirm: boolean
+  /** 本存档覆盖的模型（provider id + model id） */
+  modelProviderId?: string
+  model?: string
+  reasoningEffort?: string
+  /** 叙述段玩家偏好（叙事契约 P1）：section id → 开关 | 变体 key */
+  narrativePrefs?: Record<string, boolean | string>
   /** 叙事历史（#17/#24 修订）：权威事件流，供 GET /history 分页回读 */
   eventLog: PlayEvent[]
   requestIds: Set<string>
@@ -191,10 +235,16 @@ export function createSave(storybookId: string, title?: string, controlledCharac
     created_at: now, updated_at: now, last_played_at: now
   }
   const detail: SaveDetail = { ...item, storybook: embedded }
-  const row: SaveRow = { item, detail, seq: 0, round: 0, phase: 'idle', maintenance: [], pendingAction: null, sinks: new Set(), roundOpen: false, latestText: '', aiBusy: false, autoConfirm: false, eventLog: [], requestIds: new Set(), archivedCount: 0, projection: buildProjection(detail, 0, item, 0, 0) }
+  const row: SaveRow = { item, detail, seq: 0, round: 0, phase: 'idle', maintenance: [], pendingAction: null, sinks: new Set(), roundOpen: false, latestText: '', aiBusy: false, autoConfirm: false, narrativePrefs: {}, eventLog: [], requestIds: new Set(), archivedCount: 0, projection: buildProjection(detail, 0, item, 0, 0) }
   if (controlledCharacterId && row.projection.characters[controlledCharacterId]) row.projection.controlled = [controlledCharacterId]
   saveStore.set(saveId, row)
   return row
+}
+
+function buildInventory(c: { inventory?: { id: string; quantity?: number }[] }): Record<string, number> {
+  const out: Record<string, number> = {}
+  ;(c.inventory ?? []).forEach(e => { out[e.id] = e.quantity ?? 1 })
+  return out
 }
 
 function buildProjection(detail: SaveDetail, seq: number, meta: SaveListItem, round: number, sceneIdx: number): WorldProjection {
@@ -206,12 +256,13 @@ function buildProjection(detail: SaveDetail, seq: number, meta: SaveListItem, ro
     chars[c.id] = {
       instance_id: `inst-${c.id}`, template_id: c.id, name: c.name, kind: c.kind ?? (i === 0 ? 'pc' : 'npc'),
       attributes: { ...c.attributes }, resources: { ...(c.resources ?? {}) },
+      inventory: buildInventory(c),
       location_id: scene?.location_id, present: true, statuses: []
     }
   })
   return {
     seq, scene_id: scene?.id ?? '', scene_title: scene?.title ?? '', characters: chars,
-    controlled: controlledTpl ? [controlledTpl.id] : [], flags: {}, progress: { goals: {}, beats: {}, abandoned_scenes: [] },
+    controlled: controlledTpl ? [controlledTpl.id] : [], flags: {}, progress: { goals: {}, triggers: {}, abandoned_scenes: [] },
     locations: sb.world.locations, meta: {
       save_id: meta.id, save_title: meta.title, storybook_title: meta.storybook_title,
       revision: meta.embedded_revision, needs_upgrade: meta.needs_upgrade, auto_confirm: rowConfirmDefault
@@ -250,7 +301,7 @@ export function initSeedsAll() {
 export function listStorybooks(releasedOnly: boolean): StorybookListItem[] {
   return [...sbStore.values()].map(r => {
     const d = r.doc
-    return { id: d.id, title: d.draft.meta.title, revision: d.revision, draft_version: d.draft_version, updated_at: d.updated_at, released_at: d.released_at, published: d.published, description: d.released?.meta.description ?? d.draft.meta.description ?? '' }
+    return { id: d.id, title: d.draft.meta.title, revision: d.revision, draft_version: d.draft_version, updated_at: d.updated_at, released_at: d.released_at, published: d.published, description: d.released?.meta.description ?? d.draft.meta.description ?? '', rating: d.released?.meta.rating ?? d.draft.meta.rating ?? null }
   }).filter(s => !releasedOnly || s.published)
 }
 
@@ -261,8 +312,12 @@ export function getStorybook(id: string): StorybookDocument | null {
 export function createStorybookDraft(title = '未命名故事书'): StorybookDocument {
   _sbSeq++
   const id = 'sb-' + String(Date.now().toString(36))
-  const sb: Storybook = { schema_version: 1, meta: { id, title }, world: { premise: '', locations: [], resources: [] }, attribute_dimensions: [], skeleton: [], characters: [], skills: [], items: [], objects: [], factions: [], relationships: [], flags: [], events: [], relationship_types: [], target_types: [] }
+  const sb: Storybook = { schema_version: 3, meta: { id, title }, world: { premise: '', opening: '', locations: [], resources: [] }, attribute_dimensions: [], skeleton: [], characters: [], skills: [], items: [], objects: [], factions: [], relationships: [], statuses: [], flags: [], events: [], relationship_types: [], target_types: [] }
   return initStorybook(sb).doc
+}
+
+export function deleteStorybook(id: string): void {
+  if (!sbStore.delete(id)) throw new Error('STORYBOOK_NOT_FOUND')
 }
 
 export function saveDraft(id: string, draft: Storybook, baseVersion: number): { doc: StorybookDocument; issues: ValidationIssue[] } {
@@ -354,6 +409,117 @@ export function importSaveFile(fileName: string): SaveListItem {
   return { ...row.item }
 }
 
+// ---------- 结对会话线程（#23 ④）：一本故事书多条会话 ----------
+interface StoredPairMessage {
+  seq: number
+  role: 'user' | 'assistant'
+  content: string
+  model?: string | null
+  is_error?: boolean
+  tools?: unknown
+}
+
+interface StoredPairThread {
+  id: string
+  storybook_id: string
+  title: string
+  created_at: string
+  updated_at: string
+  pending_suggestions?: unknown
+}
+
+const pairThreadStore = new Map<string, StoredPairThread>()
+const pairMessageStore = new Map<string, StoredPairMessage[]>()
+let pairThreadSeq = 0
+
+function pairThreadRecord(t: StoredPairThread) {
+  return {
+    id: t.id,
+    storybook_id: t.storybook_id,
+    title: t.title,
+    message_count: (pairMessageStore.get(t.id) ?? []).length,
+    created_at: t.created_at,
+    updated_at: t.updated_at,
+    pending_suggestions: t.pending_suggestions,
+  }
+}
+
+function derivePairTitle(content: string): string {
+  const line = (content.split('\n').find(l => l.trim()) ?? '').trim()
+  return line.length > 20 ? line.slice(0, 20) + '…' : line
+}
+
+export function listPairThreads(storybookId: string) {
+  return [...pairThreadStore.values()]
+    .filter(t => t.storybook_id === storybookId)
+    .sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1))
+    .map(pairThreadRecord)
+}
+
+export function createPairThread(storybookId: string, title?: string) {
+  const now = new Date().toISOString()
+  const t: StoredPairThread = {
+    id: 'pt-' + (++pairThreadSeq) + '-' + Math.random().toString(36).slice(2, 8),
+    storybook_id: storybookId,
+    title: title?.trim() || '新会话',
+    created_at: now,
+    updated_at: now,
+  }
+  pairThreadStore.set(t.id, t)
+  pairMessageStore.set(t.id, [])
+  return pairThreadRecord(t)
+}
+
+export function setPairThreadPending(threadId: string, suggestions: unknown): void {
+  const t = pairThreadStore.get(threadId); if (!t) throw new Error('THREAD_NOT_FOUND')
+  t.pending_suggestions = suggestions ?? undefined
+}
+
+export function renamePairThread(threadId: string, title: string) {
+  const t = pairThreadStore.get(threadId); if (!t) throw new Error('THREAD_NOT_FOUND')
+  t.title = title
+  t.updated_at = new Date().toISOString()
+  return pairThreadRecord(t)
+}
+
+export function deletePairThread(threadId: string): void {
+  pairThreadStore.delete(threadId)
+  pairMessageStore.delete(threadId)
+}
+
+export function getPairMessages(threadId: string): StoredPairMessage[] {
+  return (pairMessageStore.get(threadId) ?? []).map(m => ({ ...m }))
+}
+
+export function appendPairMessages(threadId: string, msgs: StoredPairMessage[]): void {
+  const t = pairThreadStore.get(threadId); if (!t) throw new Error('THREAD_NOT_FOUND')
+  let list = pairMessageStore.get(threadId)
+  if (!list) { list = []; pairMessageStore.set(threadId, list) }
+  const wasEmpty = list.length === 0
+  for (const m of msgs) {
+    list.push({
+      seq: list.length + 1,
+      role: m.role,
+      content: m.content,
+      model: m.model ?? null,
+      is_error: !!m.is_error,
+      tools: m.tools,
+    })
+  }
+  if (wasEmpty) {
+    const firstUser = msgs.find(m => m.role === 'user')
+    if (firstUser && (t.title === '新会话' || t.title.startsWith('对话 '))) {
+      const derived = derivePairTitle(firstUser.content)
+      if (derived) t.title = derived
+    }
+  }
+  t.updated_at = new Date().toISOString()
+}
+
+export function clearPairMessages(threadId: string): void {
+  pairMessageStore.set(threadId, [])
+}
+
 // ---------- 叙事历史 / 存档维护（设计复审 2026-09-09 修订） ----------
 
 export function getHistory(saveId: string, beforeSeq?: number, limit = 50): HistoryPage {
@@ -383,15 +549,22 @@ export function getMaintenance(saveId: string): MaintenanceRow[] {
 
 export function getSaveSettings(saveId: string): SaveSettings {
   const r = saveStore.get(saveId); if (!r) throw new Error('SAVE_NOT_FOUND')
-  return { auto_confirm: r.autoConfirm }
+  return { auto_confirm: r.autoConfirm, model_provider_id: r.modelProviderId, model: r.model, reasoning_effort: r.reasoningEffort, narrative: { ...(r.narrativePrefs ?? {}) } }
 }
 
 export function setSaveSettings(saveId: string, settings: SaveSettings): SaveSettings {
   const r = saveStore.get(saveId); if (!r) throw new Error('SAVE_NOT_FOUND')
+  const confirmChanged = r.autoConfirm !== !!settings.auto_confirm
   r.autoConfirm = !!settings.auto_confirm
   r.projection.meta.auto_confirm = r.autoConfirm
-  emit(r, mkEvent(r, 'system', { level: 'info', code: 'confirm_toggle', text: `免确认模式已${r.autoConfirm ? '开启' : '关闭'}` }))
-  return { auto_confirm: r.autoConfirm }
+  r.modelProviderId = settings.model_provider_id || undefined
+  r.model = settings.model || undefined
+  r.reasoningEffort = settings.reasoning_effort || undefined
+  r.narrativePrefs = { ...(settings.narrative ?? {}) }
+  if (confirmChanged) {
+    emit(r, mkEvent(r, 'system', { level: 'info', code: 'confirm_toggle', text: `免确认模式已${r.autoConfirm ? '开启' : '关闭'}` }))
+  }
+  return { auto_confirm: r.autoConfirm, model_provider_id: r.modelProviderId, model: r.model, reasoning_effort: r.reasoningEffort, narrative: { ...r.narrativePrefs } }
 }
 
 /** 新原点（#24 修订：玩家侧 v1；旧日志归档只读） */
@@ -430,7 +603,10 @@ export function genSuggestions(question: string): PairSuggestion[] {
   return list
 }
 
-export function pairStreamChat(messages: { role: 'user' | 'assistant'; content: string }[]): { deltas: string[]; suggestions: PairSuggestion[]; text: string } {
+export function pairStreamChat(
+  messages: { role: 'user' | 'assistant'; content: string }[],
+  _options?: { provider_id?: string; model?: string }
+): { deltas: string[]; suggestions: PairSuggestion[]; text: string } {
   const last = [...messages].reverse().find(m => m.role === 'user')?.content ?? ''
   const suggestions = genSuggestions(last)
   const head = suggestions.length ? '我按这个方向拟了几条建议，可以先看看合不合口味。' : '这个方向我还没太想好，换个说法再聊聊？'
@@ -459,7 +635,7 @@ function mkEvent(row: SaveRow, type: PlayEvent['type'], payload: Record<string, 
 const sleep = (ms: number) => new Promise<void>(res => setTimeout(res, ms))
 
 /** 把玩家文本映射为若干叙事事件（demo 脚本，关键字驱动） */
-function narrativeScript(text: string, row: SaveRow): { narrate: string[]; dialogue: { actor: string; content: string }[]; emote?: string; scene?: { scene_id: string; title: string; description: string; present: string[] }; goal?: string; beats?: string[]; flag?: string } {
+function narrativeScript(text: string, row: SaveRow): { narrate: string[]; dialogue: { actor: string; content: string }[]; emote?: string; scene?: { scene_id: string; title: string; description: string; present: string[] }; goal?: string; triggers?: string[]; flag?: string } {
   const sb = row.detail.storybook
   const char = (id: string) => sb.characters.find(c => c.id === id)
   const mira = char('char-mira')!
@@ -490,12 +666,12 @@ function narrativeScript(text: string, row: SaveRow): { narrate: string[]; dialo
     narrate.push('伊莎压低声音，油灯的火苗晃了一下。')
     out.flag = 'heard_dreams'
     out.goal = 'g1'
-    out.beats = ['b1', 'b2']
+    out.triggers = ['b1', 'b2']
     out.emote = '伊莎说着，下意识摸了摸手腕上一道旧疤。'
   } else if (mine) {
     dialogue.push({ actor: 'char-kael', content: '封条是镇公所下的，可谁都知道那儿不对劲。我铁匠铺的伙计说，夜里能听见矿坑底下有——像心跳一样的声音。' })
     narrate.push('凯尔攥紧了拳头，指节发白。')
-    out.beats = ['b3']
+    out.triggers = ['b3']
     out.emote = '凯尔说到一半停住，像是怕被谁听见。'
   } else if (taverngo || leave) {
     dialogue.push({ actor: 'char-isa', content: '楼上空房多的是，随便挑一间。夜里要是听见什么动静——别开窗。' })
@@ -523,7 +699,7 @@ function rollFor(text: string, charId: string): { total: number; target: number;
 }
 
 /** 提交玩家回合（#24 ① POST /rounds）→ 模拟引擎管线并流式发事件 */
-export async function submitRound(saveId: string, channel: 'character' | 'meta', text: string, requestId?: string, onProgress?: (p: { stage: PhaseStage; detail?: string }) => void) {
+export async function submitRound(saveId: string, channel: 'character' | 'meta' | 'gm', text: string, requestId?: string, onProgress?: (p: { stage: PhaseStage; detail?: string }) => void, refs?: EntityRef[]) {
   const row = saveStore.get(saveId)
   if (!row) throw new Error('SAVE_NOT_FOUND')
   if (row.aiBusy) throw new Error('ROUND_IN_PROGRESS')
@@ -539,7 +715,7 @@ export async function submitRound(saveId: string, channel: 'character' | 'meta',
   const prog = (stage: PhaseStage, detail?: string) => { row.phase = stage; if (onProgress) onProgress({ stage, detail }); emit(row, mkEvent(row, 'phase', { stage, detail })) }
 
   try {
-    emit(row, mkEvent(row, 'round_start', { input: { channel, text } }, { actor: { id: playerCharId, name: row.projection.characters[playerCharId]?.name ?? '玩家' } }))
+    emit(row, mkEvent(row, 'round_start', { input: { channel, text, refs: refs ?? [] } }, { actor: { id: playerCharId, name: row.projection.characters[playerCharId]?.name ?? '玩家' } }))
     prog('story_thinking')
     await sleep(350 + seededRand(text) * 350)
 
@@ -636,14 +812,14 @@ export async function submitRound(saveId: string, channel: 'character' | 'meta',
     if (script.narrate.length === 0 && script.dialogue.length === 0) {
       emit(row, mkEvent(row, 'narrate', { content: '酒馆里的喧闹照旧，你的话像投进湖面的石子，短暂地起了涟漪。' }, { actor: { id: 'char-isa', name: '伊莎' } }))
     }
-    // 状态更新：goal / beat / flag
+    // 状态更新：goal / trigger / flag
     const changes: StateDelta[] = []
     if (script.flag) {
       row.projection.flags[script.flag] = true
       changes.push({ domain: 'flag', entity_id: script.flag, field: 'flag', op: 'set', value: true })
     }
     if (script.goal) { row.projection.progress.goals[script.goal] = true; changes.push({ domain: 'goal', entity_id: script.goal, field: 'achieved', op: 'set', value: true }) }
-    ;(script.beats ?? []).forEach(b => { row.projection.progress.beats[b] = true; changes.push({ domain: 'beat', entity_id: b, field: 'fired', op: 'set', value: true }) })
+    ;(script.triggers ?? []).forEach(t => { row.projection.progress.triggers[t] = true; changes.push({ domain: 'trigger', entity_id: t, field: 'fired', op: 'set', value: true }) })
     if (changes.length) { row.projection.seq = row.seq; emit(row, mkEvent(row, 'state_update', { changes })) }
     await sleep(200)
     emit(row, mkEvent(row, 'round_end', { round: row.round }))
@@ -652,6 +828,24 @@ export async function submitRound(saveId: string, channel: 'character' | 'meta',
     row.roundOpen = false
     row.phase = 'idle'
   }
+}
+
+/** 重跑最后一个回合（mock：截断该回合事件后重放原输入；权威状态回滚由真实后端负责） */
+export async function rerunRound(saveId: string, _focus?: FocusEntity[], text?: string): Promise<void> {
+  const row = saveStore.get(saveId)
+  if (!row) throw new Error('SAVE_NOT_FOUND')
+  if (row.aiBusy || row.pendingAction) throw new Error('ROUND_IN_PROGRESS')
+  let lastStart = -1
+  for (let i = row.eventLog.length - 1; i >= 0; i--) {
+    if (row.eventLog[i].type === 'round_start') { lastStart = i; break }
+  }
+  if (lastStart < 0) throw new Error('NO_ROUND')
+  const start = row.eventLog[lastStart] as Extract<PlayEvent, { type: 'round_start' }>
+  const round = start.round
+  const input = start.payload.input
+  row.eventLog.splice(lastStart)
+  row.round = round - 1
+  await submitRound(saveId, input.channel, text?.trim() || input.text, undefined, undefined, input.refs)
 }
 
 /** 确认门（#17/#24） */
@@ -681,9 +875,11 @@ const DEFAULT_CONFIG: AppConfig = {
   roles: {
     story: { provider_id: 'deepseek', model: catalogEntries('deepseek')[0]?.id ?? 'deepseek-chat', temperature: 0.8, max_tokens: 4096 },
     character: { provider_id: 'deepseek', model: catalogEntries('deepseek')[0]?.id ?? 'deepseek-chat', temperature: 0.7, max_tokens: 2048 },
+    pair: { provider_id: 'deepseek', model: catalogEntries('deepseek')[0]?.id ?? 'deepseek-chat', temperature: 0.8, max_tokens: 4096 },
     embedding: { provider_id: 'fastembed', model: 'bge-small-zh-v1.5' }
   },
-  turn_token_budget: 0
+  turn_token_budget: 0,
+  ai: { provider: 'auto', embedding: 'auto' }
 }
 let appConfig: AppConfig = structuredClone(DEFAULT_CONFIG)
 

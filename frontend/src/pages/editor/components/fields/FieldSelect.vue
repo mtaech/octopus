@@ -1,17 +1,20 @@
 <script setup lang="ts">
-// FieldSelect —— 带标签的下拉选择（shadcn Select）
+// FieldSelect —— 标签在上的下拉选择
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 
 export interface SelectOption { value: string; label: string }
 
-const props = withDefaults(defineProps<{
+withDefaults(defineProps<{
   label: string
   modelValue?: string
   options?: SelectOption[]
   placeholder?: string
   hint?: string
   allowEmpty?: boolean
-}>(), { modelValue: '', options: () => [], placeholder: '（未选择）', hint: '', allowEmpty: true })
+  span?: 'default' | 'full'
+  /** 标签与控件间距收紧一档 */
+  dense?: boolean
+}>(), { modelValue: '', options: () => [], placeholder: '（未选择）', hint: '', allowEmpty: true, span: 'default', dense: false })
 
 const emit = defineEmits<{ 'update:modelValue': [value: string] }>()
 
@@ -24,23 +27,21 @@ function onPick(v: unknown): void {
 </script>
 
 <template>
-  <div class="grid grid-cols-[124px_minmax(0,1fr)] items-start gap-x-4 px-0.5 py-1.5">
-    <label class="pt-2 text-xs leading-4 text-muted-foreground">{{ label }}</label>
-    <div class="flex min-w-0 flex-col gap-1">
-      <Select :model-value="modelValue" @update:model-value="onPick">
-        <SelectTrigger class="h-8 w-full text-[13px]">
-          <SelectValue :placeholder="placeholder" />
-        </SelectTrigger>
-        <SelectContent>
-          <SelectGroup>
-            <SelectItem v-if="allowEmpty && placeholder" :value="EMPTY" class="text-muted-foreground">
-              {{ placeholder }}
-            </SelectItem>
-            <SelectItem v-for="o in options" :key="o.value" :value="o.value">{{ o.label }}</SelectItem>
-          </SelectGroup>
-        </SelectContent>
-      </Select>
-      <p v-if="hint" class="text-[11px] leading-4 text-muted-foreground/70">{{ hint }}</p>
-    </div>
+  <div class="flex min-w-0 flex-col" :class="[dense ? 'gap-1' : 'gap-1.5', span === 'full' && 'col-span-full']">
+    <span class="text-[11px] leading-4 font-medium text-muted-foreground">{{ label }}</span>
+    <Select :model-value="modelValue" @update:model-value="onPick">
+      <SelectTrigger class="h-8 w-full text-[13px]">
+        <SelectValue :placeholder="placeholder" />
+      </SelectTrigger>
+      <SelectContent>
+        <SelectGroup>
+          <SelectItem v-if="allowEmpty && placeholder" :value="EMPTY" class="text-muted-foreground">
+            {{ placeholder }}
+          </SelectItem>
+          <SelectItem v-for="o in options" :key="o.value" :value="o.value">{{ o.label }}</SelectItem>
+        </SelectGroup>
+      </SelectContent>
+    </Select>
+    <span v-if="hint" class="text-[10.5px] leading-4 text-muted-foreground/65">{{ hint }}</span>
   </div>
 </template>

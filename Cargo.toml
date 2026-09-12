@@ -6,12 +6,25 @@ members = [
   "crates/octopus-ai",
   "crates/octopus-api",
   "crates/octopus-bin",
+  "crates/octopus-launcher",
   "migration",
 ]
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+
+# GPUI 与文本栈在 debug 下不优化会很慢；只优化第三方重依赖，自己的代码保持可调试。
+[profile.dev.package]
+gpui-pre          = { opt-level = 3 }
+gpui-component    = { opt-level = 3 }
+gpui-kit          = { opt-level = 3 }
+gpui-kit-assets   = { opt-level = 3 }
+gpui-pre-macros   = { opt-level = 3 }
+gpui-pre-platform = { opt-level = 3 }
+rustybuzz         = { opt-level = 3 }
+taffy             = { opt-level = 3 }
+ttf-parser        = { opt-level = 3 }
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -25,8 +38,17 @@ futures = "0.3"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 chrono = { version = "0.4", features = ["serde"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# LLM 应用框架：provider 客户端 / CompletionModel / Agent / 工具调用
+rig = { version = "0.42" }
+sha2 = "0.10"
+# 存档包容器：只写不压（图片本身已是压缩格式），读时支持 deflate 以兼容外部重打包
+zip = { version = "2", default-features = false, features = ["deflate"] }
 sea-orm = { version = "1.1", features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros"] }
 sea-orm-migration = { version = "1.1", features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
+
+# 本地启动器（原生桌面，基于 GPUI Kit）
+gpui-kit = "=0.6.1"
+libc = "0.2"

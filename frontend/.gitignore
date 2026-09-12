@@ -3,3 +3,7 @@ dist
 *.local
 .DS_Store
 node_modules/.tmp
+
+# 包管理统一走 pnpm：防止 npm / yarn 的 lockfile 回流
+package-lock.json
+yarn.lock

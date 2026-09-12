@@ -1,8 +1,9 @@
-//! Embedding 占位实现（#15：默认本地 bge-small-zh-v1.5，512 维）。
-//! 真实实现走 rig-fastembed；此处先保证端口形状与维度契约成立。
+//! Embedding 实现（#15）：rig provider（OpenAI 兼容 /embeddings）+ 确定性 Stub 回退。
 
+use async_trait::async_trait;
 use octopus_engine::{EmbeddingBackend, EngineError};
 
+/// 确定性伪向量：同一文本同一结果，便于测试与离线。
 pub struct StubEmbedding {
     dim: usize,
 }
@@ -19,9 +20,9 @@ impl StubEmbedding {
     }
 }
 
+#[async_trait]
 impl EmbeddingBackend for StubEmbedding {
-    fn embed(&self, text: &str) -> Result<Vec<f32>, EngineError> {
-        // 确定性伪向量：同一文本同一结果，便于测试对齐。
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, EngineError> {
         let mut v = vec![0f32; self.dim];
         for (i, b) in text.bytes().enumerate() {
             v[i % self.dim] += (b as f32) / 255.0;
@@ -31,6 +32,42 @@ impl EmbeddingBackend for StubEmbedding {
             *x /= norm;
         }
         Ok(v)
+    }
+
+    fn dimension(&self) -> usize {
+        self.dim
+    }
+}
+
+/// rig EmbeddingModel 适配：任意实现 rig \`EmbeddingModel\` 的 provider 都能接入。
+pub struct RigEmbedding<M> {
+    model: M,
+    dim: usize,
+}
+
+impl<M> RigEmbedding<M>
+where
+    M: rig::embeddings::EmbeddingModel,
+{
+    /// 维度由 rig 模型的 \`ndims()\` 决定。
+    pub fn new(model: M) -> Self {
+        let dim = model.ndims();
+        Self { model, dim }
+    }
+}
+
+#[async_trait]
+impl<M> EmbeddingBackend for RigEmbedding<M>
+where
+    M: rig::embeddings::EmbeddingModel + Send + Sync,
+{
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, EngineError> {
+        let e = self
+            .model
+            .embed_text(text)
+            .await
+            .map_err(|err| EngineError::Ai(format!("embedding 调用失败：{err}")))?;
+        Ok(e.vec.into_iter().map(|x| x as f32).collect())
     }
 
     fn dimension(&self) -> usize {

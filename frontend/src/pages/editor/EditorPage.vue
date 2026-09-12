@@ -2,7 +2,7 @@
 // EditorPage —— /storybook/:id/edit（id=new = 新建草稿）
 // #22：单路由 + 内部视图态（A 表单工作台 / C AI 结对 / B 文档 三平级）
 // editor store = 草稿唯一主人；pair store = 结对会话（待审查建议不入草稿）
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { toast } from '@/api'
 import { useEditorStore, PARADIGMS, type Paradigm } from './stores/editor'
@@ -12,6 +12,8 @@ import PairC from './paradigms/pair-c/PairC.vue'
 import DocumentB from './paradigms/document-b/DocumentB.vue'
 import ValidationDock from './components/refs/ValidationDock.vue'
 import PlaytestDialog from './components/PlaytestDialog.vue'
+import ThemeToggle from '@/components/ThemeToggle.vue'
+import StorybookCover from '@/components/StorybookCover.vue'
 import { Button } from '@/components/ui/button'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Badge } from '@/components/ui/badge'
@@ -26,6 +28,7 @@ import {
   IconSparkles,
   IconFileText,
   IconPlayerPlay,
+  IconPencil,
 } from '@tabler/icons-vue'
 
 const route = useRoute()
@@ -43,6 +46,19 @@ const paradigmModel = computed<Paradigm>({
   set: (v: Paradigm) => editor.setParadigm(v),
 })
 const showIntro = computed(() => isNew.value && booted.value && pair.showWelcome() && editor.paradigm === 'C')
+
+const dontShowAgain = ref(false)
+function onDismissIntro(permanent = false) {
+  pair.dismissBanner(permanent || dontShowAgain.value)
+}
+function onGoWorkbench() {
+  if (dontShowAgain.value) {
+    pair.dismissBanner(true)
+  } else {
+    pair.bannerDismissed = true
+  }
+  editor.setParadigm('A')
+}
 
 const paradigmIcons: Record<Paradigm, any> = {
   A: IconLayoutGrid,
@@ -90,6 +106,12 @@ function goBack(): void {
 }
 
 // ---------- 挂载：load（或 create） ----------
+// C 结对会话为「每本故事书一段」的临时态：切换草稿 / 重进编辑器即另起新会话（#22 ① / #23 ④）
+watch(
+  () => editor.docId,
+  (id, prev) => { if (id && id !== prev) void pair.openStorybook(id) },
+)
+
 const booted = ref(false)
 onMounted(async () => {
   const raw = String(route.params.id ?? '')
@@ -98,7 +120,7 @@ onMounted(async () => {
     isNewSession.value = true
     editor.setParadigm('C')
     pair.bannerDismissed = false
-    const newId = await editor.createNew('北境信使 · 初雪（新草稿）')
+    const newId = await editor.createNew('未命名故事书')
     if (newId) {
       void router.replace({ path: '/storybook/' + newId + '/edit' })
       ok = true
@@ -110,6 +132,10 @@ onMounted(async () => {
   if (!ok) {
     toast('error', editor.loadError ?? '无法打开故事书')
   }
+  // 同 id 重进编辑器时 docId 不变、watch 不触发；这里兜底恢复结对会话列表。
+  if (ok && editor.docId && pair.threadStorybookId !== editor.docId) {
+    void pair.openStorybook(editor.docId)
+  }
   booted.value = true
 })
 
@@ -119,26 +145,41 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="flex h-full min-h-0 flex-col bg-background">
+  <div class="flex h-dvh min-h-0 flex-col bg-background">
     <!-- ============ 应用顶栏 ============ -->
-    <header class="flex h-13 flex-none items-center gap-3 border-b border-border/80 bg-card/85 px-3.5 backdrop-blur-md">
+    <header class="flex h-13 flex-none items-center gap-3 border-b border-border bg-card/90 px-3.5 backdrop-blur-md">
       <Button variant="ghost" size="sm" class="gap-1.5 text-xs text-muted-foreground hover:text-foreground" @click="goBack">
         <IconArrowLeft data-icon="inline-start" class="size-4" />
         <span class="font-medium">故事书列表</span>
       </Button>
 
-      <div class="h-4 w-px bg-border/60" />
+      <div class="h-4 w-px bg-border" />
 
-      <div class="flex min-w-0 items-center gap-2.5">
-        <span class="truncate font-serif text-[15px] font-bold tracking-wide text-foreground" :title="editor.draft?.meta.title ?? ''">
-          {{ editor.draft?.meta.title ?? '加载中…' }}
-        </span>
+      <!-- 世界封面：与列表 / 游玩页同源，形成跨页身份延续 -->
+      <StorybookCover
+        :seed="editor.draft?.meta.id ?? 'new'"
+        :title="editor.draft?.meta.title ?? '书'"
+        :cover="editor.draft?.meta.cover ?? null"
+        size="sm"
+        class="size-8 flex-none rounded-lg border border-border/80 shadow-2xs"
+      />
+
+      <div class="flex min-w-0 items-center gap-2">
+        <input
+          v-if="editor.draft"
+          v-model="editor.draft.meta.title"
+          class="max-w-[200px] sm:max-w-[280px] truncate rounded-md border border-dashed border-border bg-muted/25 px-1.5 py-0.5 text-[14px] font-bold tracking-wide text-foreground transition-colors hover:border-solid hover:border-primary/60 hover:bg-primary/5 focus:border-solid focus:border-ring focus:bg-card focus:outline-none"
+          placeholder="未命名故事书"
+          :title="'点击可修改标题：' + editor.draft.meta.title"
+        />
+        <span v-else class="truncate text-[14px] font-bold text-muted-foreground">加载中…</span>
+        <IconPencil v-if="editor.draft" class="size-3.5 shrink-0 text-muted-foreground/45 transition-colors hover:text-primary/70" />
         <span v-if="editor.dirty" class="inline-flex items-center gap-1 text-[11px] font-semibold text-warning" title="有未保存改动">
           <span class="size-2 rounded-full bg-warning animate-pulse shadow-[0_0_8px_var(--warning)]" />
         </span>
         <Badge v-if="isNew" variant="outline" class="border-warning/45 bg-warning/10 text-[10.5px] text-warning">新草稿</Badge>
         <Badge v-if="editor.published" variant="outline" class="border-success/45 bg-success/10 font-mono text-[10.5px] text-success">rev {{ editor.revision }}</Badge>
-        <Badge v-else-if="editor.draft" variant="secondary" class="font-mono text-[10.5px] text-muted-foreground">未发布 · rev {{ editor.revision }}</Badge>
+        <Badge v-else-if="editor.draft" variant="outline" class="font-mono text-[10.5px] text-muted-foreground">未发布 · rev {{ editor.revision }}</Badge>
       </div>
 
       <!-- 自动保存状态指示 -->
@@ -152,7 +193,7 @@ onUnmounted(() => {
       <!-- 范式切换（A / C / B 视图态按钮组） -->
       <nav class="ml-auto flex items-center" aria-label="编辑范式">
         <Tabs :model-value="paradigmModel" @update:model-value="paradigmModel = ($event as Paradigm)">
-          <TabsList class="h-8 gap-0.5 rounded-lg border border-border/80 bg-background/80 p-0.5 shadow-inner">
+          <TabsList class="h-8 gap-0.5 rounded-lg border border-border bg-background/80 p-0.5 shadow-inner">
             <TabsTrigger
               v-for="p in PARADIGMS"
               :key="p.key"
@@ -167,7 +208,12 @@ onUnmounted(() => {
         </Tabs>
       </nav>
 
-      <div class="h-4 w-px bg-border/60" />
+      <div class="h-4 w-px bg-border" />
+
+      <!-- 主题切换 -->
+      <ThemeToggle />
+
+      <div class="h-4 w-px bg-border" />
 
       <!-- 沙箱试玩按钮 -->
       <Button
@@ -191,7 +237,7 @@ onUnmounted(() => {
         :disabled="errorCount > 0 || editor.publishing"
         :title="pubBlockMsg || '发布当前草稿为新版次'"
         class="gap-1.5 font-semibold transition-all duration-200"
-        :class="errorCount === 0 && !editor.publishing ? 'bg-gradient-to-r from-primary to-amber-500 hover:from-amber-500 hover:to-primary text-primary-foreground shadow-sm shadow-primary/30 hover:shadow-md hover:shadow-primary/40' : ''"
+        :class="errorCount === 0 && !editor.publishing ? 'bg-primary text-primary-foreground hover:bg-primary/90 shadow-sm shadow-primary/25 hover:shadow-md hover:shadow-primary/35' : ''"
         @click="onPublish"
       >
         <IconLoader2 v-if="editor.publishing" class="size-4 animate-spin" />
@@ -201,20 +247,31 @@ onUnmounted(() => {
       </Button>
     </header>
 
-    <!-- ============ 首屏轻引导（新建书 C 范式，#22 ① 可关不强制） ============ -->
+    <!-- ============ 首屏轻引导（新建书 C 范式，#22 ① 可关不强制，支持持久化不再提示） ============ -->
     <div v-if="showIntro" class="absolute top-16 left-1/2 z-40 w-[min(560px,calc(100vw-2rem))] -translate-x-1/2">
       <div class="rounded-xl border border-primary/40 bg-popover p-4 shadow-xl shadow-black/40">
         <div class="mb-2 flex items-center">
-          <strong class="font-serif text-[15px] text-foreground">开始创作新故事书</strong>
-          <Button variant="ghost" size="icon-sm" class="ml-auto size-6 text-muted-foreground/60" aria-label="关掉" @click="pair.bannerDismissed = true">
+          <strong class="text-[15px] font-bold text-foreground">开始创作新故事书</strong>
+          <Button variant="ghost" size="icon-sm" class="ml-auto size-6 text-muted-foreground/60 hover:text-foreground cursor-pointer" aria-label="关掉" @click="onDismissIntro(false)">
             <IconX />
           </Button>
         </div>
-        <p class="text-[13px] leading-6 text-muted-foreground">没有头绪？从 C AI 结对开始最顺——跟 Octo 聊聊设定，把建议「采纳」成实体。</p>
-        <p class="mt-1 text-xs leading-5 text-muted-foreground/70">有明确目标？切到 A 表单工作台逐项精修；想自由书写就进 B 文档。三种范式操作同一草稿，切换不丢内容。</p>
-        <div class="mt-2.5 flex gap-2">
-          <Button size="sm" @click="editor.setParadigm('A')">去 A 表单工作台</Button>
-          <Button variant="ghost" size="sm" @click="pair.bannerDismissed = true">知道了</Button>
+        <p class="text-[13px] leading-6 text-muted-foreground">没有头绪？从「AI 结对」开始最顺——跟 Octo 聊聊设定，把建议「采纳」成实体。</p>
+        <p class="mt-1 text-xs leading-5 text-muted-foreground/70">有明确目标？切到「表单工作台」逐项精修；想自由书写就进「文档」。三种范式操作同一草稿，切换不丢内容。</p>
+        <div class="mt-3.5 flex flex-wrap items-center justify-between gap-2 border-t border-border/60 pt-3">
+          <label class="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground cursor-pointer select-none">
+            <input
+              type="checkbox"
+              v-model="dontShowAgain"
+              class="size-3.5 rounded border-border accent-primary cursor-pointer"
+            />
+            <span>不再提示</span>
+          </label>
+          <div class="flex items-center gap-2">
+            <Button size="sm" variant="ghost" class="text-xs cursor-pointer" @click="onDismissIntro(true)">不再显示</Button>
+            <Button size="sm" variant="outline" class="cursor-pointer" @click="onDismissIntro(false)">知道了</Button>
+            <Button size="sm" class="cursor-pointer" @click="onGoWorkbench">去表单工作台</Button>
+          </div>
         </div>
       </div>
     </div>

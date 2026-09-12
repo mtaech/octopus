@@ -1,6 +1,8 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { defineAsyncComponent, ref, onMounted, onUnmounted } from 'vue'
 import { subscribeToasts, type Toast } from '@/api'
+// 异步引入：确认框的 shadcn/reka-ui 代码不进入口 chunk，避免拖慢首屏。
+const ConfirmHost = defineAsyncComponent(() => import('@/components/ConfirmHost.vue'))
 import {
   IconCircleCheckFilled,
   IconAlertTriangleFilled,
@@ -18,6 +20,8 @@ const kindClass = (k: Toast['kind']) => 'toast--' + k
 
 <template>
   <router-view />
+  <!-- 全局命令式确认框（替代 window.confirm） -->
+  <ConfirmHost />
   <div class="toast-stack" aria-live="polite">
     <transition-group name="toast">
       <div v-for="t in toasts" :key="t.id" class="oct-toast" :class="kindClass(t.kind)">
@@ -57,8 +61,11 @@ const kindClass = (k: Toast['kind']) => 'toast--' + k
   border-radius: 9999px;
   font-size: 13px;
   font-weight: 500;
-  box-shadow: 0 10px 30px -4px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.05);
+  box-shadow: 0 10px 25px -4px rgba(0, 0, 0, 0.12), 0 4px 8px -2px rgba(0, 0, 0, 0.06);
   max-width: min(560px, 90vw);
+}
+:is(.dark) .oct-toast {
+  box-shadow: 0 10px 30px -4px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.05);
 }
 .toast--ok {
   border-color: color-mix(in oklab, var(--success) 45%, transparent);

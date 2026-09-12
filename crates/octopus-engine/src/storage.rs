@@ -9,7 +9,8 @@ use sea_orm::{
 use serde_json::Value;
 
 use octopus_types::{
-    ArchivedCommandRecord, CommandRecord, MaintenanceRow, SaveDetail, SaveListItem, SavePackage,
+    ArchivedCommandRecord, CommandRecord, EventEnvelope, MaintenanceRow, NarrativeOverride, PlayEvent,
+    SaveDetail, SaveListItem, SavePackage,
 };
 use migration::{Migrator, MigratorTrait};
 
@@ -17,6 +18,93 @@ use crate::{entities, error::EngineError, seed::seed_storybooks};
 
 pub fn now_iso() -> String {
     Utc::now().to_rfc3339()
+}
+
+/// 从命令日志读回的一条事件，附带该条记录的幂等请求 id。
+#[derive(Debug, Clone)]
+pub struct PersistedEvent {
+    pub request_id: Option<String>,
+    pub envelope: EventEnvelope,
+}
+
+/// 待写入的结对会话消息（seq 由存储层分配）。
+#[derive(Debug, Clone)]
+pub struct NewPairMessage {
+    pub role: String,
+    pub content: String,
+    pub model: Option<String>,
+    pub is_error: bool,
+    pub tools: Option<Value>,
+    /// 该消息显式引用的实体（JSON 数组）。
+    pub refs: Option<Value>,
+    /// 仅 assistant：思考流正文。
+    pub reasoning: Option<String>,
+    /// user 消息的附件（JSON 数组）。
+    pub attachments: Option<Value>,
+}
+
+/// 结对会话线程。
+#[derive(Debug, Clone)]
+pub struct PairThreadRow {
+    pub id: String,
+    pub storybook_id: String,
+    pub title: String,
+    pub message_count: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    /// 尚未处理的待审查改动（JSON 数组）。
+    pub pending_suggestions: Option<Value>,
+}
+
+/// 由首条用户消息派生会话标题（单行、截断到 20 字符）。
+fn derive_thread_title(text: &str) -> String {
+    let line = text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    let mut out = String::new();
+    for (i, ch) in line.chars().enumerate() {
+        if i >= 20 {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// 读回的结对会话消息。
+#[derive(Debug, Clone)]
+pub struct PairMessageRow {
+    pub seq: i64,
+    pub role: String,
+    pub content: String,
+    pub model: Option<String>,
+    pub is_error: bool,
+    pub tools: Option<Value>,
+    pub refs: Option<Value>,
+    pub reasoning: Option<String>,
+    pub attachments: Option<Value>,
+}
+
+/// 事件类型标签（写入 `commands.kind`，便于按类型检索与调试）。
+pub fn event_kind(event: &PlayEvent) -> &'static str {
+    match event {
+        PlayEvent::Scene(_) => "scene",
+        PlayEvent::Narrate(_) => "narrate",
+        PlayEvent::Dialogue(_) => "dialogue",
+        PlayEvent::Emote(_) => "emote",
+        PlayEvent::Pending(_) => "pending",
+        PlayEvent::CheckResult(_) => "check_result",
+        PlayEvent::Resolution(_) => "resolution",
+        PlayEvent::StateUpdate(_) => "state_update",
+        PlayEvent::Phase(_) => "phase",
+        PlayEvent::RoundStart(_) => "round_start",
+        PlayEvent::RoundEnd(_) => "round_end",
+        PlayEvent::System(_) => "system",
+        PlayEvent::Reasoning(_) => "reasoning",
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +208,19 @@ impl SqliteStore {
         let result = rows
             .into_iter()
             .map(|r| {
+                // 列表卡要的元信息取自「已发布版次优先、否则草稿」的 meta。
+                // 注意：description 以前写死为 Null，列表页因此永远显示「尚未填写简介」。
+                let meta = r
+                    .released_json
+                    .as_deref()
+                    .or(Some(r.draft_json.as_str()))
+                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                    .and_then(|v| v.get("meta").cloned())
+                    .unwrap_or(Value::Null);
+                let description = meta.get("description").cloned().unwrap_or(Value::Null);
+                let cover = meta.get("cover").cloned().unwrap_or(Value::Null);
+                // 内容评级（P3）：缺省 sfw，仅给列表徽标用；不参与任何过滤 / 校验分支。
+                let rating = meta.get("rating").cloned().unwrap_or(Value::Null);
                 serde_json::json!({
                     "id": r.id,
                     "title": r.title,
@@ -128,7 +229,9 @@ impl SqliteStore {
                     "updated_at": r.updated_at,
                     "released_at": r.released_at,
                     "published": r.released_at.is_some(),
-                    "description": Value::Null,
+                    "description": description,
+                    "cover": cover,
+                    "rating": rating,
                 })
             })
             .collect();
@@ -139,16 +242,28 @@ impl SqliteStore {
         let model = entities::storybook::Entity::find_by_id(id.to_string())
             .one(&self.db)
             .await?;
-        Ok(model.map(|r| StorybookRow {
-            id: r.id,
-            title: r.title,
-            revision: r.revision as u32,
-            draft_version: r.draft_version as u32,
-            updated_at: r.updated_at,
-            released_at: r.released_at,
-            published: r.released_json.is_some(),
-            draft: serde_json::from_str(&r.draft_json).unwrap_or(Value::Null),
-            released: r.released_json.as_deref().and_then(|s| serde_json::from_str(s).ok()),
+        Ok(model.map(|r| {
+            let mut draft: Value = serde_json::from_str(&r.draft_json).unwrap_or(Value::Null);
+            let mut released: Option<Value> = r
+                .released_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok());
+            // 读旧格式时升格（历史数据本身不改写）
+            crate::upcast::upcast_storybook(&mut draft);
+            if let Some(rel) = released.as_mut() {
+                crate::upcast::upcast_storybook(rel);
+            }
+            StorybookRow {
+                id: r.id,
+                title: r.title,
+                revision: r.revision as u32,
+                draft_version: r.draft_version as u32,
+                updated_at: r.updated_at,
+                released_at: r.released_at,
+                published: r.released_json.is_some(),
+                draft,
+                released,
+            }
         }))
     }
 
@@ -291,10 +406,14 @@ impl SqliteStore {
                     let new_revision = model.revision + 1;
                     let new_draft_version = model.draft_version + 1;
                     let now = now_iso();
-                    let draft_val: Value = serde_json::from_str(&model.draft_json).unwrap_or(Value::Null);
+                    let mut draft_val: Value =
+                        serde_json::from_str(&model.draft_json).unwrap_or(Value::Null);
+                    // 发布即生成新快照：写入前升格，避免新存档内嵌旧字段
+                    crate::upcast::upcast_storybook(&mut draft_val);
+                    let draft_content =
+                        serde_json::to_string(&draft_val).unwrap_or_else(|_| "{}".to_string());
 
                     let mut active: entities::storybook::ActiveModel = model.into();
-                    let draft_content = active.draft_json.as_ref().clone();
                     active.released_json = Set(Some(draft_content));
                     active.revision = Set(new_revision);
                     active.draft_version = Set(new_draft_version);
@@ -328,6 +447,15 @@ impl SqliteStore {
         let res = entities::storybook::Entity::delete_by_id(id.to_string())
             .exec(&self.db)
             .await?;
+        // 结对会话随故事书一并清理（消息 → 线程）。
+        entities::pair_message::Entity::delete_many()
+            .filter(entities::pair_message::Column::StorybookId.eq(id.to_string()))
+            .exec(&self.db)
+            .await?;
+        entities::pair_thread::Entity::delete_many()
+            .filter(entities::pair_thread::Column::StorybookId.eq(id.to_string()))
+            .exec(&self.db)
+            .await?;
         Ok(res.rows_affected > 0)
     }
 
@@ -347,6 +475,10 @@ impl SqliteStore {
             is_sandbox: Set(d.item.is_sandbox.unwrap_or(false)),
             storybook_json: Set(storybook_json),
             auto_confirm: Set(auto_confirm),
+            model_provider_id: Set(None),
+            model: Set(None),
+            reasoning_effort: Set(None),
+            narrative_json: Set(None),
             created_at: Set(d.item.created_at.clone()),
             updated_at: Set(d.item.updated_at.clone()),
             last_played_at: Set(d.item.last_played_at.clone()),
@@ -385,7 +517,9 @@ impl SqliteStore {
             .one(&self.db)
             .await?;
         Ok(model.map(|m| {
-            let storybook: Value = serde_json::from_str(&m.storybook_json).unwrap_or(Value::Null);
+            let mut storybook: Value = serde_json::from_str(&m.storybook_json).unwrap_or(Value::Null);
+            // 存档内嵌冻结故事书：读旧格式时升格
+            crate::upcast::upcast_storybook(&mut storybook);
             let item = SaveListItem {
                 id: m.id,
                 title: m.title,
@@ -466,6 +600,64 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// 本存档的模型（provider id, model id, reasoning_effort）；未设置返回 (None, None, None)。
+    pub async fn get_save_model(
+        &self,
+        id: &str,
+    ) -> Result<(Option<String>, Option<String>, Option<String>), EngineError> {
+        let model = entities::save::Entity::find_by_id(id.to_string()).one(&self.db).await?;
+        Ok(model
+            .map(|m| (m.model_provider_id, m.model, m.reasoning_effort))
+            .unwrap_or((None, None, None)))
+    }
+
+    /// 设置本存档的模型；传 None 表示回落到全局默认。
+    pub async fn set_save_model(
+        &self,
+        id: &str,
+        provider_id: Option<&str>,
+        model: Option<&str>,
+        reasoning_effort: Option<&str>,
+    ) -> Result<(), EngineError> {
+        if let Some(m) = entities::save::Entity::find_by_id(id.to_string()).one(&self.db).await? {
+            let mut active: entities::save::ActiveModel = m.into();
+            active.model_provider_id = Set(provider_id.map(str::to_string));
+            active.model = Set(model.map(str::to_string));
+            active.reasoning_effort = Set(reasoning_effort.map(str::to_string));
+            active.updated_at = Set(now_iso());
+            active.update(&self.db).await?;
+        }
+        Ok(())
+    }
+
+    /// 本存档的叙述段玩家偏好；无记录 / 解析失败返回 None（等价于全用故事书默认）。
+    /// 只读存档设置，绝不触碰命令日志——历史条目无法被偏好改写。
+    pub async fn get_save_narrative(
+        &self,
+        id: &str,
+    ) -> Result<Option<std::collections::BTreeMap<String, NarrativeOverride>>, EngineError> {
+        let model = entities::save::Entity::find_by_id(id.to_string()).one(&self.db).await?;
+        Ok(model
+            .and_then(|m| m.narrative_json)
+            .and_then(|j| serde_json::from_str(&j).ok()))
+    }
+
+    /// 保存本存档的叙述段玩家偏好。传空 map 也照存（表示玩家显式清空）。
+    pub async fn set_save_narrative(
+        &self,
+        id: &str,
+        overrides: &std::collections::BTreeMap<String, NarrativeOverride>,
+    ) -> Result<(), EngineError> {
+        if let Some(m) = entities::save::Entity::find_by_id(id.to_string()).one(&self.db).await? {
+            let json = serde_json::to_string(overrides).unwrap_or_else(|_| "{}".to_string());
+            let mut active: entities::save::ActiveModel = m.into();
+            active.narrative_json = Set(Some(json));
+            active.updated_at = Set(now_iso());
+            active.update(&self.db).await?;
+        }
+        Ok(())
+    }
+
     pub async fn touch_save(&self, id: &str) -> Result<(), EngineError> {
         if let Some(m) = entities::save::Entity::find_by_id(id.to_string()).one(&self.db).await? {
             let now = now_iso();
@@ -495,9 +687,110 @@ impl SqliteStore {
             kind: Set(kind.to_string()),
             payload_json: Set(payload_json.to_string()),
             ts: Set(now_iso()),
+            request_id: sea_orm::ActiveValue::NotSet,
         };
         active.insert(&self.db).await?;
         Ok(())
+    }
+
+    /// 把 `seq >= from_seq` 的命令归档到只读归档表，并从活日志删除。
+    /// 「重跑本轮」用：被舍弃的旧回合作为分支保留（origin_seq = from_seq），
+    /// 活日志截断到回合起点之前，重放即得到回合前的世界状态。
+    pub async fn archive_commands_from(
+        &self,
+        save_id: &str,
+        from_seq: u64,
+    ) -> Result<u64, EngineError> {
+        let from = from_seq as i64;
+        let txn = self.db.begin().await?;
+        let rows = entities::command::Entity::find()
+            .filter(entities::command::Column::SaveId.eq(save_id.to_string()))
+            .filter(entities::command::Column::Seq.gte(from))
+            .all(&txn)
+            .await?;
+        let count = rows.len() as u64;
+        for m in &rows {
+            let active = entities::archived_command::ActiveModel {
+                id: sea_orm::ActiveValue::NotSet,
+                save_id: Set(m.save_id.clone()),
+                origin_seq: Set(from),
+                seq: Set(m.seq),
+                round: Set(m.round),
+                kind: Set(m.kind.clone()),
+                payload_json: Set(m.payload_json.clone()),
+                ts: Set(m.ts.clone()),
+            };
+            active.insert(&txn).await?;
+        }
+        entities::command::Entity::delete_many()
+            .filter(entities::command::Column::SaveId.eq(save_id.to_string()))
+            .filter(entities::command::Column::Seq.gte(from))
+            .exec(&txn)
+            .await?;
+        txn.commit().await?;
+        Ok(count)
+    }
+
+    /// 追加一条演出事件到命令日志（权威条目，payload 为完整 `EventEnvelope` JSON）。
+    pub async fn append_event(
+        &self,
+        save_id: &str,
+        env: &EventEnvelope,
+    ) -> Result<(), EngineError> {
+        let request_id = match &env.event {
+            PlayEvent::RoundStart(p) => p.request_id.clone(),
+            _ => None,
+        };
+        let payload_json = serde_json::to_string(env)?;
+        let active = entities::command::ActiveModel {
+            id: sea_orm::ActiveValue::NotSet,
+            save_id: Set(save_id.to_string()),
+            seq: Set(env.seq as i64),
+            round: Set(env.round as i64),
+            kind: Set(event_kind(&env.event).to_string()),
+            payload_json: Set(payload_json),
+            ts: Set(env.ts.clone()),
+            request_id: Set(request_id),
+        };
+        active.insert(&self.db).await?;
+        Ok(())
+    }
+
+    /// 读回一个存档的完整事件日志（按 seq 升序）。无法解析为 `EventEnvelope` 的
+    /// 历史行（旧格式 / 测试桩）会被跳过，保证重放不因脏数据整体失败。
+    pub async fn load_events(&self, save_id: &str) -> Result<Vec<PersistedEvent>, EngineError> {
+        let rows = entities::command::Entity::find()
+            .filter(entities::command::Column::SaveId.eq(save_id.to_string()))
+            .order_by_asc(entities::command::Column::Seq)
+            .all(&self.db)
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for m in rows {
+            match serde_json::from_str::<EventEnvelope>(&m.payload_json) {
+                Ok(mut envelope) => {
+                    // 旧格式日志：EntityRef.kind 仍是 beat 时升格为 trigger
+                    crate::upcast::upcast_event(&mut envelope);
+                    // 旧存档包导入时 request_id 列可能为空，回落到事件负载里的值。
+                    let embedded = match &envelope.event {
+                        PlayEvent::RoundStart(p) => p.request_id.clone(),
+                        _ => None,
+                    };
+                    out.push(PersistedEvent {
+                        request_id: m.request_id.or(embedded),
+                        envelope,
+                    });
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        save_id = %save_id,
+                        seq = m.seq,
+                        error = %err,
+                        "命令日志存在无法解析的条目，已跳过"
+                    );
+                }
+            }
+        }
+        Ok(out)
     }
 
     pub async fn append_maintenance(&self, save_id: &str, op: &str, summary: &str) -> Result<(), EngineError> {
@@ -528,6 +821,254 @@ impl SqliteStore {
             })
             .collect();
         Ok(list)
+    }
+
+    // ---------- 结对会话（#23 ④）：一本故事书可有多条按主题隔离的线程 ----------
+
+    async fn pair_message_count(&self, thread_id: &str) -> Result<i64, EngineError> {
+        let n = entities::pair_message::Entity::find()
+            .filter(entities::pair_message::Column::ThreadId.eq(thread_id.to_string()))
+            .count(&self.db)
+            .await?;
+        Ok(n as i64)
+    }
+
+    fn thread_row(m: entities::pair_thread::Model, message_count: i64) -> PairThreadRow {
+        PairThreadRow {
+            id: m.id,
+            storybook_id: m.storybook_id,
+            title: m.title,
+            message_count,
+            created_at: m.created_at,
+            updated_at: m.updated_at,
+            pending_suggestions: m
+                .pending_suggestions_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<Value>(s).ok()),
+        }
+    }
+
+    /// 覆盖线程的待审查改动；None / null 表示清空。
+    pub async fn set_pair_thread_pending(
+        &self,
+        thread_id: &str,
+        suggestions: Option<Value>,
+    ) -> Result<bool, EngineError> {
+        let Some(m) = entities::pair_thread::Entity::find_by_id(thread_id.to_string())
+            .one(&self.db)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let json = match suggestions {
+            Some(v) if !v.is_null() => Some(serde_json::to_string(&v)?),
+            _ => None,
+        };
+        let mut active: entities::pair_thread::ActiveModel = m.into();
+        active.pending_suggestions_json = Set(json);
+        active.update(&self.db).await?;
+        Ok(true)
+    }
+
+    pub async fn list_pair_threads(
+        &self,
+        storybook_id: &str,
+    ) -> Result<Vec<PairThreadRow>, EngineError> {
+        let rows = entities::pair_thread::Entity::find()
+            .filter(entities::pair_thread::Column::StorybookId.eq(storybook_id.to_string()))
+            .order_by_desc(entities::pair_thread::Column::UpdatedAt)
+            .all(&self.db)
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for m in rows {
+            let id = m.id.clone();
+            let count = self.pair_message_count(&id).await?;
+            out.push(Self::thread_row(m, count));
+        }
+        Ok(out)
+    }
+
+    pub async fn get_pair_thread(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<PairThreadRow>, EngineError> {
+        let m = entities::pair_thread::Entity::find_by_id(thread_id.to_string())
+            .one(&self.db)
+            .await?;
+        match m {
+            Some(m) => {
+                let count = self.pair_message_count(thread_id).await?;
+                Ok(Some(Self::thread_row(m, count)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// 新建一条会话线程。标题缺省为「新会话」，首条用户消息落下后自动补标题。
+    pub async fn create_pair_thread(
+        &self,
+        storybook_id: &str,
+        title: Option<&str>,
+    ) -> Result<PairThreadRow, EngineError> {
+        let now = now_iso();
+        let resolved = title
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .unwrap_or("新会话")
+            .to_string();
+        let active = entities::pair_thread::ActiveModel {
+            id: Set(format!("pt-{}", uuid::Uuid::new_v4().simple())),
+            storybook_id: Set(storybook_id.to_string()),
+            title: Set(resolved.clone()),
+            created_at: Set(now.clone()),
+            updated_at: Set(now.clone()),
+            pending_suggestions_json: Set(None),
+        };
+        let inserted = active.insert(&self.db).await?;
+        Ok(PairThreadRow {
+            id: inserted.id,
+            storybook_id: storybook_id.to_string(),
+            title: resolved,
+            message_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            pending_suggestions: None,
+        })
+    }
+
+    pub async fn rename_pair_thread(
+        &self,
+        thread_id: &str,
+        title: &str,
+    ) -> Result<Option<PairThreadRow>, EngineError> {
+        let Some(m) = entities::pair_thread::Entity::find_by_id(thread_id.to_string())
+            .one(&self.db)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let mut active: entities::pair_thread::ActiveModel = m.into();
+        active.title = Set(title.to_string());
+        active.updated_at = Set(now_iso());
+        let updated = active.update(&self.db).await?;
+        let count = self.pair_message_count(thread_id).await?;
+        Ok(Some(Self::thread_row(updated, count)))
+    }
+
+    pub async fn delete_pair_thread(&self, thread_id: &str) -> Result<bool, EngineError> {
+        entities::pair_message::Entity::delete_many()
+            .filter(entities::pair_message::Column::ThreadId.eq(thread_id.to_string()))
+            .exec(&self.db)
+            .await?;
+        let res = entities::pair_thread::Entity::delete_by_id(thread_id.to_string())
+            .exec(&self.db)
+            .await?;
+        Ok(res.rows_affected > 0)
+    }
+
+    pub async fn list_pair_messages(
+        &self,
+        thread_id: &str,
+    ) -> Result<Vec<PairMessageRow>, EngineError> {
+        let rows = entities::pair_message::Entity::find()
+            .filter(entities::pair_message::Column::ThreadId.eq(thread_id.to_string()))
+            .order_by_asc(entities::pair_message::Column::Seq)
+            .all(&self.db)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|m| PairMessageRow {
+                seq: m.seq,
+                role: m.role,
+                content: m.content,
+                model: m.model,
+                is_error: m.is_error,
+                tools: m.tools_json.as_deref().and_then(|s| serde_json::from_str(s).ok()),
+                refs: m.refs_json.as_deref().and_then(|s| serde_json::from_str(s).ok()),
+                reasoning: m.reasoning,
+                attachments: m.attachments_json.as_deref().and_then(|s| serde_json::from_str(s).ok()),
+            })
+            .collect())
+    }
+
+    pub async fn append_pair_messages(
+        &self,
+        thread_id: &str,
+        msgs: &[NewPairMessage],
+    ) -> Result<(), EngineError> {
+        if msgs.is_empty() {
+            return Ok(());
+        }
+        let thread = entities::pair_thread::Entity::find_by_id(thread_id.to_string())
+            .one(&self.db)
+            .await?
+            .ok_or_else(|| EngineError::Internal(format!("结对线程不存在：{thread_id}")))?;
+
+        let existing = self.pair_message_count(thread_id).await?;
+        let last = entities::pair_message::Entity::find()
+            .filter(entities::pair_message::Column::ThreadId.eq(thread_id.to_string()))
+            .order_by_desc(entities::pair_message::Column::Seq)
+            .one(&self.db)
+            .await?;
+        let mut seq = last.map(|m| m.seq).unwrap_or(0);
+        for m in msgs {
+            seq += 1;
+            let tools_json = match &m.tools {
+                Some(v) => Some(serde_json::to_string(v)?),
+                None => None,
+            };
+            let refs_json = match &m.refs {
+                Some(v) => Some(serde_json::to_string(v)?),
+                None => None,
+            };
+            let attachments_json = match &m.attachments {
+                Some(v) => Some(serde_json::to_string(v)?),
+                None => None,
+            };
+            let active = entities::pair_message::ActiveModel {
+                id: sea_orm::ActiveValue::NotSet,
+                thread_id: Set(Some(thread_id.to_string())),
+                storybook_id: Set(thread.storybook_id.clone()),
+                seq: Set(seq),
+                role: Set(m.role.clone()),
+                content: Set(m.content.clone()),
+                model: Set(m.model.clone()),
+                is_error: Set(m.is_error),
+                tools_json: Set(tools_json),
+                refs_json: Set(refs_json),
+                reasoning: Set(m.reasoning.clone()),
+                attachments_json: Set(attachments_json),
+                created_at: Set(now_iso()),
+            };
+            active.insert(&self.db).await?;
+        }
+
+        // 首条用户消息自动补标题（仅当标题仍是默认值时），并刷新 updated_at 用于排序。
+        let mut new_title = thread.title.clone();
+        let is_default = thread.title.is_empty()
+            || thread.title == "新会话"
+            || thread.title.starts_with("对话 ");
+        if existing == 0 && is_default {
+            if let Some(first) = msgs.iter().find(|m| m.role == "user") {
+                let derived = derive_thread_title(&first.content);
+                if !derived.is_empty() {
+                    new_title = derived;
+                }
+            }
+        }
+        let mut active: entities::pair_thread::ActiveModel = thread.into();
+        active.title = Set(new_title);
+        active.updated_at = Set(now_iso());
+        active.update(&self.db).await?;
+        Ok(())
+    }
+
+    pub async fn clear_pair_messages(&self, thread_id: &str) -> Result<u64, EngineError> {
+        let res = entities::pair_message::Entity::delete_many()
+            .filter(entities::pair_message::Column::ThreadId.eq(thread_id.to_string()))
+            .exec(&self.db)
+            .await?;
+        Ok(res.rows_affected)
     }
 
     // ---------- 通用自包含存档包（#27 / 跨数据库导出与导入） ----------
@@ -615,6 +1156,8 @@ impl SqliteStore {
         };
 
         let mut detail = pkg.save.clone();
+        // 导入旧存档包时升格内嵌故事书
+        crate::upcast::upcast_storybook(&mut detail.storybook);
         detail.item.id = new_id.clone();
         detail.item.title = new_title;
         detail.item.imported = Some(true);
@@ -644,6 +1187,10 @@ impl SqliteStore {
                         is_sandbox: Set(detail_to_save.item.is_sandbox.unwrap_or(false)),
                         storybook_json: Set(storybook_json),
                         auto_confirm: Set(false),
+                        model_provider_id: Set(None),
+                        model: Set(None),
+                        reasoning_effort: Set(None),
+                        narrative_json: Set(None),
                         created_at: Set(detail_to_save.item.created_at.clone()),
                         updated_at: Set(now.clone()),
                         last_played_at: Set(detail_to_save.item.last_played_at.clone()),
@@ -661,6 +1208,7 @@ impl SqliteStore {
                             kind: Set(cmd.kind),
                             payload_json: Set(payload_json),
                             ts: Set(cmd.ts),
+                            request_id: Set(None),
                         };
                         cmd_active.insert(txn).await?;
                     }
@@ -751,6 +1299,41 @@ mod tests {
         assert_eq!(fetched.draft_version, 2);
         assert_eq!(fetched.title, "修改后标题");
         assert_eq!(fetched.draft, updated_draft);
+    }
+
+    #[tokio::test]
+    async fn test_get_storybook_upcasts_legacy_beats() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        // 旧格式（v1）：骨架用 beats，条件用 beat_fired / beat_id
+        let legacy = json!({
+            "schema_version": 1,
+            "meta": { "id": "sb-legacy", "title": "旧书" },
+            "skeleton": [{ "id": "ch-1", "title": "第一章", "scenes": [{
+                "id": "sc-1",
+                "title": "场景",
+                "beats": [{ "id": "b1", "title": "触发点", "hint": "提示" }],
+                "goals": [{ "id": "g1", "text": "目标", "condition": { "op": "beat_fired", "beat_id": "b1" } }]
+            }] }]
+        });
+        let row = store.create_storybook_draft(None, &legacy).await.unwrap();
+
+        // 读回来即为当前结构
+        let fetched = store.get_storybook(&row.id).await.unwrap().unwrap();
+        let scene = &fetched.draft["skeleton"][0]["scenes"][0];
+        assert!(scene.get("beats").is_none(), "旧 beats 键应被升格");
+        assert_eq!(scene["triggers"][0]["id"], json!("b1"));
+        assert_eq!(scene["goals"][0]["condition"]["op"], json!("trigger_fired"));
+        assert_eq!(scene["goals"][0]["condition"]["trigger_id"], json!("b1"));
+        assert_eq!(fetched.draft["schema_version"], json!(3));
+        assert_eq!(fetched.draft["statuses"], json!([]));
+
+        // 落库内容仍是旧格式：历史数据永不改写
+        let model = entities::storybook::Entity::find_by_id(row.id.clone())
+            .one(&store.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(model.draft_json.contains("\"beats\""), "DB 内的历史数据不应被改写");
     }
 
     #[tokio::test]
@@ -891,6 +1474,85 @@ mod tests {
 
         assert!(store.delete_save("save-1").await.unwrap());
         assert!(store.get_save("save-1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_archive_commands_from_moves_rows() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        store.append_command("sv-arch", 1, 0, "scene", "{}").await.unwrap();
+        store.append_command("sv-arch", 2, 1, "round_start", "{}").await.unwrap();
+        store.append_command("sv-arch", 3, 1, "round_end", "{}").await.unwrap();
+        store.append_command("sv-other", 2, 1, "round_start", "{}").await.unwrap();
+
+        let n = store.archive_commands_from("sv-arch", 2).await.unwrap();
+        assert_eq!(n, 2, "只归档该存档 seq>=2 的命令");
+
+        let live = entities::command::Entity::find()
+            .filter(entities::command::Column::SaveId.eq("sv-arch"))
+            .all(&store.db)
+            .await
+            .unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].seq, 1);
+        assert_eq!(
+            entities::command::Entity::find()
+                .filter(entities::command::Column::SaveId.eq("sv-other"))
+                .count(&store.db)
+                .await
+                .unwrap(),
+            1,
+            "别的存档不受影响"
+        );
+
+        let arch = entities::archived_command::Entity::find()
+            .filter(entities::archived_command::Column::SaveId.eq("sv-arch"))
+            .all(&store.db)
+            .await
+            .unwrap();
+        assert_eq!(arch.len(), 2);
+        assert!(arch.iter().all(|m| m.origin_seq == 2));
+        assert_eq!(arch.iter().map(|m| m.seq).max(), Some(3));
+    }
+
+
+    #[tokio::test]
+    async fn test_save_model_roundtrip() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let detail = SaveDetail {
+            item: SaveListItem {
+                id: "sv-model".to_string(),
+                title: "模型存档".to_string(),
+                storybook_id: "sb-1".to_string(),
+                storybook_title: "测试".to_string(),
+                embedded_revision: 1,
+                latest_revision: 1,
+                needs_upgrade: false,
+                imported: Some(false),
+                is_sandbox: Some(false),
+                created_at: now_iso(),
+                updated_at: now_iso(),
+                last_played_at: now_iso(),
+            },
+            storybook: json!({ "meta": { "title": "测试" } }),
+        };
+        store.insert_save(&detail, false).await.unwrap();
+        assert_eq!(store.get_save_model("sv-model").await.unwrap(), (None, None, None));
+
+        store
+            .set_save_model("sv-model", Some("deepseek"), Some("deepseek-v4-pro"), Some("high"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_save_model("sv-model").await.unwrap(),
+            (
+                Some("deepseek".to_string()),
+                Some("deepseek-v4-pro".to_string()),
+                Some("high".to_string())
+            )
+        );
+
+        store.set_save_model("sv-model", None, None, None).await.unwrap();
+        assert_eq!(store.get_save_model("sv-model").await.unwrap(), (None, None, None));
     }
 
     #[tokio::test]

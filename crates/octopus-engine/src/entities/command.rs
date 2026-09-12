@@ -12,6 +12,7 @@ pub struct Model {
     #[sea_orm(column_type = "Text")]
     pub payload_json: String,
     pub ts: String,
+    pub request_id: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

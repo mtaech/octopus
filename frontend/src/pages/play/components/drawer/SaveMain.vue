@@ -6,6 +6,7 @@ import { useRouter } from 'vue-router'
 import { usePlayStore } from '../../stores/play'
 import { useDrawerStore } from '../../stores/drawer'
 import { relTime, fmtTime } from '../../utils'
+import { confirm } from '@/lib/confirm'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -50,13 +51,24 @@ function cancelRename() { renaming.value = false }
 
 async function doDelete() {
   if (!props.playSave) return
-  if (!window.confirm('确定删除该存档？删除后不可恢复（已导出的备份包不受影响）。')) return
+  const confirmed = await confirm({
+    title: '删除该存档？',
+    description: '删除后不可恢复（已导出的备份包不受影响）。',
+    confirmText: '删除',
+    destructive: true,
+  })
+  if (!confirmed) return
   const ok = await drawer.doDelete(props.playSave.id)
   if (ok) { drawer.closeDrawer(); void router.push('/') }
 }
 
 async function doOrigin() {
-  if (!window.confirm('压缩为新原点：以当前状态为新起点，之前的命令日志归档为只读。继续？')) return
+  const confirmed = await confirm({
+    title: '压缩为新原点？',
+    description: '以当前状态为新起点，之前的命令日志归档为只读。',
+    confirmText: '执行压缩',
+  })
+  if (!confirmed) return
   await drawer.doNewOrigin()
 }
 
@@ -156,16 +168,19 @@ function fmt(iso: string) { return fmtTime(iso) }
             <div v-else class="rounded-lg border border-border/50 bg-muted/20 px-3 py-2 text-[11.5px] text-muted-foreground/70">暂无维护记录</div>
           </div>
 
-          <!-- 压缩为新原点 -->
+          <!-- 压缩为新原点（v1 暂不可用：会话恢复依赖完整命令日志重放） -->
           <div class="mt-3.5">
             <h5 class="mb-1.5 text-[10px] font-extrabold tracking-[1.5px] text-muted-foreground uppercase">快照截断</h5>
             <div class="rounded-xl border border-dashed border-border/80 bg-muted/20 p-3">
-              <div class="text-[12.5px] font-bold text-foreground">压缩为新原点</div>
-              <div class="mt-1 mb-2.5 text-[11.5px] leading-relaxed text-muted-foreground">
-                以当前世界状态为新的初始锚点，先前的命令流水归档为只读记录（回放与回滚以此为界）。
+              <div class="flex items-center gap-2">
+                <div class="text-[12.5px] font-bold text-muted-foreground">压缩为新原点</div>
+                <Badge variant="outline" class="border-border/70 text-muted-foreground text-[10px]">暂不可用</Badge>
               </div>
-              <Button size="sm" variant="outline" class="h-7 text-xs font-semibold hover:border-primary/40" @click="doOrigin">
-                <IconArchive class="size-3 mr-1 text-primary" />
+              <div class="mt-1 mb-2.5 text-[11.5px] leading-relaxed text-muted-foreground">
+                v1 依赖完整命令日志重放来恢复会话，因此暂不支持把旧日志压缩归档。此功能待后续版本实现。
+              </div>
+              <Button size="sm" variant="outline" class="h-7 text-xs font-semibold" disabled title="v1 暂不可用">
+                <IconArchive class="size-3 mr-1 text-muted-foreground" />
                 <span>执行压缩</span>
               </Button>
             </div>

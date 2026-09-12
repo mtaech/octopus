@@ -1,6 +1,6 @@
 // 模型目录的查询/反查工具（基于 model-catalog.ts 的静态快照）。
 import { MODEL_CATALOG, PROVIDER_PRESETS } from './model-catalog'
-import type { CatalogProvider, ModelEntry } from '@/types'
+import type { CatalogModel, CatalogProvider, ModelEntry } from '@/types'
 
 const providerById = new Map<string, CatalogProvider>(MODEL_CATALOG.map(p => [p.id, p]))
 
@@ -63,4 +63,73 @@ export function detectProviderByUrl(url: string): string | null {
     if (stem.length >= 4 && lower.includes(stem)) return id
   }
   return null
+}
+
+/** 目录里某供应商某模型的元数据（上下文 / 思考能力）；探测来的自定义模型可能没有。 */
+export function catalogModelMeta(providerId: string, modelId: string): CatalogModel | undefined {
+  const exact = providerById.get(providerId)?.models.find(m => m.id === modelId)
+  if (exact) return exact
+  // 供应商 id 可能与目录不同（用户自定义命名）：按模型 id 全局兜底
+  for (const p of MODEL_CATALOG) {
+    const hit = p.models.find(m => m.id === modelId)
+    if (hit) return hit
+  }
+  return undefined
+}
+
+
+/** 合并「目录元数据」与「用户自定义覆盖」：用户填了哪个字段就覆盖哪个。 */
+export function mergeModelMeta(base: CatalogModel | undefined, entry: ModelEntry | undefined): CatalogModel | undefined {
+  if (!base && !entry) return undefined
+  return {
+    id: entry?.id ?? base?.id ?? '',
+    name: entry?.name ?? base?.name ?? '',
+    ctx: entry?.ctx ?? base?.ctx,
+    maxOut: entry?.maxOut ?? base?.maxOut,
+    reasoning: entry?.reasoning ?? base?.reasoning,
+    tl: entry?.tl ?? base?.tl,
+  }
+}
+
+/** 思考等级的稳定展示顺序。 */
+const LEVEL_ORDER = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
+
+/** 该模型支持的思考等级；无元数据时回落到通用档位。 */
+export function thinkingLevels(meta?: CatalogModel): string[] {
+  if (!meta?.tl || !Object.keys(meta.tl).length) return ['default', 'minimal', 'low', 'medium', 'high']
+  const keys = Object.keys(meta.tl)
+  return ['default', ...keys.sort((a, b) => {
+    const ia = LEVEL_ORDER.indexOf(a), ib = LEVEL_ORDER.indexOf(b)
+    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib)
+  })]
+}
+
+/** 等级 → 实际下发值；default / off（wire 为 null）都表示不发送该参数。 */
+export function levelToWire(meta: CatalogModel | undefined, level: string): string | undefined {
+  if (level === 'default') return undefined
+  const wire = meta?.tl?.[level]
+  return wire == null ? undefined : wire
+}
+
+/** 实际下发值 → 等级（回显用）。 */
+export function wireToLevel(meta: CatalogModel | undefined, wire?: string): string {
+  if (!wire) return 'default'
+  if (meta?.tl) {
+    const hit = Object.entries(meta.tl).find(([, v]) => v === wire)
+    if (hit) return hit[0]
+  }
+  return wire
+}
+
+/** 思考等级的展示标签。 */
+export const LEVEL_LABEL: Record<string, string> = {
+  default: '默认', off: '关闭', minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'XHigh', max: 'Max',
+}
+
+/** 上下文窗口的可读展示：1000000 → 1M，128000 → 128K。 */
+export function fmtContext(n?: number): string {
+  if (!n) return ''
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(n % 1_000_000 === 0 ? 0 : 1) + 'M'
+  if (n >= 1000) return Math.round(n / 1000) + 'K'
+  return String(n)
 }

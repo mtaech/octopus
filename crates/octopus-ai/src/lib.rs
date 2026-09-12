@@ -1,10 +1,12 @@
 //! octopus-ai：AiProvider / EmbeddingBackend 实现（#10/#20）。
 //!
-//! 里程碑 1 先落「脚本化 Provider」把端到端链路跑通；rig `CompletionModel`
-//! 适配与 fastembed 本地 embedding 随后接入（见 #10/#15）。
+//! - `RigProvider`：基于 rig 框架的真实 LLM 实现（OpenAI 兼容 Chat Completions + Agent）。
+//! - `ScriptedProvider`：确定性、零依赖，供冒烟与确定性重放测试（#20 ④）。
 
 pub mod embedding;
+pub mod rig_provider;
 pub mod scripted;
 
-pub use embedding::StubEmbedding;
+pub use embedding::{RigEmbedding, StubEmbedding};
+pub use rig_provider::{RigParams, RigProvider, RigProviderParams, RigRoleParams};
 pub use scripted::ScriptedProvider;

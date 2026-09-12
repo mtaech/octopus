@@ -40,6 +40,7 @@ impl From<EngineError> for ApiError {
                 Self::new(StatusCode::CONFLICT, "round_in_progress", e.to_string())
             }
             EngineError::EmptyInput => Self::new(StatusCode::BAD_REQUEST, "empty_input", e.to_string()),
+            EngineError::InvalidAsset(_) => Self::new(StatusCode::BAD_REQUEST, "invalid_asset", e.to_string()),
             EngineError::DraftConflict { current_draft_version, updated_at } => {
                 Self::new(
                     StatusCode::CONFLICT,
@@ -61,7 +62,7 @@ impl From<EngineError> for ApiError {
                 Self::new(StatusCode::NOT_FOUND, "character_not_found", "角色不存在")
             }
             EngineError::Conflict(_) => Self::new(StatusCode::CONFLICT, "conflict", e.to_string()),
-            EngineError::Ai(_) | EngineError::Storage(_) | EngineError::Internal(_) => {
+            EngineError::Ai(_) | EngineError::Storage(_) | EngineError::Internal(_) | EngineError::Lua(_) => {
                 Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string())
             }
         }

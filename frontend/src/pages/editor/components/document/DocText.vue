@@ -20,7 +20,7 @@ const minH = (props.rows ?? 3) * 22 + 14
 <template>
   <div class="flex flex-col gap-0.5">
     <Textarea
-      class="w-full resize-none rounded-md border-border/70 bg-transparent px-3 py-2.5 text-sm leading-[1.75] text-foreground transition-colors hover:border-border focus:border-ring focus:bg-card"
+      class="w-full resize-none rounded-md border border-border bg-transparent px-3 py-2.5 text-sm leading-[1.75] text-foreground transition-colors hover:border-border-strong focus:border-ring focus:bg-card"
       :style="{ minHeight: minH + 'px' }"
       :model-value="modelValue"
       :placeholder="placeholder"

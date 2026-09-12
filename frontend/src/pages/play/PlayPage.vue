@@ -1,24 +1,25 @@
 <script setup lang="ts">
 // ============================================================
 // 游玩页 /play/:saveId（蓝图 #08/#17/#18/#21/#24）
-// 三演出模板（A 聊天流 / B 剧本式 / C 沉浸式）共用同一演出流与 store，
-// 模板切换纯前端、不重置状态（#08 ① / #18 ①）；免确认为引擎侧开关，点击即发
-// 元指令 /免确认，本地态由 system 事件回显纠正（#17）。
-// 迁移：顶栏 Button/Tabs+Switch，升级横幅 <Alert>，布局 Tailwind 语义类。
+// 单一演出模板（A 聊天流）：左栏世界 / 中列演出 / 右栏详情。
+// 免确认为引擎侧开关，点击即发元指令 /免确认，本地态由 system 事件回显纠正（#17）。
 // ============================================================
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { usePlayStore } from './stores/play'
 import { useDrawerStore } from './stores/drawer'
 import FeedChat from './components/feed/FeedChat.vue'
-import FeedScript from './components/feed/FeedScript.vue'
-import FeedImmersive from './components/feed/FeedImmersive.vue'
-import ActorsPanel from './components/ActorsPanel.vue'
+import WorldRail from './components/WorldRail.vue'
+import DetailPanel from './components/DetailPanel.vue'
+import type { WorldSelection } from './selection'
 import SaveDrawer from './components/SaveDrawer.vue'
 import InputBar from './components/InputBar.vue'
+import NarrativePrefsDialog from './components/NarrativePrefsDialog.vue'
+import ThemeToggle from '@/components/ThemeToggle.vue'
+import StorybookCover from '@/components/StorybookCover.vue'
+import type { AssetRef } from '@/types'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
-import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Alert, AlertAction, AlertDescription } from '@/components/ui/alert'
 import { Separator } from '@/components/ui/separator'
 import {
@@ -27,11 +28,10 @@ import {
   IconX,
   IconAlertTriangle,
   IconRefresh,
-  IconMessageDots,
-  IconFileText,
-  IconSparkles,
   IconDeviceGamepad2,
   IconPencil,
+  IconArrowDown,
+  IconAdjustments,
 } from '@tabler/icons-vue'
 
 const route = useRoute()
@@ -39,25 +39,8 @@ const router = useRouter()
 const store = usePlayStore()
 const drawer = useDrawerStore()
 
-// ---------- 模板偏好（#08 ① localStorage 记忆，默认 A） ----------
-type TplId = 'A' | 'B' | 'C'
-const TPL_KEY = 'octopus.play.template'
-const TEMPLATES: { id: TplId; label: string; short: string; desc: string; icon: any }[] = [
-  { id: 'A', label: '聊天流', short: 'IM', desc: '对话气泡', icon: IconMessageDots },
-  { id: 'B', label: '剧本式', short: 'SCR', desc: '纸面脚本', icon: IconFileText },
-  { id: 'C', label: '沉浸式', short: 'VN', desc: '逐行演出', icon: IconSparkles }
-]
-const tpl = ref<TplId>('A')
-function pickTpl(id: TplId) {
-  tpl.value = id
-  try { localStorage.setItem(TPL_KEY, id) } catch { /* noop */ }
-}
-function initTpl() {
-  try {
-    const saved = localStorage.getItem(TPL_KEY) as TplId | null
-    if (saved && TEMPLATES.some(t => t.id === saved)) tpl.value = saved
-  } catch { /* noop */ }
-}
+// ---------- 左栏世界列表 / 右栏详情 ----------
+const selection = ref<WorldSelection | null>(null)
 
 // ---------- 顶栏派生 ----------
 const sceneTitle = computed(() => store.sceneTitle)
@@ -70,6 +53,17 @@ const autoConfirm = computed(() => store.autoConfirm)
 const phaseChip = computed(() => store.phaseLabel)
 const isSandbox = computed(() => Boolean(store.detail?.is_sandbox || store.detail?.title?.startsWith('【沙箱试玩】')))
 const storybookId = computed(() => store.detail?.storybook_id)
+/** 是否有作者开放给玩家的叙述段：没有就不显示「叙述偏好」入口，避免死按钮 */
+const hasNarrativePrefs = computed(() => {
+  const sb = store.detail?.storybook as { narrative?: { sections?: { playerEditable?: boolean }[] } } | undefined
+  return (sb?.narrative?.sections ?? []).some(s => s.playerEditable === true)
+})
+const narrativeOpen = ref(false)
+/** 顶栏封面取自存档内嵌的冻结故事书（发布时冻结，游玩中不随草稿变动） */
+const cover = computed(() => {
+  const sb = store.detail?.storybook as { meta?: { cover?: AssetRef } } | undefined
+  return sb?.meta?.cover ?? null
+})
 
 function goEditStorybook() {
   if (storybookId.value) {
@@ -85,15 +79,41 @@ async function toggleAutoConfirm() {
   try { await store.setAutoConfirm(!autoConfirm.value) } finally { togglingConfirm.value = false }
 }
 
-// ---------- 自动滚动 ----------
+// ---------- 滚动行为（P1-4）：上滚时暂停自动滚底，可选回到底部 ----------
 const feedRoot = ref<HTMLElement | null>(null)
-async function scrollToBottom(smooth = false) {
+const atBottom = ref(true)
+const NEAR_BOTTOM_PX = 96
+function computeAtBottom() {
+  const el = feedRoot.value
+  if (!el) return
+  atBottom.value = el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM_PX
+}
+async function scrollToBottom(smooth = false, force = false) {
   await nextTick()
   const el = feedRoot.value
-  if (el) el.scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'auto' })
+  if (!el) return
+  if (!force && !atBottom.value) return
+  el.scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'auto' })
+  atBottom.value = true
 }
-watch(() => [store.revealPulse, store.entries.length, tpl.value], () => void scrollToBottom())
+watch(() => [store.revealPulse, store.entries.length], () => {
+  if (store.loadingOlder) return
+  void scrollToBottom()
+})
 watch(() => store.phase, () => { if (store.phase === 'idle') void scrollToBottom(true) })
+function onFeedScroll() { computeAtBottom() }
+function jumpToBottom() { void scrollToBottom(true, true) }
+
+/** 加载更早历史并保持视口锚点（前插内容不跳位）。 */
+async function loadOlder() {
+  const el = feedRoot.value
+  const prevHeight = el?.scrollHeight ?? 0
+  const prevTop = el?.scrollTop ?? 0
+  await store.loadOlder()
+  await nextTick()
+  if (el) el.scrollTop = prevTop + (el.scrollHeight - prevHeight)
+  computeAtBottom()
+}
 
 // ---------- 生命周期 ----------
 const saveIdParam = computed(() => String(route.params.saveId ?? ''))
@@ -106,7 +126,6 @@ async function boot() {
   drawer.closeDrawer()
 }
 onMounted(async () => {
-  initTpl()
   await boot()
   stopWatchRoute = watch(saveIdParam, () => { void boot() })
 })
@@ -128,21 +147,30 @@ function goBack() { void router.push('/') }
 </script>
 
 <template>
-  <div class="flex h-screen flex-col overflow-hidden bg-background text-foreground">
+  <div class="flex h-dvh flex-col overflow-hidden bg-background text-foreground">
     <!-- ============ 顶栏 ============ -->
-    <header class="z-20 flex h-13 shrink-0 items-center gap-2.5 border-b border-border/80 bg-card/85 px-3.5 backdrop-blur-md">
+    <header class="z-20 flex h-13 shrink-0 items-center gap-2.5 border-b border-border bg-card/90 px-3.5 backdrop-blur-md">
       <Button variant="ghost" size="icon-sm" class="size-8 text-muted-foreground hover:text-foreground" title="返回故事书列表" @click="goBack()">
         <IconArrowLeft class="size-4" />
       </Button>
 
-      <div class="h-4 w-px bg-border/60" />
+      <div class="h-4 w-px bg-border" />
+
+      <!-- 世界封面：与列表 / 编辑器同源 -->
+      <StorybookCover
+        :seed="storybookId ?? saveIdParam"
+        :title="storybookTitle || '存档'"
+        :cover="cover"
+        size="sm"
+        class="size-8 flex-none rounded-lg border border-border/80 shadow-2xs"
+      />
 
       <div class="flex min-w-0 flex-col leading-tight">
         <span class="max-w-64 truncate font-serif text-[14px] font-bold text-foreground" :title="saveTitle">{{ saveTitle || '存档' }}</span>
         <span class="text-[11px] text-muted-foreground/80 whitespace-nowrap">{{ storybookTitle }} · rev {{ rev ?? '–' }}</span>
       </div>
 
-      <span v-if="sceneTitle" class="hidden max-w-56 truncate rounded-full border border-border/70 bg-muted/40 px-2.5 py-0.5 text-xs text-muted-foreground sm:inline-block">
+      <span v-if="sceneTitle" class="hidden max-w-56 truncate rounded-full border border-border bg-muted/50 px-2.5 py-0.5 text-xs text-muted-foreground sm:inline-block">
         {{ sceneTitle }}
       </span>
 
@@ -171,23 +199,29 @@ function goBack() { void router.push('/') }
 
       <div class="flex-1"></div>
 
-      <!-- 🎭 模板切换（segmented Tabs） -->
-      <Tabs :model-value="tpl" @update:model-value="(v: unknown) => pickTpl(v as TplId)">
-        <TabsList class="h-8 gap-0.5 rounded-lg border border-border/80 bg-background/80 p-0.5 shadow-inner">
-          <TabsTrigger v-for="t in TEMPLATES" :key="t.id" :value="t.id" class="h-7 gap-1.5 px-2.5 text-xs font-medium" :title="t.label + ' · ' + t.desc">
-            <component :is="t.icon" class="size-3.5" />
-            <span>{{ t.label }}</span>
-          </TabsTrigger>
-        </TabsList>
-      </Tabs>
+      <!-- 主题切换 -->
+      <ThemeToggle />
 
-      <Separator orientation="vertical" class="h-5 bg-border/60" />
+      <Separator orientation="vertical" class="h-5 bg-border" />
 
       <!-- 免确认开关（引擎侧：点击发 /免确认 元指令） -->
       <label class="flex cursor-pointer items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors" title="免确认：存档级设置，直接调用引擎端点">
         <Switch size="sm" :model-value="autoConfirm" :disabled="store.busy || togglingConfirm" @update:model-value="toggleAutoConfirm" />
         <span class="whitespace-nowrap text-[11.5px]">免确认: {{ autoConfirm ? '开' : '关' }}</span>
       </label>
+
+      <!-- 叙述偏好（叙事契约 P1）：只对故事书 playerEditable 段开放 -->
+      <Button
+        v-if="hasNarrativePrefs"
+        variant="outline"
+        size="sm"
+        class="gap-1.5 font-medium shadow-xs"
+        title="调整作者开放给你的叙述段（开关 / 变体）；只影响之后的回合"
+        @click="narrativeOpen = true"
+      >
+        <IconAdjustments data-icon="inline-start" class="size-3.5" />
+        <span>叙述偏好</span>
+      </Button>
 
       <!-- 存档抽屉 -->
       <Button
@@ -215,32 +249,33 @@ function goBack() { void router.push('/') }
       </AlertAction>
     </Alert>
 
-    <!-- ============ 主舞台 ============ -->
-    <main v-if="store.ready && !store.error" class="flex min-h-0 flex-1 items-stretch" :class="'tpl-' + tpl">
-      <!-- A：左主列 + 右演员卡 -->
-      <template v-if="tpl === 'A'">
-        <section class="col-main">
-          <div ref="feedRoot" class="feed-scroll"><FeedChat :feed="store.entries" /></div>
-          <InputBar />
-        </section>
-        <ActorsPanel class="actors-rail" />
-      </template>
-
-      <!-- B：居中主列（纸感子树） -->
-      <template v-else-if="tpl === 'B'">
-        <section class="col-main">
-          <div ref="feedRoot" class="feed-scroll"><FeedScript :feed="store.entries" /></div>
-          <InputBar />
-        </section>
-      </template>
-
-      <!-- C：全宽沉浸 -->
-      <template v-else>
-        <section class="col-full">
-          <div ref="feedRoot" class="feed-imms"><FeedImmersive :feed="store.entries" /></div>
-          <InputBar />
-        </section>
-      </template>
+    <!-- ============ 主舞台：左栏世界 / 中列演出 / 右栏详情 ============ -->
+    <main v-if="store.ready && !store.error" class="flex min-h-0 flex-1 items-stretch">
+      <WorldRail :selected="selection" @select="(s: WorldSelection) => (selection = s)" />
+      <section class="col-main">
+        <div class="relative flex min-h-0 flex-1 flex-col">
+          <div ref="feedRoot" class="feed-scroll" @scroll.passive="onFeedScroll">
+            <div v-if="store.hasMoreOlder" class="flex justify-center pt-3">
+              <Button variant="ghost" size="xs" class="h-6 text-[11px] text-muted-foreground" :disabled="store.loadingOlder" @click="loadOlder">
+                {{ store.loadingOlder ? '加载中…' : '加载更早' }}
+              </Button>
+            </div>
+            <FeedChat :feed="store.entries" />
+          </div>
+          <Button
+            v-if="!atBottom"
+            variant="outline"
+            size="icon-sm"
+            class="absolute bottom-3 left-1/2 z-10 -translate-x-1/2 rounded-full shadow-lg"
+            title="回到底部"
+            @click="jumpToBottom"
+          >
+            <IconArrowDown class="size-4" />
+          </Button>
+        </div>
+        <InputBar />
+      </section>
+      <DetailPanel :selected="selection" @switch="(id: string) => store.switchTo(id)" />
     </main>
 
     <!-- 加载/错误态 -->
@@ -256,21 +291,22 @@ function goBack() { void router.push('/') }
       </div>
     </main>
 
+    <!-- ============ 叙述偏好（叙事契约 P1） ============ -->
+    <NarrativePrefsDialog v-model="narrativeOpen" />
+
     <!-- ============ 存档抽屉 ============ -->
     <SaveDrawer />
   </div>
 </template>
 
 <style scoped>
+/* 中列填满左右栏之间的空间：不再用 max-width + auto margin 居中，
+   否则宽屏会在三栏之间留下大块空白。阅读宽度由 FeedChat 内部限制。 */
 .col-main {
-  flex: 1; max-width: 720px; min-width: 0;
+  flex: 1; min-width: 0;
   height: 100%; display: flex; flex-direction: column;
-  margin-inline: auto;
+  background-color: color-mix(in oklab, var(--card) 30%, transparent);
 }
-.tpl-A .col-main { max-width: min(720px, calc(100vw - 300px)); }
-.actors-rail { display: block; height: 100%; }
-.col-full { flex: 1; min-width: 0; height: 100%; display: flex; flex-direction: column; }
 .feed-scroll { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; }
 .feed-scroll > :deep(*) { width: 100%; }
-.feed-imms { flex: 1; min-height: 0; overflow: hidden; position: relative; }
 </style>

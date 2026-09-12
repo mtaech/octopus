@@ -4,7 +4,9 @@
 // 资源条自画 2px 细条（不引 Progress 组件）。
 import { ref, computed } from 'vue'
 import type { CharacterInstance, ResourceDef } from '@/types'
-import { nameTintClass, initial } from '../utils'
+import { usePlayStore } from '../stores/play'
+import { nameTintClass, initial, portraitOf } from '../utils'
+import { assetUrl } from '@/api'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -19,6 +21,8 @@ const props = defineProps<{
 const emit = defineEmits<{ (e: 'switch', characterId: string): void }>()
 const expanded = ref(false)
 const tint = computed(() => nameTintClass(props.actor.name))
+const store = usePlayStore()
+const portrait = computed(() => portraitOf(store.detail?.storybook, props.actor.template_id, props.actor.name))
 const keyAttrs = computed(() => {
   const dims = ['str', 'agi', 'wit', 'cha', 'trait', 'note']
   return Object.entries(props.actor.attributes).filter(([k]) => dims.includes(k))
@@ -38,12 +42,13 @@ const pct = (r: { value: number; max?: number }) => {
 }
 const kindLabel = computed(() => (props.actor.kind === 'pc' ? 'PC' : 'NPC'))
 
+/** 资源条：按资源语义映射主题语义色（实色即可，条高仅 1.5px），与全局调色一致 */
 function resBarClass(id: string) {
   const low = id.toLowerCase()
-  if (low.includes('hp') || low.includes('health') || low.includes('life') || low.includes('血')) return 'bg-gradient-to-r from-rose-500 to-amber-500'
-  if (low.includes('mp') || low.includes('san') || low.includes('mana') || low.includes('蓝') || low.includes('理智')) return 'bg-gradient-to-r from-sky-500 to-indigo-400'
-  if (low.includes('sta') || low.includes('energy') || low.includes('体')) return 'bg-gradient-to-r from-emerald-500 to-teal-400'
-  return 'bg-gradient-to-r from-primary to-amber-400'
+  if (low.includes('hp') || low.includes('health') || low.includes('life') || low.includes('血')) return 'bg-destructive'
+  if (low.includes('mp') || low.includes('san') || low.includes('mana') || low.includes('蓝') || low.includes('理智')) return 'bg-info'
+  if (low.includes('sta') || low.includes('energy') || low.includes('体')) return 'bg-success'
+  return 'bg-primary'
 }
 </script>
 
@@ -63,7 +68,15 @@ function resBarClass(id: string) {
         class="size-8.5 shrink-0 transition-transform group-hover:scale-105"
         :class="controlled ? 'ring-2 ring-primary/60 ring-offset-1 ring-offset-background' : ''"
       >
-        <AvatarFallback class="text-[13px] font-extrabold shadow-inner" :class="tint">
+        <img
+          v-if="portrait"
+          :src="assetUrl(portrait.asset)"
+          :alt="actor.name"
+          class="size-full object-cover"
+          loading="lazy"
+          decoding="async"
+        />
+        <AvatarFallback v-else class="text-[13px] font-extrabold shadow-inner" :class="tint">
           {{ initial(actor.name) }}
         </AvatarFallback>
       </Avatar>

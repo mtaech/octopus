@@ -21,6 +21,8 @@ const levelHint = computed(() => LEVEL_META[level.value].hint)
 const rollDice = computed(() => props.payload.rolls ?? [])
 const exprText = computed(() => props.payload.expr ?? (rollDice.value.length ? '' : '无骰判定'))
 const sign = (n: number) => (n > 0 ? '+' + n : String(n))
+const KIND_LABEL: Record<string, string> = { attribute: '属性检定', attack: '攻击检定', save: '豁免', passive: '被动值' }
+const kindText = computed(() => KIND_LABEL[props.payload.kind ?? 'attribute'] ?? '机制判定')
 
 /** level → 语义态：色类 + 底（淡） */
 const LV = {
@@ -40,7 +42,7 @@ const lv = computed(() => LV[level.value])
       </Avatar>
       <div class="min-w-0 flex-1">
         <div class="font-bold leading-tight text-foreground">{{ payload.actor.name }} · {{ payload.attribute }}</div>
-        <div class="text-[11px] text-muted-foreground/75 font-medium">机制判定</div>
+        <div class="text-[11px] text-muted-foreground/75 font-medium">{{ kindText }}</div>
       </div>
       <div class="flex items-center gap-1.5 rounded-full px-2.5 py-1 border" :class="[lv.ring, lv.text]">
         <component :is="lv.icon" class="size-3.5" />
@@ -68,8 +70,10 @@ const lv = computed(() => LV[level.value])
     <!-- 最终达成度 -->
     <div class="mt-2 flex items-center justify-between border-t border-border/50 pt-2 text-xs">
       <div class="flex items-center gap-2">
-        <span class="font-bold" :class="payload.result ? 'text-success' : 'text-destructive'">
-          {{ payload.result ? '✓ 判定达成' : '✗ 判定失败' }}
+        <span class="inline-flex items-center gap-1 font-bold" :class="payload.result ? 'text-success' : 'text-destructive'">
+          <IconCircleCheck v-if="payload.result" class="size-3.5" />
+          <IconX v-else class="size-3.5" />
+          {{ payload.result ? '判定达成' : '判定失败' }}
         </span>
       </div>
       <span class="font-mono text-[11.5px] text-muted-foreground">

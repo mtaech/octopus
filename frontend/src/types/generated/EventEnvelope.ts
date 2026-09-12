@@ -6,6 +6,7 @@ import type { EmotePayload } from "./EmotePayload";
 import type { NarratePayload } from "./NarratePayload";
 import type { PendingPayload } from "./PendingPayload";
 import type { PhasePayload } from "./PhasePayload";
+import type { ReasoningPayload } from "./ReasoningPayload";
 import type { ResolutionPayload } from "./ResolutionPayload";
 import type { RoundEndPayload } from "./RoundEndPayload";
 import type { RoundStartPayload } from "./RoundStartPayload";
@@ -13,4 +14,4 @@ import type { ScenePayload } from "./ScenePayload";
 import type { StateUpdatePayload } from "./StateUpdatePayload";
 import type { SystemPayload } from "./SystemPayload";
 
-export type EventEnvelope = { id: string, seq: bigint, round: number, ts: string, actor: ActorRef | null, intent_id: string | null, } & ({ "type": "scene", "payload": ScenePayload } | { "type": "narrate", "payload": NarratePayload } | { "type": "dialogue", "payload": DialoguePayload } | { "type": "emote", "payload": EmotePayload } | { "type": "pending", "payload": PendingPayload } | { "type": "check_result", "payload": CheckResultPayload } | { "type": "resolution", "payload": ResolutionPayload } | { "type": "state_update", "payload": StateUpdatePayload } | { "type": "phase", "payload": PhasePayload } | { "type": "round_start", "payload": RoundStartPayload } | { "type": "round_end", "payload": RoundEndPayload } | { "type": "system", "payload": SystemPayload });
+export type EventEnvelope = { id: string, seq: bigint, round: number, ts: string, actor: ActorRef | null, intent_id: string | null, } & ({ "type": "scene", "payload": ScenePayload } | { "type": "narrate", "payload": NarratePayload } | { "type": "dialogue", "payload": DialoguePayload } | { "type": "emote", "payload": EmotePayload } | { "type": "pending", "payload": PendingPayload } | { "type": "check_result", "payload": CheckResultPayload } | { "type": "resolution", "payload": ResolutionPayload } | { "type": "state_update", "payload": StateUpdatePayload } | { "type": "phase", "payload": PhasePayload } | { "type": "round_start", "payload": RoundStartPayload } | { "type": "round_end", "payload": RoundEndPayload } | { "type": "system", "payload": SystemPayload } | { "type": "reasoning", "payload": ReasoningPayload });

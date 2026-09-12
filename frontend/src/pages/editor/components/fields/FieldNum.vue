@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// FieldNum —— 带标签的数字字段（shadcn Input type=number）
+// FieldNum —— 标签在上的数字字段
 import { Input } from '@/components/ui/input'
 
 withDefaults(defineProps<{
@@ -9,30 +9,29 @@ withDefaults(defineProps<{
   max?: number
   step?: number
   hint?: string
-}>(), { modelValue: 0, hint: '', step: 1 })
+  span?: 'default' | 'full'
+}>(), { modelValue: 0, hint: '', step: 1, span: 'default' })
 
 const emit = defineEmits<{ 'update:modelValue': [value: number] }>()
 
-function onInput(e: Event): void {
-  const v = Number((e.target as HTMLInputElement).value)
-  emit('update:modelValue', Number.isNaN(v) ? 0 : v)
+function onInput(v: string | number): void {
+  const n = Number(v)
+  emit('update:modelValue', Number.isNaN(n) ? 0 : n)
 }
 </script>
 
 <template>
-  <div class="grid grid-cols-[124px_minmax(0,1fr)] items-start gap-x-4 px-0.5 py-1.5">
-    <label class="pt-2 text-xs leading-4 text-muted-foreground">{{ label }}</label>
-    <div class="flex min-w-0 flex-col gap-1">
-      <Input
-        class="h-8 w-full text-[13px]"
-        type="number"
-        :value="modelValue"
-        :min="min"
-        :max="max"
-        :step="step"
-        @input="onInput"
-      />
-      <p v-if="hint" class="text-[11px] leading-4 text-muted-foreground/70">{{ hint }}</p>
-    </div>
-  </div>
+  <label class="flex min-w-0 flex-col gap-1.5" :class="span === 'full' && 'col-span-full'">
+    <span class="text-[11px] leading-4 font-medium text-muted-foreground">{{ label }}</span>
+    <Input
+      class="h-8 w-full text-[13px]"
+      type="number"
+      :model-value="modelValue"
+      :min="min"
+      :max="max"
+      :step="step"
+      @update:model-value="onInput"
+    />
+    <span v-if="hint" class="text-[10.5px] leading-4 text-muted-foreground/65">{{ hint }}</span>
+  </label>
 </template>

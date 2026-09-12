@@ -23,8 +23,12 @@ pub enum EngineError {
     Ai(String),
     #[error("存储错误: {0}")]
     Storage(String),
+    #[error("资产无效: {0}")]
+    InvalidAsset(String),
     #[error("内部错误: {0}")]
     Internal(String),
+    #[error("Lua 错误: {0}")]
+    Lua(String),
 }
 
 
@@ -37,5 +41,11 @@ impl From<sea_orm::DbErr> for EngineError {
 impl From<serde_json::Error> for EngineError {
     fn from(e: serde_json::Error) -> Self {
         Self::Internal(format!("json: {e}"))
+    }
+}
+
+impl From<mlua::Error> for EngineError {
+    fn from(e: mlua::Error) -> Self {
+        Self::Lua(e.to_string())
     }
 }

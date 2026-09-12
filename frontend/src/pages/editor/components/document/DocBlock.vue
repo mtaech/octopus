@@ -14,7 +14,7 @@ withDefaults(defineProps<{
       <span v-if="aside" class="ml-auto shrink-0 text-[11px] text-muted-foreground/60">{{ aside }}</span>
     </header>
     <div v-if="rows.length" class="flex flex-col">
-      <div v-for="(r, i) in rows" :key="i" class="flex gap-2.5 border-b border-border/40 px-3.5 py-1 text-xs">
+      <div v-for="(r, i) in rows" :key="i" class="flex gap-2.5 border-b border-border/60 px-3.5 py-1 text-xs">
         <span v-if="r.label" class="w-16 flex-none text-[11px] text-muted-foreground/70">{{ r.label }}</span>
         <span class="min-w-0 flex-1 break-words text-foreground/90">{{ r.icon }} {{ r.value }}</span>
       </div>

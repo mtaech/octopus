@@ -4,6 +4,22 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Octopus — 通用 AI RPG</title>
+    <script>
+      (function() {
+        try {
+          var mode = localStorage.getItem('octopus-theme') || 'light';
+          var prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+          var dark = mode === 'dark' || (mode === 'auto' && prefersDark);
+          if (dark) {
+            document.documentElement.classList.add('dark');
+            document.documentElement.style.colorScheme = 'dark';
+          } else {
+            document.documentElement.classList.remove('dark');
+            document.documentElement.style.colorScheme = 'light';
+          }
+        } catch (e) {}
+      })();
+    </script>
   </head>
   <body>
     <div id="app"></div>

@@ -1,68 +1,132 @@
 
+@import url('https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&display=swap');
+
 @import "tailwindcss";
 @import "tw-animate-css";
 
-@custom-variant dark (&:is(.dark *));
+@custom-variant dark (&:where(.dark, .dark *));
 
-/* ============ Octopus 主题 · 夜行手记（墨黑 + 琥珀炉火） ============
-   shadcn-vue 语义色映射（Tailwind v4 @theme inline）。
-   语义 token 名来自 shadcn-vue 规范；值是我们定制的夜行手记色板。 */
+/* ============ Octopus 主题 · Material Design 3 (M3 规范体系) ============
+   采用 Google Material Design 3 设计语言：
+   - 强调明暗双态无缝切换、平滑微动效与符合 WCAG AA/AAA 对比度的色阶。
+   - 明亮模式：柔和高通透的 Surface，鲜活纯正的 M3 靛蓝（Royal Indigo）主色。
+   - 暗色模式：低眩光高质感 Slate 深色基底，柔和自发光 Primary 80 色系。
+   - 形状采用 Material 3 中大圆角体系（--radius: 0.75rem / 12px）。 */
 
 :root {
-  /* 让原生控件（滚动条、表单、日期选择器等）走深色 */
+  color-scheme: light;
+
+  /* 默认字体栈 */
+  --default-font-sans: "Geist", ui-sans-serif, system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  --default-font-serif: "Lora", "Noto Serif SC", ui-serif, Georgia, serif;
+
+  /* —— M3 Light 明亮模式 —— */
+  --background: #f8f9fe;
+  --foreground: #191c24;
+
+  --card: #ffffff;
+  --card-foreground: #191c24;
+
+  --popover: #ffffff;
+  --popover-foreground: #191c24;
+
+  --primary: #4355b9;
+  --primary-foreground: #ffffff;
+
+  --secondary: #595e72;
+  --secondary-foreground: #ffffff;
+
+  --muted: #eff1f8;
+  --muted-foreground: #5a6072;
+
+  --accent: #e4e7fa;
+  --accent-foreground: #1a2479;
+
+  --destructive: #ba1a1a;
+  --destructive-foreground: #ffffff;
+
+  --border: #c6cbd9;
+  --border-strong: #949db5;
+  --input: #c6cbd9;
+  --ring: #4355b9;
+
+  --radius: 0.75rem;
+
+  /* 状态与补充语义：M3 规范语义色 */
+  --success: #1a7948;
+  --warning: #b36200;
+  --info: #0077b6;
+
+  --sidebar: #f2f4fa;
+  --sidebar-foreground: #191c24;
+  --sidebar-primary: #4355b9;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #e4e7fa;
+  --sidebar-accent-foreground: #1a2479;
+  --sidebar-border: #c6cbd9;
+  --sidebar-ring: #4355b9;
+
+  /* 图表 */
+  --chart-1: #4355b9;
+  --chart-2: #0077b6;
+  --chart-3: #1a7948;
+  --chart-4: #e06d2c;
+  --chart-5: #7b5290;
+}
+
+.dark {
   color-scheme: dark;
 
-  /* —— 底色阶：暖墨黑 —— */
-  --background: #141210;
-  --foreground: #ece6da;
+  /* —— M3 Dark 暗色模式 —— */
+  --background: #111318;
+  --foreground: #e2e2e9;
 
-  --card: #1b1815;
-  --card-foreground: #ece6da;
+  --card: #191c24;
+  --card-foreground: #e2e2e9;
 
-  --popover: #1f1b17;
-  --popover-foreground: #ece6da;
+  --popover: #1f222b;
+  --popover-foreground: #e2e2e9;
 
-  --primary: #e8a44c;
-  --primary-foreground: #1a130a;
+  --primary: #b6c4ff;
+  --primary-foreground: #102282;
 
-  --secondary: #2a251f;
-  --secondary-foreground: #ece6da;
+  --secondary: #c3c5dd;
+  --secondary-foreground: #2b3042;
 
-  --muted: #27221c;
-  --muted-foreground: #a89c8a;
+  --muted: #242732;
+  --muted-foreground: #9296a6;
 
-  --accent: #3a322a;
-  --accent-foreground: #f0e9dd;
+  --accent: #2b3046;
+  --accent-foreground: #dfe3fa;
 
-  --destructive: #d9534f;
-  --destructive-foreground: #fdf3ec;
+  --destructive: #ffb4ab;
+  --destructive-foreground: #690005;
 
-  --border: #332c25;
-  --input: #3b332b;
-  --ring: #e8a44c;
+  --border: #3d4358;
+  --border-strong: #5e667f;
+  --input: #3d4358;
+  --ring: #b6c4ff;
 
-  --radius: 0.625rem;
+  --radius: 0.75rem;
 
-  /* —— 补充语义：可读性（成功/警告/信息） —— */
-  --success: #7fb069;
-  --warning: #e0a458;
-  --info: #7fa9b8;
+  --success: #7dd893;
+  --warning: #ffb858;
+  --info: #70d2ff;
 
-  --sidebar: #1b1815;
-  --sidebar-foreground: #ece6da;
-  --sidebar-primary: #e8a44c;
-  --sidebar-primary-foreground: #1a130a;
-  --sidebar-accent: #2a251f;
-  --sidebar-accent-foreground: #f0e9dd;
-  --sidebar-border: #332c25;
-  --sidebar-ring: #e8a44c;
+  --sidebar: #15171e;
+  --sidebar-foreground: #e2e2e9;
+  --sidebar-primary: #b6c4ff;
+  --sidebar-primary-foreground: #102282;
+  --sidebar-accent: #242732;
+  --sidebar-accent-foreground: #e2e2e9;
+  --sidebar-border: #3d4358;
+  --sidebar-ring: #b6c4ff;
 
-  /* 图表沿用主色板 */
-  --chart-1: #e8a44c;
-  --chart-2: #d9754d;
-  --chart-3: #7fa9b8;
-  --chart-4: #7fb069;
-  --chart-5: #c9b18a;
+  --chart-1: #b6c4ff;
+  --chart-2: #70d2ff;
+  --chart-3: #7dd893;
+  --chart-4: #ffb858;
+  --chart-5: #deb8dd;
 }
 
 /* —— shadcn-vue v2 Tailwind v4 映射 —— */
@@ -84,6 +148,7 @@
   --color-destructive: var(--destructive);
   --color-destructive-foreground: var(--destructive-foreground);
   --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
   --color-input: var(--input);
   --color-ring: var(--ring);
   --color-success: var(--success);
@@ -108,8 +173,8 @@
   --radius-lg: var(--radius);
   --radius-xl: calc(var(--radius) + 4px);
 
-  --font-sans: "Geist", ui-sans-serif, system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
-  --font-serif: "Lora", "Noto Serif SC", ui-serif, Georgia, serif;
+  --font-sans: var(--app-font-family, var(--default-font-sans));
+  --font-serif: var(--app-font-serif, var(--app-font-family, var(--default-font-serif)));
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
   --font-heading: var(--font-sans);
 }
@@ -117,24 +182,28 @@
 @layer base {
   * { @apply border-border outline-ring/50; }
   html {
+    color-scheme: light;
+    font-family: var(--app-font-family, var(--default-font-sans));
+  }
+  html.dark {
     color-scheme: dark;
   }
   body {
     @apply bg-background text-foreground;
+    font-family: var(--app-font-family, var(--default-font-sans));
     font-feature-settings: "cv02", "cv03", "cv04", "cv11";
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     text-rendering: optimizeLegibility;
+    transition: background-color 0.2s ease, color 0.2s ease;
   }
 
   ::selection {
-    background: color-mix(in oklab, var(--primary) 35%, transparent);
+    background: color-mix(in oklab, var(--primary) 28%, transparent);
     color: var(--foreground);
   }
 
-  /* —— 主题滚动条：细、无亮色轨道、悬停转琥珀 ——
-     先 color-scheme: dark 让原生滚动条走深色（Firefox/Chromium），
-     再用 WebKit 伪元素精修；不引入任何滚动条库。 */
+  /* —— 主题滚动条：Material 纤细柔和滚动条 —— */
   * {
     scrollbar-width: thin;
     scrollbar-color: color-mix(in oklab, var(--muted-foreground) 25%, transparent) transparent;
@@ -155,14 +224,14 @@
     transition: background-color 0.2s ease;
   }
   ::-webkit-scrollbar-thumb:hover {
-    background-color: color-mix(in oklab, var(--primary) 75%, transparent);
+    background-color: color-mix(in oklab, var(--primary) 70%, transparent);
   }
 }
 
-/* —— 氛围与微交互动画 —— */
+/* —— Material 动效与微交互 —— */
 @keyframes oct-pulse-glow {
-  0%, 100% { opacity: 0.55; transform: scale(1); }
-  50% { opacity: 0.85; transform: scale(1.03); }
+  0%, 100% { opacity: 0.45; transform: scale(1); }
+  50% { opacity: 0.8; transform: scale(1.03); }
 }
 
 @keyframes oct-shimmer {
@@ -177,3 +246,66 @@
 .animate-shimmer {
   animation: oct-shimmer 2.5s infinite;
 }
+
+/* 用户气泡：vue-stream-markdown 的根元素强制 color: var(--foreground)，
+   会盖掉气泡的 text-secondary-foreground（黑字压深底）。让它继承气泡前景色。 */
+.bubble-user .stream-markdown { color: inherit; }
+.bubble-user .stream-markdown a { color: inherit; text-decoration: underline; }
+
+/* ============ Markdown 只读渲染（.md-body） ============
+   用于叙事字段 / 结对会话等 v-html 输出；结构化数据不走这里。 */
+.md-body > :first-child { margin-top: 0; }
+.md-body > :last-child { margin-bottom: 0; }
+.md-body p { margin: 0 0 0.55em; }
+.md-body h1, .md-body h2, .md-body h3, .md-body h4, .md-body h5, .md-body h6 {
+  margin: 0.9em 0 0.45em;
+  font-weight: 700;
+  line-height: 1.35;
+}
+.md-body h1 { font-size: 1.25em; }
+.md-body h2 { font-size: 1.15em; }
+.md-body h3 { font-size: 1.05em; }
+.md-body h4, .md-body h5, .md-body h6 { font-size: 1em; }
+.md-body ul, .md-body ol { margin: 0.4em 0 0.6em; padding-left: 1.4em; }
+.md-body ul { list-style: disc; }
+.md-body ol { list-style: decimal; }
+.md-body li { margin: 0.15em 0; }
+.md-body li > ul, .md-body li > ol { margin: 0.15em 0; }
+.md-body blockquote {
+  margin: 0.5em 0;
+  padding: 0.1em 0.8em;
+  border-left: 3px solid var(--border-strong, var(--border));
+  color: var(--muted-foreground);
+}
+.md-body code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.88em;
+  background: var(--muted);
+  border-radius: 4px;
+  padding: 0.1em 0.36em;
+}
+.md-body pre {
+  margin: 0.5em 0;
+  padding: 0.6em 0.75em;
+  overflow-x: auto;
+  background: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.md-body pre code { background: transparent; padding: 0; }
+.md-body a { color: var(--primary); text-decoration: underline; text-underline-offset: 2px; }
+.md-body hr { margin: 0.85em 0; border: 0; border-top: 1px solid var(--border); }
+.md-body table {
+  display: block;
+  max-width: 100%;
+  margin: 0.5em 0;
+  overflow-x: auto;
+  border-collapse: collapse;
+}
+.md-body th, .md-body td {
+  border: 1px solid var(--border);
+  padding: 0.32em 0.6em;
+  vertical-align: top;
+}
+.md-body th { background: var(--muted); font-weight: 600; white-space: nowrap; }
+.md-body del { opacity: 0.7; }

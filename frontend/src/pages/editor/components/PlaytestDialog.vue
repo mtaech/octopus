@@ -106,7 +106,7 @@ function confirm() {
         <div v-if="characters.length" class="flex flex-col gap-2">
           <div class="flex items-center justify-between">
             <Label for="sbx-pc" class="text-xs font-semibold text-muted-foreground">试玩主角（受控角色）</Label>
-            <span v-if="selectedChar && selectedChar.kind !== 'pc'" class="text-[10.5px] text-amber-500">
+            <span v-if="selectedChar && selectedChar.kind !== 'pc'" class="text-[10.5px] text-warning">
               临时作为 PC 受控
             </span>
           </div>
