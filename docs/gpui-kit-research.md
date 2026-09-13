@@ -289,7 +289,7 @@ Sidebar::new()
 
 ### 6.2 放置位置
 
-现有 workspace（[根 Cargo.toml](Cargo.toml)）：
+现有 workspace（[根 Cargo.toml](../Cargo.toml)）：
 
 ```text
 [workspace]
