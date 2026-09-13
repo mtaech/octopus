@@ -1,6 +1,6 @@
 # 记忆管线（M2–M4）实现规格
 
-> 来源：设计书 `.scratch/ai-rpg/` 的 [#05](../.scratch/ai-rpg/issues/05-context-memory.md) / [#15](../.scratch/ai-rpg/issues/15-embedding-model.md) / [#27](../.scratch/ai-rpg/issues/27-storage-single-db.md)，以及决策日志第 2 条。
+> 来源：设计书 `docs/blueprint/` 的 [#05](blueprint/issues/05-context-memory.md) / [#15](blueprint/issues/15-embedding-model.md) / [#27](blueprint/issues/27-storage-single-db.md)，以及决策日志第 2 条。
 > 前置：M1（fastembed 本地 EmbeddingBackend，512d）在进行中。
 > 已拍板：**摘要由 AI 生成，且回合微摘要搭在同一轮意图里不额外调用**；**DuckDB 用 bundled crate**；**维度取真实值 + 变更时重建**。
 

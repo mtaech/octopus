@@ -21,4 +21,4 @@ Blocked by: 05
 - 不选 m3e-base/text2vec/stella：不在 fastembed-rs 内置列表，集成成本高。
 - DuckDB：FLOAT[512] 固定维度，余弦相似度（array_cosine_similarity），VSS HNSW 索引（量级大时启用）。
 
-详见 [research/15](./research/15-embedding-model.md)。
+详见 [research/15](../research/15-embedding-model.md)。

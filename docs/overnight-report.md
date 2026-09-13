@@ -1,6 +1,6 @@
 # 通宵执行报告（M1–M4 + 差距补齐）
 
-> 目标见会话 goal：对照 `.scratch/ai-rpg/` 设计书（map.md + issues 01–27 + decision-log）补齐未实现项。
+> 目标见会话 goal：对照 `docs/blueprint/` 设计书（map.md + issues 01–27 + decision-log）补齐未实现项。
 > 本文件在每阶段收口后追加，**早晨按此验收**。
 > 差距分析的原始结论在 `docs/gap-analysis.md`（锚点 `4b5b3c4`），文首加了「通宵后更新」注记。
 
@@ -232,8 +232,8 @@ git log --oneline -10           # 看这晚产生了哪些提交（若已提交�
 
 ## 设计书位置备忘
 
-- 设计地图与决策：`.scratch/ai-rpg/map.md`、`.scratch/ai-rpg/decision-log-design-pass.md`
-- 分票：`.scratch/ai-rpg/issues/01–27`；调研：`.scratch/ai-rpg/research/*`
+- 设计地图与决策：`docs/blueprint/map.md`、`docs/blueprint/decision-log-design-pass.md`
+- 分票：`docs/blueprint/issues/01–27`；调研：`docs/blueprint/research/*`
 - 本项目内的实现规格：`docs/narrative-contract.md`、`docs/protocol-interface.md`、`docs/p3-think-and-import.md`、`docs/save-role-models.md`、`docs/memory-pipeline.md`
 
 ## 未完成 / 需要你拍板

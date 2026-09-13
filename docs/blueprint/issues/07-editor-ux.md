@@ -11,7 +11,7 @@ Blocked by: 01
 
 ## Assets
 
-- 可交互原型（三范式对比：A 表单工作台 / B 文档工作台 / C AI 结对创作）：[prototypes/editor-ux.html](./prototypes/editor-ux.html)（单文件，浏览器直接打开；底栏或 ←→ 键切换变体；URL 参数 ?variant=A|B|C 可直达）
+- 可交互原型（三范式对比：A 表单工作台 / B 文档工作台 / C AI 结对创作）：[prototypes/editor-ux.html](../prototypes/editor-ux.html)（单文件，浏览器直接打开；底栏或 ←→ 键切换变体；URL 参数 ?variant=A|B|C 可直达）
 
 ## Answer
 
