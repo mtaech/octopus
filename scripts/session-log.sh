@@ -61,6 +61,9 @@ for seq, rnd, kind, payload in reversed(rows):
         extra = str(pl.get("input", {}).get("text", ""))[:50]
     elif kind == "system":
         extra = f"[{pl.get('code')}] {str(pl.get('text', ''))[:50]}"
+    elif kind == "ai_call":
+        u = pl.get("usage") or {}
+        extra = f"{pl.get('status')} {pl.get('provider')}/{pl.get('model')} in={u.get('input_tokens')} out={u.get('output_tokens')} cached={u.get('cached_input_tokens')} {pl.get('latency_ms')}ms" + (f" | {pl.get('error')}" if pl.get('error') else "")
     else:
         extra = ""
     print(seq, f"r{rnd}", kind, extra)

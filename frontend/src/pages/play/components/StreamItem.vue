@@ -1,11 +1,9 @@
 <script setup lang="ts">
-// 叙事组件宿主：把各类演出流条目渲染为模板无关卡片/行
-// —— 判定结算卡 / 确认门卡 / 系统行 / 目标与触发点进度 / 意图结算
-// 迁移：system info/warn/error → 徽标 + text-muted-foreground / text-warning / text-destructive。
+// 机器事件宿主：判定结算卡 / 确认门卡 / 系统行 / 目标与触发点进度 / 意图结算 / 思考折叠。
+// 正文（旁白/台词/神态）已由 feed/ProseFlow.vue 合并渲染，不经过这里。
 import { computed } from 'vue'
 import CheckCard from './CheckCard.vue'
 import PendingCard from './PendingCard.vue'
-import FeedText from './FeedText.vue'
 import { Reasoning, ReasoningContent, ReasoningTrigger } from '@/components/ai-elements/reasoning'
 import type { FeedEntry } from '../stores/play'
 import {
@@ -19,7 +17,7 @@ import {
   IconBook2
 } from '@tabler/icons-vue'
 
-const props = withDefaults(defineProps<{ entry: FeedEntry; showSpeaker?: boolean }>(), { showSpeaker: true })
+const props = defineProps<{ entry: FeedEntry }>()
 
 const sysLevel = computed(() => (props.entry.kind === 'system' ? props.entry.level : 'info'))
 const SYS = {
@@ -81,6 +79,4 @@ const resOk = computed(() => props.entry.kind === 'resolution' && props.entry.st
       <ReasoningContent :content="entry.text" />
     </Reasoning>
   </div>
-
-  <template v-else-if="entry.kind === 'content'"><FeedText :entry="entry" :show-speaker="showSpeaker" /></template>
 </template>

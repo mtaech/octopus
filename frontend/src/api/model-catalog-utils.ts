@@ -85,7 +85,8 @@ export function mergeModelMeta(base: CatalogModel | undefined, entry: ModelEntry
     id: entry?.id ?? base?.id ?? '',
     name: entry?.name ?? base?.name ?? '',
     ctx: entry?.ctx ?? base?.ctx,
-    maxOut: entry?.maxOut ?? base?.maxOut,
+    // 目录快照是 camelCase（maxOut），落盘的 ModelEntry 与 AppConfig 其余字段一致是 snake_case（max_out）
+    maxOut: entry?.max_out ?? base?.maxOut,
     reasoning: entry?.reasoning ?? base?.reasoning,
     tl: entry?.tl ?? base?.tl,
   }
@@ -136,6 +137,25 @@ export function wireToLevel(meta: CatalogModel | undefined, wire?: string): stri
 /** 思考等级的展示标签。 */
 export const LEVEL_LABEL: Record<string, string> = {
   default: '默认', off: '关闭', minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'XHigh', max: 'Max',
+}
+
+/** u32 上界：超过它后端反序列化会 422，整份配置都存不下去。 */
+const TOKEN_MAX = 4_294_967_295
+
+/**
+ * token 数的容错解析：`131072` / `128K` / `1M` / `1,000,000` / `100万` 都认。
+ * 认不出（含超出 u32）返回 null —— 调用方据此提示用户，而不是把输入悄悄丢掉。
+ */
+export function parseTokenCount(text: string): number | null {
+  const raw = (text ?? '').trim().replace(/[\s,，_]/g, '')
+  const m = /^(\d+(?:\.\d+)?)([kKmM万])?$/.exec(raw)
+  if (!m) return null
+  const n = Number(m[1])
+  if (!Number.isFinite(n) || n <= 0) return null
+  const unit = (m[2] ?? '').toLowerCase()
+  const scale = unit === 'k' ? 1_000 : unit === 'm' ? 1_000_000 : unit === '万' ? 10_000 : 1
+  const out = Math.round(n * scale)
+  return out > 0 && out <= TOKEN_MAX ? out : null
 }
 
 /** 上下文窗口的可读展示：1000000 → 1M，128000 → 128K。 */

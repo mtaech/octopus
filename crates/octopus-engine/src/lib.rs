@@ -50,8 +50,8 @@ pub use lua_host::{
     SandboxLimits,
 };
 pub use modifiers::{attribute_modifiers, AttrModifier};
-pub use memory::{HybridMemoryRetriever, MemoryIndexer};
-pub use ports::{AiOutput, AiProvider, AiSlot, ConvRecord, ConversationStore, EmbeddingBackend, EventSink, LoreView, MemoryHit, MemoryRetriever, ModelRef, NarrativeView, PersonaView, SceneBrief, SummaryStore, TurnContext, VectorIndex};
+pub use memory::{FtsMemoryRetriever, MemoryIndexer};
+pub use ports::{AiOutput, AiProvider, AiSlot, ConvRecord, ConversationStore, EventSink, LoreView, MemoryHit, MemoryRetriever, ModelRef, NarrativeView, PersonaView, SceneBrief, SummaryStore, TurnContext};
 pub use protocol::{
     build_protocol_adapter, check_protocol_conformance, intent_kind, is_known_intent,
     parse_intent_envelopes, parse_intents, protocol_sandbox_limits, DeclarativeProtocol, DefaultProtocol, LuaProtocol,

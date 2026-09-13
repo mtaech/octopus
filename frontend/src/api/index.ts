@@ -519,7 +519,10 @@ export async function saveAppConfig(config: AppConfig): Promise<AppConfig> {
         body: JSON.stringify(config),
       })
     } catch (e) {
+      // 只写了本地缓存却报「已保存」会骗人：下次打开读的是服务端配置，用户的自定义就凭空消失了。
+      // 本地缓存留着（服务端不可用时 getAppConfig 会回落到它），但错误必须抛给调用方。
       console.warn('保存到服务端失败，已暂存本地', e)
+      throw new Error('服务端未接受配置（本地缓存已留档，重开仍以服务端为准）：' + ((e as Error)?.message ?? String(e)))
     }
   }
   return config
@@ -559,6 +562,8 @@ export interface PairAttachment {
 export interface PairHistoryMessage {
   role: 'user' | 'assistant' | 'tool' | 'system'
   content: string
+  /** assistant：该轮思考正文（reasoning_content）。带工具调用的轮次必须回传，否则思考模型会 400 */
+  reasoning?: string
   tool_calls?: { id: string; type: 'function'; function: { name: string; arguments: string } }[]
   tool_call_id?: string
   /** 用户消息的附件 */
@@ -569,6 +574,8 @@ export interface PairToolCall {
   id: string
   name: string
   arguments: string
+  /** false = 输出预算被用尽，arguments 是半截 JSON，绝不能执行（缺省视为 true，兼容旧后端） */
+  arguments_valid?: boolean
 }
 
 /** 模型本轮真实用量（后端从流末尾的 Final 帧取回） */
@@ -594,6 +601,11 @@ export interface PairChatResult {
   reasoningChars?: number
   /** 本轮思考正文（reasoning_content） */
   reasoning?: string
+  /**
+   * 回传给下一轮请求的思考正文（多步工具循环必须原样带回去）。
+   * 与 reasoning 内容相同，单独一个字段是为了不跟展示用途混在一起。
+   */
+  reasoningForReplay?: string
   /** 各类流事件计数，用于事后诊断 */
   counts?: Record<string, number>
 }
@@ -617,6 +629,8 @@ export interface PairChatOptions {
   tools?: unknown[]
   /** 本轮显式引用的目标实体（完整定义） */
   focus?: PairFocusEntity[]
+  /** 本轮输出预算（tokens）：思考与正文共享，缺省由后端自适应（不低于 16384） */
+  max_tokens?: number
   onDelta?: (delta: string) => void
   /** 思考流（reasoning_content）；replace=true 表示整块替换此前的增量 */
   onReasoning?: (text: string, replace?: boolean) => void
@@ -646,6 +660,7 @@ export async function pairChat(
         storybook: options?.storybook,
         tools: options?.tools,
         focus: options?.focus,
+        max_tokens: options?.max_tokens,
       }),
     })
 
@@ -670,6 +685,7 @@ export async function pairChat(
     let usage: PairUsage | undefined
     let reasoningChars: number | undefined
     let reasoning = ''
+    let reasoningForReplay: string | undefined
     let counts: Record<string, number> | undefined
     let currentEvent = 'message'
 
@@ -725,6 +741,7 @@ export async function pairChat(
               if (parsed.usage) usage = parsed.usage as PairUsage
               if (typeof parsed.reasoning_chars === 'number') reasoningChars = parsed.reasoning_chars
               if (typeof parsed.reasoning === 'string' && parsed.reasoning) reasoning = parsed.reasoning
+              if (typeof parsed.reasoning_for_replay === 'string' && parsed.reasoning_for_replay) reasoningForReplay = parsed.reasoning_for_replay
               if (parsed.counts) counts = parsed.counts as Record<string, number>
               if (Array.isArray(parsed.tool_calls) && parsed.tool_calls.length) {
                 for (const tc of parsed.tool_calls as PairToolCall[]) {
@@ -761,6 +778,7 @@ export async function pairChat(
       usage,
       reasoningChars,
       reasoning: reasoning || undefined,
+      reasoningForReplay: reasoningForReplay || reasoning || undefined,
       counts,
     }
   } catch (err) {
@@ -768,6 +786,27 @@ export async function pairChat(
   }
 }
 
+
+/** 结对 web_fetch 的抓取结果（后端已做公网 / 禁内网 / 超时 / 截断护栏）。 */
+export interface FetchUrlResult {
+  url: string
+  title?: string
+  text: string
+  chars: number
+  truncated: boolean
+  content_type?: string
+}
+
+/** 读取公网网页为纯文本：经后端代理（浏览器直连会撞 CORS，且护栏必须在服务端）。 */
+export async function fetchUrl(url: string): Promise<FetchUrlResult> {
+  if (isMockMode()) {
+    throw mkErr('MOCK_UNSUPPORTED', '原型模式不支持抓取网页；在真实后端下才能用 web_fetch。')
+  }
+  return fetchJson<FetchUrlResult>('/api/fetch-url', {
+    method: 'POST',
+    body: JSON.stringify({ url }),
+  })
+}
 // ---- 结对会话线程持久化（#23 ④）：一本故事书多条会话，刷新 / 重进即恢复 ----
 
 export interface PairThreadRecord {

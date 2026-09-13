@@ -5,6 +5,7 @@
 pub mod ai;
 pub mod config;
 pub mod error;
+pub mod fetch;
 pub mod logging;
 pub mod pair;
 pub mod providers;
@@ -23,12 +24,11 @@ use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use futures::Stream;
 use octopus_engine::{
-    AiProvider, AssetStore, ConversationStore, ConvRecord, EmbeddingBackend, EngineError, EventSink, HybridMemoryRetriever,
-    LuaHost, LuaHostContext, LuaMount, MemoryIndexer, ModelRef, NewPairMessage, PairThreadRow,
+    AiProvider, AssetStore, ConversationStore, ConvRecord, EngineError, EventSink,
+    FtsMemoryRetriever, LuaHost, LuaHostContext, LuaMount, ModelRef, NewPairMessage, PairThreadRow,
     SaveUpgradeWrite, Session, SnapshotBase, SnapshotRow, SqliteStore, StorybookRow,
-    SummaryStore, VectorIndex, WorldState, compute_upgrade_report, content_type_of, event_kind,
-    is_narrative_event,
-    lint_script, narrative_text, new_lint_state, pack_bundle, unpack_bundle,
+    SummaryStore, WorldState, compute_upgrade_report, content_type_of,
+    lint_script, new_lint_state, pack_bundle, unpack_bundle,
     validate_dispositions,
 };
 #[allow(unused_imports)]
@@ -61,22 +61,6 @@ enum SinkMsg {
     Barrier(tokio::sync::oneshot::Sender<()>),
 }
 
-/// 记忆索引写队列消息（#05 §3.1）：叙事事件或派生摘要，交给同一个单消费者。
-///
-/// 摘要没有权威 seq，用负数派生编号（见 octopus_engine::storage），与叙事事件共用
-/// 这条有界 best-effort 队列，队列满即丢弃（索引可重建）。
-enum MemoryIndexMsg {
-    /// 权威命令日志里的叙事事件。
-    Event(EventEnvelope),
-    /// 派生摘要：回合微摘要 / 场景摘要。
-    Summary {
-        seq: i64,
-        round: u32,
-        kind: &'static str,
-        text: String,
-    },
-}
-
 /// 演出流出口：事件先进入单消费者队列，由写任务**先落库、后广播**。
 /// 顺序不变式保证「UI 上出现过的事件一定已经持久化」。
 struct PersistingSink {
@@ -99,94 +83,11 @@ impl EventSink for PersistingSink {
     }
 }
 
-/// 记忆索引写队列容量：有界（满则丢弃，索引可重建），单消费者处理，避免任务无界增长。
-const MEMORY_INDEX_QUEUE: usize = 256;
-
-/// 把一条叙事事件 best-effort 写入派生向量索引（#05 §3.1）。
-///
-/// 索引是派生数据：embedding / upsert 任何失败都只 warn，不影响权威落库与回合。
-async fn index_narrative_event(
-    embedding: &Arc<dyn EmbeddingBackend>,
-    index: &Arc<dyn VectorIndex>,
-    save_id: &str,
-    env: &EventEnvelope,
-) {
-    let Some(text) = narrative_text(&env.event) else {
-        return;
-    };
-    if text.trim().is_empty() {
-        return;
-    }
-    let vector = match embedding.embed(&text).await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(save_id = %save_id, seq = env.seq, error = %e,
-                "叙事事件 embedding 失败，跳过向量写入（索引可重建）");
-            return;
-        }
-    };
-    if let Err(e) = index
-        .upsert(save_id, env.seq as i64, env.round, event_kind(&env.event), &text, &vector)
-        .await
-    {
-        tracing::warn!(save_id = %save_id, seq = env.seq, error = %e,
-            "叙事事件写入向量索引失败（索引可重建）");
-    }
-}
-
-/// 把一条派生摘要 best-effort 写入向量索引（#05 §3.2/§3.3）。
-///
-/// 与叙事事件同一套语义：任何失败都只 warn，索引可重建；seq 为负数派生编号。
-async fn index_summary_text(
-    embedding: &Arc<dyn EmbeddingBackend>,
-    index: &Arc<dyn VectorIndex>,
-    save_id: &str,
-    seq: i64,
-    round: u32,
-    kind: &str,
-    text: &str,
-) {
-    if text.trim().is_empty() {
-        return;
-    }
-    let vector = match embedding.embed(text).await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(save_id = %save_id, seq, error = %e,
-                "摘要 embedding 失败，跳过向量写入（索引可重建）");
-            return;
-        }
-    };
-    if let Err(e) = index.upsert(save_id, seq, round, kind, text, &vector).await {
-        tracing::warn!(save_id = %save_id, seq, error = %e,
-            "摘要写入向量索引失败（索引可重建）");
-    }
-}
-
-/// 摘要落库端口实现（#05 §3.2/§3.3）：写派生表 + FTS5，向量索引走同一 best-effort 队列。
+/// 摘要落库端口实现（#05 §3.2/§3.3）：写派生表 + FTS5。
 ///
 /// 组合根在建立会话时注入；端口方法返回错误由 Session 只记 warn，绝不影响权威回合。
 struct StoreSummaryStore {
     store: Arc<SqliteStore>,
-    mem_tx: Option<tokio::sync::mpsc::Sender<MemoryIndexMsg>>,
-}
-
-impl StoreSummaryStore {
-    /// 把摘要的向量写入排进有界队列；队列满 / 未启用都只记 warn（索引可重建）。
-    fn enqueue_vector(&self, seq: i64, round: u32, kind: &'static str, text: &str) {
-        let Some(tx) = &self.mem_tx else { return };
-        if tx
-            .try_send(MemoryIndexMsg::Summary {
-                seq,
-                round,
-                kind,
-                text: text.to_string(),
-            })
-            .is_err()
-        {
-            tracing::warn!("记忆索引写队列已满，丢弃摘要向量（索引可重建）");
-        }
-    }
 }
 
 #[async_trait::async_trait]
@@ -197,8 +98,7 @@ impl SummaryStore for StoreSummaryStore {
         round: u32,
         text: &str,
     ) -> Result<(), EngineError> {
-        let seq = self.store.upsert_round_summary(save_id, round, text).await?;
-        self.enqueue_vector(seq, round, "summary", text);
+        self.store.upsert_round_summary(save_id, round, text).await?;
         Ok(())
     }
 
@@ -217,8 +117,7 @@ impl SummaryStore for StoreSummaryStore {
         round: u32,
         text: &str,
     ) -> Result<(), EngineError> {
-        let seq = self.store.upsert_scene_summary(save_id, scene_id, round, text).await?;
-        self.enqueue_vector(seq, round, "scene_summary", text);
+        self.store.upsert_scene_summary(save_id, scene_id, round, text).await?;
         Ok(())
     }
 }
@@ -229,9 +128,6 @@ pub struct AppState {
     assets: Arc<AssetStore>,
     /// AI provider 槽：保存配置后热替换，后续回合立即用新模型（无需重启）。
     ai: Arc<RwLock<Arc<dyn AiProvider>>>,
-    embedding: Arc<dyn EmbeddingBackend>,
-    /// 派生向量索引（#27/#05 M2）：best-effort 打开，失败则为 None，应用照常启动。
-    index: Option<Arc<dyn VectorIndex>>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     senders: Mutex<HashMap<String, broadcast::Sender<EventEnvelope>>>,
     /// 每回合 token 预算（0 = 不限）：保存配置后热更新到所有会话。
@@ -276,54 +172,19 @@ impl ConversationStore for SqliteConversationStore {
 
 impl AppState {
     /// 组装应用状态。
-    ///
-    /// `vector_index_path` = Some 时 best-effort 打开派生向量索引；打开失败只 warn，
-    /// 应用照常启动（M2 不消费索引，M3 检索会降级到 FTS5）。
     pub fn new(
         store: Arc<SqliteStore>,
         ai: Arc<dyn AiProvider>,
-        embedding: Arc<dyn EmbeddingBackend>,
         assets: Arc<AssetStore>,
-        vector_index_path: Option<String>,
     ) -> Arc<Self> {
-        let (index, index_reset): (Option<Arc<dyn VectorIndex>>, bool) = match vector_index_path {
-            Some(path) => match octopus_index::DuckDbVectorIndex::open(&path, embedding.clone()) {
-                Ok(idx) => {
-                    // 指纹/维度变化 ⇒ open 已丢弃旧表；旧向量需要重灌，放在**启动期**做。
-                    let reset = idx.was_reset();
-                    if reset {
-                        tracing::warn!(
-                            path = %path,
-                            dim = embedding.dimension(),
-                            "向量索引因 embedding 后端/维度变化被重建；启动后会重灌（派生数据，不影响权威日志）"
-                        );
-                    } else {
-                        tracing::info!(
-                            path = %path,
-                            dim = embedding.dimension(),
-                            "向量索引已打开（派生数据，可重建）"
-                        );
-                    }
-                    (Some(Arc::new(idx) as Arc<dyn VectorIndex>), reset)
-                }
-                Err(e) => {
-                    // 索引是派生且可选的：打开失败不阻断应用启动，只禁用向量检索。
-                    tracing::warn!(path = %path, error = %e, "向量索引打开失败，已禁用（应用继续启动）");
-                    (None, false)
-                }
-            },
-            None => (None, false),
-        };
         // 会话持久化端口：让「每存档一条会话」跨重启保持缓存前缀（派生数据）。
         let conv_store: Arc<dyn ConversationStore> =
             Arc::new(SqliteConversationStore { store: store.clone() });
         ai.set_conversation_store(conv_store.clone());
-        let app = Arc::new(Self {
+        Arc::new(Self {
             store,
             assets,
             ai: Arc::new(RwLock::new(ai)),
-            embedding,
-            index,
             sessions: Mutex::new(HashMap::new()),
             senders: Mutex::new(HashMap::new()),
             token_budget: AtomicU32::new(
@@ -332,35 +193,7 @@ impl AppState {
                     .unwrap_or(0),
             ),
             conv_store,
-        });
-        // 启动期重灌：向量库因 fingerprint/维度变化刚被清空时，这里把它重灌回来。
-        // **只在启动期做**——此刻还没有任何会话（也就没有写队列），是唯一不会与
-        // 写路径抢同一批行的时机；放到 session_for 里做会与增量索引竞态丢行。
-        if index_reset {
-            if let Some(idx) = app.index.as_ref() {
-                let store = app.store.clone();
-                let idx = idx.clone();
-                tokio::spawn(async move {
-                    let saves = match store.list_saves().await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "启动期读取存档列表失败，跳过向量索引重灌");
-                            return;
-                        }
-                    };
-                    let indexer = MemoryIndexer::new(store, idx);
-                    let mut total = 0usize;
-                    for s in &saves {
-                        match indexer.rebuild_memory_index(&s.id).await {
-                            Ok(n) => total += n,
-                            Err(e) => tracing::warn!(save_id = %s.id, error = %e, "启动期重灌向量索引失败（该存档检索降级为 FTS）"),
-                        }
-                    }
-                    tracing::info!(saves = saves.len(), rows = total, "启动期向量索引重灌完成（派生数据）");
-                });
-            }
-        }
-        app
+        })
     }
 
     pub fn store(&self) -> &Arc<SqliteStore> {
@@ -369,29 +202,6 @@ impl AppState {
 
     pub fn assets(&self) -> &Arc<AssetStore> {
         &self.assets
-    }
-
-    pub fn embedding(&self) -> &Arc<dyn EmbeddingBackend> {
-        &self.embedding
-    }
-
-    /// 派生向量索引；None = 未启用（路径未配置或 DuckDB 打不开）。
-    pub fn index(&self) -> Option<&Arc<dyn VectorIndex>> {
-        self.index.as_ref()
-    }
-
-    /// 重建某存档的向量索引（读命令日志 → 覆盖式重建，返回写入条数）。
-    ///
-    /// 派生数据入口：换 embedding 模型 / 维度变更 / 手动重建时调用。索引未启用时
-    /// 返回明确错误（调用方可忽略，不影响回合）。
-    pub async fn rebuild_memory_index(&self, save_id: &str) -> Result<usize, EngineError> {
-        let index = self
-            .index
-            .as_ref()
-            .ok_or_else(|| EngineError::Internal("向量索引未启用，无法重建".into()))?;
-        MemoryIndexer::new(self.store.clone(), index.clone())
-            .rebuild_memory_index(save_id)
-            .await
     }
 
     /// 热替换 AI provider：保存配置后调用，后续回合立即用新模型（无需重启进程/重建会话）。
@@ -454,32 +264,6 @@ impl AppState {
         let sid = save_id.to_string();
         let btx = tx.clone();
 
-        // 记忆写入侧（#05 §3.1）：派生向量索引 best-effort 增量写入。
-        // 有界队列 + 单消费者，避免「每条事件 spawn 一个任务」的无界增长：
-        // 队列满即丢弃（索引可重建），embedding 慢也不会拖住权威落库 / 广播。
-        let mem_tx = self.index.clone().map(|index| {
-            let embedding = self.embedding.clone();
-            let sid_mem = sid.clone();
-            let (mem_tx, mut mem_rx) =
-                tokio::sync::mpsc::channel::<MemoryIndexMsg>(MEMORY_INDEX_QUEUE);
-            tokio::spawn(async move {
-                while let Some(msg) = mem_rx.recv().await {
-                    match msg {
-                        MemoryIndexMsg::Event(env) => {
-                            index_narrative_event(&embedding, &index, &sid_mem, &env).await;
-                        }
-                        MemoryIndexMsg::Summary { seq, round, kind, text } => {
-                            index_summary_text(&embedding, &index, &sid_mem, seq, round, kind, &text)
-                                .await;
-                        }
-                    }
-                }
-            });
-            mem_tx
-        });
-        // 摘要落库端口复用上面那条队列做向量写入；队列未启用（无向量库）时只写派生表 + FTS。
-        let summary_mem_tx = mem_tx.clone();
-
         // 单消费者串行落库：保证「先落库、后广播」的顺序不变式。
         tokio::spawn(async move {
             while let Some(msg) = event_rx.recv().await {
@@ -498,17 +282,6 @@ impl AppState {
                         error = %e,
                         "演出事件落库失败；事件仍会广播，但该条未持久化"
                     );
-                } else if is_narrative_event(&env.event) {
-                    if let Some(mem_tx) = &mem_tx {
-                        // 只入队叙事事件；try_send 不阻塞权威写路径，满则丢弃。
-                        if mem_tx.try_send(MemoryIndexMsg::Event(env.clone())).is_err() {
-                            tracing::warn!(
-                                save_id = %sid,
-                                seq = env.seq,
-                                "记忆索引写队列已满，丢弃该条（索引可重建）"
-                            );
-                        }
-                    }
                 }
                 let _ = btx.send(env);
             }
@@ -534,17 +307,12 @@ impl AppState {
         if let Some(overrides) = self.store.get_save_narrative(save_id).await? {
             session.set_narrative_overrides(overrides);
         }
-        // 摘要派生落库（#05 §3.2/§3.3）：写派生表 + FTS，向量走同一条 best-effort 队列。
+        // 摘要派生落库（#05 §3.2/§3.3）：写派生表 + FTS。
         session.set_summary_store(Some(Arc::new(StoreSummaryStore {
             store: self.store.clone(),
-            mem_tx: summary_mem_tx,
         })));
-        // 相关往事检索（#05 §3.4）：向量 + FTS 混合；索引缺失 / 失败由检索器内部降级到 FTS。
-        session.set_memory_retriever(Some(Arc::new(HybridMemoryRetriever::new(
-            self.store.clone(),
-            self.embedding.clone(),
-            self.index.clone(),
-        ))));
+        // 相关往事检索（#05 §3.4）：FTS5 关键词召回；失败由检索器内部降级为空。
+        session.set_memory_retriever(Some(Arc::new(FtsMemoryRetriever::new(self.store.clone()))));
         self.senders
             .lock()
             .expect("senders poisoned")
@@ -851,6 +619,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/providers/probe", post(providers::probe_models))
         .route("/api/providers/test", post(providers::test_provider))
         .route("/api/pair/chat", post(pair::pair_chat))
+        .route("/api/fetch-url", post(fetch::fetch_url))
         .route("/api/pair/chat/stream", post(pair::pair_chat_stream))
         .route(
             "/api/storybooks",
@@ -2284,7 +2053,7 @@ async fn stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use octopus_ai::{ScriptedProvider, StubEmbedding};
+    use octopus_ai::ScriptedProvider;
     use octopus_engine::{AiOutput, MemoryRetriever, TurnContext};
     use octopus_types::{
         Intent, MaintenanceRow, NewOriginResult, PlayEvent, SaveDetail,
@@ -2302,7 +2071,7 @@ mod tests {
         let assets_dir =
             std::env::temp_dir().join(format!("octopus-test-assets-{}", uuid::Uuid::new_v4()));
         let assets = Arc::new(AssetStore::open(&assets_dir).await.unwrap());
-        let state = AppState::new(store, ai, Arc::new(StubEmbedding::default()), assets, None);
+        let state = AppState::new(store, ai, assets);
         let app = router(state.clone());
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2339,7 +2108,7 @@ mod tests {
         let assets_dir =
             std::env::temp_dir().join(format!("octopus-test-assets-{}", uuid::Uuid::new_v4()));
         let assets = Arc::new(AssetStore::open(&assets_dir).await.unwrap());
-        let state = AppState::new(store, ai, Arc::new(StubEmbedding::default()), assets, None);
+        let state = AppState::new(store, ai, assets);
         let app = router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2716,77 +2485,6 @@ mod tests {
         let _ = std::fs::remove_file(&db_path);
     }
 
-    /// #05 §3.1：回合产生的叙事事件被 best-effort 写入派生向量索引。
-    #[tokio::test]
-    async fn round_narrative_events_are_indexed_best_effort() {
-        let store = Arc::new(SqliteStore::open_in_memory().await.unwrap());
-        let assets_dir =
-            std::env::temp_dir().join(format!("octopus-test-assets-{}", uuid::Uuid::new_v4()));
-        let assets = Arc::new(AssetStore::open(&assets_dir).await.unwrap());
-        let vec_path =
-            std::env::temp_dir().join(format!("octopus-vec-{}.duckdb", uuid::Uuid::new_v4()));
-        let state = AppState::new(
-            store.clone(),
-            Arc::new(ScriptedProvider),
-            Arc::new(StubEmbedding::default()),
-            assets,
-            Some(vec_path.to_string_lossy().into_owned()),
-        );
-        let app = router(state.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        let base = format!("http://{addr}");
-        let client = reqwest::Client::new();
-
-        let detail: SaveDetail = client
-            .post(format!("{base}/api/saves"))
-            .json(&CreateSaveRequest {
-                storybook_id: "sb-fallingstar".to_string(),
-                title: Some("索引写入测试".to_string()),
-                controlled_character_id: None,
-                is_sandbox: Some(true),
-            })
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        let save_id = detail.item.id.clone();
-
-        let res = client
-            .post(format!("{base}/api/saves/{save_id}/rounds"))
-            .json(&json!({ "channel": "character", "text": "你好" }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::ACCEPTED);
-
-        // 等回合彻底结算（RoundEnd）后再统计，避免边跑边数。
-        wait_round_end(&store, &save_id).await;
-        let expected = store.load_narrative_events(&save_id).await.unwrap().len();
-        assert!(expected > 0, "回合应产生叙事事件");
-
-        // 等派生索引追上（异步 best-effort）；用任意向量查全量。
-        let probe = state.embedding().embed("probe").await.unwrap();
-        let index = state.index().expect("测试已启用向量索引");
-        let mut got = 0usize;
-        for _ in 0..200 {
-            got = index.search(&save_id, &probe, 100).await.unwrap().len();
-            if got >= expected {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert_eq!(got, expected, "每条叙事事件都应写入向量索引");
-
-        let _ = std::fs::remove_file(&vec_path);
-        let _ = std::fs::remove_file(vec_path.with_extension("duckdb.wal"));
-    }
-
     /// 只产出「叙事 + 回合微摘要」的确定性 provider（验证摘要进索引与检索）。
     struct SummaryProvider;
 
@@ -2800,27 +2498,20 @@ mod tests {
                 ],
                 reasoning: None,
                 intent_warnings: vec![],
+                trace: None,
             })
         }
         
     }
 
-    /// #05 §3.2 / §3.1：微摘要写派生表、进 FTS5 与向量索引，并能被检索器召回。
+    /// #05 §3.2：微摘要写派生表、进 FTS5，并能被检索器召回。
     #[tokio::test]
     async fn round_summary_is_indexed_and_retrievable() {
         let store = Arc::new(SqliteStore::open_in_memory().await.unwrap());
         let assets_dir =
             std::env::temp_dir().join(format!("octopus-test-assets-{}", uuid::Uuid::new_v4()));
         let assets = Arc::new(AssetStore::open(&assets_dir).await.unwrap());
-        let vec_path =
-            std::env::temp_dir().join(format!("octopus-vec-{}.duckdb", uuid::Uuid::new_v4()));
-        let state = AppState::new(
-            store.clone(),
-            Arc::new(SummaryProvider),
-            Arc::new(StubEmbedding::default()),
-            assets,
-            Some(vec_path.to_string_lossy().into_owned()),
-        );
+        let state = AppState::new(store.clone(), Arc::new(SummaryProvider), assets);
         let app = router(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2864,35 +2555,13 @@ mod tests {
         let fts = store.search_events_fts(&save_id, "微光", 10).await.unwrap();
         assert!(!fts.is_empty(), "摘要应进 FTS5");
 
-        // 向量索引：叙事 + 摘要都应写入（等 best-effort 队列追上）。
-        let expected = store.load_narrative_events(&save_id).await.unwrap().len();
-        assert!(expected >= 2, "至少叙事 + 摘要");
-        let probe = state.embedding().embed("probe").await.unwrap();
-        let index = state.index().expect("测试已启用向量索引");
-        let mut got = 0usize;
-        for _ in 0..200 {
-            got = index.search(&save_id, &probe, 100).await.unwrap().len();
-            if got >= expected {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert_eq!(got, expected, "摘要也应写入向量索引");
-
-        // 混合检索器无需特判即可召回摘要。
-        let retriever = HybridMemoryRetriever::new(
-            store.clone(),
-            state.embedding().clone(),
-            state.index().cloned(),
-        );
+        // 检索器无需特判即可召回摘要。
+        let retriever = FtsMemoryRetriever::new(store.clone());
         let hits = retriever.retrieve(&save_id, "微光", 5).await.unwrap();
         assert!(
             hits.iter().any(|h| h.kind == "summary" && h.text.contains("微光")),
             "摘要应可被检索: {hits:?}"
         );
-
-        let _ = std::fs::remove_file(&vec_path);
-        let _ = std::fs::remove_file(vec_path.with_extension("duckdb.wal"));
     }
 
     /// #24 决策 6：非 idle 提交必须**同步**拿到 409 round_in_progress，而不是 202 之后被吞掉。
@@ -2911,6 +2580,7 @@ mod tests {
                     intents: vec![Intent::Narrate { content: "……".into(), actor_id: None }.into()],
                     reasoning: None,
                     intent_warnings: vec![],
+                    trace: None,
                 })
             }
             

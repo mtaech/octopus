@@ -7,7 +7,6 @@ edition.workspace = true
 octopus-types = { path = "../octopus-types" }
 octopus-engine = { path = "../octopus-engine" }
 octopus-ai = { path = "../octopus-ai" }
-octopus-index = { path = "../octopus-index" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }

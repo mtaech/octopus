@@ -34,7 +34,8 @@ import {
 import {
   IconSend, IconSparkles, IconUser, IconCheck, IconLoader2,
   IconListCheck, IconGlassFull, IconUsers, IconBolt, IconRobot, IconSettings,
-  IconArrowBackUp, IconTool, IconPlus, IconAt, IconPaperclip, IconFileText
+  IconArrowBackUp, IconTool, IconPlus, IconAt, IconPaperclip, IconFileText,
+  IconAlertTriangle
 } from '@tabler/icons-vue'
 import type { PairAttachment } from '@/api'
 
@@ -69,8 +70,23 @@ const lastTurnLine = computed(() => {
     parts.push('缓存命中 ' + (rate != null ? rate + '%' : fmtTokens(s.cachedTokens) + ' tok'))
   }
   if (s.reasoningChars) parts.push('思考 ' + s.reasoningChars + ' 字')
+  if (s.reasoningTokens) parts.push('思考 ' + fmtTokens(s.reasoningTokens) + ' tok')
+  if (s.finishReason === 'length') parts.push('输出预算已用尽，回答被截断')
   return parts.join(' · ')
 })
+
+/** 截断提示里那句「本轮预算」：优先报真实用量，其次报设置里的预算 */
+const truncationBudgetLabel = computed(() => {
+  const s = pair.lastTurnStats
+  const used = s?.maxTokens ?? s?.reasoningTokens ?? 0
+  return used > 0 ? fmtTokens(used) + ' tok' : ''
+})
+
+/** 继续写：填好续写指令后走与输入框同一条发送链路 */
+async function onResumeTruncated(): Promise<void> {
+  pair.seedResumePrompt()
+  await onSend()
+}
 
 // ---------- 多会话栏（一本故事书多条线程，按主题隔离上下文） ----------
 const renamingId = ref('')
@@ -491,6 +507,34 @@ const canSend = computed(() => pair.sending || !pair.input.trim())
                 <span>{{ tc.ok ? (m.turnState === 'staged' ? '待批准 · ' : m.turnState === 'discarded' ? '已放弃 · ' : m.turnState === 'applied' ? '已应用 · ' : '') + tc.label : '失败 · ' + tc.label }}</span>
               </div>
               <div v-if="m.turnState === 'discarded'" class="pt-1 text-[11px] text-muted-foreground/70">本轮改动已放弃，草稿未变。</div>
+            </div>
+            <!-- 输出预算用尽：正文断在半句话上。必须显式说明，并给一条继续写的出路。 -->
+            <div
+              v-if="m.role === 'assistant' && m.truncated"
+              class="mt-2.5 flex flex-wrap items-center gap-2 border-t border-warning/30 pt-2"
+            >
+              <span class="flex items-center gap-1.5 text-[11px] leading-4 text-warning">
+                <IconAlertTriangle class="size-3.5 shrink-0" />
+                回答被输出预算截断（{{ truncationBudgetLabel }}）——上面可能停在半句话上。思考与正文共享这份预算。
+              </span>
+              <Button
+                v-if="i === pair.messages.length - 1"
+                size="xs"
+                variant="outline"
+                class="h-6 gap-1 border-warning/50 text-[11px] text-foreground hover:bg-warning/10"
+                :disabled="pair.sending"
+                @click="onResumeTruncated()"
+              >
+                <IconArrowBackUp class="size-3" />
+                继续写完
+              </Button>
+              <button
+                type="button"
+                class="text-[11px] text-muted-foreground/70 underline decoration-dotted hover:text-foreground"
+                @click="settingsOpen = true"
+              >
+                调大输出预算
+              </button>
             </div>
             <div v-if="m.isError" class="mt-2.5 pt-2 border-t border-destructive/20 flex items-center justify-between gap-2">
               <span class="text-xs text-muted-foreground">未配置有效密钥或服务连接失败</span>

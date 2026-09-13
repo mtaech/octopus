@@ -4,12 +4,6 @@
 *.db-wal
 octopus.db*
 
-# 派生向量库（#27）：可从命令日志重建，不入版本控制
-octopus-vectors.duckdb*
-
-# fastembed 模型缓存（M1）：91MB 二进制权重，首次运行时自动下载
-.fastembed_cache/
-
 # 资产库（#28）：图片内容寻址存储，不入版本控制
 /assets/
 

@@ -5,7 +5,6 @@ members = [
   "crates/octopus-engine",
   "crates/octopus-ai",
   "crates/octopus-api",
-  "crates/octopus-index",
   "crates/octopus-bin",
   "crates/octopus-launcher",
   "migration",
@@ -41,7 +40,7 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 chrono = { version = "0.4", features = ["serde"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "gzip", "brotli", "zstd"] }
 # LLM 应用框架：provider 客户端 / CompletionModel / Agent / 工具调用
 rig = { version = "0.42" }
 sha2 = "0.10"

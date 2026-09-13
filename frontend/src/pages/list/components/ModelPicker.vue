@@ -6,7 +6,7 @@ import { Input } from '@/components/ui/input'
 import { IconPlus, IconTrash, IconWand, IconLoader2, IconAdjustments } from '@tabler/icons-vue'
 import { toast } from '@/api'
 import { probeProviderModels } from '@/api'
-import { catalogEntries, catalogProvider, detectProviderByUrl, fmtContext } from '@/api/model-catalog-utils'
+import { catalogEntries, catalogModelMeta, catalogProvider, detectProviderByUrl, fmtContext, mergeModelMeta, parseTokenCount } from '@/api/model-catalog-utils'
 import type { ModelEntry, ProviderConfig } from '@/types'
 
 const props = defineProps<{
@@ -25,27 +25,61 @@ const detectedName = computed(() => (detectedId.value ? catalogProvider(detected
 const detectedCount = computed(() => (detectedId.value ? catalogEntries(detectedId.value).length : 0))
 const models = computed(() => props.modelValue ?? [])
 
-function addRow() { emit('update:modelValue', [...models.value, { id: '', name: '' }]) }
-function removeAt(i: number) { emit('update:modelValue', models.value.filter((_, idx) => idx !== i)) }
+/** 数字字段的编辑态：留住用户敲的原文（128K / 1M / 1,000,000），认不出也不清空输入框。 */
+const drafts = ref<Record<string, string>>({})
+
+function addRow() { drafts.value = {}; emit('update:modelValue', [...models.value, { id: '', name: '' }]) }
+function removeAt(i: number) { drafts.value = {}; emit('update:modelValue', models.value.filter((_, idx) => idx !== i)) }
 function restoreDefaults() {
   tried.value = true
   const pid = detectedId.value
   if (!pid) return
+  drafts.value = {}
   emit('update:modelValue', catalogEntries(pid).map(m => ({ ...m })))
 }
 function onIdChange(id: string) { if (id.trim()) emit('pick', id.trim()) }
 
 // ---- 自定义模型元数据（小中转站 / 目录未收录的模型） ----
 const expanded = ref<number | null>(null)
-function toggleMeta(i: number) { expanded.value = expanded.value === i ? null : i }
-function metaSummary(m: ModelEntry): string {
-  const bits: string[] = []
-  if (m.ctx) bits.push(fmtContext(m.ctx))
-  if (m.reasoning === true) bits.push('思考')
-  if (m.reasoning === false) bits.push('非思考')
-  if (m.tl) bits.push(Object.keys(m.tl).join('/'))
-  return bits.join(' · ')
+function toggleMeta(i: number) {
+  expanded.value = expanded.value === i ? null : i
+  drafts.value = {}
 }
+type NumKey = 'ctx' | 'max_out'
+function draftKey(i: number, key: NumKey) { return i + ':' + key }
+/** 输入框显示的文本：编辑态优先，否则是已保存的数值。 */
+function numText(i: number, m: ModelEntry, key: NumKey): string {
+  const d = drafts.value[draftKey(i, key)]
+  if (d !== undefined) return d
+  return m[key] == null ? '' : String(m[key])
+}
+/** 认不出的写法：红框 + 提示，而不是悄悄把值丢掉。 */
+function numBad(i: number, key: NumKey): boolean {
+  const d = drafts.value[draftKey(i, key)]
+  return d !== undefined && d.trim() !== '' && parseTokenCount(d) == null
+}
+function setNum(i: number, m: ModelEntry, key: NumKey, v: string) {
+  drafts.value[draftKey(i, key)] = String(v)
+  const raw = String(v).trim()
+  m[key] = raw ? parseTokenCount(raw) ?? undefined : undefined
+}
+type MetaBadge = { text: string; custom: boolean }
+/** 行尾徽标：生效的上下文窗口 / 思考能力（目录默认 or 自定义覆盖）。 */
+function badgeOf(m: ModelEntry): MetaBadge | null {
+  const eff = mergeModelMeta(catalogModelMeta(detectedId.value ?? '', m.id), m)
+  if (!eff) return null
+  const bits: string[] = []
+  if (eff.ctx) bits.push(fmtContext(eff.ctx))
+  if (eff.reasoning === true) bits.push('思考')
+  if (eff.reasoning === false) bits.push('非思考')
+  if (eff.tl) bits.push(Object.keys(eff.tl).join('/'))
+  if (!bits.length) return null
+  return {
+    text: bits.join(' · '),
+    custom: m.ctx != null || m.reasoning !== undefined || m.tl != null,
+  }
+}
+const badges = computed<MetaBadge[]>(() => models.value.map(m => badgeOf(m) ?? { text: '', custom: false }))
 function levelsText(m: ModelEntry): string {
   if (!m.tl) return ''
   return Object.entries(m.tl).map(([k, v]) => (v == null || v === k ? k : `${k}=${v}`)).join(', ')
@@ -59,17 +93,13 @@ function setLevels(m: ModelEntry, text: string) {
   }
   m.tl = Object.keys(tl).length ? tl : undefined
 }
-function setNum(m: ModelEntry, key: 'ctx' | 'maxOut', v: string) {
-  const n = Number(v)
-  m[key] = v.trim() && Number.isFinite(n) && n > 0 ? Math.round(n) : undefined
-}
-
 /** 探测：调用 models 端点拉取可用模型 */
 async function probe() {
   if (probing.value) return
   probing.value = true
   try {
     const res = await probeProviderModels(props.provider)
+    drafts.value = {}
     emit('update:modelValue', res.models.map(m => ({ ...m })))
     toast('ok', `探测到 ${res.models.length} 个模型（${res.source}）`)
   } catch (e) {
@@ -102,7 +132,12 @@ async function probe() {
         <div class="flex items-center gap-1.5">
           <Input v-model="m.id" placeholder="模型 id（如 deepseek-chat）" class="h-9 flex-1 font-mono text-[12.5px]" @change="onIdChange(m.id)" />
           <Input v-model="m.name" placeholder="显示名（可选）" class="h-9 flex-1" />
-          <span v-if="metaSummary(m)" class="shrink-0 rounded-full bg-muted/70 px-1.5 font-mono text-[9.5px] text-muted-foreground/80">{{ metaSummary(m) }}</span>
+          <span
+            v-if="badges[i]?.text"
+            class="shrink-0 rounded-full px-1.5 font-mono text-[9.5px]"
+            :class="badges[i]?.custom ? 'bg-primary/12 text-primary' : 'bg-muted/70 text-muted-foreground/80'"
+            :title="badges[i]?.custom ? '自定义元数据（覆盖目录默认）' : '模型目录默认'"
+          >{{ badges[i]?.text }}</span>
           <Button size="icon-sm" variant="ghost" class="shrink-0" :class="expanded === i ? 'text-primary' : 'text-muted-foreground'" title="自定义上下文 / 思考等级（小中转站）" @click="toggleMeta(i)">
             <IconAdjustments />
           </Button>
@@ -115,11 +150,27 @@ async function probe() {
         <div v-if="expanded === i" class="grid grid-cols-1 gap-2 rounded-lg border border-border/70 bg-muted/20 p-2.5 sm:grid-cols-2">
           <label class="flex flex-col gap-1">
             <span class="text-[10.5px] font-semibold text-muted-foreground">上下文窗口（tokens）</span>
-            <Input :model-value="m.ctx ?? ''" placeholder="如 128000；留空用目录" class="h-8 font-mono text-[12px]" @update:model-value="(v) => setNum(m, 'ctx', String(v))" />
+            <Input
+              :model-value="numText(i, m, 'ctx')"
+              placeholder="131072 / 128K / 1M；留空用目录"
+              class="h-8 font-mono text-[12px]"
+              :class="numBad(i, 'ctx') && 'border-destructive focus-visible:border-destructive focus-visible:ring-destructive/20'"
+              :aria-invalid="numBad(i, 'ctx') || undefined"
+              @update:model-value="(v) => setNum(i, m, 'ctx', String(v))"
+            />
+            <span v-if="numBad(i, 'ctx')" class="text-[10px] text-destructive">认不出这个数：写 131072 或 128K（留空 = 用目录默认）</span>
           </label>
           <label class="flex flex-col gap-1">
             <span class="text-[10.5px] font-semibold text-muted-foreground">最大输出（tokens）</span>
-            <Input :model-value="m.maxOut ?? ''" placeholder="如 8192；留空同上下文" class="h-8 font-mono text-[12px]" @update:model-value="(v) => setNum(m, 'maxOut', String(v))" />
+            <Input
+              :model-value="numText(i, m, 'max_out')"
+              placeholder="8192 / 8K；留空同上下文"
+              class="h-8 font-mono text-[12px]"
+              :class="numBad(i, 'max_out') && 'border-destructive focus-visible:border-destructive focus-visible:ring-destructive/20'"
+              :aria-invalid="numBad(i, 'max_out') || undefined"
+              @update:model-value="(v) => setNum(i, m, 'max_out', String(v))"
+            />
+            <span v-if="numBad(i, 'max_out')" class="text-[10px] text-destructive">认不出这个数：写 8192 或 8K（留空 = 同上下文）</span>
           </label>
           <div class="flex flex-col gap-1">
             <span class="text-[10.5px] font-semibold text-muted-foreground">是否支持思考</span>
@@ -133,7 +184,7 @@ async function probe() {
             <span class="text-[10.5px] font-semibold text-muted-foreground">思考等级（逗号分隔，可写 等级=下发值）</span>
             <Input :model-value="levelsText(m)" placeholder="如 low, medium, high=max" class="h-8 font-mono text-[12px]" @update:model-value="(v) => setLevels(m, String(v))" />
           </label>
-          <p class="col-span-full text-[10.5px] leading-relaxed text-muted-foreground/70">小中转站 / 目录未收录的模型：在这里自定义上下文与思考等级；留空则沿用目录默认。只写等级名表示下发同名字段，写「等级=下发值」可映射到不同值。</p>
+          <p class="col-span-full text-[10.5px] leading-relaxed text-muted-foreground/70">小中转站 / 目录未收录的模型：在这里自定义上下文与思考等级；留空则沿用目录默认（行尾徽标里的数字就是当前生效值，自定义时变主题色）。数字支持 131072 / 128K / 1M 写法。只写等级名表示下发同名字段，写「等级=下发值」可映射到不同值。</p>
         </div>
       </div>
     </div>

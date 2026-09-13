@@ -32,6 +32,7 @@ impl AiProvider for ScriptedProvider {
             intents: out.into_iter().map(Into::into).collect(),
             reasoning: None,
             intent_warnings: vec![],
+            trace: None,
         })
     }
 

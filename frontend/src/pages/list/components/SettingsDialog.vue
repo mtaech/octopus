@@ -31,11 +31,10 @@ const props = defineProps<{ open: boolean }>()
 const emit = defineEmits<{ (e: 'update:open', v: boolean): void }>()
 const store = useSettingsStore()
 
-type RoleKey = 'story' | 'pair' | 'embedding'
+type RoleKey = 'story' | 'pair'
 const ROLES: { key: RoleKey; label: string; desc: string }[] = [
   { key: 'story', label: 'AI（单一）', desc: '故事走向、旁白、世界响应并扮演所有 NPC' },
   { key: 'pair', label: '结对 AI', desc: '设定构思、启发与结构化建议（用于 AI 结对工作台）' },
-  { key: 'embedding', label: 'Embedding', desc: '事件检索向量化（默认本地 bge-small-zh）' },
 ]
 
 /** 各协议类型的默认端点；选中类型时自动填入 Base URL */
@@ -44,8 +43,6 @@ const KIND_DEFAULT_URL: Record<ProviderKind, string> = {
   anthropic: 'https://api.anthropic.com',
   ollama: 'http://127.0.0.1:11434',
   'openai-compatible': '',
-  // 本地 fastembed：由后端内置，无端点
-  'local-embedding': '',
 }
 
 const KINDS: { value: ProviderKind; label: string }[] = [
@@ -53,7 +50,6 @@ const KINDS: { value: ProviderKind; label: string }[] = [
   { value: 'anthropic', label: 'Anthropic' },
   { value: 'ollama', label: 'Ollama（本地）' },
   { value: 'openai-compatible', label: 'OpenAI 兼容端点（DeepSeek / Moonshot / Groq…）' },
-  { value: 'local-embedding', label: '本地 Embedding（fastembed，无需端点）' },
 ]
 
 type SectionKey = 'roles' | 'providers' | 'budget' | 'appearance' | 'about'
@@ -165,27 +161,21 @@ function ensureRole(key: RoleKey): RoleConfig {
       provider_id: fallback,
       model: modelsOf(fallback)[0]?.id || c.roles.story?.model || '',
       temperature: 0.8,
-      max_tokens: 4096,
     }
   }
   return c.roles[key]!
 }
 /** AI 后端开关（config.ai 可能缺失，按需补默认） */
-function ensureAi(): { provider: string; embedding: string } {
+function ensureAi(): { provider: string } {
   const c = config.value
-  if (!c) return { provider: 'auto', embedding: 'auto' }
-  if (!c.ai) c.ai = { provider: 'auto', embedding: 'auto' }
+  if (!c) return { provider: 'auto' }
+  if (!c.ai) c.ai = { provider: 'auto' }
   return c.ai
 }
 const PROVIDER_MODES = [
   { value: 'auto', label: '自动（rig 优先，失败回退脚本）' },
   { value: 'rig', label: 'rig（失败回退脚本）' },
   { value: 'scripted', label: 'scripted（确定性，离线 / 测试）' },
-]
-const EMBEDDING_MODES = [
-  { value: 'auto', label: '自动（rig 优先，失败回退 Stub）' },
-  { value: 'rig', label: 'rig（失败回退 Stub）' },
-  { value: 'stub', label: 'stub（确定性，离线 / 测试）' },
 ]
 function onRoleProvider(key: RoleKey, providerId: string) {
   const role = ensureRole(key)
@@ -305,7 +295,7 @@ async function removeProvider(p: ProviderConfig) {
   if (!confirmed) return
   c.providers = c.providers.filter(x => x.id !== p.id)
   const fallback = c.providers[0]?.id ?? ''
-  ;(['story', 'pair', 'embedding'] as RoleKey[]).forEach(k => {
+  ;(['story', 'pair'] as RoleKey[]).forEach(k => {
     if (c.roles[k]?.provider_id === p.id) {
       c.roles[k]!.provider_id = fallback
       c.roles[k]!.model = modelsOf(fallback)[0]?.id ?? ''
@@ -355,7 +345,7 @@ async function save() { if (await store.save()) close() }
           <!-- —— AI 模型 —— -->
           <template v-if="active === 'roles'">
             <p class="mb-4 text-xs leading-relaxed text-muted-foreground">
-              单一 AI 负责旁白与世界响应并扮演所有 NPC；结对用于启发设定建议；模型调用与向量化各自选择运行后端。
+              单一 AI 负责旁白与世界响应并扮演所有 NPC；结对用于启发设定建议。
             </p>
 
             <section class="mb-5">
@@ -372,23 +362,6 @@ async function save() { if (await store.save()) close() }
                       <SelectContent>
                         <SelectGroup>
                           <SelectItem v-for="m in PROVIDER_MODES" :key="m.value" :value="m.value">{{ m.label }}</SelectItem>
-                        </SelectGroup>
-                      </SelectContent>
-                    </Select>
-                  </div>
-                </div>
-
-                <div class="flex items-center justify-between gap-6 py-2.5">
-                  <div class="min-w-0">
-                    <div class="text-[13px] font-semibold">Embedding 后端</div>
-                    <div class="mt-0.5 text-xs text-muted-foreground">rig = 调 embedding 端点；stub = 确定性伪向量（离线 / 测试）</div>
-                  </div>
-                  <div class="w-52 shrink-0">
-                    <Select :model-value="ensureAi().embedding" @update:model-value="(v) => { if (typeof v === 'string') ensureAi().embedding = v }">
-                      <SelectTrigger class="w-full"><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        <SelectGroup>
-                          <SelectItem v-for="m in EMBEDDING_MODES" :key="m.value" :value="m.value">{{ m.label }}</SelectItem>
                         </SelectGroup>
                       </SelectContent>
                     </Select>
@@ -434,14 +407,22 @@ async function save() { if (await store.save()) close() }
                   </div>
                 </div>
 
-                <template v-if="r.key !== 'embedding'">
-                  <div class="flex items-center justify-between gap-6 py-2.5">
+                <div class="flex items-center justify-between gap-6 py-2.5">
                     <div class="min-w-0">
                       <div class="text-[13px] font-semibold">温度</div>
                       <div class="mt-0.5 text-xs text-muted-foreground">越高越发散，0–2</div>
                     </div>
                     <div class="w-28 shrink-0">
                       <Input v-model.number="ensureRole(r.key).temperature" type="number" step="0.1" min="0" max="2" class="h-9 text-right" />
+                    </div>
+                  </div>
+                  <div class="flex items-center justify-between gap-6 py-2.5">
+                    <div class="min-w-0">
+                      <div class="text-[13px] font-semibold">输出预算</div>
+                      <div class="mt-0.5 text-xs text-muted-foreground">max_tokens：思考与正文共享这份预算，越长的回答需要越大；留空按模型上限自动取（不低于 16384）</div>
+                    </div>
+                    <div class="w-28 shrink-0">
+                      <Input v-model.number="ensureRole(r.key).max_tokens" type="number" step="1024" min="1024" max="65536" class="h-9 text-right" placeholder="自动" />
                     </div>
                   </div>
                   <div v-if="roleSupportsReasoning(r.key)" class="flex items-center justify-between gap-6 py-2.5">
@@ -509,7 +490,6 @@ async function save() { if (await store.save()) close() }
                       />
                     </div>
                   </div>
-                </template>
               </div>
             </section>
           </template>
@@ -937,7 +917,7 @@ async function save() { if (await store.save()) close() }
               </div>
               <div class="flex items-center justify-between gap-6 py-2.5">
                 <div class="text-[13px] font-semibold">AI 模型</div>
-                <span class="text-xs text-muted-foreground">AI / 结对 / Embedding 各自可配</span>
+                <span class="text-xs text-muted-foreground">AI / 结对各自可配</span>
               </div>
             </div>
           </template>

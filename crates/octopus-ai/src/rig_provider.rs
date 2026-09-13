@@ -8,9 +8,11 @@ use async_trait::async_trait;
 use octopus_engine::{
     AiOutput, AiProvider, EngineError, ModelRef, TurnContext, build_protocol_adapter,
 };
-use octopus_types::RoundChannel;
-use rig::completion::message::{AssistantContent, ReasoningContent};
-use rig::completion::{CompletionRequest, Message};
+use octopus_types::{
+    AiCallMessage, AiCallPayload, AiCallStatus, AiCallUsage, IntentEnvelope, RoundChannel,
+};
+use rig::completion::message::{AssistantContent, ReasoningContent, UserContent};
+use rig::completion::{CompletionRequest, Message, ToolDefinition};
 use rig::prelude::*;
 use rig::providers::openai;
 
@@ -101,6 +103,10 @@ enum ConvRole {
 
 /// 单存档会话保留的消息上限：超出后从最旧丢弃（缓存前缀随之重建）。
 const MAX_CONV_MESSAGES: usize = 80;
+
+/// 意图解析失败后的自动重试次数（不含首次）：重试 = 把失败原因回喂模型重新输出。
+/// 上限 2 次 = 单轮最多 3 次调用；再失败才把回合判失败（pi 式 agent 循环的 retry 上限）。
+const INTENT_PARSE_RETRIES: u32 = 2;
 
 fn build_client(
     id: &str,
@@ -508,10 +514,17 @@ fn turn_prompt_inner(ctx: &TurnContext, include_memories: bool) -> String {
     )
 }
 
-/// 从 rig 响应里抽出正文与思考链文本。
-fn split_response(choice: &[AssistantContent]) -> (String, String) {
+/// 一次原生工具调用（意图工具）：name = 意图 type，arguments = 意图字段。
+struct ToolCallExtract {
+    name: String,
+    arguments: serde_json::Value,
+}
+
+/// 从 rig 响应里抽出正文、思考链文本与工具调用。
+fn split_response(choice: &[AssistantContent]) -> (String, String, Vec<ToolCallExtract>) {
     let mut text = String::new();
     let mut reasoning = String::new();
+    let mut tools = Vec::new();
     for c in choice {
         match c {
             AssistantContent::Text(t) => text.push_str(&t.text),
@@ -524,10 +537,67 @@ fn split_response(choice: &[AssistantContent]) -> (String, String) {
                     }
                 }
             }
+            AssistantContent::ToolCall(tc) => {
+                tools.push(ToolCallExtract {
+                    name: tc.function.name.clone(),
+                    arguments: tc.function.arguments.clone(),
+                });
+            }
             _ => {}
         }
     }
-    (text, reasoning)
+    (text, reasoning, tools)
+}
+
+/// 把一次原生工具调用反序列化为意图包络：工具名 = 意图 type，参数 = 意图字段。
+/// 与文本协议的 `parse_intent_envelopes` 同构（包络携带可选 intent_id）。
+fn intent_from_tool_call(name: &str, arguments: &serde_json::Value) -> Result<IntentEnvelope, String> {
+    let mut value = arguments.clone();
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("type".to_string(), serde_json::Value::String(name.to_string()));
+    }
+    serde_json::from_value::<IntentEnvelope>(value)
+        .map_err(|e| format!("意图工具 {name} 参数无法解析为合法意图：{e}"))
+}
+
+/// 把工具调用渲染成可读文本（会话记录 / 日志展示）。
+fn tool_call_text(name: &str, arguments: &serde_json::Value) -> String {
+    format!("[工具调用] {name} {arguments}")
+}
+
+/// 把 rig Message 折叠成日志可读的 (role, content)：纯文本直出，工具调用 / 附件
+/// 折叠成一行摘要。游玩主线不用 tools，历史里基本只有 Text；兜底保证不 panic。
+fn message_to_trace(m: &Message) -> AiCallMessage {
+    fn user_part(c: &UserContent) -> String {
+        match c {
+            rig::completion::message::UserContent::Text(t) => t.text.clone(),
+            _ => "[非文本用户内容]".to_string(),
+        }
+    }
+    fn assistant_part(c: &AssistantContent) -> String {
+        match c {
+            AssistantContent::Text(t) => t.text.clone(),
+            AssistantContent::Reasoning(_) => String::new(),
+            AssistantContent::ToolCall(tc) => {
+                tool_call_text(&tc.function.name, &tc.function.arguments)
+            }
+            _ => "[非文本内容]".to_string(),
+        }
+    }
+    let (role, content) = match m {
+        Message::System { content } => ("system".to_string(), content.clone()),
+        Message::User { content } => (
+            "user".to_string(),
+            content.iter().map(user_part).collect::<Vec<_>>().join("
+"),
+        ),
+        Message::Assistant { content, .. } => (
+            "assistant".to_string(),
+            content.iter().map(assistant_part).collect::<Vec<_>>().join("
+"),
+        ),
+    };
+    AiCallMessage { role, content }
 }
 
 impl RigProvider {
@@ -581,6 +651,13 @@ impl RigProvider {
     ///
     /// preamble 与 parse 都由故事书声明的协议适配器决定（叙事契约 P2）：
     /// 缺省协议 = 引擎内置文本 + `parse_intents`，与旧行为逐字一致。
+    ///
+    /// 同时采集本次调用的完整轨迹（pi 式 span）：发给模型的完整上下文 + 思考链 +
+    /// 用量 + 延迟 + 状态，随 AiOutput.trace 交给 Session 落 ai_call 事件，供日志复盘。
+    ///
+    /// **自动重试（pi 式 agent 循环的 retry）**：协议解析失败时，把失败原因作为一条
+    /// 纠正消息回喂给模型重新输出（失败轮成对保留在会话里，模型能看到自己的上轮输出
+    /// 为何不被接受），最多 `INTENT_PARSE_RETRIES` 次；尝试次数记入 `AiCallPayload.attempts`。
     async fn complete(
         &self,
         client: &openai::CompletionsClient,
@@ -595,57 +672,248 @@ impl RigProvider {
         let adapter = build_protocol_adapter(&spec);
         // 首次看到该存档时从持久层读回会话（重启后仍能维持缓存前缀）。
         self.ensure_loaded(&ctx.save_id).await;
-        // 追加式会话：取出本存档历史（整轮开始 / 重跑时截断到本回合之前），
-        // 再把这次的 user 提示词追加为最后一条——前缀稳定，缓存才命中。
-        let chat_history = {
-            let mut conv = self.conversations.lock().expect("conversations poisoned");
-            let entry = conv.entry(ctx.save_id.clone()).or_default();
-            append_round_history(entry, ctx.round, ctx.turn_feedback.is_empty(), &prompt)
-        };
-        let request = CompletionRequest {
-            model: None,
-            preamble: Some(adapter.preamble(ctx)),
-            chat_history,
-            documents: Vec::new(),
-            tools: Vec::new(),
-            temperature: Some(temperature),
-            max_tokens: Some(max_tokens),
-            tool_choice: None,
-            additional_params: sampling,
-            output_schema: None,
-            record_telemetry_content: false,
-        };
-        let rig_model = client.completion_model(model);
-        let response = rig_model
-            .completion(request)
-            .await
-            .map_err(|e| EngineError::Ai(e.to_string()))?;
-        let (text, reasoning) = split_response(&response.choice);
-        // 用量遥测：cached 是检验「缓存是否吃满」的关键指标（供应商不回传时为 0）。
-        tracing::info!(
-            save_id = %ctx.save_id,
-            round = ctx.round,
-            input = response.usage.input_tokens,
-            output = response.usage.output_tokens,
-            cached = response.usage.cached_input_tokens,
-            cache_write = response.usage.cache_creation_input_tokens,
-            "AI 调用用量"
-        );
-        // 把这次的 user 提示词与模型原文追加进会话（下次请求即成为稳定前缀）。
-        if let Ok(mut conv) = self.conversations.lock() {
-            let entry = conv.entry(ctx.save_id.clone()).or_default();
-            record_round(entry, ctx.round, prompt, text.clone());
+        // 该协议是否启用「原生工具调用」（意图 = 工具）：default / declarative 走工具，
+        // lua 协议保持文本。工具模式下模型通过调用意图工具输出意图，parse 退居兜底。
+        let tool_specs = adapter.tools();
+        let tool_mode = tool_specs.is_some();
+        // 整轮开始 / 重跑时截断到本回合之前；续轮 / 重试都保留本回合已产生的消息。
+        let fresh_round = ctx.turn_feedback.is_empty();
+        // provider id：存档覆盖的模型优先（与 pick 同一口径），否则角色默认供应商。
+        let provider_id = ctx
+            .model
+            .as_ref()
+            .filter(|m| self.clients.contains_key(&m.provider_id))
+            .map(|m| m.provider_id.clone())
+            .unwrap_or_else(|| self.story_provider.clone());
+        let rig_model = client.completion_model(model.clone());
+
+        // 解析失败重试循环（pi：failToolCallsFromTruncatedMessage 的「错误回喂重发」思路）。
+        // 首次尝试按整轮语义截断；重试时失败轮已 record_round 进会话，fresh=false 保留它，
+        // 模型在下一次请求里能看到自己上一轮的输出与纠正指令。
+        let mut attempts = 0u32;
+        let mut current_prompt = prompt;
+        // 原生工具调用是否已降级为文本协议（供应商不支持 tools 字段时自动回退）。
+        let mut degraded = false;
+        loop {
+            attempts += 1;
+            // 工具模式（未降级）：把「意图工具」交给模型原生调用；文本协议则要求输出 JSON。
+            let tool_active = tool_mode && !degraded;
+            let tool_defs: Option<Vec<ToolDefinition>> = if tool_active {
+                tool_specs.as_ref().map(|specs|
+                    specs
+                        .iter()
+                        .map(|s| ToolDefinition {
+                            name: s.name.clone(),
+                            description: s.description.clone(),
+                            parameters: s.parameters.clone(),
+                        })
+                        .collect(),
+                )
+            } else {
+                None
+            };
+            let preamble = if tool_active {
+                adapter.tool_preamble(ctx).unwrap_or_else(|| adapter.preamble(ctx))
+            } else {
+                adapter.preamble(ctx)
+            };
+            // 追加式会话：取出本存档历史（首次尝试按整轮语义截断），再把这次的
+            // user 提示词追加为最后一条——前缀稳定，缓存才命中。
+            let chat_history = {
+                let mut conv = self.conversations.lock().expect("conversations poisoned");
+                let entry = conv.entry(ctx.save_id.clone()).or_default();
+                append_round_history(
+                    entry,
+                    ctx.round,
+                    fresh_round && attempts == 1,
+                    &current_prompt,
+                )
+            };
+            let request = CompletionRequest {
+                model: None,
+                preamble: Some(preamble.clone()),
+                chat_history,
+                documents: Vec::new(),
+                tools: tool_defs.unwrap_or_default(),
+                temperature: Some(temperature),
+                max_tokens: Some(max_tokens),
+                // None = 供应商默认（OpenAI 兼容端点为 auto）：允许但引导模型优先调用工具。
+                tool_choice: None,
+                additional_params: sampling.clone(),
+                output_schema: None,
+                record_telemetry_content: false,
+            };
+            // 轨迹用的请求上下文：system 提示词 + 会话历史（含本次输入）。必须在 request move 前取。
+            let mut trace_messages: Vec<AiCallMessage> =
+                Vec::with_capacity(request.chat_history.len() + 1);
+            trace_messages.push(AiCallMessage {
+                role: "system".into(),
+                content: preamble.clone(),
+            });
+            for m in &request.chat_history {
+                trace_messages.push(message_to_trace(m));
+            }
+
+            let started = std::time::Instant::now();
+            let response = match rig_model.completion(request).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let latency_ms = started.elapsed().as_millis() as u64;
+                    tracing::warn!(
+                        save_id = %ctx.save_id,
+                        round = ctx.round,
+                        provider = %provider_id,
+                        model = %model,
+                        latency_ms,
+                        error = %e,
+                        "AI 调用失败"
+                    );
+                    // 原生工具调用被供应商拒绝（如不支持 tools 字段）→ 降级为文本协议重试一次。
+                    if tool_mode && !degraded {
+                        tracing::warn!(
+                            save_id = %ctx.save_id,
+                            round = ctx.round,
+                            provider = %provider_id,
+                            model = %model,
+                            "原生工具调用不可用，降级为文本协议"
+                        );
+                        degraded = true;
+                        continue;
+                    }
+                    return Err(EngineError::Ai(e.to_string()));
+                }
+            };
+            let latency_ms = started.elapsed().as_millis() as u64;
+            let (text, reasoning, tool_calls) = split_response(&response.choice);
+            // 用量遥测：cached 是检验「缓存是否吃满」的关键指标（供应商不回传时为 0）。
+            tracing::info!(
+                save_id = %ctx.save_id,
+                round = ctx.round,
+                provider = %provider_id,
+                model = %model,
+                attempt = attempts,
+                tool_active,
+                tool_calls = tool_calls.len(),
+                input = response.usage.input_tokens,
+                output = response.usage.output_tokens,
+                cached = response.usage.cached_input_tokens,
+                cache_write = response.usage.cache_creation_input_tokens,
+                latency_ms,
+                "AI 调用用量"
+            );
+            // 把这次的 user 提示词与模型输出追加进会话（失败轮也成对保留——pi transcript
+            // 思路：模型下一轮能看到自己上轮的输出与纠正指令）。工具调用渲染成文本。
+            let assistant_text = if tool_active && !tool_calls.is_empty() {
+                tool_calls
+                    .iter()
+                    .map(|tc| tool_call_text(&tc.name, &tc.arguments))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                text.clone()
+            };
+            if let Ok(mut conv) = self.conversations.lock() {
+                let entry = conv.entry(ctx.save_id.clone()).or_default();
+                record_round(entry, ctx.round, current_prompt.clone(), assistant_text);
+            }
+            // 产出意图：工具模式优先取原生工具调用（每个工具调用 = 一个意图）；
+            // 模型没调工具只输出文本时，走协议 parse 兜底。任一失败 → 回喂纠正重试。
+            let parsed: Result<Vec<IntentEnvelope>, String> =
+                if tool_active && !tool_calls.is_empty() {
+                    let mut out = Vec::with_capacity(tool_calls.len());
+                    let mut first_err: Option<String> = None;
+                    for tc in &tool_calls {
+                        match intent_from_tool_call(&tc.name, &tc.arguments) {
+                            Ok(envelope) => out.push(envelope),
+                            Err(e) => {
+                                first_err = Some(e);
+                                break;
+                            },
+                        }
+                    }
+                    match first_err {
+                        Some(e) => Err(e),
+                        None => Ok(out),
+                    }
+                } else {
+                    adapter.parse(&text, ctx).map_err(|e| e.to_string())
+                };
+            match parsed {
+                Ok(raw_intents) => {
+                    let intents = adapter.normalize(raw_intents, ctx);
+                    let intent_warnings = adapter.take_warnings();
+                    self.persist_conversation(&ctx.save_id).await;
+                    // 轨迹（pi 式 span 的结束属性）：意图名摘要 + 用量 + 延迟 + 状态 + 尝试次数。
+                    let intent_names: Vec<String> = intents
+                        .iter()
+                        .map(|en| octopus_engine::intent_kind(&en.intent).to_string())
+                        .collect();
+                    let trace = AiCallPayload {
+                        stage: "story_thinking".to_string(),
+                        provider: provider_id,
+                        model,
+                        temperature,
+                        max_tokens,
+                        messages: trace_messages,
+                        reasoning: (!reasoning.trim().is_empty()).then(|| reasoning.clone()),
+                        usage: AiCallUsage {
+                            input_tokens: response.usage.input_tokens,
+                            output_tokens: response.usage.output_tokens,
+                            total_tokens: response.usage.total_tokens,
+                            cached_input_tokens: response.usage.cached_input_tokens,
+                            cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
+                        },
+                        latency_ms,
+                        attempts,
+                        status: AiCallStatus::Ok,
+                        error: None,
+                        intents: intent_names,
+                        warnings: intent_warnings.clone(),
+                    };
+                    return Ok(AiOutput {
+                        intents,
+                        reasoning: (!reasoning.trim().is_empty()).then_some(reasoning),
+                        intent_warnings,
+                        trace: Some(trace),
+                    });
+                }
+                Err(e) => {
+                    if attempts > INTENT_PARSE_RETRIES {
+                        tracing::warn!(
+                            save_id = %ctx.save_id,
+                            round = ctx.round,
+                            provider = %provider_id,
+                            model = %model,
+                            attempt = attempts,
+                            error = %e,
+                            "意图产出失败已达重试上限"
+                        );
+                        self.persist_conversation(&ctx.save_id).await;
+                        return Err(EngineError::Ai(e));
+                    }
+                    tracing::warn!(
+                        save_id = %ctx.save_id,
+                        round = ctx.round,
+                        provider = %provider_id,
+                        model = %model,
+                        attempt = attempts,
+                        error = %e,
+                        "意图产出失败，回喂纠正消息重试"
+                    );
+                    // 纠正消息：明确失败原因与要求，让模型忽略上一条重新输出（pi retry 思路）。
+                    current_prompt = if tool_active {
+                        format!(
+                            "你的上一次输出未被接受（原因：{e}）。请直接调用可用的意图工具来推进剧情（一次可并行调用多个，最后调用 finish_turn 收束）；不要输出 JSON 数组。"
+                        )
+                    } else {
+                        format!(
+                            "你的上一次输出无法被解析为合法的意图 JSON（原因：{e}）。\
+                             请忽略上一条输出，严格按照协议重新输出意图 JSON 数组。"
+                        )
+                    };
+                }
+            }
         }
-        self.persist_conversation(&ctx.save_id).await;
-        // 协议解析 → 归一化；白名单过滤等警告随 AiOutput 交给 Session 落事件。
-        let intents = adapter.parse(&text, ctx)?;
-        let intents = adapter.normalize(intents, ctx);
-        let intent_warnings = adapter.take_warnings();
-        Ok(AiOutput {
-            intents,
-            reasoning: (!reasoning.trim().is_empty()).then_some(reasoning),
-            intent_warnings,
-        })
     }
 }
 
@@ -760,7 +1028,7 @@ impl AiProvider for RigProvider {
             .completion(request)
             .await
             .map_err(|e| EngineError::Ai(e.to_string()))?;
-        let (out, _) = split_response(&response.choice);
+        let (out, _, _) = split_response(&response.choice);
         let trimmed = out.trim();
         // 空输出视同没有压缩结果，交给调用方回退拼接。
         Ok((!trimmed.is_empty()).then(|| trimmed.to_string()))
@@ -771,6 +1039,51 @@ impl AiProvider for RigProvider {
 mod tests {
     use octopus_engine::parse_intents;
     use octopus_types::Intent;
+
+    /// 原生工具调用 → 意图：工具名即意图 type，参数即字段。
+    #[test]
+    fn intent_from_tool_call_parses_narrate_speak_and_finish() {
+        let narrate = super::intent_from_tool_call(
+            "narrate",
+            &serde_json::json!({ "content": "夜色沉下来。" }),
+        )
+        .expect("narrate");
+        assert!(matches!(
+            narrate.intent,
+            Intent::Narrate { ref content, .. } if content == "夜色沉下来。"
+        ));
+        let speak = super::intent_from_tool_call(
+            "speak",
+            &serde_json::json!({ "content": "别走那条路。", "actor_id": "char-linas", "tone": "warn" }),
+        )
+        .expect("speak");
+        assert!(matches!(
+            speak.intent,
+            Intent::Speak { ref actor_id, .. } if actor_id.as_deref() == Some("char-linas")
+        ));
+        let finish = super::intent_from_tool_call("finish_turn", &serde_json::json!({}))
+            .expect("finish_turn");
+        assert!(matches!(finish.intent, Intent::FinishTurn));
+    }
+
+    /// 工具参数非法（缺必需字段 / 未知工具）必须明确报错，交由重试循环回喂。
+    #[test]
+    fn intent_from_tool_call_rejects_bad_args() {
+        // narrate 缺 content。
+        assert!(super::intent_from_tool_call("narrate", &serde_json::json!({})).is_err());
+        // 未知工具名。
+        assert!(super::intent_from_tool_call("hack", &serde_json::json!({})).is_err());
+        // 非对象参数。
+        assert!(super::intent_from_tool_call("narrate", &serde_json::json!(42)).is_err());
+    }
+
+    /// 工具调用渲染成可读文本（会话记录 / 日志展示用）。
+    #[test]
+    fn tool_call_text_is_readable() {
+        let t = super::tool_call_text("check", &serde_json::json!({ "attribute": "wit" }));
+        assert!(t.starts_with("[工具调用] check"), "{t}");
+        assert!(t.contains("wit"), "{t}");
+    }
 
     /// 追加式会话：前缀逐字节稳定、重跑按回合截断。
     #[test]

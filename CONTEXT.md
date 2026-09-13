@@ -50,6 +50,10 @@ _Avoid_: 思考开关（它是强度档，不是开关）
 _实现_: `PlayEvent::Reasoning`（`ReasoningPayload.source`，serde 缺省 provider 以兼容旧数据）；引擎在主线 / 角色 AI 调用后各推一条，`think` 意图落 `source: model` 且不进叙事、不改世界状态；故事书 `narrative.display.draft`（folded / hidden，缺省 folded）控制 think 草稿是否渲染；前端用 ai-elements `Reasoning` 组件折叠展示。
 _Avoid_: 内心独白（那是叙事内容，属角色演绎）
 
+**AI 调用轨迹 (AiCallTrace)**:
+一次 AI 调用（主线 / 角色）的完整日志：**发给模型的完整上下文**（system 提示词 + 会话历史原文）+ 思考链 + 解析意图 + 用量（input/output/cached tokens）+ 延迟 + 状态（ok / error）+ 尝试次数（attempts）。区别于 `reasoning`：它保留请求全文，供游玩页「日志」tab 复盘（pi 式 span：请求属性 → 事件 → 状态）。
+_实现_: `PlayEvent::AiCall`（`AiCallPayload`）；rig provider 在每次补全后采集，成功 / 失败都会落事件；只进日志视图，不渲染进对话，也不改变世界状态。**自动重试（pi 式 agent 循环的 retry）**：意图解析失败时把失败原因作为纠正消息回喂模型重新输出（失败轮成对保留在会话里），最多 2 次重试；`attempts > 1` 即发生过重试。
+
 **内容评级 (Rating)**:
 故事书创作者自报的 `meta.rating`（sfw / nsfw，缺省 sfw）——**仅**驱动列表页徽标，不做内容过滤、不做年龄验证；引擎 / 提示词 / 校验都不读它。
 _实现_: `storybook.meta.rating`（A 范式「世界」tab 编辑）；ST 预设导入按 NSFW 关键词推断为提案默认值；列表卡角标（P3 只做标，不做筛）。
@@ -65,6 +69,7 @@ _Avoid_: 规则系统（引擎是领域整体，规则系统只是其一）、�
 
 **动作协议 (Action Protocol)**:
 AI 以结构化「意图」与引擎交互的协议；引擎校验→结算→回写结果。
+_实现_: default / declarative 协议走**原生工具调用**（pi 式 agent：意图 = 工具，模型调用工具输出意图，`parse` 退居兜底；白名单即工具清单，模型无法输出白名单外意图）；lua 协议保持文本。供应商不支持 tools 字段时自动降级为文本协议。
 _Avoid_: 工具调用协议、函数调用协议（实现名）
 
 **意图 (Intent)**:

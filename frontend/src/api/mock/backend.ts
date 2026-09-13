@@ -638,6 +638,36 @@ function mkEvent(row: SaveRow, type: PlayEvent['type'], payload: Record<string, 
 
 const sleep = (ms: number) => new Promise<void>(res => setTimeout(res, ms))
 
+/** 模拟一次 AI 调用轨迹（ai_call 事件）：给「日志」tab 的结构化视图提供样例数据。 */
+function emitAiCall(row: SaveRow, stage: string, text: string): void {
+  const input = 120 + Math.floor(seededRand(text + 'in') * 260)
+  const output = 60 + Math.floor(seededRand(text + 'out') * 200)
+  emit(row, mkEvent(row, 'ai_call', {
+    stage,
+    provider: 'deepseek',
+    model: 'deepseek-chat',
+    temperature: 0.8,
+    max_tokens: 4096,
+    messages: [
+      { role: 'system', content: '你是 Octopus 的主线 AI：负责旁白、场景推进与世界响应，并扮演所有非玩家角色。请只输出意图 JSON 数组，不要解释。' },
+      { role: 'user', content: '【回合 ' + row.round + '】\n场景：' + row.projection.scene_title + '\n输入渠道：角色输入\n输入：' + text + '\n请输出意图 JSON 数组。' },
+    ],
+    reasoning: '让我想想玩家「' + text + '」这个行动该怎么推演：先依据当前场景与人物设定决定叙事走向，再想清楚要触发哪些引擎结算。',
+    usage: {
+      input_tokens: input,
+      output_tokens: output,
+      total_tokens: input + output,
+      cached_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+    },
+    latency_ms: 420 + Math.floor(seededRand(text + stage) * 1500),
+    attempts: 1,
+    status: 'ok',
+    intents: stage === 'story_thinking' ? ['narrate', 'speak'] : ['narrate', 'emote'],
+    warnings: [],
+  }))
+}
+
 /** 把玩家文本映射为若干叙事事件（demo 脚本，关键字驱动） */
 function narrativeScript(text: string, row: SaveRow): { narrate: string[]; dialogue: { actor: string; content: string }[]; emote?: string; scene?: { scene_id: string; title: string; description: string; present: string[] }; goal?: string; triggers?: string[]; flag?: string } {
   const sb = row.detail.storybook
@@ -754,6 +784,7 @@ export async function submitRound(saveId: string, channel: 'character' | 'meta' 
     // ===== 角色输入 → 判定类动作（观察/调查/说服）=====
     const isCheck = /观察|调查|查看|说服|搜|侦察|聆听|嗅/.test(text)
     if (isCheck) {
+      emitAiCall(row, 'story_thinking', text)
       prog('resolving')
       const actionId = uid('act')
       const attr = /说服|搭话/.test(text) ? 'cha' : 'wit'
@@ -805,6 +836,7 @@ export async function submitRound(saveId: string, channel: 'character' | 'meta' 
 
     // ===== 角色输入 → 一般叙事 =====
     prog('character_thinking')
+    emitAiCall(row, 'character_thinking', text)
     await sleep(400 + seededRand(text + 'c') * 500)
     const script = narrativeScript(text, row)
     if (script.emote) { emit(row, mkEvent(row, 'emote', { content: script.emote, emotion: 'concern', gesture: 'gesture' }, { actor: { id: 'char-isa', name: '伊莎' } })) }
@@ -873,16 +905,14 @@ const DEFAULT_CONFIG: AppConfig = {
   providers: [
     { id: 'deepseek', label: 'DeepSeek', kind: 'openai-compatible', base_url: 'https://api.deepseek.com', api_key: '', models: catalogEntries('deepseek') },
     { id: 'openai', label: 'OpenAI', kind: 'openai', base_url: 'https://api.openai.com/v1', api_key: '', models: catalogEntries('openai') },
-    { id: 'ollama', label: '本地 Ollama', kind: 'ollama', base_url: 'http://127.0.0.1:11434', api_key: '', models: [{ id: 'qwen2.5:7b', name: 'Qwen2.5 7B' }, { id: 'llama3.1:8b', name: 'Llama 3.1 8B' }] },
-    { id: 'fastembed', label: '本地 Embedding', kind: 'local-embedding', api_key: '', models: [{ id: 'bge-small-zh-v1.5', name: 'BGE Small ZH v1.5' }, { id: 'bge-m3', name: 'BGE M3' }] }
+    { id: 'ollama', label: '本地 Ollama', kind: 'ollama', base_url: 'http://127.0.0.1:11434', api_key: '', models: [{ id: 'qwen2.5:7b', name: 'Qwen2.5 7B' }, { id: 'llama3.1:8b', name: 'Llama 3.1 8B' }] }
   ],
   roles: {
     story: { provider_id: 'deepseek', model: catalogEntries('deepseek')[0]?.id ?? 'deepseek-chat', temperature: 0.8, max_tokens: 4096 },
-    pair: { provider_id: 'deepseek', model: catalogEntries('deepseek')[0]?.id ?? 'deepseek-chat', temperature: 0.8, max_tokens: 4096 },
-    embedding: { provider_id: 'fastembed', model: 'bge-small-zh-v1.5' }
+    pair: { provider_id: 'deepseek', model: catalogEntries('deepseek')[0]?.id ?? 'deepseek-chat', temperature: 0.8, max_tokens: 4096 }
   },
   turn_token_budget: 0,
-  ai: { provider: 'auto', embedding: 'auto' }
+  ai: { provider: 'auto' }
 }
 let appConfig: AppConfig = structuredClone(DEFAULT_CONFIG)
 

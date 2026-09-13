@@ -793,6 +793,50 @@ export interface ResolutionPayload {
   state_changes: StateDelta[]
 }
 
+/** 一次 AI 调用的 token 用量（供应商不回传时为 0） */
+export interface AiCallUsage {
+  input_tokens: number
+  output_tokens: number
+  total_tokens: number
+  /** 命中缓存的输入 token（检验「缓存是否吃满」的关键指标） */
+  cached_input_tokens: number
+  /** 写入缓存的输入 token */
+  cache_creation_input_tokens: number
+}
+
+/** 发给模型的上下文里的一条消息（日志视图用；只保留可读正文） */
+export interface AiCallMessage {
+  role: string
+  content: string
+}
+
+/** 一次 AI 调用（主线）的完整轨迹：pi 式 span 的「请求属性 → 事件 → 状态」。
+ *  请求属性：provider / model / temperature / max_tokens / messages（system 提示词 +
+ *  会话历史**完整原文**）；事件：思考链 / 解析意图 / 协议警告；结束属性：用量 / 延迟 / 状态。 */
+export interface AiCallPayload {
+  /** 思考阶段：story_thinking（角色 AI 接入后为 character_thinking） */
+  stage: string
+  provider: string
+  model: string
+  temperature: number
+  max_tokens: number
+  /** 发给模型的完整上下文：首条为 system 提示词，其后为会话历史 + 本次输入 */
+  messages: AiCallMessage[]
+  /** 供应商返回的思考链全文 */
+  reasoning?: string
+  usage: AiCallUsage
+  /** 本次补全的端到端耗时（毫秒，含网络往返） */
+  latency_ms: number
+  /** 该回合这一轮 AI 调用的总尝试次数（含首次）；>1 表示发生过「解析失败→回喂纠正→重试」 */
+  attempts?: number
+  status: 'ok' | 'error'
+  error?: string
+  /** 解析出的意图名摘要（narrate / speak / check …） */
+  intents: string[]
+  /** 协议适配器警告（白名单过滤等） */
+  warnings: string[]
+}
+
 export type PlayEvent =
   | (EventEnvelopeBase & { type: 'scene'; payload: { scene_id: string; title: string; description?: string; present: string[] } })
   | (EventEnvelopeBase & { type: 'narrate'; payload: { content: string; scene_ref?: string } })
@@ -807,6 +851,8 @@ export type PlayEvent =
   | (EventEnvelopeBase & { type: 'round_end'; payload: { round: number } })
   | (EventEnvelopeBase & { type: 'system'; payload: { level: 'info' | 'warn' | 'error'; code?: string; text: string } })
   | (EventEnvelopeBase & { type: 'reasoning'; payload: { stage: string; text: string; /** P3：provider = 供应商 reasoning_content；model = think 意图。旧事件缺省为 provider */ source?: 'provider' | 'model' } })
+  /** 一次 AI 调用（主线）的完整轨迹：发给模型的完整上下文 + 思考链 + 用量 + 延迟 + 状态。只进「日志」tab。 */
+  | (EventEnvelopeBase & { type: 'ai_call'; payload: AiCallPayload })
 
 export type StreamStatus = 'connecting' | 'open' | 'closed' | 'error'
 
@@ -842,14 +888,15 @@ export interface MaintenanceRow { at: string; op: string; summary: string }
 // ---------- 应用配置 / AI Provider（#26） ----------
 
 // 类型 = 协议方言（不是厂商）；DeepSeek/Moonshot/Groq 等走 openai-compatible
-export type ProviderKind = 'openai' | 'anthropic' | 'ollama' | 'openai-compatible' | 'local-embedding'
+export type ProviderKind = 'openai' | 'anthropic' | 'ollama' | 'openai-compatible'
 
 export interface ModelEntry {
   id: string
   name?: string
   /** 用户自定义的模型元数据（小中转站等目录未收录的模型）：覆盖目录快照 */
   ctx?: number
-  maxOut?: number
+  /** 最大输出（tokens）。落盘 schema 与 AppConfig 其余字段一致是 snake_case（Rust ModelEntry）；目录快照里那个 camelCase 的 maxOut 属于 CatalogModel */
+  max_out?: number
   reasoning?: boolean
   /** 思考等级 → 实际下发值（null = 不发送该参数） */
   tl?: Record<string, string | null>
@@ -887,18 +934,17 @@ export interface RoleConfig {
   reasoning_effort?: string
 }
 
-/** 全局模型配置（#26 ③）：单一 AI（story）+ 结对（pair）+ 向量化（embedding） */
+/** 全局模型配置（#26 ③）：单一 AI（story）+ 结对（pair） */
 export interface AppConfig {
   providers: ProviderConfig[]
   roles: {
     story: RoleConfig
     pair?: RoleConfig
-    embedding: RoleConfig
   }
   /** 成本护栏：每回合 token 上限，0 = 不限（#26 ⑤） */
   turn_token_budget?: number
-  /** AI 后端开关：provider = auto|rig|scripted；embedding = auto|rig|stub */
-  ai?: { provider: string; embedding: string }
+  /** AI 后端开关：provider = auto|rig|scripted */
+  ai?: { provider: string }
 }
 
 export interface ProviderTestResult {

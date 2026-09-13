@@ -135,6 +135,9 @@ pub struct AiOutput {
     pub reasoning: Option<String>,
     /// 协议适配器产生的警告（如 declarative 白名单过滤掉的意图）；引擎落 System 事件。
     pub intent_warnings: Vec<String>,
+    /// 本次调用的完整轨迹（pi 式 span）：请求上下文 + 用量 + 延迟 + 状态。
+    /// None = 该 provider 不采集（ScriptedProvider 等确定性实现）。
+    pub trace: Option<octopus_types::AiCallPayload>,
 }
 
 impl AiOutput {
@@ -145,6 +148,7 @@ impl AiOutput {
             intents: intents.into_iter().map(IntentEnvelope::from).collect(),
             reasoning: None,
             intent_warnings: Vec::new(),
+            trace: None,
         }
     }
 }
@@ -218,13 +222,13 @@ pub struct MemoryHit {
     pub round: u32,
     pub kind: String,
     pub text: String,
-    /// 相关性分数：向量命中为余弦（越大越相关），FTS 命中为 -bm25（越大越相关）。
+    /// 相关性分数：FTS 命中为 -bm25（越大越相关）。
     pub score: f32,
 }
 
 /// 相关往事检索（#05 §3.4）：组合根注入；None = 不检索，行为与今天一致。
 ///
-/// 这是**派生数据**端口：实现可以失败（无向量库 / 维度不符 / embedding 挂了），
+/// 这是**派生数据**端口：实现可以失败（FTS 索引不可用 / 派生库损坏），
 /// 调用方（Session）必须静默降级，绝不因此让回合失败。
 #[async_trait]
 pub trait MemoryRetriever: Send + Sync {
@@ -239,7 +243,7 @@ pub trait MemoryRetriever: Send + Sync {
 
 /// 摘要持久化端口（#05 §3.2/§3.3）：回合微摘要与场景摘要都写派生表。
 ///
-/// 实现负责落库 + best-effort 同步 FTS5 / 向量索引；调用方（Session）把任何失败
+/// 实现负责落库 + best-effort 同步 FTS5；调用方（Session）把任何失败
 /// 只当 warn——摘要是派生数据，丢了 / 失败了都不该影响权威回合与 `replay()`。
 #[async_trait]
 pub trait SummaryStore: Send + Sync {
@@ -258,59 +262,5 @@ pub trait SummaryStore: Send + Sync {
         scene_id: &str,
         round: u32,
         text: &str,
-    ) -> Result<(), EngineError>;
-}
-
-/// 向量化（#15/#27）：默认本地 bge-small-zh-v1.5，512 维。
-/// `embed` 为异步，以支持 rig 等网络 provider。
-#[async_trait]
-pub trait EmbeddingBackend: Send + Sync {
-    async fn embed(&self, text: &str) -> Result<Vec<f32>, EngineError>;
-    fn dimension(&self) -> usize;
-    /// 后端标识（stub / fastembed / rig…）：日志与测试用。
-    ///
-    /// 有些后端维度相同（Stub 与 bge-small 都是 512），只靠 `dimension()` 区分不出来，
-    /// 而「到底退到了哪个后端」正是配置排障最需要的信息。
-    fn backend_name(&self) -> &'static str {
-        "unknown"
-    }
-    /// 向量库指纹：后端 + 模型 + 维度。
-    ///
-    /// **换 embedding 但维度相同时**（例如 Stub(512) → bge-small(512)）维度校验发现不了，
-    /// 只有指纹能识别出「旧向量不能再用」，从而触发索引重建——否则新旧向量会混在一起。
-    fn fingerprint(&self) -> String {
-        format!("{}:{}", self.backend_name(), self.dimension())
-    }
-}
-
-/// 派生向量索引（#27/#05 M2）：只服务检索，不参与权威路径。
-///
-/// 不变量：索引是可重建的派生数据——删掉它不影响命令日志与 replay；
-/// 写索引失败只记 warn，绝不阻断权威写入。实现（如 DuckDB）可按自身存储
-/// 决定物理布局，engine 只认这里的语义。
-#[async_trait]
-pub trait VectorIndex: Send + Sync {
-    /// 某存档当前索引条数：自愈判断用（索引为空但日志有叙事事件 ⇒ 需要重建）。
-    fn indexed_count(&self, save_id: &str) -> Result<usize, EngineError>;
-    /// 写入/覆盖一条向量（save_id + seq 唯一）。
-    async fn upsert(
-        &self,
-        save_id: &str,
-        seq: i64,
-        round: u32,
-        kind: &str,
-        text: &str,
-        embedding: &[f32],
-    ) -> Result<(), EngineError>;
-    /// 余弦 top-K；返回 (seq, score)，score 越大越相似。
-    async fn search(&self, save_id: &str, query: &[f32], k: usize) -> Result<Vec<(i64, f32)>, EngineError>;
-    /// 当前索引的向量维度（换 embedding 模型时用于校验/重建判断）。
-    async fn dimension(&self) -> Result<usize, EngineError>;
-    /// 用一批叙事事件 (seq, round, kind, text) **覆盖式**重建某存档的向量。
-    /// 实现负责把这些文本生成 embedding（重建时调用方未必已有向量）。
-    async fn rebuild_from(
-        &self,
-        save_id: &str,
-        rows: &[(i64, u32, String, String)],
     ) -> Result<(), EngineError>;
 }

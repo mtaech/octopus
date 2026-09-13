@@ -18,7 +18,7 @@ use octopus_types::{
     EncounterView, EnemyView, QuestView, RoundEndPayload, RoundInput, RoundStartPayload, ScenePayload, Seq,
     SkillDef, StateDelta, StateUpdatePayload, StatusUnit,
     EffectTrigger, StatusDef, StatusInstance, SystemLevel, SystemPayload,
-    ReasoningPayload,
+    AiCallPayload, AiCallStatus, AiCallUsage, ReasoningPayload,
     WorldProjection,
 };
 use serde_json::Value;
@@ -90,6 +90,11 @@ const PERSONA_LIMIT: usize = 6;
 
 /// 单回合最多注入多少条「相关往事」（#05 §3.4 的 K=5）。
 const MEMORY_TOP_K: usize = 5;
+
+/// 无归属旁白认人时只看开头多少字（主语位窗口）。
+/// 旁白常被模型用来写角色动作（「露西靠在他身侧…」），要在主语位认出来；
+/// 但环境描写里顺带提及的名字（「露西家的灯还亮着」）不该被当成行动者。
+const NARRATE_ACTOR_HEAD_CHARS: usize = 6;
 
 /// 一个玩家回合内主线 AI 最多调用几次（#04 ⑦：首轮 + 最多 2 轮续写 = 3）。
 /// 达到上限即收束，防止「查询—再查询」无限循环；不产出引擎可见信息的模型
@@ -626,7 +631,7 @@ impl Session {
 
     /// 检索本回合相关往事：query = 玩家输入 + 当前场景标题，取 top-K。
     ///
-    /// 派生数据：检索器内部已做「向量失败 → FTS → 空」的降级；这里再兜一层，
+    /// 派生数据：检索器内部已做「FTS 失败 → 空」的降级；这里再兜一层，
     /// 任何错误只 warn 并返回空，绝不把失败传导给权威回合。
     async fn retrieve_memories(&self, query: &str) -> Vec<MemoryHit> {
         // 先把 Arc 克隆出来，避免跨 await 持有锁。
@@ -1364,7 +1369,36 @@ impl Session {
                 }
                 None => ctx.clone(),
             };
-            let out = ai.story_intents(&call_ctx).await?;
+            // 主线 AI 调用：成功带完整轨迹（ai_call 事件，含发给模型的完整上下文）；
+            // 失败也发一条 error 状态的 ai_call 留痕（pi 式 span 的 status），再向上抛错。
+            let out = match ai.story_intents(&call_ctx).await {
+                Ok(out) => out,
+                Err(e) => {
+                    let model = call_ctx.model.as_ref();
+                    self.emit_simple(PlayEvent::AiCall(AiCallPayload {
+                        stage: "story_thinking".to_string(),
+                        provider: model
+                            .map(|m| m.provider_id.clone())
+                            .unwrap_or_default(),
+                        model: model.map(|m| m.model.clone()).unwrap_or_default(),
+                        temperature: 0.0,
+                        max_tokens: 0,
+                        messages: Vec::new(),
+                        reasoning: None,
+                        usage: AiCallUsage::default(),
+                        latency_ms: 0,
+                        attempts: 1,
+                        status: AiCallStatus::Error,
+                        error: Some(e.to_string()),
+                        intents: Vec::new(),
+                        warnings: Vec::new(),
+                    }));
+                    return Err(e);
+                }
+            };
+            if let Some(trace) = out.trace.clone() {
+                self.emit_simple(PlayEvent::AiCall(trace));
+            }
             if let Some(reasoning) = out.reasoning.clone() {
                 self.emit_reasoning("story_thinking", reasoning);
             }
@@ -2164,13 +2198,25 @@ impl Session {
 
     /// 从台词/神态文本里认人：取**最长**的名字匹配，避免「诺德罗」被更短的别名抢先。
     fn actor_in_text(&self, text: &str) -> Option<ActorRef> {
-        if text.is_empty() { return None }
+        self.longest_npc_in(text)
+    }
+
+    /// 只认**句首主语位**的名字：旁白里顺带提到的名字不算行动者。
+    /// 「Lucy靠在他身侧」是她的动作；「Lucy家的灯还亮着」只是环境描写。
+    fn actor_leading_in_text(&self, text: &str, chars: usize) -> Option<ActorRef> {
+        let head: String = text.trim_start().chars().take(chars).collect();
+        self.longest_npc_in(&head)
+    }
+
+    /// 在一段文本里找**最长**的非玩家角色名。
+    /// 玩家角色（PC）不由 AI 代说：文本里出现的「你 / PC 名」是**称呼**，不是行动者，
+    /// 否则 PC 名恰好是「你」时，「你带伞了吗？」这类 NPC 台词会被判给玩家。
+    fn longest_npc_in(&self, hay: &str) -> Option<ActorRef> {
+        if hay.is_empty() { return None }
         let st = self.state.lock().ok()?;
         let mut best: Option<(usize, ActorRef)> = None;
         for c in st.characters.values() {
-            if c.name.is_empty() || !text.contains(&c.name) { continue }
-            // 玩家角色（PC）不由 AI 代说：意图文本里出现的「你 / PC 名」是**称呼**，不是说话人。
-            // 否则 PC 名恰好是「你」时，「你带伞了吗？」这类 NPC 台词会被判给玩家。
+            if c.name.is_empty() || !hay.contains(&c.name) { continue }
             if c.kind == "pc" { continue }
             let len = c.name.chars().count();
             if best.as_ref().is_none_or(|(l, _)| len > *l) {
@@ -2180,17 +2226,24 @@ impl Session {
         best.map(|(_, a)| a)
     }
 
-    /// 意图归属：① 意图自带的 actor_id；② 台词里提到的角色名；③ None（调用方回落）。
+    /// 意图归属：① 意图自带的 actor_id；② 文本里提到的角色名；③ None（调用方回落）。
+    ///
+    /// 旁白也参与推断（#17：叙事事件必带归属），但**只认句首主语位**的名字：
+    /// 角色动作常被模型写成无归属旁白（「Lucy靠在他身侧…」），这类要认出来；
+    /// 而环境描写里顺带提及的名字（「Lucy家的灯还亮着」）不该被当成行动者。
     fn resolve_intent_actor(&self, intent: &Intent) -> Option<ActorRef> {
-        let (id, content) = match intent {
-            Intent::Speak { actor_id, content, .. } => (actor_id.clone(), content.as_str()),
-            Intent::Emote { actor_id, content, .. } => (actor_id.clone(), content.as_str()),
-            Intent::Check { actor_id, .. } => (actor_id.clone(), ""),
-            Intent::Narrate { actor_id, .. } => (actor_id.clone(), ""),
-            _ => (None, ""),
+        let (id, content, leading_only) = match intent {
+            Intent::Speak { actor_id, content, .. } => (actor_id.clone(), content.as_str(), false),
+            Intent::Emote { actor_id, content, .. } => (actor_id.clone(), content.as_str(), false),
+            Intent::Check { actor_id, .. } => (actor_id.clone(), "", false),
+            Intent::Narrate { actor_id, content } => (actor_id.clone(), content.as_str(), true),
+            _ => (None, "", false),
         };
         if let Some(a) = id.and_then(|i| self.actor_by_id(&i)) {
             return Some(a);
+        }
+        if leading_only {
+            return self.actor_leading_in_text(content, NARRATE_ACTOR_HEAD_CHARS);
         }
         self.actor_in_text(content)
     }
@@ -4393,7 +4446,7 @@ mod tests {
     impl AiProvider for CapturingAi {
         async fn story_intents(&self, ctx: &TurnContext) -> Result<AiOutput, EngineError> {
             self.0.lock().unwrap().push(ctx.clone());
-            Ok(AiOutput { intents: vec![Intent::FinishTurn.into()], reasoning: None, intent_warnings: vec![] })
+            Ok(AiOutput { intents: vec![Intent::FinishTurn.into()], reasoning: None, intent_warnings: vec![], trace: None })
         }
         
     }
@@ -4633,6 +4686,7 @@ mod tests {
                 intents: vec![Intent::Speak { content: "你带伞了吗？".into(), tone: None, actor_id: None }.into()],
                 reasoning: None,
                 intent_warnings: vec![],
+                trace: None,
             })
         }
         
@@ -4696,6 +4750,72 @@ mod tests {
         );
     }
 
+    /// 旁白写的是角色动作（名字在主语位）→ 归属该角色；只是提及（名字不在主语位）→ 不归属。
+    struct NarrateActorAi;
+
+    #[async_trait::async_trait]
+    impl AiProvider for NarrateActorAi {
+        async fn story_intents(&self, _ctx: &TurnContext) -> Result<AiOutput, EngineError> {
+            Ok(AiOutput::from_intents(vec![
+                Intent::Narrate { content: "露西靠在他身侧，把伞递了过去。".into(), actor_id: None },
+                Intent::Narrate { content: "门口那盏灯把台阶照得发亮，露西的车停在那儿。".into(), actor_id: None },
+                Intent::FinishTurn,
+            ]))
+        }
+        
+    }
+
+    #[tokio::test]
+    async fn narrate_actor_is_inferred_only_from_leading_subject() {
+        let mut state = state_with_pc();
+        let mut chars = std::collections::BTreeMap::new();
+        chars.insert("char-pc".to_string(), character_instance("char-pc", "米拉", "pc"));
+        chars.insert("char-lucy".to_string(), character_instance("char-lucy", "露西", "npc"));
+        state.characters = chars;
+        state.controlled = vec!["char-pc".into()];
+
+        let sink = Arc::new(CaptureSink(StdMutex::new(vec![])));
+        let session = Arc::new(Session::new(
+            "s".into(),
+            state,
+            sink.clone() as Arc<dyn EventSink>,
+            ai_slot(Arc::new(NarrateActorAi)),
+            true,
+            json!({ "world": {} }),
+        ));
+        session
+            .run_round(
+                RoundInput { channel: RoundChannel::Character, text: "我们走吧".into(), refs: vec![] },
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let events = sink.0.lock().unwrap().clone();
+        let actors: Vec<(Option<String>, String)> = events
+            .iter()
+            .filter_map(|e| match &e.event {
+                PlayEvent::Narrate(p) => Some((
+                    e.actor.as_ref().map(|a| a.id.clone()),
+                    p.content.clone(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(actors.len(), 2, "两条旁白都应落地：{actors:?}");
+        assert_eq!(
+            actors[0].0.as_deref(),
+            Some("char-lucy"),
+            "「露西靠在他身侧…」是她的动作，应归属露西：{actors:?}"
+        );
+        assert_eq!(
+            actors[1].0.as_deref(),
+            Some("char-pc"),
+            "「…露西的车停在那儿」只是环境描写里提及，应回落玩家角色：{actors:?}"
+        );
+    }
+
     struct ReasoningAi;
 
     #[async_trait::async_trait]
@@ -4705,6 +4825,7 @@ mod tests {
                 intents: vec![Intent::Narrate { content: "雨。".into(), actor_id: None }.into()],
                 reasoning: Some("先想想天气。".into()),
                 intent_warnings: vec![],
+                trace: None,
             })
         }
         
@@ -4755,6 +4876,7 @@ mod tests {
                 intents: vec![Intent::Think { content: "先在心里推演一遍。".into() }.into()],
                 reasoning: None,
                 intent_warnings: vec![],
+                trace: None,
             })
         }
         
@@ -4911,7 +5033,7 @@ mod tests {
             } else {
                 q.remove(0).into_iter().map(IntentEnvelope::from).collect()
             };
-            Ok(AiOutput { intents, reasoning: None, intent_warnings: vec![] })
+            Ok(AiOutput { intents, reasoning: None, intent_warnings: vec![], trace: None })
         }
         
     }
@@ -5109,6 +5231,7 @@ mod tests {
                 ],
                 reasoning: None,
                 intent_warnings: vec![],
+                trace: None,
             })
         }
         
@@ -5289,6 +5412,7 @@ mod tests {
                 ],
                 reasoning: None,
                 intent_warnings: vec![],
+                trace: None,
             })
         }
         

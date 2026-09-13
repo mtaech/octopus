@@ -144,9 +144,9 @@ pub fn is_known_intent(name: &str) -> bool {
 /// 每个意图的签名与用途：declarative 模板按白名单渲染。
 const INTENT_CATALOG: &[(&str, &str, &str)] = &[
     ("think", "think {content}", "思考草稿（引擎折叠展示，不进叙事）"),
-    ("narrate", "narrate {content, actor_id?}", "旁白"),
+    ("narrate", "narrate {content, actor_id?}", "旁白（环境 / 场景 / 玩家角色动作；角色自身的动作请用 emote）"),
     ("speak", "speak {content, actor_id, tone?}", "角色台词"),
-    ("emote", "emote {content, actor_id, emotion?}", "神态动作"),
+    ("emote", "emote {content, actor_id, emotion?}", "神态动作（角色自身的动作与神态，必须带 actor_id）"),
     ("check", "check {attribute, difficulty?}", "判定"),
     ("move", "move {destination_id}", "移动"),
     ("use_skill", "use_skill {skill_id, target_id?}", "使用技能"),
@@ -216,7 +216,8 @@ pub const SYSTEM_PREAMBLE: &str = "你是 Octopus 游戏的「AI 主持」：负
    narrate {content, actor_id?} 旁白；speak {content, actor_id, tone?} 角色台词；emote {content, actor_id, emotion?} 神态动作；\n\
    check {attribute, difficulty?} 判定（attribute 只能填「可用判定属性」里列出的 key）；move {destination_id}；use_skill {skill_id, target_id?}；\n\
    use_item {item_id, target_id?}；interact {object_id, action} 与场景物件交互；strike {enemy_id, skill_id?} 攻击遭遇中的敌人；advance_scene {target_scene_id?, abandon?}；query_world {query}；finish_turn {}\n\
-3. speak / emote 带上 actor_id：只填「在场角色」名单里括号内的 id（如 char-isa），一次只扮演一个人；玩家受控角色的台词由玩家输入，你专注世界与 NPC 的回应。纯旁白 narrate 可省略。\n\
+3. speak / emote 带上 actor_id：只填「在场角色」名单里括号内的 id（如 char-isa），一次只扮演一个人；玩家受控角色的台词由玩家输入，你专注世界与 NPC 的回应。\n\
+   **归属分清：角色的动作、神态与反应一律用 emote（带 actor_id）**；narrate 只写环境、天气、时间流逝、场景切换与玩家角色自己的动作，这类纯旁白可省略 actor_id。\n\
 4. 扮演 NPC 时以第一人称口吻，符合其背景、性格与对话示例的语气；引用实体时使用名单里给出的 id。\n\
 5. 玩家攻击「当前遭遇」里的敌人时，用 strike {enemy_id} 交给引擎结算；把引擎给出的结果叙述得有画面感。\n\
 6. 每次输出 1-3 个意图；确实无事可做时输出 []。\n\
@@ -224,6 +225,21 @@ pub const SYSTEM_PREAMBLE: &str = "你是 Octopus 游戏的「AI 主持」：负
 8. 需要先打草稿 / 内心推演时，用 think {content} 意图写思考；引擎会把它折叠展示，不算叙事。\n\
 9. 每回合**恰好**输出一条 summary {text}：用一两句话概括本回合发生的事（供记忆检索）。它不算叙事、不改世界状态，属可选但鼓励。\n\
 10. 需要世界状态或判定结果时，先输出 query_world / check / interact 意图；引擎会把结果回给你，你据此在同一回合继续输出意图，最后用 finish_turn {} 收束。信息已经足够时一次给全，并用 finish_turn {} 收束。";
+
+/// 工具模式（原生工具调用）下的引擎默认系统提示词：行为规则与 SYSTEM_PREAMBLE 一致，
+/// 但输出形态从「输出 JSON 数组」改为「调用意图工具」。
+pub const TOOL_PREAMBLE: &str = "你是 Octopus 游戏的「AI 主持」：负责故事走向、旁白与世界响应，并扮演所有非玩家角色（NPC）的台词、神态与动作，在故事书的结构化骨架内即兴导演。\n\
+行为规则（必须严格遵守）：\n\
+1. 通过调用「意图工具」推进剧情：每个工具对应一种意图（narrate 旁白 / speak 台词 / emote 神态 / check 判定 / move 移动 / use_skill 用技能 / use_item 用物品 / interact 交互 / strike 攻击 / advance_scene 换场 / query_world 查世界 / finish_turn 收束等），一次可并行调用多个。\n\
+2. speak / emote 带上 actor_id：只填「在场角色」名单里括号内的 id（如 char-isa），一次只扮演一个人；玩家受控角色的台词由玩家输入，你专注世界与 NPC 的回应。\n\
+   **归属分清：角色的动作、神态与反应一律用 emote（带 actor_id）**；narrate 只写环境、天气、时间流逝、场景切换与玩家角色自己的动作，这类纯旁白可省略 actor_id。\n\
+3. 扮演 NPC 时以第一人称口吻，符合其背景、性格与对话示例的语气；引用实体时使用名单里给出的 id。\n\
+4. 玩家攻击「当前遭遇」里的敌人时，用 strike {enemy_id} 交给引擎结算；把引擎给出的结果叙述得有画面感。\n\
+5. 每轮调用 1-3 个意图工具；确实无事可做时直接调用 finish_turn。\n\
+6. 叙事、遭遇与场景推进都围绕【当前场景】与【当前任务】展开，保持一致。\n\
+7. 需要先打草稿 / 内心推演时，用 think {content} 意图写思考；引擎会把它折叠展示，不算叙事。\n\
+8. 每回合**恰好**输出一条 summary {text}：用一两句话概括本回合发生的事（供记忆检索）。它不算叙事、不改世界状态，属可选但鼓励。\n\
+9. 需要世界状态或判定结果时，先调用 query_world / check / interact；引擎会把结果回给你，你据此在本轮继续调用工具，最后调用 finish_turn 收束。信息已经足够时一次给全，并用 finish_turn 收束。";
 
 
 
@@ -269,8 +285,135 @@ pub fn parse_intents(raw: &str) -> Result<Vec<Intent>, String> {
     parse_intent_envelopes(raw).map(|v| v.into_iter().map(|e| e.intent).collect())
 }
 
+/// 一个「意图工具」：模型通过**原生工具调用**输出意图（pi 式 agent 的工具形态）。
+/// 工具名 = 意图 type；参数 = 意图字段的 JSON Schema（宽松提示，服务端反序列化仍严格校验）。
+#[derive(Debug, Clone)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema 对象（properties + required）。
+    pub parameters: Value,
+}
+
+/// 由字段表生成 JSON Schema：`(字段名, JSON Schema type, 是否必需)`。
+fn tool_schema(props: &[(&str, &str, bool)]) -> Value {
+    let mut properties = serde_json::Map::new();
+    let mut required: Vec<Value> = Vec::new();
+    for (name, ty, req) in props {
+        properties.insert(name.to_string(), serde_json::json!({ "type": ty }));
+        if *req {
+            required.push(serde_json::json!(name));
+        }
+    }
+    serde_json::json!({ "type": "object", "properties": properties, "required": required })
+}
+
+/// 意图工具清单：`(意图 type, 用途, 参数字段 (名, JSON Schema type, 是否必需))`。
+/// 与 `Intent` 变体字段一一对应；`finish_turn` 无参数。
+const INTENT_TOOLS: &[(&str, &str, &[(&str, &str, bool)])] = &[
+    ("think", "思考草稿（引擎折叠展示，不进叙事）", &[("content", "string", true)]),
+    ("narrate", "旁白（环境 / 场景 / 玩家角色动作；角色自身的动作请用 emote）", &[("content", "string", true), ("actor_id", "string", false)]),
+    (
+        "speak",
+        "角色台词",
+        &[("content", "string", true), ("actor_id", "string", true), ("tone", "string", false)],
+    ),
+    (
+        "emote",
+        "神态动作（角色自身的动作与神态，必须带 actor_id）",
+        &[("content", "string", true), ("actor_id", "string", false), ("emotion", "string", false)],
+    ),
+    (
+        "check",
+        "判定（attribute 只能填「可用判定属性」里列出的 key）",
+        &[("attribute", "string", true), ("difficulty", "integer", false), ("actor_id", "string", false)],
+    ),
+    ("move", "移动", &[("destination_id", "string", true)]),
+    ("use_skill", "使用技能", &[("skill_id", "string", true), ("target_id", "string", false)]),
+    ("use_item", "使用物品", &[("item_id", "string", true), ("target_id", "string", false)]),
+    ("interact", "与场景物件交互", &[("object_id", "string", true), ("action", "string", true)]),
+    ("strike", "攻击遭遇中的敌人（由引擎结算）", &[("enemy_id", "string", true), ("skill_id", "string", false)]),
+    (
+        "advance_scene",
+        "推进场景",
+        &[("target_scene_id", "string", false), ("abandon", "boolean", false)],
+    ),
+    ("query_world", "查询世界", &[("query", "string", true)]),
+    ("query_character", "查询角色资料", &[("character_id", "string", false)]),
+    ("query_relationships", "查询关系", &[("entity_id", "string", false)]),
+    ("intervene", "介入", &[("content", "string", true)]),
+    (
+        "quest",
+        "新增任务（导演）",
+        &[("text", "string", true), ("hidden", "boolean", false), ("primary", "boolean", false)],
+    ),
+    (
+        "encounter",
+        "创建遭遇（导演）",
+        &[("name", "string", true), ("enemies", "array", true), ("note", "string", false)],
+    ),
+    (
+        "adjust",
+        "调整资源（导演）",
+        &[("character_id", "string", true), ("resource", "string", true), ("amount", "integer", true)],
+    ),
+    (
+        "status",
+        "施加 / 移除状态（导演）",
+        &[("character_id", "string", true), ("status_id", "string", true), ("remove", "boolean", false)],
+    ),
+    ("summary", "本回合微摘要（派生记忆，不进叙事）", &[("text", "string", true)]),
+    ("finish_turn", "回合收束（本轮不再产生意图）", &[]),
+];
+
+/// 全部意图的工具定义（default 协议）。
+pub fn all_intent_tools() -> Vec<ToolSpec> {
+    INTENT_TOOLS
+        .iter()
+        .map(|(name, desc, props)| ToolSpec {
+            name: name.to_string(),
+            description: desc.to_string(),
+            parameters: tool_schema(props),
+        })
+        .collect()
+}
+
+/// 白名单意图的工具定义（declarative 协议）；`finish_turn` 恒保留。
+pub fn whitelist_intent_tools(names: &[String]) -> Vec<ToolSpec> {
+    let mut out: Vec<ToolSpec> = INTENT_TOOLS
+        .iter()
+        .filter(|(name, _, _)| names.iter().any(|w| w == name))
+        .map(|(name, desc, props)| ToolSpec {
+            name: name.to_string(),
+            description: desc.to_string(),
+            parameters: tool_schema(props),
+        })
+        .collect();
+    if !out.iter().any(|t| t.name == "finish_turn") {
+        out.push(ToolSpec {
+            name: "finish_turn".to_string(),
+            description: "回合收束（本轮不再产生意图）".to_string(),
+            parameters: tool_schema(&[]),
+        });
+    }
+    out
+}
+
 /// 协议适配器端口：三种模式出口统一为 \`Vec<Intent>\`（与 \`AiProvider\` 同构）。
 pub trait ProtocolAdapter: Send + Sync {
+    /// 该协议支持的原生意图工具清单；None = 走文本协议（模型输出文本由 `parse` 解析）。
+    ///
+    /// 工具模式下，模型通过「调用意图工具」输出意图，`parse` 退居兜底
+    /// （模型没调工具、只输出文本时仍能解析）。
+    fn tools(&self) -> Option<Vec<ToolSpec>> {
+        None
+    }
+
+    /// 工具模式的系统提示词变体：不再要求输出 JSON 数组，改为引导使用工具。
+    /// None = 复用 `preamble()`。
+    fn tool_preamble(&self, _ctx: &TurnContext) -> Option<String> {
+        None
+    }
     /// 注入系统层的协议说明（替代硬编码 preamble 里的协议段）。
     fn preamble(&self, ctx: &TurnContext) -> String;
 
@@ -298,6 +441,15 @@ impl DefaultProtocol {
 }
 
 impl ProtocolAdapter for DefaultProtocol {
+    fn tools(&self) -> Option<Vec<ToolSpec>> {
+        // 默认协议：全部意图工具化（模型原生调用工具输出意图；文本输出仍可兜底解析）。
+        Some(all_intent_tools())
+    }
+
+    fn tool_preamble(&self, _ctx: &TurnContext) -> Option<String> {
+        Some(TOOL_PREAMBLE.to_string())
+    }
+
     fn preamble(&self, _ctx: &TurnContext) -> String {
         SYSTEM_PREAMBLE.to_string()
     }
@@ -330,6 +482,32 @@ impl DeclarativeProtocol {
 }
 
 impl ProtocolAdapter for DeclarativeProtocol {
+    fn tools(&self) -> Option<Vec<ToolSpec>> {
+        // 白名单即工具清单：模型只能调用白名单内的意图工具（比「输出后过滤」更强）。
+        Some(whitelist_intent_tools(&self.allowed()))
+    }
+
+    fn tool_preamble(&self, ctx: &TurnContext) -> Option<String> {
+        let mut b = String::new();
+        b.push_str("你是 Octopus 游戏的「AI 主持」：负责故事走向、旁白与世界响应，并扮演所有非玩家角色的台词、神态与动作，在故事书的结构化骨架内即兴导演。\n");
+        b.push_str("行为规则（必须严格遵守）：\n");
+        b.push_str("1. 通过调用「意图工具」推进剧情：每个工具对应一种意图；本故事书允许以下工具：\n");
+        for name in self.allowed() {
+            if let Some((_, desc)) = catalog_entry(&name) {
+                b.push_str(&format!("   {name}：{desc}；\n"));
+            }
+        }
+        b.push_str("2. speak / emote 带上 actor_id：只填「在场角色」名单里括号内的 id（如 char-isa）；纯旁白 narrate 可省略。\n");
+        b.push_str("3. 扮演 NPC 时以第一人称口吻，符合其背景、性格与对话示例的语气；引用实体时使用名单里给出的 id。\n");
+        b.push_str("4. 每轮调用 1-3 个意图工具；确实无事可做时直接调用 finish_turn。\n");
+        if let Some(ins) = self.instructions.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            b.push_str("\n【协议补充说明】\n");
+            b.push_str(&trim_instructions(ins, ctx.token_budget));
+            b.push('\n');
+        }
+        Some(b)
+    }
+
     fn preamble(&self, ctx: &TurnContext) -> String {
         let intro = "你是 Octopus 游戏的「AI 主持」：负责故事走向、旁白与世界响应，并扮演所有非玩家角色的台词、神态与动作，在故事书的结构化骨架内即兴导演。";
         let mut b = String::new();
@@ -579,6 +757,65 @@ fn push_conformance(issues: &mut Vec<ValidationIssue>, message: &str) {
 mod tests {
     use super::*;
     use octopus_types::{ActorRef, RoundChannel};
+
+    /// 原生工具调用：default 协议的工具清单必须覆盖全部已知意图（工具名 = 意图 type）。
+    #[test]
+    fn default_tool_catalog_covers_all_known_intents() {
+        let tools = all_intent_tools();
+        let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        names.sort_unstable();
+        let mut known: Vec<&str> = KNOWN_INTENTS.to_vec();
+        known.sort_unstable();
+        assert_eq!(names, known, "default 协议的工具清单应与 KNOWN_INTENTS 一一对应");
+        for t in &tools {
+            assert!(
+                t.parameters.get("type").and_then(Value::as_str) == Some("object"),
+                "工具 {} 的参数必须是 object schema",
+                t.name
+            );
+        }
+    }
+
+    /// declarative 白名单 = 工具清单；finish_turn 恒保留。
+    #[test]
+    fn declarative_tools_follow_whitelist_and_keep_finish_turn() {
+        let tools = whitelist_intent_tools(&["narrate".to_string(), "speak".to_string()]);
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["narrate", "speak", "finish_turn"]);
+        // 空白名单也保留 finish_turn。
+        let empty = whitelist_intent_tools(&[]);
+        assert_eq!(empty.len(), 1);
+        assert_eq!(empty[0].name, "finish_turn");
+    }
+
+    /// 工具模式的系统提示词引导「调用工具」，不再要求输出 JSON 数组。
+    #[test]
+    fn tool_preamble_guides_tool_calls_not_json() {
+        assert!(TOOL_PREAMBLE.contains("意图工具"), "{TOOL_PREAMBLE}");
+        assert!(!TOOL_PREAMBLE.contains("JSON 数组"), "工具模式不应再要求 JSON 数组");
+        assert!(TOOL_PREAMBLE.contains("finish_turn"));
+        // 文本模式的 SYSTEM_PREAMBLE 仍要求 JSON 数组（互不干扰）。
+        assert!(SYSTEM_PREAMBLE.contains("JSON 数组"));
+    }
+
+    /// 工具参数 schema：必需字段进 required，可选字段只在 properties。
+    #[test]
+    fn tool_schema_marks_required_fields() {
+        let tools = all_intent_tools();
+        let narrate = tools.iter().find(|t| t.name == "narrate").expect("narrate 工具");
+        let required: Vec<&str> = narrate
+            .parameters
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        assert_eq!(required, vec!["content"], "narrate 只需 content");
+        let finish = tools.iter().find(|t| t.name == "finish_turn").expect("finish_turn 工具");
+        assert_eq!(
+            finish.parameters.get("required").and_then(Value::as_array).map(Vec::len),
+            Some(0)
+        );
+    }
 
     fn turn_ctx(protocol: Option<ProtocolSpec>) -> TurnContext {
         TurnContext {

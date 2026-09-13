@@ -7,7 +7,7 @@ import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import type {
   WorldProjection, PlayEvent, PhaseStage, SaveDetail, CheckResultPayload, StateDelta, CharacterInstance,
-  EntityRef, FocusEntity, Storybook, SaveModelChoice
+  EntityRef, FocusEntity, Storybook, SaveModelChoice, AiCallPayload
 } from '@/types'
 import { hydrate, subscribe, submitRound, rerunRound, confirmAction, getSave, getHistory, getSaveSettings, switchCharacter, setSaveSettings, toast } from '@/api'
 import { uid } from '@/types'
@@ -36,6 +36,25 @@ export interface FlowLogLine {
   text: string
   /** UI 上色：error = 驳回 / 失败，warn = 需要注意，muted = 管线噪音 */
   tone: 'info' | 'warn' | 'error' | 'muted'
+  /** 原始事件完整 payload（pi 式 span 属性）：日志行可展开查看全量细节（ai_call 的完整上下文等）。 */
+  detail?: unknown
+}
+
+/** 一回合 AI 调用的真实用量聚合（ai_call 事件，供应商回传；一回合可多次调用——工具结果回喂轮）。 */
+export interface AiUsageSummary {
+  round: number
+  provider: string
+  model: string
+  /** 本回合 AI 调用次数 */
+  calls: number
+  /** 输入 token（含会话历史） */
+  input: number
+  output: number
+  /** 命中缓存的输入 token（缓存是否吃满的关键指标） */
+  cached: number
+  /** 写入缓存的输入 token */
+  cacheWrite: number
+  latencyMs: number
 }
 
 /** 每次拉取的历史页大小（后端上限 200） */
@@ -51,6 +70,8 @@ export const usePlayStore = defineStore('play', () => {
   const phase = ref<PhaseStage>('idle')
   const phaseDetail = ref('')
   const sending = ref(false)
+  /** 重跑进行中：画面保持旧内容（见 init 的 keepVisible），PlayPage 据此不自动滚底、保留阅读位置。 */
+  const rerunning = ref(false)
   const confirmBusy = ref(false)
   const goalTexts = ref<Record<string, string>>({})
   const triggerTexts = ref<Record<string, string>>({})
@@ -66,6 +87,12 @@ export const usePlayStore = defineStore('play', () => {
   const oldestSeq = ref<number | null>(null)
   const hasMoreOlder = ref(false)
   const loadingOlder = ref(false)
+  /** 上一回合 AI 实际用量（供应商回传；输入区「上下文用量」弹层的真实数据，区别于本地粗估） */
+  const lastAiUsage = ref<AiUsageSummary | null>(null)
+  /** 全程累计（按已加载的事件日志统计；向前分页会继续累加） */
+  const aiUsageTotal = ref<{ calls: number; input: number; output: number; cached: number }>({ calls: 0, input: 0, output: 0, cached: 0 })
+  /** 累计去重：历史分页回放同一事件不重复计入 */
+  const usageSeqSeen = new Set<number>()
 
   let unsub: (() => void) | null = null
   let keySeq = 0
@@ -126,8 +153,14 @@ export const usePlayStore = defineStore('play', () => {
   // ---------- 工具 ----------
   function nextKey(): string { keySeq++; return 'f' + keySeq }
   function isContent(e: FeedEntry): e is Extract<FeedEntry, { kind: 'content' }> { return e.kind === 'content' }
-  /** 统一入口：向前分页时写入缓冲，其余写入 entries。 */
+  /** 统一入口：向前分页 / 重跑缓冲时写入缓冲，其余写入 entries。 */
   function addEntry(e: FeedEntry): void { (entrySink ?? entries.value).push(e) }
+  /**
+   * 「当前条目视图」：缓冲回放期间就是缓冲本身，否则是 entries。
+   * 回放时的一切查重 / 对账都必须走这里——否则会拿旧数组判断，
+   * 把本轮已存在的回合条目当成重复而丢弃（重跑缓冲时踩过这个坑）。
+   */
+  function currentEntries(): FeedEntry[] { return entrySink ?? entries.value }
 
   // ---------- 流程日志（页面「日志」tab） ----------
   /** 单存档保留的日志行上限：超出丢最旧，避免长局无限增长。 */
@@ -151,6 +184,14 @@ export const usePlayStore = defineStore('play', () => {
       case 'state_update': return `状态变更 ${e.payload.changes.length} 项`
       case 'system': return `[${e.payload.code ?? e.payload.level}] ${e.payload.text}`
       case 'pending': return `等待确认：${e.payload.description}`
+      case 'ai_call': {
+        const p = e.payload
+        const tokens = p.usage.total_tokens ? ` ${p.usage.input_tokens}→${p.usage.output_tokens} tok` : ''
+        const status = p.status === 'error' ? '失败' : '完成'
+        const retry = (p.attempts ?? 1) > 1 ? `（重试 ${(p.attempts ?? 1) - 1} 次后成功）` : ''
+        const intents = p.intents?.length ? ` · ${p.intents.join('、')}` : ''
+        return `AI 调用（${p.model}）${status}${retry}${tokens} · ${p.latency_ms}ms${intents}${p.error ? ' · ' + p.error : ''}`
+      }
       default: return ''
     }
   }
@@ -160,6 +201,7 @@ export const usePlayStore = defineStore('play', () => {
       case 'check_result': return e.payload.result ? 'info' : 'warn'
       case 'system': return e.payload.level === 'error' ? 'error' : e.payload.level === 'warn' ? 'warn' : 'muted'
       case 'pending': return 'warn'
+      case 'ai_call': return e.payload.status === 'error' ? 'error' : 'info'
       case 'narrate': case 'dialogue': case 'emote': return 'info'
       default: return 'muted'
     }
@@ -170,8 +212,33 @@ export const usePlayStore = defineStore('play', () => {
     let lo = 0, hi = arr.length
     while (lo < hi) { const mid = (lo + hi) >> 1; if (arr[mid].seq < e.seq) lo = mid + 1; else hi = mid }
     if (arr[lo]?.seq === e.seq) return
-    arr.splice(lo, 0, { seq: e.seq, round: e.round, type: e.type, ts: e.ts, text: flowText(e), tone: flowTone(e) })
+    arr.splice(lo, 0, { seq: e.seq, round: e.round, type: e.type, ts: e.ts, text: flowText(e), tone: flowTone(e), detail: e.payload })
     if (arr.length > FLOW_LOG_LIMIT) arr.splice(0, arr.length - FLOW_LOG_LIMIT)
+  }
+
+  /**
+   * 累计一次 AI 调用的真实用量（仅 ok 状态；error 的 usage 全 0 无意义）。
+   * 「上一回合」按回合号聚合（一回合可能多次调用）；早于当前回合的是向前分页到的历史，不影响它。
+   */
+  function trackAiUsage(seq: number, round: number, p: AiCallPayload): void {
+    const input = Number(p.usage.input_tokens)
+    const output = Number(p.usage.output_tokens)
+    const cached = Number(p.usage.cached_input_tokens)
+    const cacheWrite = Number(p.usage.cache_creation_input_tokens)
+    const cur = lastAiUsage.value
+    if (!cur || round > cur.round) {
+      lastAiUsage.value = { round, provider: p.provider, model: p.model, calls: 1, input, output, cached, cacheWrite, latencyMs: p.latency_ms }
+    } else if (round === cur.round) {
+      cur.calls += 1
+      cur.input += input; cur.output += output; cur.cached += cached; cur.cacheWrite += cacheWrite
+      cur.latencyMs += p.latency_ms
+      cur.provider = p.provider; cur.model = p.model
+    }
+    if (!usageSeqSeen.has(seq)) {
+      usageSeqSeen.add(seq)
+      const t = aiUsageTotal.value
+      t.calls += 1; t.input += input; t.output += output; t.cached += cached
+    }
   }
 
   // ---------- 实体引用（本次行动的目标） ----------
@@ -351,7 +418,7 @@ export const usePlayStore = defineStore('play', () => {
     switch (e.type) {
       case 'round_start': {
         // 与乐观追加的玩家回合对账，避免出现两条。
-        const opt = entries.value.find(
+        const opt = currentEntries().find(
           (en): en is Extract<FeedEntry, { kind: 'round' }> =>
             en.kind === 'round' && !!en.pending && en.text === e.payload.input.text && en.channel === e.payload.input.channel
         )
@@ -363,7 +430,7 @@ export const usePlayStore = defineStore('play', () => {
           opt.ts = ts
           if (refs) opt.refs = refs
           if (!replay && e.actor) { opt.actorName = e.actor.name; opt.actorId = e.actor.id }
-        } else if (!entries.value.some(en => en.key === key)) {
+        } else if (!currentEntries().some(en => en.key === key)) {
           // 同一事件重复到达时不要重复插卡（幂等兜底）
           addEntry({
             key, kind: 'round', round: e.round,
@@ -442,16 +509,30 @@ export const usePlayStore = defineStore('play', () => {
         addEntry({ key, kind: 'reasoning', round: e.round, stage: e.payload.stage, text: e.payload.text, source, ts })
         break
       }
+      case 'ai_call': {
+        // 真实用量（供应商回传）：喂给输入区「上下文用量」弹层；日志行由 recordFlow 统一记录
+        if (e.payload.status !== 'error') trackAiUsage(e.seq, e.round, e.payload)
+        break
+      }
     }
   }
 
   // ---------- 对外动作 ----------
-  async function init(id: string) {
-    teardown()
+  /**
+   * 水合存档。默认整块重建（清屏 → ready=false → 加载占位）。
+   * `keepVisible`：重跑这类「原地换数据」的场景用——画面与滚动保持不动，
+   * 新数据先攒进缓冲，到手后原子替换（数据面仍是完整重新水合，不省任何一步）。
+   */
+  async function init(id: string, opts: { keepVisible?: boolean } = {}) {
+    const keepVisible = opts.keepVisible === true && ready.value && saveId.value === id
+    if (!keepVisible) {
+      teardown()
+      ready.value = false
+      entries.value = []
+      flowLog.value = []
+    }
     saveId.value = id
     error.value = ''
-    ready.value = false
-    entries.value = []
     pendingRefs.value = []
     oldestSeq.value = null
     hasMoreOlder.value = false
@@ -479,24 +560,36 @@ export const usePlayStore = defineStore('play', () => {
       triggerTexts.value = b
       // 回放叙事历史：只重建 feed，不改投影（投影由后端重放权威给出）。
       // 流程日志同样从头重建（换存档 / 重新水合时不能残留上一个存档的事件）。
+      // 先写进 buf，全部回放完再整体替换 entries——keepVisible 时画面上始终是旧内容，不会闪空。
+      const buf: FeedEntry[] = []
       flowLog.value = []
       watermark = 0
-      hist.events.forEach(e => onEvent(e, true))
+      entrySink = buf
+      try {
+        hist.events.forEach(e => onEvent(e, true))
+        if (!hist.events.length) {
+          buf.push({ key: 'init:scene', kind: 'scene', round: 0, sceneId: p.scene_id, title: p.scene_title })
+          // 故事开头优先，缺省回落为世界前提（#29 opening）
+          const opening = d.storybook.world.opening?.trim() || d.storybook.world.premise
+          if (opening) pushContent('narrate', opening, null, 0, undefined, 'init:opening')
+          buf.push({ key: 'init:hint', kind: 'system', round: 0, level: 'info', text: '直接输入想做的事（如「打听怪梦的传闻」）；以 / 开头发送元指令（/存档 /免确认 /帮助）。' })
+        }
+      } finally {
+        entrySink = null
+      }
+      entries.value = buf
       // 水位线取「投影 seq」与「历史最大 seq」的较大者：二者并发拉取，投影可能比历史旧；
       // 只取投影 seq 会让 SSE 首次 onopen 的补拉把已水合的事件再放一遍。
       watermark = hist.events.reduce((m, e) => Math.max(m, e.seq), p.seq)
       if (hist.events.length) {
         oldestSeq.value = hist.events[0].seq
         hasMoreOlder.value = hist.hasMore
-      } else {
-        entries.value.push({ key: 'init:scene', kind: 'scene', round: 0, sceneId: p.scene_id, title: p.scene_title })
-        // 故事开头优先，缺省回落为世界前提（#29 opening）
-        const opening = d.storybook.world.opening?.trim() || d.storybook.world.premise
-        if (opening) pushContent('narrate', opening, null, 0, undefined, 'init:opening')
-        entries.value.push({ key: 'init:hint', kind: 'system', round: 0, level: 'info', text: '直接输入想做的事（如「打听怪梦的传闻」）；以 / 开头发送元指令（/存档 /免确认 /帮助）。' })
       }
       ready.value = true
       // 先订阅再允许回合（#24 时序）；onResync：断线重连后按水位线补拉错过的事件。
+      // keepVisible 路径没走 teardown，这里必须先关掉旧订阅：直接覆盖 unsub 会让旧 EventSource
+      // 一直开着，之后的实时事件被双投（feed 与流程日志都会出现重复）。
+      if (unsub) { unsub(); unsub = null }
       unsub = subscribe(id, onEvent, { onResync: () => { void backfill() } })
     } catch (err) {
       error.value = (err as Error)?.message ?? String(err)
@@ -722,11 +815,13 @@ export const usePlayStore = defineStore('play', () => {
     const refs = last?.refs ?? []
     const focus = focusFor(refs)
     sending.value = true
+    rerunning.value = true
     try {
       // 带上编辑后的文本：后端用它替换原回合输入，其余（渠道 / 引用）沿用。
       const text = editedText?.trim() || undefined
       await rerunRound(saveId.value, focus.length ? focus : undefined, text)
-      await init(saveId.value)
+      // 原地换数据：不回退到「水合世界中…」占位，画面与滚动位置保持到新内容就绪。
+      await init(saveId.value, { keepVisible: true })
       toast('ok', text ? '已按修改后的话重跑本轮' : '已重跑本轮')
       return true
     } catch (err) {
@@ -736,6 +831,7 @@ export const usePlayStore = defineStore('play', () => {
       return false
     } finally {
       sending.value = false
+      rerunning.value = false
     }
   }
 
@@ -745,13 +841,16 @@ export const usePlayStore = defineStore('play', () => {
     projection.value = null
     ready.value = false
     pendingRefs.value = []
+    lastAiUsage.value = null
+    aiUsageTotal.value = { calls: 0, input: 0, output: 0, cached: 0 }
+    usageSeqSeen.clear()
   }
 
   return {
-    saveId, ready, error, projection, detail, entries, phase, phaseDetail, sending, confirmBusy,
+    saveId, ready, error, projection, detail, entries, phase, phaseDetail, sending, rerunning, confirmBusy,
     goalTexts, triggerTexts,
     pendingRefs, addRef, removeRef, clearRefs, listRefs, saveModel, narrativePrefs, flowLog,
-    oldestSeq, hasMoreOlder, loadingOlder,
+    oldestSeq, hasMoreOlder, loadingOlder, lastAiUsage, aiUsageTotal,
     autoConfirm, sceneTitle, controlledId, controlled, presentChars, allChars, busy, waitingConfirm, canRerun,
     phaseLabel,
     init, loadOlder, send, rerunLastRound, confirm, switchTo, setAutoConfirm, setModel, clearModel, setNarrativeOverride, applyUpgrade, teardown

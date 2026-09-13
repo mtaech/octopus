@@ -279,8 +279,8 @@ function onUseGlobal() {
 /** 系统提示词模板粗估：对应 Rust 侧 SYSTEM_PREAMBLE 大致长度 */
 const PREAMBLE_TOKENS = 880
 
-/** 本回合发给模型的上下文估算（不含按存档追加的会话历史） */
-const usage = computed(() => {
+/** 本回合发给模型的新增上下文估算（不含按存档追加的会话历史；真实总量见 actual） */
+const estimate = computed(() => {
   const p = store.projection
   const sb = store.detail?.storybook as Storybook | undefined
   const rows: { label: string; tokens: number }[] = []
@@ -305,6 +305,16 @@ const usage = computed(() => {
   rows.push({ label: '玩家输入', tokens: estimateTokens(input.value) })
   return { rows, total: rows.reduce((a, b) => a + b.tokens, 0) }
 })
+
+/** 上一回合 AI 实际用量（供应商回传；null = 本存档还没跑过回合） */
+const actual = computed(() => store.lastAiUsage)
+/** 缓存命中率（%）：cached 是检验「缓存是否吃满」的关键指标 */
+const cachePct = computed(() => {
+  const a = actual.value
+  return a && a.input > 0 ? Math.round((a.cached / a.input) * 100) : 0
+})
+/** 精确计数：192,971（与估算的 k/M 缩写区分） */
+function fmtExact(n: number): string { return n.toLocaleString() }
 
 type Quick = { label: string; kind: 'meta' | 'toggle' | 'switch'; value?: string }
 const QUICK: Quick[] = [
@@ -513,7 +523,7 @@ function quickRun(label: string) {
         <!-- 文字与引用 chip 混排（contenteditable） -->
         <div
           ref="editorEl"
-          class="mention-editor max-h-[440px] min-h-[12rem] overflow-y-auto px-4 py-3 text-[15px] leading-relaxed whitespace-pre-wrap outline-none"
+          class="mention-editor max-h-[300px] min-h-[5rem] overflow-y-auto px-4 py-2.5 text-[15px] leading-relaxed whitespace-pre-wrap outline-none"
           :contenteditable="!disabled"
           :data-placeholder="placeholder"
           @keydown="onKeydown"
@@ -541,16 +551,16 @@ function quickRun(label: string) {
       <span class="relative flex min-w-0 items-center gap-1.5">
         <span class="hidden font-mono text-[10px] text-muted-foreground/50 2xl:inline">Enter 发送 · Shift+Enter 换行</span>
 
-        <!-- 上下文用量（估算） -->
+        <!-- 上下文用量：有真实回传后显示上回合实际输入，否则显示本地粗估 -->
         <button
           type="button"
           class="inline-flex shrink-0 cursor-pointer items-center gap-1 rounded-full border border-border/80 px-2 py-0.5 text-[10.5px] text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground"
           :class="usageOpen ? 'border-primary/50 text-foreground' : ''"
-          title="本回合上下文用量（估算，不含会话历史）"
+          :title="actual ? '上回合 AI 实际用量（供应商回传，含会话历史），点击查看明细' : '本回合上下文用量（估算，不含会话历史）'"
           @click="usageOpen = !usageOpen"
         >
           <IconChartHistogram class="size-3 text-primary/70" />
-          本回合 ≈{{ fmtTokens(usage.total) }}
+          {{ actual ? '上回合 ' + fmtTokens(actual.input) : '本回合 ≈' + fmtTokens(estimate.total) }}
         </button>
 
         <Button
@@ -574,20 +584,60 @@ function quickRun(label: string) {
           <IconSettings class="size-3.5" />
         </Button>
 
-        <!-- 用量明细（贴右下角弹出） -->
-        <div v-if="usageOpen" class="absolute right-0 bottom-full z-40 mb-2 w-60 rounded-xl border border-border bg-popover p-3 text-[11px] shadow-xl">
+        <!-- 用量明细（贴右下角弹出）：真实回传 + 本地粗估 -->
+        <div v-if="usageOpen" class="absolute right-0 bottom-full z-40 mb-2 w-64 rounded-xl border border-border bg-popover p-3 text-[11px] shadow-xl">
           <div class="flex items-center justify-between">
-            <span class="font-semibold text-foreground">本回合上下文估算</span>
-            <span class="font-mono font-semibold text-foreground/85">≈{{ fmtTokens(usage.total) }} tok</span>
+            <span class="font-semibold text-foreground">上下文用量</span>
+            <span class="font-mono font-semibold text-foreground/85">{{ actual ? fmtTokens(actual.input) : '≈' + fmtTokens(estimate.total) }} tok</span>
           </div>
-          <div class="mt-2 space-y-1">
-            <div v-for="row in usage.rows" :key="row.label" class="flex items-center justify-between gap-3">
-              <span class="text-muted-foreground/80">{{ row.label }}</span>
-              <span class="font-mono text-muted-foreground/70">{{ fmtTokens(row.tokens) }}</span>
+
+          <!-- 上回合实际：ai_call 事件回传的真实用量（含会话历史） -->
+          <template v-if="actual">
+            <div class="mt-1.5 text-[10px] text-muted-foreground/55">
+              上回合实际 · 第 {{ actual.round }} 回合 · {{ modelDisplayName(actual.provider, actual.model) }}<template v-if="actual.calls > 1"> · {{ actual.calls }} 次调用</template>
+            </div>
+            <div class="mt-1 space-y-1">
+              <div class="flex items-center justify-between gap-3">
+                <span class="text-muted-foreground/80">输入（含会话历史）</span>
+                <span class="font-mono text-foreground/85">{{ fmtExact(actual.input) }}</span>
+              </div>
+              <div class="flex items-center justify-between gap-3">
+                <span class="text-muted-foreground/80">其中缓存命中</span>
+                <span class="font-mono text-muted-foreground/70">{{ fmtExact(actual.cached) }} · {{ cachePct }}%</span>
+              </div>
+              <div v-if="actual.cacheWrite > 0" class="flex items-center justify-between gap-3">
+                <span class="text-muted-foreground/80">写入缓存</span>
+                <span class="font-mono text-muted-foreground/70">{{ fmtExact(actual.cacheWrite) }}</span>
+              </div>
+              <div class="flex items-center justify-between gap-3">
+                <span class="text-muted-foreground/80">输出</span>
+                <span class="font-mono text-muted-foreground/70">{{ fmtExact(actual.output) }}</span>
+              </div>
+              <div class="flex items-center justify-between gap-3">
+                <span class="text-muted-foreground/80">延迟</span>
+                <span class="font-mono text-muted-foreground/70">{{ (actual.latencyMs / 1000).toFixed(1) }}s</span>
+              </div>
+            </div>
+            <div class="mt-1.5 text-[10px] text-muted-foreground/55" title="按本页已加载的事件日志累计；向前翻页会继续累加">
+              累计 {{ store.aiUsageTotal.calls }} 次调用 · 输入 {{ fmtTokens(store.aiUsageTotal.input) }} · 输出 {{ fmtTokens(store.aiUsageTotal.output) }}
+            </div>
+          </template>
+
+          <!-- 本回合新增估算：下次调用将在历史之上多带的上下文 -->
+          <div :class="actual ? 'mt-2 border-t border-border/60 pt-2' : 'mt-2'">
+            <div class="flex items-center justify-between">
+              <span class="text-muted-foreground/80">本回合新增估算</span>
+              <span class="font-mono text-muted-foreground/70">≈{{ fmtTokens(estimate.total) }}</span>
+            </div>
+            <div class="mt-1 space-y-1">
+              <div v-for="row in estimate.rows" :key="row.label" class="flex items-center justify-between gap-3">
+                <span class="text-muted-foreground/80">{{ row.label }}</span>
+                <span class="font-mono text-muted-foreground/70">{{ fmtTokens(row.tokens) }}</span>
+              </div>
             </div>
           </div>
           <p class="mt-2 border-t border-border/60 pt-2 text-[10px] leading-relaxed text-muted-foreground/55">
-            CJK 按 1 tok 粗估。单一 AI 每回合一次调用：实际输入 = 会话历史（按存档追加，前缀可被供应商缓存复用）+ 本回合上下文。
+            实际值由供应商回传：输入 = 会话历史（前缀被缓存复用）+ 本回合新增。估算按 CJK 1 tok 粗估，仅作参考。
           </p>
         </div>
       </span>

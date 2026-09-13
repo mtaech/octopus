@@ -179,10 +179,11 @@ pub fn event_kind(event: &PlayEvent) -> &'static str {
         PlayEvent::RoundEnd(_) => "round_end",
         PlayEvent::System(_) => "system",
         PlayEvent::Reasoning(_) => "reasoning",
+        PlayEvent::AiCall(_) => "ai_call",
     }
 }
 
-/// 是否叙事事件（narrate / dialogue / emote）——只有它们写 FTS / 向量库。
+/// 是否叙事事件（narrate / dialogue / emote）——只有它们写 FTS 索引。
 pub fn is_narrative_event(event: &PlayEvent) -> bool {
     matches!(
         event,
@@ -218,7 +219,7 @@ fn decode_narrative_rows(rows: Vec<entities::command::Model>) -> Vec<(i64, u32, 
 
 /// 摘要派生索引的 seq 命名空间（#05 §3.2/§3.3）：用**负数**与命令日志的正 seq 区分。
 ///
-/// 摘要不在命令日志里，没有权威 seq；但 FTS5 / 向量索引都按 (save_id, seq) 定位，
+/// 摘要不在命令日志里，没有权威 seq；但 FTS5 按 (save_id, seq) 定位，
 /// 所以给它们编一套稳定、可重建、且不与正 seq 冲突的编号。检索回填时按同一规则反解，
 /// 于是「摘要也进索引」不需要在检索器里加特判。
 const SCENE_SUMMARY_SEQ_BASE: i64 = 1_000_000_000;
@@ -1184,30 +1185,9 @@ impl SqliteStore {
         Ok(out)
     }
 
-    /// 读某存档的可索引正文（叙事事件 + 派生摘要），按 seq 升序，供重建向量索引。
-    ///
-    /// 叙事来自权威 commands 表，摘要来自派生表；都不读 FTS / 向量库本身。
-    /// 空文本跳过，返回 (seq, round, kind, text)；摘要用负数派生 seq（kind 可区分）。
-    pub async fn load_narrative_events(
-        &self,
-        save_id: &str,
-    ) -> Result<Vec<(i64, u32, String, String)>, EngineError> {
-        let rows = entities::command::Entity::find()
-            .filter(entities::command::Column::SaveId.eq(save_id.to_string()))
-            .filter(entities::command::Column::Kind.is_in(vec!["narrate", "dialogue", "emote"]))
-            .order_by_asc(entities::command::Column::Seq)
-            .all(&self.db)
-            .await?;
-        let mut out = decode_narrative_rows(rows);
-        // 摘要也是可检索的派生记忆（kind = summary / scene_summary），一并纳入重建。
-        out.extend(self.load_summary_rows(save_id, None).await?);
-        out.sort_by_key(|(seq, _, _, _)| *seq);
-        Ok(out)
-    }
-
     /// 按 seq 精确回填可索引正文（叙事事件正 seq + 摘要负 seq）。
     ///
-    /// 与 `load_narrative_events` 同源，空 seqs 直接返回空。负 seq 命中派生摘要表。
+    /// 空 seqs 直接返回空。负 seq 命中派生摘要表。
     pub async fn load_narrative_events_by_seqs(
         &self,
         save_id: &str,
@@ -1235,10 +1215,9 @@ impl SqliteStore {
         Ok(out)
     }
 
-    /// 读某存档的摘要行 (seq, round, kind, text)，供检索回填与索引重建。
+    /// 读某存档的摘要行 (seq, round, kind, text)，供检索回填。
     ///
-    /// seq 用与写入一致的负数编码反解；only 给定时只返回命中的 seq（检索路径），
-    /// None 表示全量（重建路径）。只读派生表，不触任何权威状态。
+    /// seq 用与写入一致的负数编码反解；None 表示全量。只读派生表，不触任何权威状态。
     async fn load_summary_rows(
         &self,
         save_id: &str,
@@ -1284,7 +1263,7 @@ impl SqliteStore {
 
     /// 写入 / 覆盖回合微摘要，并同事务刷新它的 FTS 行；返回派生 seq。
     ///
-    /// 只写派生数据：调用方（Session）对错误只 warn。向量索引由组合根 best-effort 异步补。
+    /// 只写派生数据：调用方（Session）对错误只 warn。
     pub async fn upsert_round_summary(
         &self,
         save_id: &str,

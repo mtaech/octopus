@@ -396,6 +396,10 @@ pub enum PlayEvent {
     System(SystemPayload),
     /// AI 思考链（reasoning_content）：给玩家作参考，不改变世界状态。
     Reasoning(ReasoningPayload),
+    /// 一次 AI 调用（主线 / 角色）的完整轨迹（pi 式 span）：请求上下文 + 用量 + 延迟 + 状态。
+    /// 与 reasoning 的区别：保留发给模型的**完整上下文**（system 提示词 + 会话历史），
+    /// 供游玩页「日志」tab 复盘；数据量较大，只在日志视图展示。
+    AiCall(AiCallPayload),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -447,6 +451,78 @@ pub struct ReasoningPayload {
 
 fn default_reasoning_source() -> String {
     "provider".to_string()
+}
+
+/// 一次 AI 调用的结果状态（pi 式 span 的 status）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum AiCallStatus {
+    Ok,
+    Error,
+}
+
+/// 一次 AI 调用的 token 用量（供应商不回传时对应字段为 0）。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+pub struct AiCallUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    /// 命中缓存的输入 token（cached 是检验「缓存是否吃满」的关键指标）。
+    pub cached_input_tokens: u64,
+    /// 写入缓存的输入 token。
+    pub cache_creation_input_tokens: u64,
+}
+
+/// 发给模型的上下文里的一条消息（日志视图用；只保留可读正文，工具调用等折叠为文本）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+#[ts(export)]
+pub struct AiCallMessage {
+    /// system / user / assistant
+    pub role: String,
+    pub content: String,
+}
+
+/// 一次 AI 调用（主线 / 角色）的完整轨迹：pi 式 span 的「请求属性 → 事件 → 状态」。
+///
+/// - 请求属性：provider / model / temperature / max_tokens / messages（含 system 提示词与
+///   会话历史的**完整原文**，供游玩页「日志」tab 复盘）。
+/// - 事件：思考链（reasoning）、解析出的意图、协议警告。
+/// - 结束属性：用量、延迟、状态（ok / error）。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AiCallPayload {
+    /// 思考阶段：story_thinking（角色 AI 接入后为 character_thinking）。
+    pub stage: String,
+    /// 供应商 id（config.json providers[].id）。
+    pub provider: String,
+    /// 实际调用的模型 id。
+    pub model: String,
+    pub temperature: f64,
+    pub max_tokens: u64,
+    /// 发给模型的完整上下文：首条为 system 提示词，其后为会话历史 + 本次输入。
+    pub messages: Vec<AiCallMessage>,
+    /// 供应商返回的思考链全文（同 reasoning 事件，这里保留完整副本）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    #[serde(default)]
+    pub usage: AiCallUsage,
+    /// 本次补全的端到端耗时（毫秒，含网络往返）。
+    pub latency_ms: u64,
+    /// 该回合这一轮 AI 调用的总尝试次数（含首次）。
+    /// >1 表示发生过「意图解析失败 → 回喂纠正 → 重试」（pi 式 agent 循环的 retry）。
+    #[serde(default)]
+    pub attempts: u32,
+    pub status: AiCallStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// 解析出的意图名摘要（narrate / speak / check …），一眼可见模型要做什么。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intents: Vec<String>,
+    /// 协议适配器警告（白名单过滤等）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
