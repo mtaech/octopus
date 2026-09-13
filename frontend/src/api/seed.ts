@@ -97,9 +97,9 @@ export function storybookFallingStar(): Storybook {
       { id: 'fac-church', name: '星辰教会', description: '供奉星象的老教会。', goals: ['守望星象', '看守地窖'], default_attitude: 20 }
     ],
     relationships: [
-      { id: 'rel-1', from_kind: 'character', from_id: 'char-isa', to_kind: 'character', to_id: 'char-mira', type: '好感', value: 30 },
-      { id: 'rel-2', from_kind: 'character', from_id: 'char-kael', to_kind: 'character', to_id: 'char-isa', type: '敬畏', value: 40 },
-      { id: 'rel-3', from_kind: 'faction', from_id: 'fac-church', to_kind: 'character', to_id: 'char-oden', type: '隶属', value: 90 }
+      { id: 'rel-1', from_kind: 'character', from: 'char-isa', to_kind: 'character', to: 'char-mira', type: '好感', value: 30 },
+      { id: 'rel-2', from_kind: 'character', from: 'char-kael', to_kind: 'character', to: 'char-isa', type: '敬畏', value: 40 },
+      { id: 'rel-3', from_kind: 'faction', from: 'fac-church', to_kind: 'character', to: 'char-oden', type: '隶属', value: 90 }
     ],
     statuses: [
       { id: 'st-burn', name: '灼烧', description: '被流星余烬灼伤，每回合流失体力。', duration: 3, unit: 'turns', stack: 'replace', effect: [{ kind: 'damage', amount: '3', resource: 'res-stamina' }] },
@@ -113,7 +113,7 @@ export function storybookFallingStar(): Storybook {
       { key: 'mine_probed', label: '矿坑已探查' }
     ],
     events: [
-      { key: 'scene_change', label: '场景切换' },
+      { key: 'scene', label: '场景切换' },
       { key: 'character_death', label: '角色死亡' }
     ],
     relationship_types: [

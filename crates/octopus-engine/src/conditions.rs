@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use octopus_types::{CondExpr, DeltaDomain, DeltaOp, StateDelta};
+use octopus_types::{relationship_endpoint, CondExpr, DeltaDomain, DeltaOp, StateDelta};
 use serde_json::Value;
 
 use crate::error::EngineError;
@@ -69,9 +69,10 @@ pub fn eval_cond(cond: &CondExpr, ctx: &EvalContext<'_>) -> Result<bool, EngineE
             .and_then(as_number)
             .map(|v| v >= *value)
             .unwrap_or(false),
+        // 关系边端点：兼容规范 from/to 与旧 from_id/to_id（决策 #11）。
         CondExpr::RelationshipGe { from, to, r#type, value } => ctx.relationships.iter().any(|r| {
-            r.get("from_id").and_then(Value::as_str) == Some(from.as_str())
-                && r.get("to_id").and_then(Value::as_str) == Some(to.as_str())
+            relationship_endpoint(r, "from", "from_id") == Some(from.as_str())
+                && relationship_endpoint(r, "to", "to_id") == Some(to.as_str())
                 && r.get("type").and_then(Value::as_str) == Some(r#type.as_str())
                 && r.get("value").and_then(as_number).unwrap_or(0.0) >= *value
         }),
@@ -292,5 +293,43 @@ mod tests {
         };
         let (again, _) = evaluate_skeleton(&skeleton, &ctx).unwrap();
         assert!(again.is_empty());
+    }
+
+    /// 关系边端点读取：规范 from/to 与旧 from_id/to_id 都能让 relationship_ge 求值（决策 #11）。
+    #[test]
+    fn relationship_ge_reads_canonical_and_legacy_endpoints() {
+        let flags = BTreeMap::new();
+        let goals = serde_json::Map::new();
+        let triggers = serde_json::Map::new();
+        let cond = CondExpr::RelationshipGe {
+            from: "char-a".into(),
+            to: "char-b".into(),
+            r#type: "好感".into(),
+            value: 50.0,
+        };
+
+        let canonical = vec![json!({ "from": "char-a", "to": "char-b", "type": "好感", "value": 60 })];
+        let ctx = EvalContext {
+            flags: &flags,
+            goals: &goals,
+            triggers: &triggers,
+            actor_location: None,
+            actor_attributes: None,
+            relationships: &canonical,
+            lua: None,
+        };
+        assert!(eval_cond(&cond, &ctx).unwrap(), "规范 from/to 应可求值");
+
+        let legacy = vec![json!({ "from_id": "char-a", "to_id": "char-b", "type": "好感", "value": 60 })];
+        let ctx = EvalContext {
+            flags: &flags,
+            goals: &goals,
+            triggers: &triggers,
+            actor_location: None,
+            actor_attributes: None,
+            relationships: &legacy,
+            lua: None,
+        };
+        assert!(eval_cond(&cond, &ctx).unwrap(), "旧 from_id/to_id 应继续可求值");
     }
 }

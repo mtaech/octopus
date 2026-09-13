@@ -2,7 +2,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use octopus_types::{CondExpr, IssueSeverity, ValidateResult, ValidationIssue};
+use octopus_types::{
+    normalize_event_name, relationship_endpoint, CondExpr, IssueSeverity, ValidateResult,
+    ValidationIssue,
+};
 use serde_json::Value;
 
 use crate::protocol::{is_known_intent, ProtocolMode, KNOWN_INTENTS, NARRATIVE_INTENTS};
@@ -461,6 +464,12 @@ pub fn validate_storybook(sb: &Value) -> Vec<ValidationIssue> {
         }
     }
 
+    // 声明区（#01 修订 / 决策 #10）：events / relationship_types / target_types 的 key 集合。
+    // 在这里收集，供后文的条件校验与引用校验共用；声明区为空 = 作者未启用该契约。
+    let event_keys = collect_declaration_keys(sb, "events");
+    let relationship_type_keys = collect_declaration_keys(sb, "relationship_types");
+    let target_type_keys = collect_declaration_keys(sb, "target_types");
+
     // Collect all trigger IDs across skeleton
     let mut all_trigger_ids = HashSet::new();
     if let Some(chapters) = sb.get("skeleton").and_then(|v| v.as_array()) {
@@ -591,6 +600,7 @@ pub fn validate_storybook(sb: &Value) -> Vec<ValidationIssue> {
                         when,
                         &target,
                         &flag_keys,
+                        &relationship_type_keys,
                         &all_trigger_ids,
                         &location_ids,
                         &mut issues,
@@ -989,6 +999,54 @@ pub fn validate_storybook(sb: &Value) -> Vec<ValidationIssue> {
             }
         }
         for (label, c) in checkers {
+            // 未知字段 / 缺骰式不再静默：故事书写错 key（如用 type 代替 dice）会让整套判定失效，
+            // 表现为「无骰判定 → 0 分 → 必失败」，这里必须提前暴露。
+            const KNOWN_CHECK_KEYS: &[&str] = &[
+                "dice", "mode", "attribute_modifier", "modifier_formula", "degree_thresholds",
+                "lua", "kind", "passive_base", "type", "attributes", "default_dc",
+            ];
+            let dice_like = |s: &str| -> bool {
+                let s = s.trim().to_ascii_lowercase();
+                let Some((a, b)) = s.split_once('d') else { return false };
+                (a.is_empty() || a.chars().all(|c| c.is_ascii_digit()))
+                    && !b.is_empty()
+                    && b.chars().all(|c| c.is_ascii_digit())
+            };
+            if let Some(obj) = c.as_object() {
+                for k in obj.keys() {
+                    if !KNOWN_CHECK_KEYS.contains(&k.as_str()) {
+                        issues.push(ValidationIssue {
+                            severity: IssueSeverity::Warning,
+                            code: "unknown_check_field".to_string(),
+                            target: Some(label.clone()),
+                            message: format!(
+                                "Unknown check field '{k}' (ignored; known: {})",
+                                KNOWN_CHECK_KEYS.join(", ")
+                            ),
+                            related_refs: None,
+                        });
+                    }
+                }
+            }
+            let kind_str = c.get("kind").and_then(|v| v.as_str()).unwrap_or("attribute");
+            let has_dice = c
+                .get("dice")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .is_some_and(|s| !s.is_empty())
+                || c.get("type")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(dice_like);
+            if kind_str != "passive" && !has_dice {
+                issues.push(ValidationIssue {
+                    severity: IssueSeverity::Warning,
+                    code: "check_without_dice".to_string(),
+                    target: Some(label.clone()),
+                    message: "Check declares no dice/type: active checks will roll nothing and always score 0"
+                        .to_string(),
+                    related_refs: None,
+                });
+            }
             if let Some(kind) = c.get("kind").and_then(|v| v.as_str()) {
                 if !["attribute", "attack", "save", "passive"].contains(&kind) {
                     issues.push(ValidationIssue {
@@ -1133,7 +1191,7 @@ pub fn validate_storybook(sb: &Value) -> Vec<ValidationIssue> {
         for (i, sec) in sheet.iter().enumerate() {
             let title = sec.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let target = format!("sheet[{i}]:{title}");
-            let mut check = |field: &str, known: &HashSet<String>, issues: &mut Vec<ValidationIssue>| {
+            let check = |field: &str, known: &HashSet<String>, issues: &mut Vec<ValidationIssue>| {
                 if let Some(list) = sec.get(field).and_then(|v| v.as_array()) {
                     for v in list {
                         if let Some(k) = v.as_str() {
@@ -1335,10 +1393,52 @@ pub fn validate_storybook(sb: &Value) -> Vec<ValidationIssue> {
                 issues.push(ValidationIssue {
                     severity: IssueSeverity::Error,
                     code: "missing_name".to_string(),
-                    target: Some(target),
+                    target: Some(target.clone()),
                     message: "Object name must be a non-empty string".to_string(),
                     related_refs: None,
                 });
+            }
+
+            // 物件引用校验（#01 修订）：所属地点 / 挂载技能必须存在（悬空挡发布）。
+            if let Some(loc_id) = obj.get("location_id").and_then(Value::as_str) {
+                let loc_id = loc_id.trim();
+                if !loc_id.is_empty() && !location_ids.contains(loc_id) {
+                    issues.push(ValidationIssue {
+                        severity: IssueSeverity::Error,
+                        code: "dangling_location_ref".to_string(),
+                        target: Some(target.clone()),
+                        message: format!("Object references non-existent location '{loc_id}'"),
+                        related_refs: Some(vec![loc_id.to_string()]),
+                    });
+                }
+            }
+            if let Some(obj_skills) = obj.get("skills").and_then(Value::as_array) {
+                for sk in obj_skills {
+                    if let Some(sk_id) = sk.as_str() {
+                        let sk_id = sk_id.trim();
+                        if !sk_id.is_empty() && !skill_ids.contains(sk_id) {
+                            issues.push(ValidationIssue {
+                                severity: IssueSeverity::Error,
+                                code: "dangling_skill_ref".to_string(),
+                                target: Some(target.clone()),
+                                message: format!("Object references non-existent skill '{sk_id}'"),
+                                related_refs: Some(vec![sk_id.to_string()]),
+                            });
+                        }
+                    }
+                }
+            }
+            // 物件触发条件：复用条件校验器（flag / trigger / location / 关系类型引用）。
+            if let Some(cond) = obj.get("condition") {
+                validate_condition(
+                    cond,
+                    &target,
+                    &flag_keys,
+                    &relationship_type_keys,
+                    &all_trigger_ids,
+                    &location_ids,
+                    &mut issues,
+                );
             }
         }
     }
@@ -1407,16 +1507,11 @@ pub fn validate_storybook(sb: &Value) -> Vec<ValidationIssue> {
             let from_kind = rel.get("from_kind").and_then(|v| v.as_str());
             let to_kind = rel.get("to_kind").and_then(|v| v.as_str());
 
-            let from = rel
-                .get("from_id")
-                .or_else(|| rel.get("from"))
-                .and_then(|v| v.as_str())
+            // 端点读取：规范 from/to 优先，兼容旧 from_id/to_id（决策 #11）。
+            let from = relationship_endpoint(rel, "from", "from_id")
                 .map(str::trim)
                 .unwrap_or("");
-            let to = rel
-                .get("to_id")
-                .or_else(|| rel.get("to"))
-                .and_then(|v| v.as_str())
+            let to = relationship_endpoint(rel, "to", "to_id")
                 .map(str::trim)
                 .unwrap_or("");
 
@@ -1470,6 +1565,78 @@ pub fn validate_storybook(sb: &Value) -> Vec<ValidationIssue> {
                         Some(vec![to.to_string()])
                     },
                 });
+            }
+        }
+    }
+
+    // 11b. 声明区引用校验（#01 修订 / 决策 #10）：故事书顶部声明 flags / events /
+    // relationship_types / target_types，供其它字段按键引用。声明区一旦非空即视为
+    // 作者启用了该契约——此时悬空引用（拼写错误、删声明未清引用）挡发布（Error）；
+    // 声明区为空则保持旧故事书原样（不校验）。flags 沿用既有 undeclared_flag（Warning），
+    // 此处不重复产出。Lua 兜底允许运行期绕过，但编辑器校验必须抓住悬空。
+    if !event_keys.is_empty() {
+        // 规范名 scene 与旧名 scene_change 等价（决策 #11）：两者都算已声明。
+        let declared: HashSet<String> = event_keys
+            .iter()
+            .map(|e| normalize_event_name(e).to_string())
+            .collect();
+        if let Some(skills) = sb.get("skills").and_then(Value::as_array) {
+            for (i, skill) in skills.iter().enumerate() {
+                let sid = skill.get("id").and_then(Value::as_str).unwrap_or("");
+                let target = if sid.is_empty() { format!("skill[{i}]") } else { format!("skill:{sid}") };
+                if let Some(triggers) = skill.pointer("/effect/triggers").and_then(Value::as_array) {
+                    for trigger in triggers {
+                        let event = trigger.get("event").and_then(Value::as_str).unwrap_or("");
+                        let event = normalize_event_name(event);
+                        if !event.is_empty() && !declared.contains(event) {
+                            issues.push(ValidationIssue {
+                                severity: IssueSeverity::Error,
+                                code: "dangling_event_ref".to_string(),
+                                target: Some(target.clone()),
+                                message: format!("Effect trigger references undeclared event '{event}'"),
+                                related_refs: Some(vec![event.to_string()]),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !relationship_type_keys.is_empty() {
+        if let Some(rels) = sb.get("relationships").and_then(Value::as_array) {
+            for (i, rel) in rels.iter().enumerate() {
+                let rel_id = rel.get("id").and_then(Value::as_str).unwrap_or("");
+                let target = if rel_id.is_empty() { format!("relationship[{i}]") } else { format!("relationship:{rel_id}") };
+                let ty = rel.get("type").and_then(Value::as_str).map(str::trim).unwrap_or("");
+                if !ty.is_empty() && !relationship_type_keys.contains(ty) {
+                    issues.push(ValidationIssue {
+                        severity: IssueSeverity::Error,
+                        code: "dangling_relationship_type_ref".to_string(),
+                        target: Some(target),
+                        message: format!("Relationship references undeclared type '{ty}'"),
+                        related_refs: Some(vec![ty.to_string()]),
+                    });
+                }
+            }
+        }
+    }
+
+    if !target_type_keys.is_empty() {
+        if let Some(skills) = sb.get("skills").and_then(Value::as_array) {
+            for (i, skill) in skills.iter().enumerate() {
+                let sid = skill.get("id").and_then(Value::as_str).unwrap_or("");
+                let target = if sid.is_empty() { format!("skill[{i}]") } else { format!("skill:{sid}") };
+                let ty = skill.get("target").and_then(Value::as_str).map(str::trim).unwrap_or("");
+                if !ty.is_empty() && !target_type_keys.contains(ty) {
+                    issues.push(ValidationIssue {
+                        severity: IssueSeverity::Error,
+                        code: "dangling_target_type_ref".to_string(),
+                        target: Some(target),
+                        message: format!("Skill references undeclared target type '{ty}'"),
+                        related_refs: Some(vec![ty.to_string()]),
+                    });
+                }
             }
         }
     }
@@ -1612,6 +1779,7 @@ pub fn validate_storybook(sb: &Value) -> Vec<ValidationIssue> {
                                     cond,
                                     &g_target,
                                     &flag_keys,
+                                    &relationship_type_keys,
                                     &all_trigger_ids,
                                     &location_ids,
                                     &mut issues,
@@ -1634,6 +1802,7 @@ pub fn validate_storybook(sb: &Value) -> Vec<ValidationIssue> {
                                     cond,
                                     &t_target,
                                     &flag_keys,
+                                    &relationship_type_keys,
                                     &all_trigger_ids,
                                     &location_ids,
                                     &mut issues,
@@ -1680,10 +1849,32 @@ pub fn validate_storybook(sb: &Value) -> Vec<ValidationIssue> {
     issues
 }
 
+/// 收集声明区（flags / events / relationship_types / target_types）的 key 集合。
+///
+/// 条目允许字符串或 { key | id, label } 对象（与既有 flags 收集口径一致）；空 key 忽略。
+/// 声明区是「可选的引用契约」——只有非空时才参与悬空校验，旧故事书不受影响。
+fn collect_declaration_keys(sb: &Value, field: &str) -> HashSet<String> {
+    let mut keys = HashSet::new();
+    if let Some(items) = sb.get(field).and_then(Value::as_array) {
+        for item in items {
+            let key = item
+                .as_str()
+                .or_else(|| item.get("key").and_then(Value::as_str))
+                .or_else(|| item.get("id").and_then(Value::as_str))
+                .unwrap_or("");
+            if !key.trim().is_empty() {
+                keys.insert(key.to_string());
+            }
+        }
+    }
+    keys
+}
+
 fn validate_condition(
     cond: &Value,
     target: &str,
     declared_flags: &HashSet<String>,
+    declared_relationship_types: &HashSet<String>,
     all_trigger_ids: &HashSet<String>,
     all_location_ids: &HashSet<String>,
     issues: &mut Vec<ValidationIssue>,
@@ -1694,6 +1885,7 @@ fn validate_condition(
                 item,
                 target,
                 declared_flags,
+                declared_relationship_types,
                 all_trigger_ids,
                 all_location_ids,
                 issues,
@@ -1767,6 +1959,26 @@ fn validate_condition(
                 });
             }
         }
+        "relationship_ge" => {
+            // 条件的 type 也引用声明区 relationship_types（#01 修订）；声明区为空则不校验。
+            let ty = cond
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or("");
+            if !ty.is_empty()
+                && !declared_relationship_types.is_empty()
+                && !declared_relationship_types.contains(ty)
+            {
+                issues.push(ValidationIssue {
+                    severity: IssueSeverity::Error,
+                    code: "dangling_relationship_type_ref".to_string(),
+                    target: Some(target.to_string()),
+                    message: format!("Condition references undeclared relationship type '{ty}'"),
+                    related_refs: Some(vec![ty.to_string()]),
+                });
+            }
+        }
         "all_of" | "any_of" => {
             if let Some(children) = cond
                 .get("children")
@@ -1778,6 +1990,7 @@ fn validate_condition(
                         child,
                         target,
                         declared_flags,
+                        declared_relationship_types,
                         all_trigger_ids,
                         all_location_ids,
                         issues,
@@ -1791,6 +2004,7 @@ fn validate_condition(
                     child,
                     target,
                     declared_flags,
+                    declared_relationship_types,
                     all_trigger_ids,
                     all_location_ids,
                     issues,
@@ -2046,6 +2260,32 @@ mod tests {
                 && matches!(i.severity, IssueSeverity::Error)));
     }
 
+    /// A：world.check 的未知字段 / 缺骰式必须报警，而不是静默失效。
+    #[test]
+    fn test_check_unknown_field_and_missing_dice_warn() {
+        let mut sb = crate::seed::seed_storybooks()[0].json.clone();
+        sb["world"]["check"] = json!({ "type": "d20", "bogus": 1 });
+        let issues = validate_storybook(&sb);
+        assert!(
+            issues.iter().any(|i| i.code == "unknown_check_field"
+                && matches!(i.severity, IssueSeverity::Warning)),
+            "未知判定字段应报警: {issues:?}"
+        );
+        assert!(
+            !issues.iter().any(|i| i.code == "check_without_dice"),
+            "type: d20 已提供骰式，不应报缺骰: {issues:?}"
+        );
+
+        // 只有 kind、既无 dice 也无 type：报缺骰（active check 会 0 分必失败）。
+        sb["world"]["check"] = json!({ "kind": "attribute" });
+        let issues = validate_storybook(&sb);
+        assert!(
+            issues.iter().any(|i| i.code == "check_without_dice"
+                && matches!(i.severity, IssueSeverity::Warning)),
+            "缺骰式应报警: {issues:?}"
+        );
+    }
+
     #[test]
     fn test_missing_title() {
         let mut sb = crate::seed::seed_storybooks()[0].json.clone();
@@ -2258,5 +2498,117 @@ mod tests {
             .issues
             .iter()
             .any(|i| i.code == "undeclared_flag" && matches!(i.severity, IssueSeverity::Warning)));
+    }
+
+    /// #01 声明区：events / relationship_types / target_types 的悬空引用必须报 Error。
+    #[test]
+    fn test_declaration_area_dangling_refs_are_errors() {
+        let mut sb = crate::seed::seed_storybooks()[0].json.clone();
+        // events 声明了 scene，但技能效果触发器引用了未声明的 boom。
+        sb["skills"] = json!([{
+            "id": "sk-x", "name": "测试技能", "target": "area",
+            "effect": { "triggers": [{ "id": "tr1", "event": "boom", "effects": [] }] }
+        }]);
+        // relationship_types 声明了好感，但关系边用了未声明的敌意。
+        sb["relationships"] = json!([
+            { "id": "rel-x", "from_kind": "character", "from": "char-mira", "to_kind": "character", "to": "char-isa", "type": "敌意", "value": -10 }
+        ]);
+        // target_types 声明了 single，但技能 target 用了未声明的 area。
+        let res = validate_storybook_result(&sb);
+        assert!(!res.valid);
+        assert!(res.issues.iter().any(|i| i.code == "dangling_event_ref"
+            && matches!(i.severity, IssueSeverity::Error)), "events 悬空应报 Error");
+        assert!(res.issues.iter().any(|i| i.code == "dangling_relationship_type_ref"
+            && matches!(i.severity, IssueSeverity::Error)), "relationship_types 悬空应报 Error");
+        assert!(res.issues.iter().any(|i| i.code == "dangling_target_type_ref"
+            && matches!(i.severity, IssueSeverity::Error)), "target_types 悬空应报 Error");
+    }
+
+    /// 声明区引用校验：规范写法（from/to）与旧写法（from_id/to_id）都算合法引用。
+    #[test]
+    fn test_declaration_area_canonical_and_legacy_relationship_fields() {
+        let mut sb = crate::seed::seed_storybooks()[0].json.clone();
+        sb["relationships"] = json!([
+            { "id": "rel-canonical", "from_kind": "character", "from": "char-mira", "to_kind": "character", "to": "char-isa", "type": "好感", "value": 20 },
+            { "id": "rel-legacy", "from_kind": "character", "from_id": "char-isa", "to_kind": "character", "to_id": "char-mira", "type": "好感", "value": 30 }
+        ]);
+        let res = validate_storybook_result(&sb);
+        assert!(res.valid, "规范与旧字段都应校验通过：{:?}", res.issues);
+    }
+
+    /// scene（规范）与 scene_change（旧）在声明区引用中互为别名。
+    #[test]
+    fn test_event_name_aliases_validate() {
+        // 声明 scene，触发器写旧名 scene_change → 合法。
+        let mut sb = crate::seed::seed_storybooks()[0].json.clone();
+        sb["skills"] = json!([{
+            "id": "sk-x", "name": "测试技能",
+            "effect": { "triggers": [{ "id": "tr1", "event": "scene_change", "effects": [] }] }
+        }]);
+        let res = validate_storybook_result(&sb);
+        assert!(res.valid, "声明 scene 时引用旧名 scene_change 应合法：{:?}", res.issues);
+
+        // 声明旧名 scene_change，触发器写规范名 scene → 合法。
+        sb["events"] = json!([{ "key": "scene_change", "label": "场景切换" }]);
+        sb["skills"][0]["effect"]["triggers"][0]["event"] = json!("scene");
+        let res = validate_storybook_result(&sb);
+        assert!(res.valid, "声明旧名时引用规范名 scene 应合法：{:?}", res.issues);
+    }
+
+    /// 声明区为空 = 未启用该契约：旧故事书（无声明）里的引用一律不校验，保持原行为。
+    #[test]
+    fn test_empty_declaration_areas_skip_reference_validation() {
+        let mut sb = crate::seed::seed_storybooks()[0].json.clone();
+        sb["events"] = json!([]);
+        sb["relationship_types"] = json!([]);
+        sb["target_types"] = json!([]);
+        sb["skills"] = json!([{
+            "id": "sk-x", "name": "测试技能", "target": "whatever",
+            "effect": { "triggers": [{ "id": "tr1", "event": "never_declared", "effects": [] }] }
+        }]);
+        sb["relationships"] = json!([
+            { "id": "rel-x", "from_kind": "character", "from": "char-mira", "to_kind": "character", "to": "char-isa", "type": "未声明类型", "value": 0 }
+        ]);
+        let res = validate_storybook_result(&sb);
+        assert!(res.valid, "声明区为空时不应产生悬空引用错误：{:?}", res.issues);
+        assert!(!res.issues.iter().any(|i| i.code == "dangling_event_ref"));
+        assert!(!res.issues.iter().any(|i| i.code == "dangling_relationship_type_ref"));
+        assert!(!res.issues.iter().any(|i| i.code == "dangling_target_type_ref"));
+    }
+
+    /// objects 的地点 / 技能引用悬空 → Error（#01 修订的物件实体）。
+    #[test]
+    fn test_objects_dangling_location_and_skill_refs() {
+        let mut sb = crate::seed::seed_storybooks()[0].json.clone();
+        sb["objects"] = json!([
+            { "id": "obj-x", "name": "机关", "location_id": "loc-void", "skills": ["sk-void"],
+              "condition": { "op": "trigger_fired", "trigger_id": "trigger-ghost" } }
+        ]);
+        let res = validate_storybook_result(&sb);
+        assert!(!res.valid);
+        assert!(res.issues.iter().any(|i| i.code == "dangling_location_ref"
+            && matches!(i.severity, IssueSeverity::Error)));
+        assert!(res.issues.iter().any(|i| i.code == "dangling_skill_ref"
+            && matches!(i.severity, IssueSeverity::Error)));
+        // 物件 condition 复用条件校验器：悬空触发器同样报 Error。
+        assert!(res.issues.iter().any(|i| i.code == "dangling_trigger_ref"
+            && matches!(i.severity, IssueSeverity::Error)));
+    }
+
+    /// relationship_ge 条件的 type 同样引用声明区 relationship_types：悬空 → Error。
+    #[test]
+    fn test_relationship_ge_condition_dangling_type_ref() {
+        let mut sb = crate::seed::seed_storybooks()[0].json.clone();
+        sb["skeleton"][0]["scenes"][0]["goals"][0]["condition"] = json!({
+            "op": "relationship_ge",
+            "from": "char-mira",
+            "to": "char-isa",
+            "type": "敌意",
+            "value": 10
+        });
+        let res = validate_storybook_result(&sb);
+        assert!(!res.valid);
+        assert!(res.issues.iter().any(|i| i.code == "dangling_relationship_type_ref"
+            && matches!(i.severity, IssueSeverity::Error)));
     }
 }

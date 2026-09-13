@@ -26,7 +26,11 @@ pub struct LocalMillis;
 
 impl FormatTime for LocalMillis {
     fn format_time(&self, w: &mut Writer<'_>) -> fmt::Result {
-        write!(w, "{}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"))
+        write!(
+            w,
+            "{}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f")
+        )
     }
 }
 
@@ -35,8 +39,7 @@ impl FormatTime for LocalMillis {
 /// - 级别：`RUST_LOG`，缺省 `info,sqlx=warn`（SQL 明细要看的用 `RUST_LOG=sqlx=debug`）。
 /// - 格式：`OCTOPUS_LOG_FORMAT=json` 时结构化 JSON，否则可读文本。
 pub fn init() {
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| DEFAULT_FILTER.into());
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| DEFAULT_FILTER.into());
     tracing::debug!(filter = %filter, "日志过滤级别已设定");
     let json = std::env::var("OCTOPUS_LOG_FORMAT")
         .map(|v| v.eq_ignore_ascii_case("json"))
@@ -112,28 +115,16 @@ pub fn http_trace_layer() -> tower_http::trace::TraceLayer<
     tower_http::classify::SharedClassifier<tower_http::classify::ServerErrorsAsFailures>,
     fn(&axum::http::Request<axum::body::Body>) -> tracing::Span,
     tower_http::trace::DefaultOnRequest,
-    fn(
-        &axum::http::Response<axum::body::Body>,
-        std::time::Duration,
-        &tracing::Span,
-    ),
+    fn(&axum::http::Response<axum::body::Body>, std::time::Duration, &tracing::Span),
     tower_http::trace::DefaultOnBodyChunk,
     tower_http::trace::DefaultOnEos,
-    fn(
-        tower_http::classify::ServerErrorsFailureClass,
-        std::time::Duration,
-        &tracing::Span,
-    ),
+    fn(tower_http::classify::ServerErrorsFailureClass, std::time::Duration, &tracing::Span),
 > {
     tower_http::trace::TraceLayer::new_for_http()
         .make_span_with(http_span as fn(&axum::http::Request<axum::body::Body>) -> tracing::Span)
         .on_response(
             http_response
-                as fn(
-                    &axum::http::Response<axum::body::Body>,
-                    std::time::Duration,
-                    &tracing::Span,
-                ),
+                as fn(&axum::http::Response<axum::body::Body>, std::time::Duration, &tracing::Span),
         )
         .on_failure(
             http_failure

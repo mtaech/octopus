@@ -66,8 +66,12 @@ function validateStorybook(sb: Storybook): ValidationIssue[] {
   sb.items.forEach(it => (it.skills ?? []).forEach(sid => { if (!skillIds.has(sid)) issues.push({ severity: 'error', code: 'dangling_ref', target: `item:${it.id}`, message: `物品「${it.name}」引用了不存在的技能 "${sid}"`, related_refs: [] }) }))
   sb.characters.forEach(c => (c.skills ?? []).forEach(sid => { if (!skillIds.has(sid)) issues.push({ severity: 'error', code: 'dangling_ref', target: `character:${c.id}`, message: `人物「${c.name}」引用了不存在的技能 "${sid}"`, related_refs: [] }) }))
   sb.relationships.forEach(rel => {
-    const fromOk = rel.from_kind === 'faction' ? facIds.has(rel.from_id) : charIds.has(rel.from_id)
-    const toOk = rel.to_kind === 'faction' ? facIds.has(rel.to_id) : charIds.has(rel.to_id)
+    // 读取侧兼容（决策 #11）：规范 from/to 优先，兼容旧 from_id/to_id。
+    const legacy = rel as typeof rel & { from_id?: string; to_id?: string }
+    const from = rel.from ?? legacy.from_id ?? ''
+    const to = rel.to ?? legacy.to_id ?? ''
+    const fromOk = rel.from_kind === 'faction' ? facIds.has(from) : charIds.has(from)
+    const toOk = rel.to_kind === 'faction' ? facIds.has(to) : charIds.has(to)
     if (!fromOk) issues.push({ severity: 'error', code: 'dangling_ref', target: `relationship:${rel.id}`, message: `关系 ${rel.id} 的起点实体不存在` })
     if (!toOk) issues.push({ severity: 'error', code: 'dangling_ref', target: `relationship:${rel.id}`, message: `关系 ${rel.id} 的终点实体不存在` })
   })
@@ -165,7 +169,7 @@ interface SaveRow {
   latestText: string
   aiBusy: boolean
   autoConfirm: boolean
-  /** 本存档覆盖的模型（provider id + model id） */
+  /** 本存档覆盖的模型（provider id + model id，旧兼容列） */
   modelProviderId?: string
   model?: string
   reasoningEffort?: string
@@ -870,11 +874,10 @@ const DEFAULT_CONFIG: AppConfig = {
     { id: 'deepseek', label: 'DeepSeek', kind: 'openai-compatible', base_url: 'https://api.deepseek.com', api_key: '', models: catalogEntries('deepseek') },
     { id: 'openai', label: 'OpenAI', kind: 'openai', base_url: 'https://api.openai.com/v1', api_key: '', models: catalogEntries('openai') },
     { id: 'ollama', label: '本地 Ollama', kind: 'ollama', base_url: 'http://127.0.0.1:11434', api_key: '', models: [{ id: 'qwen2.5:7b', name: 'Qwen2.5 7B' }, { id: 'llama3.1:8b', name: 'Llama 3.1 8B' }] },
-    { id: 'fastembed', label: '本地 Embedding', kind: 'openai-compatible', api_key: '', models: [{ id: 'bge-small-zh-v1.5', name: 'BGE Small ZH v1.5' }, { id: 'bge-m3', name: 'BGE M3' }] }
+    { id: 'fastembed', label: '本地 Embedding', kind: 'local-embedding', api_key: '', models: [{ id: 'bge-small-zh-v1.5', name: 'BGE Small ZH v1.5' }, { id: 'bge-m3', name: 'BGE M3' }] }
   ],
   roles: {
     story: { provider_id: 'deepseek', model: catalogEntries('deepseek')[0]?.id ?? 'deepseek-chat', temperature: 0.8, max_tokens: 4096 },
-    character: { provider_id: 'deepseek', model: catalogEntries('deepseek')[0]?.id ?? 'deepseek-chat', temperature: 0.7, max_tokens: 2048 },
     pair: { provider_id: 'deepseek', model: catalogEntries('deepseek')[0]?.id ?? 'deepseek-chat', temperature: 0.8, max_tokens: 4096 },
     embedding: { provider_id: 'fastembed', model: 'bge-small-zh-v1.5' }
   },

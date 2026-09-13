@@ -97,16 +97,26 @@ const LEVEL_ORDER = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
 /** 该模型支持的思考等级；无元数据时回落到通用档位。 */
 export function thinkingLevels(meta?: CatalogModel): string[] {
   if (!meta?.tl || !Object.keys(meta.tl).length) return ['default', 'minimal', 'low', 'medium', 'high']
-  const keys = Object.keys(meta.tl)
-  return ['default', ...keys.sort((a, b) => {
+  const keys = Object.keys(meta.tl).sort((a, b) => {
     const ia = LEVEL_ORDER.indexOf(a), ib = LEVEL_ORDER.indexOf(b)
     return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib)
-  })]
+  })
+  // 目录里有些 reasoning 模型没声明 off 档（pi.dev 的数据不全），但用户仍需要能关掉思考；
+  // 这里补一个「关闭」兜底，实际下发值见 levelToWire。
+  const ordered = keys.includes('off') ? keys : ['off', ...keys]
+  return ['default', ...ordered]
 }
 
 /** 等级 → 实际下发值；default / off（wire 为 null）都表示不发送该参数。 */
 export function levelToWire(meta: CatalogModel | undefined, level: string): string | undefined {
   if (level === 'default') return undefined
+  if (level === 'off') {
+    if (!meta?.tl) return undefined
+    // 目录声明了 off：按其 wire 值下发（null = 不发送，即交给供应商默认）
+    if ('off' in meta.tl) return meta.tl.off ?? undefined
+    // 目录没声明 off（数据不全）：显式下发 none —— 目录里 132 个模型就是这么标的
+    return 'none'
+  }
   const wire = meta?.tl?.[level]
   return wire == null ? undefined : wire
 }
@@ -118,6 +128,8 @@ export function wireToLevel(meta: CatalogModel | undefined, wire?: string): stri
     const hit = Object.entries(meta.tl).find(([, v]) => v === wire)
     if (hit) return hit[0]
   }
+  // 我们为「关闭」补的显式值：回显成 off 档
+  if (wire === 'none') return 'off'
   return wire
 }
 

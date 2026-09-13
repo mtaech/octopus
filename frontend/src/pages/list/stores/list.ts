@@ -71,7 +71,7 @@ export const useListStore = defineStore('list', () => {
   }
 
   /** 开档（新建游戏）：确认弹窗 → createSave → 返回新存档 id */
-  async function startNewGame(storybookId: string, title: string, controlledCharacterId?: string): Promise<string> {
+  async function startNewGame(storybookId: string, title: string, controlledCharacterId: string | undefined): Promise<string> {
     const detail = await createSave(storybookId, title, controlledCharacterId)
     // 新档已产生，本地即时刷新（last_played_at 最新 → 排到最近存档）
     await load()

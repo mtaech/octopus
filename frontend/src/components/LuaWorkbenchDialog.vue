@@ -153,7 +153,7 @@ const WORKBENCH_SNIPPETS = [
   { label: '扣除消耗', icon: IconCoins, iconClass: 'text-warning', code: "host.request_cost('res-stamina', 2)" },
   { label: '施加状态', icon: IconSparkles, iconClass: 'text-purple-500', code: "host.apply_status(host.target.id, 'burn', 3, 'turns')" },
   { label: '确定性骰点', icon: IconDice, iconClass: 'text-primary', code: "local roll = host.engine_rng(1, 20)" },
-  { label: '触发事件', icon: IconFlame, iconClass: 'text-emerald-500', code: "host.trigger_event('scene_change')" },
+  { label: '触发事件', icon: IconFlame, iconClass: 'text-emerald-500', code: "host.trigger_event('scene')" },
   { label: '跨回合存储', icon: IconHourglass, iconClass: 'text-blue-500', code: "host.storage.combo = (host.storage.combo or 0) + 1" },
   { label: '调试输出', icon: IconTerminal2, iconClass: 'text-muted-foreground', code: "host.log('调试信息')" },
 ]

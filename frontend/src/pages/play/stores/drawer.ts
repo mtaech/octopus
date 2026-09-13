@@ -207,7 +207,7 @@ export const useDrawerStore = defineStore('playDrawer', () => {
       toast('ok', '升级完成，已自动备份')
     } catch (err) {
       const code = (err as { code?: string })?.code
-      w.error = code === 'MISSING_DISPOSITIONS' ? '还有人物未裁决处置方式。' : ((err as Error)?.message ?? '升级执行失败')
+      w.error = code === 'missing_dispositions' || code === 'MISSING_DISPOSITIONS' ? '还有人物未裁决处置方式。' : ((err as Error)?.message ?? '升级执行失败')
       toast('error', w.error)
     } finally {
       w.executing = false

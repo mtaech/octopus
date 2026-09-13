@@ -9,6 +9,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { usePlayStore } from './stores/play'
 import { useDrawerStore } from './stores/drawer'
 import FeedChat from './components/feed/FeedChat.vue'
+import FlowLog from './components/FlowLog.vue'
 import WorldRail from './components/WorldRail.vue'
 import DetailPanel from './components/DetailPanel.vue'
 import type { WorldSelection } from './selection'
@@ -79,6 +80,18 @@ async function toggleAutoConfirm() {
   try { await store.setAutoConfirm(!autoConfirm.value) } finally { togglingConfirm.value = false }
 }
 
+// ---------- 对话 / 流程日志 切换 ----------
+// 「日志」保留全部原始事件（含被驳回的意图），用于在游玩时复盘整个流程。
+const TAB_KEY = 'octopus:play-tab'
+const tab = ref<'chat' | 'log'>(localStorage.getItem(TAB_KEY) === 'log' ? 'log' : 'chat')
+async function switchTab(next: 'chat' | 'log') {
+  tab.value = next
+  try { localStorage.setItem(TAB_KEY, next) } catch { /* 隐私模式忽略 */ }
+  await nextTick()
+  atBottom.value = true
+  void scrollToBottom(false, true)
+}
+
 // ---------- 滚动行为（P1-4）：上滚时暂停自动滚底，可选回到底部 ----------
 const feedRoot = ref<HTMLElement | null>(null)
 const atBottom = ref(true)
@@ -104,6 +117,39 @@ watch(() => store.phase, () => { if (store.phase === 'idle') void scrollToBottom
 function onFeedScroll() { computeAtBottom() }
 function jumpToBottom() { void scrollToBottom(true, true) }
 
+// ---------- 贴底保持 ----------
+// 卡片内容是异步渲染/合并的（markdown、字体、流式片段并进已有卡片、instant 推送不产生 revealPulse），
+// 单次 nextTick 的 scrollTo 会落空，最后一张卡（含「重发 / 编辑 / 重跑本轮」那行）就被输入栏压住。
+// 所以在「内容变化」与「可视区变化」之后，只要玩家本来在底部，就重新贴底。
+let feedObserver: MutationObserver | null = null
+let sizeObserver: ResizeObserver | null = null
+let pinFrame = 0
+function pinToBottomIfNeeded(): void {
+  const el = feedRoot.value
+  if (!el || !atBottom.value) return
+  // 同步贴底（读取 scrollHeight 会强制布局，拿到的是最新高度）；
+  // 再补一个宏任务兜底，覆盖字体 / markdown 二次回流导致的再增长。
+  el.scrollTop = el.scrollHeight
+  if (pinFrame) return
+  pinFrame = window.setTimeout(() => {
+    pinFrame = 0
+    const cur = feedRoot.value
+    if (cur && atBottom.value) cur.scrollTop = cur.scrollHeight
+  }, 0)
+}
+function startBottomPin(): void {
+  const el = feedRoot.value
+  if (!el) return
+  feedObserver?.disconnect()
+  sizeObserver?.disconnect()
+  feedObserver = new MutationObserver(pinToBottomIfNeeded)
+  feedObserver.observe(el, { childList: true, subtree: true, characterData: true })
+  if (typeof ResizeObserver !== 'undefined') {
+    sizeObserver = new ResizeObserver(pinToBottomIfNeeded)
+    sizeObserver.observe(el)
+  }
+}
+
 /** 加载更早历史并保持视口锚点（前插内容不跳位）。 */
 async function loadOlder() {
   const el = feedRoot.value
@@ -127,9 +173,21 @@ async function boot() {
 }
 onMounted(async () => {
   await boot()
-  stopWatchRoute = watch(saveIdParam, () => { void boot() })
+  await nextTick()
+  startBottomPin()
+  stopWatchRoute = watch(saveIdParam, async () => {
+    await boot()
+    await nextTick()
+    startBottomPin()
+  })
 })
-onUnmounted(() => { stopWatchRoute?.(); store.teardown() })
+onUnmounted(() => {
+  stopWatchRoute?.()
+  store.teardown()
+  feedObserver?.disconnect()
+  sizeObserver?.disconnect()
+  if (pinFrame) clearTimeout(pinFrame)
+})
 
 // 全局空格 = 跳过打字机 / 快进（不拦截输入框内空格）
 function globalKey(e: KeyboardEvent) {
@@ -253,14 +311,36 @@ function goBack() { void router.push('/') }
     <main v-if="store.ready && !store.error" class="flex min-h-0 flex-1 items-stretch">
       <WorldRail :selected="selection" @select="(s: WorldSelection) => (selection = s)" />
       <section class="col-main">
+        <!-- 视图切换：对话 / 流程日志（日志含引擎内部事件，如被驳回的意图） -->
+        <div class="flex shrink-0 items-center gap-1 border-b border-border/60 bg-card/60 px-2.5 py-1.5">
+          <button
+            type="button"
+            class="cursor-pointer rounded-md px-2.5 py-0.5 text-[11.5px] font-semibold transition-colors"
+            :class="tab === 'chat' ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:text-foreground'"
+            @click="switchTab('chat')"
+          >对话</button>
+          <button
+            type="button"
+            class="cursor-pointer rounded-md px-2.5 py-0.5 text-[11.5px] font-semibold transition-colors"
+            :class="tab === 'log' ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:text-foreground'"
+            title="显示本会话全部原始事件（含被驳回的意图 / 阶段 / 思考 / 状态变更）"
+            @click="switchTab('log')"
+          >日志<span class="ml-1 font-mono text-[10px] opacity-70">{{ store.flowLog.length }}</span></button>
+          <span class="ml-auto truncate text-[10.5px] text-muted-foreground/60">
+            {{ tab === 'log' ? '引擎内部事件也在这里' : '' }}
+          </span>
+        </div>
         <div class="relative flex min-h-0 flex-1 flex-col">
           <div ref="feedRoot" class="feed-scroll" @scroll.passive="onFeedScroll">
-            <div v-if="store.hasMoreOlder" class="flex justify-center pt-3">
-              <Button variant="ghost" size="xs" class="h-6 text-[11px] text-muted-foreground" :disabled="store.loadingOlder" @click="loadOlder">
-                {{ store.loadingOlder ? '加载中…' : '加载更早' }}
-              </Button>
-            </div>
-            <FeedChat :feed="store.entries" />
+            <template v-if="tab === 'chat'">
+              <div v-if="store.hasMoreOlder" class="flex justify-center pt-3">
+                <Button variant="ghost" size="xs" class="h-6 text-[11px] text-muted-foreground" :disabled="store.loadingOlder" @click="loadOlder">
+                  {{ store.loadingOlder ? '加载中…' : '加载更早' }}
+                </Button>
+              </div>
+              <FeedChat :feed="store.entries" />
+            </template>
+            <FlowLog v-else :lines="store.flowLog" />
           </div>
           <Button
             v-if="!atBottom"

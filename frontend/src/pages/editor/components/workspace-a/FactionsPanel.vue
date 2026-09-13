@@ -64,7 +64,7 @@ function setGoals(f: FactionDef, t: string): void {
       <EntityFormHeader :title="current.name" sub="势力 · 组织或阵营" :icon="IconBuilding" :meta="current.id" @remove="remove(current)" />
       <FieldGrid class="mt-4">
         <FieldText label="名称" :model-value="current.name" @update:model-value="current.name = $event" />
-        <FieldText label="id" mono hint="关系边的 from_id / to_id 引用此 id" :model-value="current.id" @update:model-value="current.id = $event" />
+        <FieldText label="id" mono hint="关系边的 from / to 引用此 id" :model-value="current.id" @update:model-value="current.id = $event" />
         <FieldNum label="默认态度" :min="-100" :max="100" hint="对陌生人的初始关系值（-100 敌意 … 100 友善）" :model-value="current.default_attitude ?? 0" @update:model-value="current.default_attitude = $event" />
         <FieldArea label="描述" :model-value="current.description" @update:model-value="current.description = $event" />
         <FieldArea label="目标（每行一个）" :rows="3" :model-value="goalText(current)" @update:model-value="setGoals(current, $event)" />

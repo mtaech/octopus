@@ -9,7 +9,7 @@ import { createStorybookDraft, getStorybook, playtestStorybook, publishDraft, sa
 import type { ChapterDef, DeclarationDef, Definition, EntityRef, FocusEntity, GoalDef, KindDef, NarrativeSection, PairSuggestion, SceneDef, Storybook, StorybookDocument, TriggerDef, ValidationIssue } from '@/types'
 import { listEntityRefs as listRefsFrom, resolveEntityRef as resolveRefFrom, resolveFocus as resolveFocusFrom } from '@/lib/entity-refs'
 import { describeActionTitle, describePatch } from '@/lib/describe-patch'
-import { uid } from '@/types'
+import { normalizeRelationshipFields, uid } from '@/types'
 
 // ---------- 范式（视图态，#22 ①） ----------
 export type Paradigm = 'A' | 'B' | 'C'
@@ -267,7 +267,11 @@ export const useEditorStore = defineStore('editor', () => {
       releasedAt.value = doc.released_at ?? null
       updatedAt.value = doc.updated_at ?? null
       if (replaceDraft) {
-        draft.value = structuredClone(doc.draft)
+        // 读取侧兼容（决策 #11）：旧草稿的关系边可能写作 from_id/to_id，
+        // 载入时归一为规范字段 from/to，之后编辑器只写规范字段。
+        const cloned = structuredClone(doc.draft)
+        normalizeRelationshipFields(cloned)
+        draft.value = cloned
         undoStack.length = 0
         undoDepth.value = 0
       }
@@ -962,7 +966,7 @@ export const useEditorStore = defineStore('editor', () => {
   function cascadeCleanup(d: Storybook, kind: string, id: string): void {
     if (kind === 'character' || kind === 'faction') {
       const relKind = kind === 'faction' ? 'faction' : 'character'
-      d.relationships = d.relationships.filter(r => !(r.from_kind === relKind && r.from_id === id) && !(r.to_kind === relKind && r.to_id === id))
+      d.relationships = d.relationships.filter(r => !(r.from_kind === relKind && r.from === id) && !(r.to_kind === relKind && r.to === id))
       if (kind === 'character') {
         d.skeleton.forEach(ch => ch.scenes.forEach(sc => { sc.present_char_ids = (sc.present_char_ids ?? []).filter(c => c !== id) }))
       }

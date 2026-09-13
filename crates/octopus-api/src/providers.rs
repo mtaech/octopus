@@ -2,8 +2,8 @@
 
 use std::time::Duration;
 
-use axum::http::StatusCode;
 use axum::Json;
+use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -35,7 +35,11 @@ pub struct ProbeResponse {
 pub async fn probe_models(Json(req): Json<ProbeRequest>) -> Result<Json<ProbeResponse>, ApiError> {
     let base = req.base_url.trim().trim_end_matches('/').to_string();
     if base.is_empty() {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "empty_base_url", "Base URL 不能为空"));
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "empty_base_url",
+            "Base URL 不能为空",
+        ));
     }
     let url = format!("{base}/models");
 
@@ -43,17 +47,31 @@ pub async fn probe_models(Json(req): Json<ProbeRequest>) -> Result<Json<ProbeRes
         .timeout(Duration::from_secs(20))
         .user_agent("octopus/0.1")
         .build()
-        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "http_client", e.to_string()))?;
+        .map_err(|e| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "http_client",
+                e.to_string(),
+            )
+        })?;
 
     let mut rb = client.get(&url);
-    if let Some(key) = req.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+    if let Some(key) = req
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+    {
         rb = rb.bearer_auth(key);
     }
 
-    let resp = rb
-        .send()
-        .await
-        .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, "probe_failed", format!("请求 {url} 失败：{e}")))?;
+    let resp = rb.send().await.map_err(|e| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "probe_failed",
+            format!("请求 {url} 失败：{e}"),
+        )
+    })?;
     let status = resp.status();
     let body = resp
         .text()
@@ -79,7 +97,10 @@ pub async fn probe_models(Json(req): Json<ProbeRequest>) -> Result<Json<ProbeRes
             "端点返回成功但未解析到模型（兼容 OpenAI /models 形状）",
         ));
     }
-    Ok(Json(ProbeResponse { models, source: url }))
+    Ok(Json(ProbeResponse {
+        models,
+        source: url,
+    }))
 }
 
 /// 兼容多种形状：OpenAI `{data:[{id,name?}]}`、`{models:[...]}`、`{result:[...]}`、顶层数组。
@@ -96,7 +117,10 @@ fn parse_models(v: &Value) -> Vec<ModelItem> {
     let mut out = Vec::new();
     for item in arr {
         match item {
-            Value::String(s) => out.push(ModelItem { id: s.clone(), name: None }),
+            Value::String(s) => out.push(ModelItem {
+                id: s.clone(),
+                name: None,
+            }),
             Value::Object(o) => {
                 let id = o
                     .get("id")
@@ -109,7 +133,10 @@ fn parse_models(v: &Value) -> Vec<ModelItem> {
                         .and_then(Value::as_str)
                         .map(str::to_string)
                         .filter(|n| n != id);
-                    out.push(ModelItem { id: id.to_string(), name });
+                    out.push(ModelItem {
+                        id: id.to_string(),
+                        name,
+                    });
                 }
             }
             _ => {}
@@ -142,8 +169,16 @@ pub struct ProviderTestResponse {
     pub latency_ms: Option<u64>,
 }
 
-pub async fn test_provider(Json(req): Json<ProviderTestRequest>) -> Result<Json<ProviderTestResponse>, ApiError> {
-    let base = req.base_url.as_deref().unwrap_or("").trim().trim_end_matches('/').to_string();
+pub async fn test_provider(
+    Json(req): Json<ProviderTestRequest>,
+) -> Result<Json<ProviderTestResponse>, ApiError> {
+    let base = req
+        .base_url
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
     if base.is_empty() {
         return Ok(Json(ProviderTestResponse {
             ok: false,
@@ -153,7 +188,11 @@ pub async fn test_provider(Json(req): Json<ProviderTestRequest>) -> Result<Json<
     }
     let kind = req.kind.as_deref().unwrap_or("openai-compatible");
     let is_local = base.contains("127.0.0.1") || base.contains("localhost");
-    let key = req.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty());
+    let key = req
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty());
     if kind != "ollama" && !is_local && key.is_none() {
         return Ok(Json(ProviderTestResponse {
             ok: false,
@@ -166,7 +205,13 @@ pub async fn test_provider(Json(req): Json<ProviderTestRequest>) -> Result<Json<
         .timeout(Duration::from_secs(12))
         .user_agent("octopus/0.1")
         .build()
-        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "http_client", e.to_string()))?;
+        .map_err(|e| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "http_client",
+                e.to_string(),
+            )
+        })?;
 
     let start = std::time::Instant::now();
 
@@ -193,7 +238,9 @@ pub async fn test_provider(Json(req): Json<ProviderTestRequest>) -> Result<Json<
                 if let Some(k) = key {
                     crb = crb.bearer_auth(k);
                 }
-                let model_name = req.models.first()
+                let model_name = req
+                    .models
+                    .first()
                     .and_then(|m| m.get("id").and_then(Value::as_str))
                     .unwrap_or("gpt-3.5-turbo");
                 let body = serde_json::json!({
@@ -211,10 +258,14 @@ pub async fn test_provider(Json(req): Json<ProviderTestRequest>) -> Result<Json<
                                 message: "连通正常（Chat Completions 成功）".into(),
                                 latency_ms: Some(latency_ms),
                             }));
-                        } else if cstatus == StatusCode::UNAUTHORIZED || cstatus == StatusCode::FORBIDDEN {
+                        } else if cstatus == StatusCode::UNAUTHORIZED
+                            || cstatus == StatusCode::FORBIDDEN
+                        {
                             return Ok(Json(ProviderTestResponse {
                                 ok: false,
-                                message: format!("认证失败（HTTP {cstatus}）：API Key 无效或未授权"),
+                                message: format!(
+                                    "认证失败（HTTP {cstatus}）：API Key 无效或未授权"
+                                ),
                                 latency_ms: None,
                             }));
                         } else {
@@ -260,4 +311,3 @@ pub async fn test_provider(Json(req): Json<ProviderTestRequest>) -> Result<Json<
         }
     }
 }
-

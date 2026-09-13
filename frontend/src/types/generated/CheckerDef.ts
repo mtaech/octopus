@@ -33,4 +33,17 @@ kind?: CheckKind | null,
 /**
  * 被动判定的基数（缺省 10；D&D 被动察觉 = 10 + 加值）。
  */
-passive_base?: bigint | null, };
+passive_base?: bigint | null, 
+/**
+ * 兼容别名：故事书常写 type: "d20" / type: "d100" 表示骰子家族；
+ * 未显式给 dice 时据此推导（d20 → 1d20）。非骰式类型名（如 attribute）忽略。
+ */
+type?: string | null, 
+/**
+ * 合法判定属性 key 白名单；声明后意图的 attribute 必须命中（否则驳回，不再静默 0 分）。
+ */
+attributes?: Array<string> | null, 
+/**
+ * 判定难度缺省值（意图未给 difficulty 时用它）；再缺省回落 12。
+ */
+default_dc?: bigint | null, };

@@ -31,10 +31,9 @@ const props = defineProps<{ open: boolean }>()
 const emit = defineEmits<{ (e: 'update:open', v: boolean): void }>()
 const store = useSettingsStore()
 
-type RoleKey = 'story' | 'character' | 'pair' | 'embedding'
+type RoleKey = 'story' | 'pair' | 'embedding'
 const ROLES: { key: RoleKey; label: string; desc: string }[] = [
-  { key: 'story', label: '主线 AI', desc: '故事走向、旁白与世界响应' },
-  { key: 'character', label: '角色 AI', desc: '扮演人物言行（可用更便宜的模型）' },
+  { key: 'story', label: 'AI（单一）', desc: '故事走向、旁白、世界响应并扮演所有 NPC' },
   { key: 'pair', label: '结对 AI', desc: '设定构思、启发与结构化建议（用于 AI 结对工作台）' },
   { key: 'embedding', label: 'Embedding', desc: '事件检索向量化（默认本地 bge-small-zh）' },
 ]
@@ -45,6 +44,8 @@ const KIND_DEFAULT_URL: Record<ProviderKind, string> = {
   anthropic: 'https://api.anthropic.com',
   ollama: 'http://127.0.0.1:11434',
   'openai-compatible': '',
+  // 本地 fastembed：由后端内置，无端点
+  'local-embedding': '',
 }
 
 const KINDS: { value: ProviderKind; label: string }[] = [
@@ -52,11 +53,12 @@ const KINDS: { value: ProviderKind; label: string }[] = [
   { value: 'anthropic', label: 'Anthropic' },
   { value: 'ollama', label: 'Ollama（本地）' },
   { value: 'openai-compatible', label: 'OpenAI 兼容端点（DeepSeek / Moonshot / Groq…）' },
+  { value: 'local-embedding', label: '本地 Embedding（fastembed，无需端点）' },
 ]
 
 type SectionKey = 'roles' | 'providers' | 'budget' | 'appearance' | 'about'
 const NAV: { key: SectionKey; label: string; icon: unknown }[] = [
-  { key: 'roles', label: '模型分工', icon: IconRobot },
+  { key: 'roles', label: 'AI 模型', icon: IconRobot },
   { key: 'providers', label: '供应商', icon: IconPlugConnected },
   { key: 'budget', label: '成本护栏', icon: IconCoin },
   { key: 'appearance', label: '外观与主题', icon: IconPalette },
@@ -162,8 +164,8 @@ function ensureRole(key: RoleKey): RoleConfig {
     c.roles[key] = {
       provider_id: fallback,
       model: modelsOf(fallback)[0]?.id || c.roles.story?.model || '',
-      temperature: key === 'character' ? 0.7 : 0.8,
-      max_tokens: key === 'character' ? 2048 : 4096,
+      temperature: 0.8,
+      max_tokens: 4096,
     }
   }
   return c.roles[key]!
@@ -296,14 +298,14 @@ async function removeProvider(p: ProviderConfig) {
   if (!c) return
   const confirmed = await confirm({
     title: '删除供应商「' + p.label + '」？',
-    description: '引用了它的模型分工将回退到第一个供应商。',
+    description: '引用了它的模型配置将回退到第一个供应商。',
     confirmText: '删除',
     destructive: true,
   })
   if (!confirmed) return
   c.providers = c.providers.filter(x => x.id !== p.id)
   const fallback = c.providers[0]?.id ?? ''
-  ;(['story', 'character', 'pair', 'embedding'] as RoleKey[]).forEach(k => {
+  ;(['story', 'pair', 'embedding'] as RoleKey[]).forEach(k => {
     if (c.roles[k]?.provider_id === p.id) {
       c.roles[k]!.provider_id = fallback
       c.roles[k]!.model = modelsOf(fallback)[0]?.id ?? ''
@@ -350,10 +352,10 @@ async function save() { if (await store.save()) close() }
 
         <!-- ============ 右：内容 ============ -->
         <div class="min-h-0 flex-1 overflow-y-auto px-5 py-4">
-          <!-- —— 模型分工 —— -->
+          <!-- —— AI 模型 —— -->
           <template v-if="active === 'roles'">
             <p class="mb-4 text-xs leading-relaxed text-muted-foreground">
-              各类模型分工各自可配。主线用强模型、角色用更具个性的模型、结对用于启发设定建议；模型调用与向量化各自选择运行后端。
+              单一 AI 负责旁白与世界响应并扮演所有 NPC；结对用于启发设定建议；模型调用与向量化各自选择运行后端。
             </p>
 
             <section class="mb-5">
@@ -361,7 +363,7 @@ async function save() { if (await store.save()) close() }
               <div class="divide-y divide-border/60 rounded-xl border border-border bg-card/40 px-3.5">
                 <div class="flex items-center justify-between gap-6 py-2.5">
                   <div class="min-w-0">
-                    <div class="text-[13px] font-semibold">故事 / 角色 AI 后端</div>
+                    <div class="text-[13px] font-semibold">AI 后端</div>
                     <div class="mt-0.5 text-xs text-muted-foreground">rig = 用框架调真实模型；scripted = 确定性脚本（离线 / 测试）</div>
                   </div>
                   <div class="w-52 shrink-0">
@@ -934,8 +936,8 @@ async function save() { if (await store.save()) close() }
                 <span class="text-xs text-muted-foreground">本地配置文件，日志脱敏</span>
               </div>
               <div class="flex items-center justify-between gap-6 py-2.5">
-                <div class="text-[13px] font-semibold">模型分工</div>
-                <span class="text-xs text-muted-foreground">主线 / 角色 / Embedding 三类各自可配</span>
+                <div class="text-[13px] font-semibold">AI 模型</div>
+                <span class="text-xs text-muted-foreground">AI / 结对 / Embedding 各自可配</span>
               </div>
             </div>
           </template>

@@ -29,7 +29,7 @@ interface Group {
 
 const GROUPS: Group[] = [
   { key: 'flags', title: '标记 flags', desc: '条件 flag_set 与「设标记」效果引用这些 key。', keyPlaceholder: 'met_isa', labelPlaceholder: '结识伊莎' },
-  { key: 'events', title: '事件 events', desc: '效果触发器的 event 引用这些 key。', keyPlaceholder: 'scene_change', labelPlaceholder: '场景切换' },
+  { key: 'events', title: '事件 events', desc: '效果触发器的 event 引用这些 key。', keyPlaceholder: 'scene', labelPlaceholder: '场景切换' },
   { key: 'relationship_types', title: '关系类型 relationship_types', desc: '关系边的 type 引用这些 key。', keyPlaceholder: '好感', labelPlaceholder: '好感' },
   { key: 'target_types', title: '目标类型 target_types', desc: '技能 target 引用这些 key。', keyPlaceholder: 'single', labelPlaceholder: '单体' },
 ]

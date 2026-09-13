@@ -3,14 +3,15 @@
 
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Database, DatabaseConnection, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, Database, DatabaseConnection, DbBackend,
+    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
+    TransactionTrait,
 };
 use serde_json::Value;
 
 use octopus_types::{
-    ArchivedCommandRecord, CommandRecord, EventEnvelope, MaintenanceRow, NarrativeOverride, PlayEvent,
-    SaveDetail, SaveListItem, SavePackage,
+    ArchivedCommandRecord, CommandRecord, EventEnvelope, LegacyDefinition, MaintenanceRow,
+    NarrativeOverride, PlayEvent, SaveDetail, SaveListItem, SavePackage,
 };
 use migration::{Migrator, MigratorTrait};
 
@@ -20,11 +21,85 @@ pub fn now_iso() -> String {
     Utc::now().to_rfc3339()
 }
 
+/// 空遗留区不落库（NULL），避免无遗留的存档多出一列无意义空数组。
+fn none_if_empty_legacy(legacy: &[LegacyDefinition]) -> Option<String> {
+    if legacy.is_empty() {
+        None
+    } else {
+        serde_json::to_string(legacy).ok()
+    }
+}
+
+fn parse_legacy(json: Option<&str>) -> Vec<LegacyDefinition> {
+    json.and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default()
+}
+
+/// 由存档行计算列表项：needs_upgrade 由「内嵌版次 < 该故事书当前已发布版次」实时推导，
+/// 而不是信任落库的历史列（故事书随后再次发布时旧列会过期）。沙箱存档不提示升级。
+fn save_item_from_model(m: entities::save::Model, latest_released: Option<u32>) -> SaveListItem {
+    let embedded = m.embedded_revision.max(0) as u32;
+    let latest = latest_released.unwrap_or(embedded);
+    let needs_upgrade = !m.is_sandbox && latest_released.is_some_and(|l| l > embedded);
+    SaveListItem {
+        id: m.id,
+        title: m.title,
+        storybook_id: m.storybook_id,
+        storybook_title: m.storybook_title,
+        embedded_revision: embedded,
+        latest_revision: latest,
+        needs_upgrade,
+        imported: Some(m.imported),
+        is_sandbox: Some(m.is_sandbox),
+        created_at: m.created_at,
+        updated_at: m.updated_at,
+        last_played_at: m.last_played_at,
+    }
+}
+
 /// 从命令日志读回的一条事件，附带该条记录的幂等请求 id。
 #[derive(Debug, Clone)]
 pub struct PersistedEvent {
     pub request_id: Option<String>,
     pub envelope: EventEnvelope,
+}
+
+/// 快照格式版本（#06 ②）：引擎改变 WorldState 形状时 +1，旧版本快照一律作废、回退全量重放。
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+
+/// 每个存档保留的最新快照份数（#06 ②：最新 5 份），写入时同事务裁剪。
+pub const SNAPSHOT_RETENTION: i64 = 5;
+
+/// 一份全量世界状态快照（派生启动缓存，非权威）。state_json 是 OriginCheckpoint 形态。
+#[derive(Debug, Clone)]
+pub struct SnapshotRow {
+    pub seq: i64,
+    pub taken_at: String,
+    pub format_version: u32,
+    pub storybook_revision: u32,
+    pub state_json: String,
+}
+
+impl SnapshotRow {
+    /// 是否可用于本存档：格式版本一致且故事书版次一致，否则视为过期、回退全量重放。
+    pub fn usable_for(&self, storybook_revision: u32) -> bool {
+        self.format_version == SNAPSHOT_FORMAT_VERSION
+            && self.storybook_revision == storybook_revision
+    }
+}
+
+/// 一次版次升级要原子写入的内容（#14 ②）：新内嵌故事书 + 版次 + 遗留区 +
+/// 升级引起的权威事件 + 维护历史。全部在一个事务里，杜绝半升级。
+#[derive(Debug, Clone)]
+pub struct SaveUpgradeWrite {
+    pub storybook: Value,
+    pub storybook_title: String,
+    pub to_revision: u32,
+    pub legacy: Vec<LegacyDefinition>,
+    /// 升级引起的世界状态变更（检查点 + 人物离场等），作为引擎命令进日志。
+    pub events: Vec<EventEnvelope>,
+    pub maintenance_op: String,
+    pub maintenance_summary: String,
 }
 
 /// 待写入的结对会话消息（seq 由存储层分配）。
@@ -107,6 +182,57 @@ pub fn event_kind(event: &PlayEvent) -> &'static str {
     }
 }
 
+/// 是否叙事事件（narrate / dialogue / emote）——只有它们写 FTS / 向量库。
+pub fn is_narrative_event(event: &PlayEvent) -> bool {
+    matches!(
+        event,
+        PlayEvent::Narrate(_) | PlayEvent::Dialogue(_) | PlayEvent::Emote(_)
+    )
+}
+
+/// 叙事事件的可索引正文；其它事件返回 None。
+pub fn narrative_text(event: &PlayEvent) -> Option<String> {
+    match event {
+        PlayEvent::Narrate(p) => Some(p.content.clone()),
+        PlayEvent::Dialogue(p) => Some(p.content.clone()),
+        PlayEvent::Emote(p) => Some(p.content.clone()),
+        _ => None,
+    }
+}
+
+/// 把 commands 行解码成 (seq, round, kind, text)：无法解析 / 非叙事 / 空文本的行跳过。
+fn decode_narrative_rows(rows: Vec<entities::command::Model>) -> Vec<(i64, u32, String, String)> {
+    let mut out = Vec::with_capacity(rows.len());
+    for m in rows {
+        let Ok(env) = serde_json::from_str::<EventEnvelope>(&m.payload_json) else {
+            continue;
+        };
+        if let Some(text) = narrative_text(&env.event) {
+            if !text.trim().is_empty() {
+                out.push((m.seq, m.round.max(0) as u32, m.kind, text));
+            }
+        }
+    }
+    out
+}
+
+/// 摘要派生索引的 seq 命名空间（#05 §3.2/§3.3）：用**负数**与命令日志的正 seq 区分。
+///
+/// 摘要不在命令日志里，没有权威 seq；但 FTS5 / 向量索引都按 (save_id, seq) 定位，
+/// 所以给它们编一套稳定、可重建、且不与正 seq 冲突的编号。检索回填时按同一规则反解，
+/// 于是「摘要也进索引」不需要在检索器里加特判。
+const SCENE_SUMMARY_SEQ_BASE: i64 = 1_000_000_000;
+
+/// 回合微摘要的派生 seq：round 1 → -2、round 2 → -3…（round 0 不用，故 seq 恒 < 0）。
+fn round_summary_seq(round: u32) -> i64 {
+    -(round as i64) - 1
+}
+
+/// 场景摘要的派生 seq：id 是 scene_summaries 的自增主键，落在 -1e9 之外，避开回合区间。
+fn scene_summary_seq(id: i64) -> i64 {
+    -(SCENE_SUMMARY_SEQ_BASE + id)
+}
+
 #[derive(Debug, Clone)]
 pub struct StorybookRow {
     pub id: String,
@@ -143,10 +269,32 @@ impl SqliteStore {
         let mut opt = sea_orm::ConnectOptions::new(url);
         opt.max_connections(5);
         let db = Database::connect(opt).await?;
+        // WAL（#27 ⑥）：单库单写者 + 崩溃恢复。journal_mode 是库级持久设置，
+        // 在连接池任一连线上设置一次即对整库生效。
+        Self::enable_wal(&db).await;
         Self::run_migrations(&db).await?;
         let store = Self { db };
         store.seed_if_empty().await?;
         Ok(store)
+    }
+
+    /// 开启 SQLite WAL。内存库不支持（journal_mode=memory），只记录实际模式，不报错。
+    async fn enable_wal(db: &DatabaseConnection) {
+        let stmt = Statement::from_string(DbBackend::Sqlite, "PRAGMA journal_mode=WAL".to_string());
+        match db.query_one(stmt).await {
+            Ok(Some(row)) => {
+                let mode: String = row.try_get("", "journal_mode").unwrap_or_default();
+                if mode.eq_ignore_ascii_case("wal") {
+                    tracing::debug!("SQLite journal_mode=WAL 已开启");
+                } else {
+                    tracing::warn!(mode = %mode, "SQLite 未进入 WAL（内存库或不支持，可忽略）");
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "开启 SQLite WAL 失败，继续以默认 journal_mode 运行")
+            }
+        }
     }
 
     /// 仅内存（测试 / 冒烟用）。
@@ -479,6 +627,7 @@ impl SqliteStore {
             model: Set(None),
             reasoning_effort: Set(None),
             narrative_json: Set(None),
+            legacy_json: Set(none_if_empty_legacy(&d.legacy)),
             created_at: Set(d.item.created_at.clone()),
             updated_at: Set(d.item.updated_at.clone()),
             last_played_at: Set(d.item.last_played_at.clone()),
@@ -492,79 +641,71 @@ impl SqliteStore {
             .order_by_desc(entities::save::Column::LastPlayedAt)
             .all(&self.db)
             .await?;
+        // 版次升级提示必须反映「故事书当前已发布版次」，而不是建档时写死的列。
+        let latest = self.released_revision_map().await?;
         let list = rows
             .into_iter()
-            .map(|m| SaveListItem {
-                id: m.id,
-                title: m.title,
-                storybook_id: m.storybook_id,
-                storybook_title: m.storybook_title,
-                embedded_revision: m.embedded_revision as u32,
-                latest_revision: m.latest_revision as u32,
-                needs_upgrade: m.needs_upgrade,
-                imported: Some(m.imported),
-                is_sandbox: Some(m.is_sandbox),
-                created_at: m.created_at,
-                updated_at: m.updated_at,
-                last_played_at: m.last_played_at,
+            .map(|m| {
+                let l = latest.get(&m.storybook_id).copied();
+                save_item_from_model(m, l)
             })
             .collect();
         Ok(list)
+    }
+
+    /// 所有已发布故事书的 id -> 当前版次。用于批量计算 needs_upgrade。
+    async fn released_revision_map(
+        &self,
+    ) -> Result<std::collections::HashMap<String, u32>, EngineError> {
+        let rows = entities::storybook::Entity::find()
+            .filter(entities::storybook::Column::ReleasedJson.is_not_null())
+            .all(&self.db)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.id, r.revision.max(0) as u32))
+            .collect())
     }
 
     pub async fn get_save(&self, id: &str) -> Result<Option<SaveDetail>, EngineError> {
         let model = entities::save::Entity::find_by_id(id.to_string())
             .one(&self.db)
             .await?;
-        Ok(model.map(|m| {
-            let mut storybook: Value = serde_json::from_str(&m.storybook_json).unwrap_or(Value::Null);
-            // 存档内嵌冻结故事书：读旧格式时升格
-            crate::upcast::upcast_storybook(&mut storybook);
-            let item = SaveListItem {
-                id: m.id,
-                title: m.title,
-                storybook_id: m.storybook_id,
-                storybook_title: m.storybook_title,
-                embedded_revision: m.embedded_revision as u32,
-                latest_revision: m.latest_revision as u32,
-                needs_upgrade: m.needs_upgrade,
-                imported: Some(m.imported),
-                is_sandbox: Some(m.is_sandbox),
-                created_at: m.created_at,
-                updated_at: m.updated_at,
-                last_played_at: m.last_played_at,
-            };
-            SaveDetail { item, storybook }
-        }))
+        let Some(m) = model else {
+            return Ok(None);
+        };
+        // 目标已发布版次：故事书被删除 / 未发布时无升级目标。
+        let latest_released = self
+            .get_storybook(&m.storybook_id)
+            .await?
+            .filter(|sb| sb.published)
+            .map(|sb| sb.revision);
+        let legacy = parse_legacy(m.legacy_json.as_deref());
+        let mut storybook: Value = serde_json::from_str(&m.storybook_json).unwrap_or(Value::Null);
+        // 存档内嵌冻结故事书：读旧格式时升格
+        crate::upcast::upcast_storybook(&mut storybook);
+        let item = save_item_from_model(m, latest_released);
+        Ok(Some(SaveDetail { item, storybook, legacy }))
     }
 
     pub async fn rename_save(&self, id: &str, title: &str) -> Result<Option<SaveListItem>, EngineError> {
         let model = entities::save::Entity::find_by_id(id.to_string())
             .one(&self.db)
             .await?;
-        if let Some(m) = model {
-            let now = now_iso();
-            let mut active: entities::save::ActiveModel = m.into();
-            active.title = Set(title.to_string());
-            active.updated_at = Set(now);
-            let updated = active.update(&self.db).await?;
-            Ok(Some(SaveListItem {
-                id: updated.id,
-                title: updated.title,
-                storybook_id: updated.storybook_id,
-                storybook_title: updated.storybook_title,
-                embedded_revision: updated.embedded_revision as u32,
-                latest_revision: updated.latest_revision as u32,
-                needs_upgrade: updated.needs_upgrade,
-                imported: Some(updated.imported),
-                is_sandbox: Some(updated.is_sandbox),
-                created_at: updated.created_at,
-                updated_at: updated.updated_at,
-                last_played_at: updated.last_played_at,
-            }))
-        } else {
-            Ok(None)
-        }
+        let Some(m) = model else {
+            return Ok(None);
+        };
+        let latest_released = self
+            .get_storybook(&m.storybook_id)
+            .await?
+            .filter(|sb| sb.published)
+            .map(|sb| sb.revision);
+        let now = now_iso();
+        let mut active: entities::save::ActiveModel = m.into();
+        active.title = Set(title.to_string());
+        active.updated_at = Set(now);
+        let updated = active.update(&self.db).await?;
+        Ok(Some(save_item_from_model(updated, latest_released)))
     }
 
     pub async fn delete_save(&self, id: &str) -> Result<bool, EngineError> {
@@ -576,8 +717,18 @@ impl SqliteStore {
             .filter(entities::command::Column::SaveId.eq(save_id.clone()))
             .exec(&self.db)
             .await?;
+        // 归档日志随存档一并删除：新原点 / 重跑留下的只读归档不应成为孤儿。
+        entities::archived_command::Entity::delete_many()
+            .filter(entities::archived_command::Column::SaveId.eq(save_id.clone()))
+            .exec(&self.db)
+            .await?;
         entities::maintenance::Entity::delete_many()
-            .filter(entities::maintenance::Column::SaveId.eq(save_id))
+            .filter(entities::maintenance::Column::SaveId.eq(save_id.clone()))
+            .exec(&self.db)
+            .await?;
+        // 快照是派生缓存，随存档一并删除，不留孤儿。
+        entities::snapshot::Entity::delete_many()
+            .filter(entities::snapshot::Column::SaveId.eq(save_id))
             .exec(&self.db)
             .await?;
         Ok(res.rows_affected > 0)
@@ -658,6 +809,61 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// 读取某存档的追加式模型会话快照；无记录 / 解析失败返回空。
+    ///
+    /// 派生数据：失败只当「没有历史」，绝不阻断回合。
+    pub async fn load_ai_conversation(
+        &self,
+        save_id: &str,
+    ) -> Result<Vec<crate::ports::ConvRecord>, EngineError> {
+        let rows = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT messages_json FROM ai_conversations WHERE save_id = ?",
+                [save_id.to_string().into()],
+            ))
+            .await?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(Vec::new());
+        };
+        let json: String = row.try_get("", "messages_json")?;
+        Ok(serde_json::from_str(&json).unwrap_or_default())
+    }
+
+    /// 覆盖写入某存档的模型会话快照（每存档一行）。
+    pub async fn save_ai_conversation(
+        &self,
+        save_id: &str,
+        records: &[crate::ports::ConvRecord],
+    ) -> Result<(), EngineError> {
+        let json = serde_json::to_string(records).unwrap_or_else(|_| "[]".to_string());
+        self.db
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO ai_conversations (save_id, messages_json, updated_at) VALUES (?, ?, ?)                  ON CONFLICT(save_id) DO UPDATE SET messages_json = excluded.messages_json,                  updated_at = excluded.updated_at",
+                [
+                    save_id.to_string().into(),
+                    json.into(),
+                    now_iso().into(),
+                ],
+            ))
+            .await?;
+        Ok(())
+    }
+
+    /// 删除某存档的模型会话快照（新原点 / 升级 / 导入 / 删除时清理）。
+    pub async fn clear_ai_conversation(&self, save_id: &str) -> Result<(), EngineError> {
+        self.db
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "DELETE FROM ai_conversations WHERE save_id = ?",
+                [save_id.to_string().into()],
+            ))
+            .await?;
+        Ok(())
+    }
+
     pub async fn touch_save(&self, id: &str) -> Result<(), EngineError> {
         if let Some(m) = entities::save::Entity::find_by_id(id.to_string()).one(&self.db).await? {
             let now = now_iso();
@@ -731,7 +937,169 @@ impl SqliteStore {
         Ok(count)
     }
 
+    /// 原子执行一次版次升级：换内嵌故事书 + 写升级事件 + 记维护历史。
+    ///
+    /// 返回 false 表示事务内发现存档已到达 / 超过目标版次（并发或重复执行），
+    /// 此时不做任何写入——升级幂等。
+    pub async fn apply_save_upgrade(
+        &self,
+        save_id: &str,
+        w: &SaveUpgradeWrite,
+    ) -> Result<bool, EngineError> {
+        let save_id_owned = save_id.to_string();
+        let storybook_json =
+            serde_json::to_string(&w.storybook).unwrap_or_else(|_| "{}".to_string());
+        let legacy_json = none_if_empty_legacy(&w.legacy);
+        let events = w.events.clone();
+        let to_revision = w.to_revision;
+        let storybook_title = w.storybook_title.clone();
+        let maintenance_op = w.maintenance_op.clone();
+        let maintenance_summary = w.maintenance_summary.clone();
+        self.db
+            .transaction::<_, bool, EngineError>(|txn| {
+                let save_id = save_id_owned.clone();
+                let storybook_json = storybook_json.clone();
+                let legacy_json = legacy_json.clone();
+                let events = events.clone();
+                let storybook_title = storybook_title.clone();
+                let maintenance_op = maintenance_op.clone();
+                let maintenance_summary = maintenance_summary.clone();
+                Box::pin(async move {
+                    let Some(model) = entities::save::Entity::find_by_id(save_id.clone())
+                        .one(txn)
+                        .await?
+                    else {
+                        return Err(EngineError::SaveNotFound(save_id));
+                    };
+                    if model.embedded_revision >= to_revision as i64 {
+                        return Ok(false); // 已升级：幂等无操作
+                    }
+                    let mut active: entities::save::ActiveModel = model.into();
+                    active.storybook_json = Set(storybook_json);
+                    active.storybook_title = Set(storybook_title);
+                    active.embedded_revision = Set(to_revision as i64);
+                    active.latest_revision = Set(to_revision as i64);
+                    active.needs_upgrade = Set(false);
+                    active.legacy_json = Set(legacy_json);
+                    active.updated_at = Set(now_iso());
+                    active.update(txn).await?;
+
+                    for env in &events {
+                        let payload_json =
+                            serde_json::to_string(env).unwrap_or_else(|_| "{}".to_string());
+                        let cmd = entities::command::ActiveModel {
+                            id: sea_orm::ActiveValue::NotSet,
+                            save_id: Set(save_id.clone()),
+                            seq: Set(env.seq as i64),
+                            round: Set(env.round as i64),
+                            kind: Set(event_kind(&env.event).to_string()),
+                            payload_json: Set(payload_json),
+                            ts: Set(env.ts.clone()),
+                            request_id: Set(None),
+                        };
+                        cmd.insert(txn).await?;
+                    }
+
+                    let m = entities::maintenance::ActiveModel {
+                        id: sea_orm::ActiveValue::NotSet,
+                        save_id: Set(save_id.clone()),
+                        at: Set(now_iso()),
+                        op: Set(maintenance_op),
+                        summary: Set(maintenance_summary),
+                    };
+                    m.insert(txn).await?;
+                    Ok(true)
+                })
+            })
+            .await
+            .map_err(|e| match e {
+                sea_orm::TransactionError::Connection(db_err) => EngineError::from(db_err),
+                sea_orm::TransactionError::Transaction(engine_err) => engine_err,
+            })
+    }
+
+    /// 新原点（#14 ④ 修订 / 决策 3）：以 checkpoint 为新起点，把 seq 更小的旧日志
+    /// 全部移入库内只读归档表，并记维护历史。返回归档条数。
+    ///
+    /// 检查点本身留在活日志（携带全量状态），因此重放正确性与世界状态都保住；
+    /// 归档 + 检查点 + 维护历史在同一事务，崩溃不会留下半压缩状态。
+    pub async fn new_origin(
+        &self,
+        save_id: &str,
+        checkpoint: &EventEnvelope,
+        summary: &str,
+    ) -> Result<u64, EngineError> {
+        let save_id_owned = save_id.to_string();
+        let checkpoint = checkpoint.clone();
+        let summary = summary.to_string();
+        self.db
+            .transaction::<_, u64, EngineError>(|txn| {
+                let save_id = save_id_owned.clone();
+                let checkpoint = checkpoint.clone();
+                let summary = summary.clone();
+                Box::pin(async move {
+                    let origin_seq = checkpoint.seq as i64;
+                    let payload_json =
+                        serde_json::to_string(&checkpoint).unwrap_or_else(|_| "{}".to_string());
+                    let cmd = entities::command::ActiveModel {
+                        id: sea_orm::ActiveValue::NotSet,
+                        save_id: Set(save_id.clone()),
+                        seq: Set(origin_seq),
+                        round: Set(checkpoint.round as i64),
+                        kind: Set(event_kind(&checkpoint.event).to_string()),
+                        payload_json: Set(payload_json),
+                        ts: Set(checkpoint.ts.clone()),
+                        request_id: Set(None),
+                    };
+                    cmd.insert(txn).await?;
+
+                    let rows = entities::command::Entity::find()
+                        .filter(entities::command::Column::SaveId.eq(save_id.clone()))
+                        .filter(entities::command::Column::Seq.lt(origin_seq))
+                        .all(txn)
+                        .await?;
+                    let count = rows.len() as u64;
+                    for m in &rows {
+                        let arch = entities::archived_command::ActiveModel {
+                            id: sea_orm::ActiveValue::NotSet,
+                            save_id: Set(m.save_id.clone()),
+                            origin_seq: Set(origin_seq),
+                            seq: Set(m.seq),
+                            round: Set(m.round),
+                            kind: Set(m.kind.clone()),
+                            payload_json: Set(m.payload_json.clone()),
+                            ts: Set(m.ts.clone()),
+                        };
+                        arch.insert(txn).await?;
+                    }
+                    entities::command::Entity::delete_many()
+                        .filter(entities::command::Column::SaveId.eq(save_id.clone()))
+                        .filter(entities::command::Column::Seq.lt(origin_seq))
+                        .exec(txn)
+                        .await?;
+
+                    let m = entities::maintenance::ActiveModel {
+                        id: sea_orm::ActiveValue::NotSet,
+                        save_id: Set(save_id.clone()),
+                        at: Set(now_iso()),
+                        op: Set("压缩为新原点".to_string()),
+                        summary: Set(summary),
+                    };
+                    m.insert(txn).await?;
+                    Ok(count)
+                })
+            })
+            .await
+            .map_err(|e| match e {
+                sea_orm::TransactionError::Connection(db_err) => EngineError::from(db_err),
+                sea_orm::TransactionError::Transaction(engine_err) => engine_err,
+            })
+    }
+
     /// 追加一条演出事件到命令日志（权威条目，payload 为完整 `EventEnvelope` JSON）。
+    ///
+    /// 叙事事件（narrate / dialogue / emote）在**同一事务**内写一行 events_fts，
+    /// 保证关键词索引与权威日志不会漂移（索引失败即整条写入失败）。
     pub async fn append_event(
         &self,
         save_id: &str,
@@ -741,18 +1109,290 @@ impl SqliteStore {
             PlayEvent::RoundStart(p) => p.request_id.clone(),
             _ => None,
         };
+        let kind = event_kind(&env.event);
         let payload_json = serde_json::to_string(env)?;
         let active = entities::command::ActiveModel {
             id: sea_orm::ActiveValue::NotSet,
             save_id: Set(save_id.to_string()),
             seq: Set(env.seq as i64),
             round: Set(env.round as i64),
-            kind: Set(event_kind(&env.event).to_string()),
+            kind: Set(kind.to_string()),
             payload_json: Set(payload_json),
             ts: Set(env.ts.clone()),
             request_id: Set(request_id),
         };
-        active.insert(&self.db).await?;
+        let txn = self.db.begin().await?;
+        active.insert(&txn).await?;
+        if let Some(text) = narrative_text(&env.event) {
+            // 写入前先做 CJK 逐字分词（unicode61 否则把整段中文当一个词，子串查不中）。
+            let indexed = crate::text_index::index_text(&text);
+            if !indexed.is_empty() {
+                txn.execute(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "INSERT INTO events_fts (save_id, seq, kind, text) VALUES (?, ?, ?, ?)",
+                    [
+                        save_id.to_string().into(),
+                        (env.seq as i64).into(),
+                        kind.to_string().into(),
+                        indexed.into(),
+                    ],
+                ))
+                .await?;
+            }
+        }
+        txn.commit().await?;
+        Ok(())
+    }
+
+    /// FTS5 关键词检索（#05）：BM25 排序取 K，按 save_id 隔离。
+    ///
+    /// `query` 是**原始查询文本**（不是 FTS5 语法）：内部用 `text_index::match_expression`
+    /// 归一为 CJK 短语 + 拉丁词项，与写入时的分词保持一致（中文两字子串因此可命中）。
+    /// 返回 (seq, bm25 原始分)；SQLite 的 bm25() 越小越相关（负分），调用方按升序即得最优。
+    pub async fn search_events_fts(
+        &self,
+        save_id: &str,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<(i64, f32)>, EngineError> {
+        if query.trim().is_empty() || k == 0 {
+            return Ok(Vec::new());
+        }
+        // 没有可检索 token（纯标点 / 空白）时直接返回空，避免拼出非法 MATCH。
+        let Some(match_expr) = crate::text_index::match_expression(query) else {
+            return Ok(Vec::new());
+        };
+        let rows = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT seq, bm25(events_fts) AS score FROM events_fts \
+                 WHERE save_id = ? AND events_fts MATCH ? ORDER BY score LIMIT ?",
+                [
+                    save_id.to_string().into(),
+                    match_expr.into(),
+                    (k as i64).into(),
+                ],
+            ))
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let seq: i64 = row.try_get("", "seq")?;
+            let score: f64 = row.try_get("", "score")?;
+            out.push((seq, score as f32));
+        }
+        Ok(out)
+    }
+
+    /// 读某存档的可索引正文（叙事事件 + 派生摘要），按 seq 升序，供重建向量索引。
+    ///
+    /// 叙事来自权威 commands 表，摘要来自派生表；都不读 FTS / 向量库本身。
+    /// 空文本跳过，返回 (seq, round, kind, text)；摘要用负数派生 seq（kind 可区分）。
+    pub async fn load_narrative_events(
+        &self,
+        save_id: &str,
+    ) -> Result<Vec<(i64, u32, String, String)>, EngineError> {
+        let rows = entities::command::Entity::find()
+            .filter(entities::command::Column::SaveId.eq(save_id.to_string()))
+            .filter(entities::command::Column::Kind.is_in(vec!["narrate", "dialogue", "emote"]))
+            .order_by_asc(entities::command::Column::Seq)
+            .all(&self.db)
+            .await?;
+        let mut out = decode_narrative_rows(rows);
+        // 摘要也是可检索的派生记忆（kind = summary / scene_summary），一并纳入重建。
+        out.extend(self.load_summary_rows(save_id, None).await?);
+        out.sort_by_key(|(seq, _, _, _)| *seq);
+        Ok(out)
+    }
+
+    /// 按 seq 精确回填可索引正文（叙事事件正 seq + 摘要负 seq）。
+    ///
+    /// 与 `load_narrative_events` 同源，空 seqs 直接返回空。负 seq 命中派生摘要表。
+    pub async fn load_narrative_events_by_seqs(
+        &self,
+        save_id: &str,
+        seqs: &[i64],
+    ) -> Result<Vec<(i64, u32, String, String)>, EngineError> {
+        if seqs.is_empty() {
+            return Ok(Vec::new());
+        }
+        // 命令日志只可能命中正 seq；摘要命中负 seq（同一命名规则，见文件顶部编码）。
+        let positive: Vec<i64> = seqs.iter().copied().filter(|s| *s > 0).collect();
+        let negative: Vec<i64> = seqs.iter().copied().filter(|s| *s < 0).collect();
+        let mut out = Vec::new();
+        if !positive.is_empty() {
+            let rows = entities::command::Entity::find()
+                .filter(entities::command::Column::SaveId.eq(save_id.to_string()))
+                .filter(entities::command::Column::Kind.is_in(vec!["narrate", "dialogue", "emote"]))
+                .filter(entities::command::Column::Seq.is_in(positive))
+                .all(&self.db)
+                .await?;
+            out.extend(decode_narrative_rows(rows));
+        }
+        if !negative.is_empty() {
+            out.extend(self.load_summary_rows(save_id, Some(&negative)).await?);
+        }
+        Ok(out)
+    }
+
+    /// 读某存档的摘要行 (seq, round, kind, text)，供检索回填与索引重建。
+    ///
+    /// seq 用与写入一致的负数编码反解；only 给定时只返回命中的 seq（检索路径），
+    /// None 表示全量（重建路径）。只读派生表，不触任何权威状态。
+    async fn load_summary_rows(
+        &self,
+        save_id: &str,
+        only: Option<&[i64]>,
+    ) -> Result<Vec<(i64, u32, String, String)>, EngineError> {
+        let mut out = Vec::new();
+        let want = |seq: i64| only.is_none_or(|s| s.contains(&seq));
+        let rows = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT round, text FROM round_summaries WHERE save_id = ?",
+                [save_id.to_string().into()],
+            ))
+            .await?;
+        for row in rows {
+            let round: i64 = row.try_get("", "round")?;
+            let text: String = row.try_get("", "text")?;
+            let seq = round_summary_seq(round.max(0) as u32);
+            if want(seq) && !text.trim().is_empty() {
+                out.push((seq, round.max(0) as u32, "summary".to_string(), text));
+            }
+        }
+        let rows = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT id, round, text FROM scene_summaries WHERE save_id = ?",
+                [save_id.to_string().into()],
+            ))
+            .await?;
+        for row in rows {
+            let id: i64 = row.try_get("", "id")?;
+            let round: i64 = row.try_get("", "round")?;
+            let text: String = row.try_get("", "text")?;
+            let seq = scene_summary_seq(id);
+            if want(seq) && !text.trim().is_empty() {
+                out.push((seq, round.max(0) as u32, "scene_summary".to_string(), text));
+            }
+        }
+        Ok(out)
+    }
+
+    /// 写入 / 覆盖回合微摘要，并同事务刷新它的 FTS 行；返回派生 seq。
+    ///
+    /// 只写派生数据：调用方（Session）对错误只 warn。向量索引由组合根 best-effort 异步补。
+    pub async fn upsert_round_summary(
+        &self,
+        save_id: &str,
+        round: u32,
+        text: &str,
+    ) -> Result<i64, EngineError> {
+        let seq = round_summary_seq(round);
+        let txn = self.db.begin().await?;
+        txn.execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO round_summaries (save_id, round, text) VALUES (?, ?, ?) \
+             ON CONFLICT(save_id, round) DO UPDATE SET text = excluded.text",
+            [save_id.to_string().into(), (round as i64).into(), text.to_string().into()],
+        ))
+        .await?;
+        Self::write_summary_fts(&txn, save_id, seq, "summary", text).await?;
+        txn.commit().await?;
+        Ok(seq)
+    }
+
+    /// 写入 / 覆盖场景摘要，并同事务刷新它的 FTS 行；返回派生 seq。
+    pub async fn upsert_scene_summary(
+        &self,
+        save_id: &str,
+        scene_id: &str,
+        round: u32,
+        text: &str,
+    ) -> Result<i64, EngineError> {
+        let txn = self.db.begin().await?;
+        txn.execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO scene_summaries (save_id, scene_id, round, text) VALUES (?, ?, ?, ?) \
+             ON CONFLICT(save_id, scene_id) DO UPDATE SET round = excluded.round, text = excluded.text",
+            [
+                save_id.to_string().into(),
+                scene_id.to_string().into(),
+                (round as i64).into(),
+                text.to_string().into(),
+            ],
+        ))
+        .await?;
+        // ON CONFLICT 保留原 id，故同一场景重写时派生 seq 稳定，FTS 行被原地替换。
+        let row = txn
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT id FROM scene_summaries WHERE save_id = ? AND scene_id = ?",
+                [save_id.to_string().into(), scene_id.to_string().into()],
+            ))
+            .await?
+            .ok_or_else(|| EngineError::Storage("场景摘要写入后读不到 id".into()))?;
+        let id: i64 = row.try_get("", "id")?;
+        let seq = scene_summary_seq(id);
+        Self::write_summary_fts(&txn, save_id, seq, "scene_summary", text).await?;
+        txn.commit().await?;
+        Ok(seq)
+    }
+
+    /// 读回 round > after_round 的微摘要（场景压缩输入），按 round 升序。
+    pub async fn round_summaries_after(
+        &self,
+        save_id: &str,
+        after_round: u32,
+    ) -> Result<Vec<(u32, String)>, EngineError> {
+        let rows = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT round, text FROM round_summaries WHERE save_id = ? AND round > ? ORDER BY round ASC",
+                [save_id.to_string().into(), (after_round as i64).into()],
+            ))
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let round: i64 = row.try_get("", "round")?;
+            let text: String = row.try_get("", "text")?;
+            out.push((round.max(0) as u32, text));
+        }
+        Ok(out)
+    }
+
+    /// 用同一份 CJK 分词刷新一条摘要的 FTS 行（先删后插，覆盖旧文本；空文本不留行）。
+    async fn write_summary_fts<C: ConnectionTrait>(
+        conn: &C,
+        save_id: &str,
+        seq: i64,
+        kind: &str,
+        text: &str,
+    ) -> Result<(), EngineError> {
+        conn.execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM events_fts WHERE save_id = ? AND seq = ?",
+            [save_id.to_string().into(), seq.into()],
+        ))
+        .await?;
+        let indexed = crate::text_index::index_text(text);
+        if !indexed.is_empty() {
+            conn.execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO events_fts (save_id, seq, kind, text) VALUES (?, ?, ?, ?)",
+                [
+                    save_id.to_string().into(),
+                    seq.into(),
+                    kind.to_string().into(),
+                    indexed.into(),
+                ],
+            ))
+            .await?;
+        }
         Ok(())
     }
 
@@ -791,6 +1431,79 @@ impl SqliteStore {
             }
         }
         Ok(out)
+    }
+
+
+    /// 写入一份全量世界状态快照，并在**同一事务**内裁剪到最新 SNAPSHOT_RETENTION 份（#06 ②）。
+    ///
+    /// 快照是派生缓存：写失败由调用方只 warn，不影响权威回合。 (save_id, seq) 唯一，
+    /// 同一序号重复手动存档覆盖旧快照而非堆积。
+    pub async fn put_snapshot(
+        &self,
+        save_id: &str,
+        seq: i64,
+        storybook_revision: u32,
+        state_json: &str,
+    ) -> Result<(), EngineError> {
+        let save_id = save_id.to_string();
+        let state_json = state_json.to_string();
+        self.db
+            .transaction::<_, (), EngineError>(|txn| {
+                let save_id = save_id.clone();
+                let state_json = state_json.clone();
+                Box::pin(async move {
+                    txn.execute(Statement::from_sql_and_values(
+                        DbBackend::Sqlite,
+                        "INSERT OR REPLACE INTO snapshots \
+                         (save_id, seq, taken_at, format_version, storybook_revision, state_json) \
+                         VALUES (?, ?, ?, ?, ?, ?)",
+                        [
+                            save_id.clone().into(),
+                            seq.into(),
+                            now_iso().into(),
+                            (SNAPSHOT_FORMAT_VERSION as i64).into(),
+                            (storybook_revision as i64).into(),
+                            state_json.into(),
+                        ],
+                    ))
+                    .await?;
+                    // 保留最新 N 份：按 seq 降序取前 N 个 seq，其余删除。
+                    txn.execute(Statement::from_sql_and_values(
+                        DbBackend::Sqlite,
+                        "DELETE FROM snapshots WHERE save_id = ? AND seq NOT IN (\
+                           SELECT seq FROM snapshots WHERE save_id = ? \
+                           ORDER BY seq DESC LIMIT ?)",
+                        [
+                            save_id.clone().into(),
+                            save_id.into(),
+                            SNAPSHOT_RETENTION.into(),
+                        ],
+                    ))
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .map_err(|e| match e {
+                sea_orm::TransactionError::Connection(db_err) => EngineError::from(db_err),
+                sea_orm::TransactionError::Transaction(engine_err) => engine_err,
+            })
+    }
+
+    /// 读某存档最新的一份快照（按 seq 降序）；没有则 None（启动回退全量重放）。
+    pub async fn latest_snapshot(&self, save_id: &str) -> Result<Option<SnapshotRow>, EngineError> {
+        let row = entities::snapshot::Entity::find()
+            .filter(entities::snapshot::Column::SaveId.eq(save_id.to_string()))
+            .order_by_desc(entities::snapshot::Column::Seq)
+            .one(&self.db)
+            .await?;
+        Ok(row.map(|m| SnapshotRow {
+            seq: m.seq,
+            taken_at: m.taken_at,
+            format_version: m.format_version.max(0) as u32,
+            storybook_revision: m.storybook_revision.max(0) as u32,
+            state_json: m.state_json,
+        }))
     }
 
     pub async fn append_maintenance(&self, save_id: &str, op: &str, summary: &str) -> Result<(), EngineError> {
@@ -1190,7 +1903,8 @@ impl SqliteStore {
                         model_provider_id: Set(None),
                         model: Set(None),
                         reasoning_effort: Set(None),
-                        narrative_json: Set(None),
+                                    narrative_json: Set(None),
+                        legacy_json: Set(none_if_empty_legacy(&detail_to_save.legacy)),
                         created_at: Set(detail_to_save.item.created_at.clone()),
                         updated_at: Set(now.clone()),
                         last_played_at: Set(detail_to_save.item.last_played_at.clone()),
@@ -1258,13 +1972,18 @@ impl SqliteStore {
                 sea_orm::TransactionError::Transaction(engine_err) => engine_err,
             })?;
 
-        Ok(detail.item)
+        // 导入后按目标环境的故事书重新计算 needs_upgrade（包里的列可能已过期）。
+        self.get_save(&new_id)
+            .await?
+            .map(|d| d.item)
+            .ok_or_else(|| EngineError::Internal("导入后读取存档失败".to_string()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use octopus_types::{DeltaDomain, DeltaOp, StateDelta, StateUpdatePayload};
     use serde_json::json;
 
     #[tokio::test]
@@ -1451,6 +2170,7 @@ mod tests {
                 last_played_at: now_iso(),
             },
             storybook: json!({ "meta": { "title": "故事书1" } }),
+            legacy: Vec::new(),
         };
 
         store.insert_save(&detail, true).await.unwrap();
@@ -1534,6 +2254,7 @@ mod tests {
                 last_played_at: now_iso(),
             },
             storybook: json!({ "meta": { "title": "测试" } }),
+            legacy: Vec::new(),
         };
         store.insert_save(&detail, false).await.unwrap();
         assert_eq!(store.get_save_model("sv-model").await.unwrap(), (None, None, None));
@@ -1574,6 +2295,7 @@ mod tests {
                 last_played_at: now_iso(),
             },
             storybook: json!({ "meta": { "title": "测试故事书" } }),
+            legacy: Vec::new(),
         };
         store1.insert_save(&detail, false).await.unwrap();
         store1
@@ -1609,5 +2331,364 @@ mod tests {
         let imported_again = store2.import_save_package(&pkg).await.unwrap();
         assert_ne!(imported_again.id, "sv-test-pkg");
         assert!(imported_again.title.contains("(导入)"));
+    }
+
+    fn narrate(seq: u64, text: &str) -> EventEnvelope {
+        EventEnvelope {
+            id: format!("ev-{seq}"),
+            seq,
+            round: 1,
+            ts: now_iso(),
+            actor: None,
+            intent_id: None,
+            event: PlayEvent::Narrate(octopus_types::NarratePayload {
+                content: text.to_string(),
+                scene_ref: None,
+            }),
+        }
+    }
+
+    /// #05/#27 M2：叙事事件落库时同事务写 FTS5，MATCH 命中且按 save_id 隔离。
+    #[tokio::test]
+    async fn test_events_fts_write_and_match_is_scoped_by_save_id() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        // 写入时会做 CJK 逐字分词，这里验证关键词命中与 save_id 隔离。
+        store.append_event("sv-a", &narrate(1, "月光 古堡 阴森")).await.unwrap();
+        store.append_event("sv-a", &narrate(2, "铁匠 打铁 炉火")).await.unwrap();
+        store.append_event("sv-b", &narrate(1, "月光 森林 静谧")).await.unwrap();
+        // 非叙事事件不写 FTS：reasoning 不应被关键词检索命中。
+        store
+            .append_event(
+                "sv-a",
+                &EventEnvelope {
+                    id: "ev-r".into(),
+                    seq: 3,
+                    round: 1,
+                    ts: now_iso(),
+                    actor: None,
+                    intent_id: None,
+                    event: PlayEvent::Reasoning(octopus_types::ReasoningPayload {
+                        stage: "story_thinking".into(),
+                        text: "月光".into(),
+                        source: "provider".into(),
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        // MATCH「古堡」只命中 sv-a 的第 1 条；reasoning 提到「月光」也不算。
+        let hits = store.search_events_fts("sv-a", "古堡", 10).await.unwrap();
+        assert_eq!(hits.iter().map(|(s, _)| *s).collect::<Vec<_>>(), vec![1]);
+        let hits_moon = store.search_events_fts("sv-a", "月光", 10).await.unwrap();
+        assert_eq!(hits_moon.iter().map(|(s, _)| *s).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(store.search_events_fts("sv-a", "森林", 10).await.unwrap().len(), 0);
+
+        // 同词在 sv-b 只命中 sv-b 自己的事件（按 save_id 隔离）。
+        let hits_b = store.search_events_fts("sv-b", "森林", 10).await.unwrap();
+        assert_eq!(hits_b.iter().map(|(s, _)| *s).collect::<Vec<_>>(), vec![1]);
+
+        // 空查询 / 无命中都返回空，不报错。
+        assert!(store.search_events_fts("sv-a", "", 10).await.unwrap().is_empty());
+        assert!(store.search_events_fts("sv-a", "不存在的词", 10).await.unwrap().is_empty());
+    }
+
+    /// #05 M3：连续中文按「逐字索引 + 短语查询」命中子串；拉丁词仍可查；save_id 隔离。
+    #[tokio::test]
+    async fn test_events_fts_matches_cjk_substrings_and_latin_words() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        // 关键回归：文档中间没有空格，2 字中文子串「古堡」必须命中。
+        store.append_event("sv-a", &narrate(1, "月光下的古堡")).await.unwrap();
+        store.append_event("sv-a", &narrate(2, "the Ancient Castle")).await.unwrap();
+        store.append_event("sv-b", &narrate(1, "森林里的古堡")).await.unwrap();
+
+        let seqs = |hits: Vec<(i64, f32)>| hits.into_iter().map(|(s, _)| s).collect::<Vec<_>>();
+
+        // (a) 2 字中文子串命中。
+        assert_eq!(seqs(store.search_events_fts("sv-a", "古堡", 10).await.unwrap()), vec![1]);
+        // 短语语义：两字必须在文档里相邻（「光古」不相邻 → 不命中）。
+        assert!(store.search_events_fts("sv-a", "光古", 10).await.unwrap().is_empty());
+        // (b) 拉丁词命中（大小写由 unicode61 折叠），多词按 AND。
+        assert_eq!(seqs(store.search_events_fts("sv-a", "castle", 10).await.unwrap()), vec![2]);
+        assert_eq!(seqs(store.search_events_fts("sv-a", "Ancient", 10).await.unwrap()), vec![2]);
+        assert_eq!(seqs(store.search_events_fts("sv-a", "Ancient Castle", 10).await.unwrap()), vec![2]);
+        // (c) save_id 隔离：sv-b 的「古堡」只命中 sv-b 自己，且查不到 sv-a 的拉丁词。
+        assert_eq!(seqs(store.search_events_fts("sv-b", "古堡", 10).await.unwrap()), vec![1]);
+        assert!(store.search_events_fts("sv-b", "castle", 10).await.unwrap().is_empty());
+        // 无命中 / 纯标点 query 不报错、返回空。
+        assert!(store.search_events_fts("sv-a", "不存在", 10).await.unwrap().is_empty());
+        assert!(store.search_events_fts("sv-a", "。。！", 10).await.unwrap().is_empty());
+    }
+
+    /// #27 ⑥：磁盘库应开启 WAL（journal_mode 是库级持久设置）。
+    #[tokio::test]
+    async fn test_open_enables_wal() {
+        let path = std::env::temp_dir().join(format!("octopus-wal-{}.db", uuid::Uuid::new_v4()));
+        {
+            let store = SqliteStore::open(path.to_str().unwrap()).await.unwrap();
+            let row = store
+                .conn()
+                .query_one(Statement::from_string(
+                    DbBackend::Sqlite,
+                    "PRAGMA journal_mode".to_string(),
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            let mode: String = row.try_get("", "journal_mode").unwrap();
+            assert_eq!(mode.to_ascii_lowercase(), "wal");
+        }
+        // 清理（WAL / SHM 是附加文件，允许残留）。
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    /// 模型会话持久化：每存档一行 JSON 快照，读写 / 覆盖 / 清空。
+    #[tokio::test]
+    async fn test_ai_conversation_roundtrip() {
+        use crate::ports::ConvRecord;
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        assert!(store.load_ai_conversation("sv-c").await.unwrap().is_empty(), "无记录返回空");
+
+        let recs = vec![
+            ConvRecord { round: 1, role: "user".into(), content: "u1".into() },
+            ConvRecord { round: 1, role: "assistant".into(), content: "a1".into() },
+        ];
+        store.save_ai_conversation("sv-c", &recs).await.unwrap();
+        assert_eq!(store.load_ai_conversation("sv-c").await.unwrap(), recs);
+
+        // 覆盖写：同一存档只保留一行最新快照。
+        let recs2 = vec![ConvRecord { round: 2, role: "user".into(), content: "u2".into() }];
+        store.save_ai_conversation("sv-c", &recs2).await.unwrap();
+        assert_eq!(store.load_ai_conversation("sv-c").await.unwrap(), recs2);
+        assert!(store.load_ai_conversation("sv-d").await.unwrap().is_empty(), "其它存档互不影响");
+
+        store.clear_ai_conversation("sv-c").await.unwrap();
+        assert!(store.load_ai_conversation("sv-c").await.unwrap().is_empty());
+    }
+
+    // ---------- #14 存档版次迁移 ----------
+
+    fn save_detail(id: &str, storybook_id: &str, revision: u32, storybook: Value) -> SaveDetail {
+        SaveDetail {
+            item: SaveListItem {
+                id: id.to_string(),
+                title: "迁移测试".to_string(),
+                storybook_id: storybook_id.to_string(),
+                storybook_title: "书".to_string(),
+                embedded_revision: revision,
+                latest_revision: revision,
+                needs_upgrade: false,
+                imported: Some(false),
+                is_sandbox: Some(false),
+                created_at: now_iso(),
+                updated_at: now_iso(),
+                last_played_at: now_iso(),
+            },
+            storybook,
+            legacy: Vec::new(),
+        }
+    }
+
+    /// needs_upgrade 是读时计算：故事书再次发布后旧存档立即变为可升级。
+    #[tokio::test]
+    async fn test_needs_upgrade_computed_from_released_revision() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let row = store
+            .create_storybook_draft(Some("书"), &json!({ "meta": { "title": "书" } }))
+            .await
+            .unwrap();
+        let sb1 = store.publish_storybook(&row.id, 1).await.unwrap();
+        assert_eq!(sb1.revision, 1);
+
+        store
+            .insert_save(
+                &save_detail("sv-nu", &row.id, 1, json!({ "meta": { "title": "书" } })),
+                false,
+            )
+            .await
+            .unwrap();
+        let got = store.get_save("sv-nu").await.unwrap().unwrap();
+        assert!(!got.item.needs_upgrade, "与已发布版次一致时不应提示升级");
+        assert_eq!(got.item.latest_revision, 1);
+
+        // 再发布一版：读时计算立刻变 true（落库的 needs_upgrade 列仍是 false）。
+        let d2 = store
+            .save_draft(&row.id, &json!({ "meta": { "title": "书2" } }), sb1.draft_version)
+            .await
+            .unwrap();
+        let sb2 = store.publish_storybook(&row.id, d2.draft_version).await.unwrap();
+        assert_eq!(sb2.revision, 2);
+        let got = store.get_save("sv-nu").await.unwrap().unwrap();
+        assert!(got.item.needs_upgrade, "故事书新版次发布后应提示升级");
+        assert_eq!(got.item.latest_revision, 2);
+        let listed = store.list_saves().await.unwrap();
+        assert!(listed.iter().find(|s| s.id == "sv-nu").unwrap().needs_upgrade);
+    }
+
+    /// 升级写入是一个事务：换内嵌故事书 + 写权威事件 + 记维护历史；重复执行幂等。
+    #[tokio::test]
+    async fn test_apply_save_upgrade_atomic_and_idempotent() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let old_sb = json!({ "meta": { "title": "书" }, "characters": [{ "id": "c1", "name": "甲" }] });
+        let new_sb = json!({ "meta": { "title": "书" }, "characters": [] });
+        store
+            .insert_save(&save_detail("sv-up", "sb-up", 1, old_sb), false)
+            .await
+            .unwrap();
+
+        let checkpoint = EventEnvelope {
+            id: "ev-cp".to_string(),
+            seq: 5,
+            round: 2,
+            ts: now_iso(),
+            actor: None,
+            intent_id: None,
+            event: PlayEvent::StateUpdate(StateUpdatePayload {
+                changes: vec![StateDelta {
+                    domain: DeltaDomain::Origin,
+                    entity_id: "sv-up".to_string(),
+                    field: "state".to_string(),
+                    op: DeltaOp::Set,
+                    value: json!({ "state": { "seq": 4 }, "scene_start_round": 0 }),
+                }],
+            }),
+        };
+        let write = SaveUpgradeWrite {
+            storybook: new_sb.clone(),
+            storybook_title: "书".to_string(),
+            to_revision: 2,
+            legacy: vec![LegacyDefinition {
+                kind: "character".to_string(),
+                id: "c1".to_string(),
+                name: "甲".to_string(),
+                definition: json!({ "id": "c1", "name": "甲" }),
+                frozen_at_revision: 1,
+            }],
+            events: vec![checkpoint],
+            maintenance_op: "升级 rev1 -> rev2".to_string(),
+            maintenance_summary: "备份 x；1 名遗留冻结".to_string(),
+        };
+        assert!(store.apply_save_upgrade("sv-up", &write).await.unwrap());
+        let got = store.get_save("sv-up").await.unwrap().unwrap();
+        assert_eq!(got.item.embedded_revision, 2);
+        assert!(!got.item.needs_upgrade);
+        assert_eq!(got.storybook, new_sb);
+        assert_eq!(got.legacy.len(), 1);
+        assert_eq!(got.legacy[0].id, "c1");
+        let events = store.load_events("sv-up").await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].envelope.seq, 5);
+        let m = store.list_maintenance("sv-up").await.unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].op, "升级 rev1 -> rev2");
+
+        // 第二次执行：目标版次已达到 -> 无写入（幂等）。
+        assert!(!store.apply_save_upgrade("sv-up", &write).await.unwrap());
+        assert_eq!(store.list_maintenance("sv-up").await.unwrap().len(), 1, "幂等不应重复记历史");
+    }
+
+    /// 新原点：旧日志移入只读归档表，检查点留在活日志作为重放基线。
+    #[tokio::test]
+    async fn test_new_origin_archives_old_log_keeps_checkpoint() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        store.append_event("sv-origin", &narrate(1, "旧一")).await.unwrap();
+        store.append_event("sv-origin", &narrate(2, "旧二")).await.unwrap();
+        store.append_event("sv-other", &narrate(1, "别的存档")).await.unwrap();
+
+        let checkpoint = EventEnvelope {
+            id: "ev-cp".to_string(),
+            seq: 3,
+            round: 1,
+            ts: now_iso(),
+            actor: None,
+            intent_id: None,
+            event: PlayEvent::StateUpdate(StateUpdatePayload {
+                changes: vec![StateDelta {
+                    domain: DeltaDomain::Origin,
+                    entity_id: "sv-origin".to_string(),
+                    field: "state".to_string(),
+                    op: DeltaOp::Set,
+                    value: json!({ "state": { "seq": 2 }, "scene_start_round": 0 }),
+                }],
+            }),
+        };
+        let count = store
+            .new_origin("sv-origin", &checkpoint, "压缩为新原点")
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+
+        let live = store.load_events("sv-origin").await.unwrap();
+        assert_eq!(live.len(), 1, "活日志只剩检查点");
+        assert_eq!(live[0].envelope.seq, 3);
+
+        let arch = entities::archived_command::Entity::find()
+            .filter(entities::archived_command::Column::SaveId.eq("sv-origin"))
+            .all(&store.db)
+            .await
+            .unwrap();
+        assert_eq!(arch.len(), 2);
+        assert!(arch.iter().all(|m| m.origin_seq == 3));
+
+        // 别的存档不受影响。
+        assert_eq!(store.load_events("sv-other").await.unwrap().len(), 1);
+        assert_eq!(store.list_maintenance("sv-origin").await.unwrap().len(), 1);
+    }
+
+    /// #06 ② 快照只保留最新 5 份；同 seq 覆盖不堆积；格式 / 版次门禁拒绝过期快照。
+    #[tokio::test]
+    async fn test_snapshots_retain_newest_five_and_format_gate() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        assert!(store.latest_snapshot("sv").await.unwrap().is_none());
+
+        for seq in 1..=7i64 {
+            store.put_snapshot("sv", seq, 1, "{}").await.unwrap();
+        }
+        // 别的存档不参与裁剪。
+        store.put_snapshot("sv2", 1, 1, "{}").await.unwrap();
+
+        let count_sv = entities::snapshot::Entity::find()
+            .filter(entities::snapshot::Column::SaveId.eq("sv".to_string()))
+            .count(&store.db)
+            .await
+            .unwrap();
+        let count_sv2 = entities::snapshot::Entity::find()
+            .filter(entities::snapshot::Column::SaveId.eq("sv2".to_string()))
+            .count(&store.db)
+            .await
+            .unwrap();
+        assert_eq!(count_sv, 5, "每个存档只保留最新 5 份");
+        assert_eq!(count_sv2, 1, "别的存档不受影响");
+
+        let latest = store.latest_snapshot("sv").await.unwrap().unwrap();
+        assert_eq!(latest.seq, 7, "取到的是最新一份");
+        assert!(latest.usable_for(1));
+        assert!(!latest.usable_for(2), "版次不一致不算可用");
+
+        // 同 seq 覆盖：数量不增。
+        store.put_snapshot("sv", 7, 1, r#"{"x":1}"#).await.unwrap();
+        let count_sv_after = entities::snapshot::Entity::find()
+            .filter(entities::snapshot::Column::SaveId.eq("sv".to_string()))
+            .count(&store.db)
+            .await
+            .unwrap();
+        assert_eq!(count_sv_after, 5);
+        assert_eq!(
+            store.latest_snapshot("sv").await.unwrap().unwrap().state_json,
+            r#"{"x":1}"#
+        );
+
+        // 旧格式直接作废（模拟引擎升级后的旧快照）。
+        store
+            .db
+            .execute_unprepared("UPDATE snapshots SET format_version = 99 WHERE save_id = 'sv'")
+            .await
+            .unwrap();
+        assert!(
+            !store.latest_snapshot("sv").await.unwrap().unwrap().usable_for(1),
+            "旧格式快照必须判定为不可用"
+        );
     }
 }

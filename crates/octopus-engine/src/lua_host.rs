@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use mlua::chunk::ChunkMode;
 use mlua::{HookTriggers, Lua, LuaOptions, StdLib, Table, Value as LuaValue, VmState};
+use octopus_types::relationship_endpoint;
 use serde_json::{json, Value};
 
 use crate::error::EngineError;
@@ -490,8 +491,9 @@ impl LuaHost {
             "relationship",
             lua.create_function(move |_, (from, to, kind): (String, String, String)| {
                 let value = relationships.iter().find_map(|r| {
-                    let same = r.get("from_id").and_then(Value::as_str) == Some(from.as_str())
-                        && r.get("to_id").and_then(Value::as_str) == Some(to.as_str())
+                    // 兼容规范 from/to 与旧 from_id/to_id（决策 #11）。
+                    let same = relationship_endpoint(r, "from", "from_id") == Some(from.as_str())
+                        && relationship_endpoint(r, "to", "to_id") == Some(to.as_str())
                         && r.get("type").and_then(Value::as_str) == Some(kind.as_str());
                     if same { r.get("value").and_then(Value::as_i64) } else { None }
                 });

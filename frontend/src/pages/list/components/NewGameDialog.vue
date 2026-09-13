@@ -34,6 +34,7 @@ const selectedId = ref('')
 const name = ref('')
 const pcs = ref<CharacterDef[]>([])
 const controlledId = ref('')
+
 /** 选中故事书的已发布正文（用于预览卡的简介 / 规模统计） */
 const detail = ref<Storybook | null>(null)
 

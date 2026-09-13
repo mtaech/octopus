@@ -6,18 +6,18 @@ import { ref, computed, watch, nextTick, onMounted } from 'vue'
 import { usePlayStore } from '../stores/play'
 import { useSettingsStore } from '@/pages/list/stores/settings'
 import SettingsDialog from '@/pages/list/components/SettingsDialog.vue'
-import type { EntityRef, Storybook } from '@/types'
+import type { EntityRef, Storybook, SaveModelChoice } from '@/types'
 import { refKindLabel } from '@/lib/entity-refs'
 import { estimateTokens, estimateTokensOf, fmtTokens } from '@/lib/tokens'
 import RefList from './RefList.vue'
 import { filterRefItems, groupRefItems, playRefItems, toEntityRef, type RefItem } from '../ref-items'
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
-import { Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger } from '@/components/ui/select'
-import { IconSend, IconTerminal2, IconUser, IconDeviceFloppy, IconHelp, IconArrowsExchange, IconCheck, IconAt, IconWand, IconSwords, IconRobot, IconSettings, IconChartHistogram, IconBrain } from '@tabler/icons-vue'
+import { IconSend, IconTerminal2, IconUser, IconDeviceFloppy, IconHelp, IconArrowsExchange, IconCheck, IconAt, IconWand, IconSwords, IconRobot, IconSettings, IconChartHistogram } from '@tabler/icons-vue'
+import SaveModelPicker from '@/components/SaveModelPicker.vue'
+import { catalogModelMeta, mergeModelMeta, wireToLevel, LEVEL_LABEL } from '@/api/model-catalog-utils'
 import { toast } from '@/api'
-import { catalogModelMeta, mergeModelMeta, thinkingLevels, levelToWire, wireToLevel, LEVEL_LABEL, fmtContext } from '@/api/model-catalog-utils'
 
 const store = usePlayStore()
 /** 序列化后的纯文本（chip → @名字）；发送用 */
@@ -224,67 +224,62 @@ const placeholder = computed(() => {
   return '输入你想做的事（/ 开头 = 元指令，如 /存档 /帮助）…'
 })
 
-// ---------- 模型切换（story / character 角色模型）与上下文用量 ----------
+// ---------- 上下文用量 ----------
 const settingsStore = useSettingsStore()
 const settingsOpen = ref(false)
 const usageOpen = ref(false)
-
-const providers = computed(() => settingsStore.config?.providers ?? [])
-/** 生效模型：本存档覆盖优先，否则回落到全局 story 角色默认。 */
-const effectiveModel = computed(() => {
-  const m = store.saveModel
-  if (m) return m
-  const r = settingsStore.config?.roles.story
-  return r?.provider_id && r?.model ? { provider_id: r.provider_id, model: r.model } : null
-})
-const currentModelValue = computed(() => {
-  const m = effectiveModel.value
-  return m ? m.provider_id + '::' + m.model : ''
-})
-const currentModelDisplay = computed(() => {
-  const m = effectiveModel.value
-  if (!m) return { providerName: '默认', modelName: '未配置' }
-  const p = providers.value.find(x => x.id === m.provider_id)
-  const mod = p?.models.find(x => x.id === m.model)
-  return { providerName: p?.label || m.provider_id, modelName: mod?.name || m.model }
-})
-/** 只覆盖「本存档」，不写全局配置（全局默认在设置弹窗里改）。 */
-function onModelChange(val: unknown) {
-  if (typeof val !== 'string') return
-  const [providerId, modelId] = val.split('::')
-  if (providerId && modelId) void store.setModel(providerId, modelId, store.saveModel?.reasoning_effort)
-}
-
-// ---------- 思考强度（reasoning_effort）：档位来自 pi.dev 目录的 thinkingLevelMap ----------
-/** 当前生效模型在目录里的元数据（上下文 / 思考能力）；自定义模型可能没有。 */
-const activeMeta = computed(() => {
-  const m = effectiveModel.value
-  if (!m) return undefined
-  // 目录元数据 + 用户在供应商里对该模型的自定义覆盖（小中转站）
-  const entry = providers.value.find(p => p.id === m.provider_id)?.models.find(x => x.id === m.model)
-  return mergeModelMeta(catalogModelMeta(m.provider_id, m.model), entry)
-})
-const supportsReasoning = computed(() => activeMeta.value?.reasoning !== false)
-const effortOptions = computed(() => thinkingLevels(activeMeta.value))
-const currentEffort = computed(() => wireToLevel(activeMeta.value, store.saveModel?.reasoning_effort))
-const effortLabel = computed(() => LEVEL_LABEL[currentEffort.value] ?? currentEffort.value)
-const ctxLabel = computed(() => fmtContext(activeMeta.value?.ctx))
-/** 目录里某模型的上下文标签（下拉项展示用） */
-function modelCtx(providerId: string, modelId: string): string {
-  return fmtContext(catalogModelMeta(providerId, modelId)?.ctx)
-}
-function onEffortChange(val: unknown) {
-  if (typeof val !== 'string') return
-  const m = effectiveModel.value
-  if (!m) { toast('warn', '请先在设置里配置模型'); return }
-  void store.setModel(m.provider_id, m.model, levelToWire(activeMeta.value, val))
-}
 onMounted(() => { if (!settingsStore.config) void settingsStore.load() })
 
-/** 系统提示词模板粗估：对应 Rust 侧 STORY_PREAMBLE + CHARACTER_PREAMBLE 大致长度 */
+// ---------- 本存档模型 / 思考强度（单一 AI） ----------
+/** 可用供应商（来自全局配置）。 */
+const providers = computed(() => settingsStore.config?.providers ?? [])
+/** 模型弹层开关。 */
+const modelDialogOpen = ref(false)
+/** 全局 AI 默认（本存档未指定时继承）。 */
+const globalModel = computed<SaveModelChoice>(() => {
+  const gs = settingsStore.config?.roles.story
+  return {
+    provider_id: gs?.provider_id ?? '',
+    model: gs?.model ?? '',
+    reasoning_effort: gs?.reasoning_effort,
+  }
+})
+/** 本存档是否在继承全局默认（没有存档级覆盖）。 */
+const isModelInherited = computed(() => !store.saveModel)
+/** 本存档生效的模型 = 存档覆盖 ?? 全局默认。 */
+const effectiveModel = computed<SaveModelChoice>(() => store.saveModel ?? globalModel.value)
+function modelMetaOf(m: SaveModelChoice) {
+  if (!m.provider_id || !m.model) return undefined
+  const entry = providers.value.find(p => p.id === m.provider_id)?.models.find(x => x.id === m.model)
+  return mergeModelMeta(catalogModelMeta(m.provider_id, m.model), entry)
+}
+function modelDisplayName(pid?: string, mid?: string): string {
+  if (!pid || !mid) return '未配置'
+  const p = providers.value.find(x => x.id === pid)
+  // 自定义条目常只有 id：显示名回落到目录快照。
+  return p?.models.find(x => x.id === mid)?.name || catalogModelMeta(pid, mid)?.name || mid
+}
+/** 「模型名 · 思考档位」简报（默认档不显示强度）。 */
+function modelSummaryOf(m: SaveModelChoice): string {
+  const lv = wireToLevel(modelMetaOf(m), m.reasoning_effort)
+  const effort = lv === 'default' ? '' : ' · ' + (LEVEL_LABEL[lv] ?? lv)
+  return modelDisplayName(m.provider_id, m.model) + effort
+}
+/** 按钮上的简报。 */
+const modelSummary = computed(() => modelSummaryOf(effectiveModel.value))
+/** 继承状态里展示的全局默认。 */
+const globalModelSummary = computed(() => modelSummaryOf(globalModel.value))
+function onModelChange(v: SaveModelChoice) {
+  void store.setModel(v)
+}
+function onUseGlobal() {
+  void store.clearModel()
+}
+
+/** 系统提示词模板粗估：对应 Rust 侧 SYSTEM_PREAMBLE 大致长度 */
 const PREAMBLE_TOKENS = 880
 
-/** 本轮实际发给模型的上下文估算（游玩 AI 每回合不带历史，故只有这些） */
+/** 本回合发给模型的上下文估算（不含按存档追加的会话历史） */
 const usage = computed(() => {
   const p = store.projection
   const sb = store.detail?.storybook as Storybook | undefined
@@ -551,57 +546,23 @@ function quickRun(label: string) {
           type="button"
           class="inline-flex shrink-0 cursor-pointer items-center gap-1 rounded-full border border-border/80 px-2 py-0.5 text-[10.5px] text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground"
           :class="usageOpen ? 'border-primary/50 text-foreground' : ''"
-          title="本轮上下文用量（估算）"
+          title="本回合上下文用量（估算，不含会话历史）"
           @click="usageOpen = !usageOpen"
         >
           <IconChartHistogram class="size-3 text-primary/70" />
-          上下文 ≈{{ fmtTokens(usage.total) }}
+          本回合 ≈{{ fmtTokens(usage.total) }}
         </button>
 
-        <!-- 模型切换：story + character 一起切 -->
-        <Select :model-value="currentModelValue" @update:model-value="onModelChange">
-          <SelectTrigger
-            size="sm"
-            class="h-6 max-w-[170px] gap-1 border border-border/80 bg-card/80 px-2 text-[10.5px] font-semibold shadow-2xs hover:bg-muted/50"
-            :title="'游玩模型：' + currentModelDisplay.modelName + ' · ' + currentModelDisplay.providerName"
-          >
-            <IconRobot class="size-3 shrink-0 text-primary" />
-            <span class="min-w-0 flex-1 truncate text-left">{{ currentModelDisplay.modelName }}</span>
-            <span v-if="ctxLabel" class="shrink-0 rounded-full bg-muted/70 px-1.5 font-mono text-[9.5px] font-normal text-muted-foreground/80">{{ ctxLabel }}</span>
-          </SelectTrigger>
-          <SelectContent class="z-50 max-h-72">
-            <template v-if="providers.length">
-              <SelectGroup v-for="pr in providers" :key="pr.id">
-                <SelectLabel class="px-2 py-1 text-[10.5px] font-bold text-muted-foreground uppercase">{{ pr.label }}</SelectLabel>
-                <SelectItem v-for="m in pr.models" :key="pr.id + '::' + m.id" :value="pr.id + '::' + m.id" class="text-xs">
-                  <div class="flex w-full items-center justify-between gap-4">
-                    <span>{{ m.name || m.id }}</span>
-                    <span class="flex shrink-0 items-center gap-2">
-                      <span v-if="modelCtx(pr.id, m.id)" class="rounded-full bg-muted/70 px-1.5 font-mono text-[9.5px] text-muted-foreground/80">{{ modelCtx(pr.id, m.id) }}</span>
-                      <span class="font-mono text-[10px] text-muted-foreground/70">{{ m.id }}</span>
-                    </span>
-                  </div>
-                </SelectItem>
-              </SelectGroup>
-            </template>
-            <div v-else class="p-2 text-center text-xs text-muted-foreground">尚未配置供应商</div>
-          </SelectContent>
-        </Select>
-
-        <!-- 思考强度（reasoning_effort）：档位来自该模型在目录里的 thinkingLevelMap -->
-        <Select v-if="supportsReasoning" :model-value="currentEffort" @update:model-value="onEffortChange">
-          <SelectTrigger
-            size="sm"
-            class="h-6 gap-1 border border-border/80 bg-card/80 px-2 text-[10.5px] font-semibold shadow-2xs hover:bg-muted/50"
-            title="模型思考强度（reasoning_effort）：本存档随模型一起保存"
-          >
-            <IconBrain class="size-3 shrink-0 text-primary" />
-            <span class="min-w-0 truncate text-left">{{ effortLabel }}</span>
-          </SelectTrigger>
-          <SelectContent class="z-50">
-            <SelectItem v-for="lv in effortOptions" :key="lv" :value="lv" class="text-xs">{{ LEVEL_LABEL[lv] ?? lv }}</SelectItem>
-          </SelectContent>
-        </Select>
+        <Button
+          variant="outline"
+          size="sm"
+          class="h-8 max-w-[220px] shrink-0 gap-1.5 border border-border/80 bg-card/80 px-2 text-[10.5px] font-semibold shadow-2xs hover:bg-muted/50"
+          title="本存档模型与思考强度"
+          @click="modelDialogOpen = true"
+        >
+          <IconRobot class="size-3.5 shrink-0 text-primary" />
+          <span class="min-w-0 truncate">{{ modelSummary }}</span>
+        </Button>
 
         <Button
           variant="ghost"
@@ -616,7 +577,7 @@ function quickRun(label: string) {
         <!-- 用量明细（贴右下角弹出） -->
         <div v-if="usageOpen" class="absolute right-0 bottom-full z-40 mb-2 w-60 rounded-xl border border-border bg-popover p-3 text-[11px] shadow-xl">
           <div class="flex items-center justify-between">
-            <span class="font-semibold text-foreground">本轮上下文估算</span>
+            <span class="font-semibold text-foreground">本回合上下文估算</span>
             <span class="font-mono font-semibold text-foreground/85">≈{{ fmtTokens(usage.total) }} tok</span>
           </div>
           <div class="mt-2 space-y-1">
@@ -626,7 +587,7 @@ function quickRun(label: string) {
             </div>
           </div>
           <p class="mt-2 border-t border-border/60 pt-2 text-[10px] leading-relaxed text-muted-foreground/55">
-            CJK 按 1 tok 粗估。游玩 AI 每回合不带历史，故总量偏小；实际每轮会跑主线 + 角色两次调用。
+            CJK 按 1 tok 粗估。单一 AI 每回合一次调用：实际输入 = 会话历史（按存档追加，前缀可被供应商缓存复用）+ 本回合上下文。
           </p>
         </div>
       </span>
@@ -657,6 +618,50 @@ function quickRun(label: string) {
           <span>共 {{ pickerItems.length }} 项</span>
           <Button size="sm" variant="ghost" class="h-7 px-2.5 text-xs" @click="pickerOpen = false">关闭</Button>
         </div>
+      </DialogContent>
+    </Dialog>
+
+    <!-- 本存档模型 / 思考强度（单一 AI） -->
+    <Dialog v-model:open="modelDialogOpen">
+      <DialogContent class="gap-0 p-0 sm:max-w-md">
+        <DialogHeader class="border-b border-border/70 px-5 py-4">
+          <DialogTitle class="flex items-center gap-2 text-[15px]">
+            <IconRobot class="size-4 text-primary" />
+            模型与思考强度
+          </DialogTitle>
+          <DialogDescription class="text-[11.5px] leading-5">
+            本存档使用；改动写回存档、只影响之后的回合。未指定时继承全局 AI 默认。
+          </DialogDescription>
+        </DialogHeader>
+        <div class="px-5 py-4">
+          <!-- 继承状态：明确现在用的是「本存档指定」还是「全局默认」，并给出全局默认内容 -->
+          <div class="mb-4 flex items-center justify-between gap-3 rounded-lg border border-border/70 bg-muted/30 px-3 py-2">
+            <div class="min-w-0">
+              <div class="text-[12px] font-semibold">
+                {{ isModelInherited ? '继承全局默认' : '本存档指定' }}
+              </div>
+              <div class="mt-0.5 truncate text-[11px] text-muted-foreground">
+                全局默认：{{ globalModelSummary }}
+              </div>
+            </div>
+            <Button
+              v-if="!isModelInherited"
+              size="sm"
+              variant="outline"
+              class="h-7 shrink-0 px-2 text-[11px]"
+              @click="onUseGlobal"
+            >恢复继承</Button>
+          </div>
+
+          <SaveModelPicker
+            :model-value="effectiveModel"
+            :providers="providers"
+            @update:model-value="onModelChange"
+          />
+        </div>
+        <DialogFooter class="border-t border-border/70 px-5 py-3 sm:justify-end">
+          <Button size="sm" @click="modelDialogOpen = false">完成</Button>
+        </DialogFooter>
       </DialogContent>
     </Dialog>
 

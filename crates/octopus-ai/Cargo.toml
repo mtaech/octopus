@@ -12,3 +12,8 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 rig = { workspace = true }
+# 本地 embedding 推理（ONNX Runtime）：离线、免 base_url。
+# 固定 4.9 系：Cargo.lock 是 feature 无关的，rig 0.42 的可选 rig-fastembed 总会把
+# fastembed 4.x（ort =2.0.0-rc.9）解析进锁文件；fastembed 5.x 需要 ort rc.10+，
+# 两者 ort 均为 exact pin，无法共存。
+fastembed = "4.9"

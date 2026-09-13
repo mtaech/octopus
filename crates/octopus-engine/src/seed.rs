@@ -47,7 +47,7 @@ pub fn seed_storybooks() -> Vec<SeedStorybook> {
             "skills": [], "items": [], "objects": [], "factions": [], "relationships": [],
             "statuses": [],
             "flags": [ { "key": "heard_dreams", "label": "听闻怪梦" }, { "key": "met_isa", "label": "结识伊莎" } ],
-            "events": [ { "key": "scene_change", "label": "场景切换" } ],
+            "events": [ { "key": "scene", "label": "场景切换" } ],
             "relationship_types": [ { "key": "好感", "label": "好感" } ],
             "target_types": [ { "key": "single", "label": "单体" } ]
         }),

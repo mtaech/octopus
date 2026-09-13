@@ -63,9 +63,11 @@
 
 ### 3.4 快照
 
-v1 策略：**全量重放，不落快照**。预留 `snapshots` 表与接口位置，但不在本次实现。
+策略：**全量快照 = 启动缓存**（#06 ②）。`snapshots` 表存 `{ save_id, seq, taken_at, format_version, storybook_revision, state_json }`；`state_json` 为 `OriginCheckpoint` 形态（`WorldState` + 场景压缩左界，`WorldState.rng_position` 记 RNG 消耗位置）。
 
-`manual_save` 已如实描述为「标记检查点」；`new_origin` 返回 `501 not_implemented`，前端按钮同步标注「暂不可用」。
+- 写入时机：手动存档 + 每 10 回合；同一事务保留最新 5 份，同 `seq` 覆盖。
+- 启动：取最新可用快照，只重放其后的命令；`format_version` / 内嵌故事书版次不一致、JSON 损坏、`seq` 超出日志都视为过期，回退全量重放。
+- 快照是派生缓存，非权威；导出存档不依赖它，丢失可从命令日志重建。重放末尾据日志 / 快照记录的消耗次数复位 RNG，与全量重放逐位一致。
 
 ### 3.5 存量数据
 

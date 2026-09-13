@@ -68,7 +68,7 @@ export const LUA_API_REFERENCE: LuaApiEntry[] = [
   { name: 'request_cost', signature: 'host.request_cost(id, amount)', group: '可写', desc: '声明资源消耗（引擎校验后扣减）', snippet: "host.request_cost('res-gold', 1)", argContext: 'resources' },
   { name: 'apply_status', signature: 'host.apply_status(target, id, duration, unit)', group: '可写', desc: '施加持续状态', snippet: "host.apply_status('target', 'burn', 3, 'turns')", argContext: 'characters' },
   { name: 'remove_status', signature: 'host.remove_status(target, id)', group: '可写', desc: '移除状态', snippet: "host.remove_status('target', 'burn')", argContext: 'characters' },
-  { name: 'trigger_event', signature: 'host.trigger_event(event)', group: '可写', desc: '触发引擎事件', snippet: "host.trigger_event('scene_change')", argContext: 'events' },
+  { name: 'trigger_event', signature: 'host.trigger_event(event)', group: '可写', desc: '触发引擎事件', snippet: "host.trigger_event('scene')", argContext: 'events' },
   { name: 'query_world', signature: 'host.query_world(query)', group: '可写', desc: '查询世界（返回过滤后的实体）', snippet: "host.query_world('...')" },
   { name: 'scene_id', signature: 'host.scene_id', group: '环境', desc: '当前场景 id', snippet: 'host.scene_id' },
   { name: 'round', signature: 'host.round', group: '环境', desc: '当前回合数', snippet: 'host.round' },

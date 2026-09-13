@@ -26,7 +26,6 @@ pub struct ActorRef {
 pub enum PhaseStage {
     Idle,
     StoryThinking,
-    CharacterThinking,
     Resolving,
     WaitingConfirm,
 }
@@ -93,6 +92,16 @@ pub struct CheckerDef {
     /// 被动判定的基数（缺省 10；D&D 被动察觉 = 10 + 加值）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub passive_base: Option<i64>,
+    /// 兼容别名：故事书常写 type: "d20" / type: "d100" 表示骰子家族；
+    /// 未显式给 dice 时据此推导（d20 → 1d20）。非骰式类型名（如 attribute）忽略。
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>,
+    /// 合法判定属性 key 白名单；声明后意图的 attribute 必须命中（否则驳回，不再静默 0 分）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attributes: Option<Vec<String>>,
+    /// 判定难度缺省值（意图未给 difficulty 时用它）；再缺省回落 12。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_dc: Option<i64>,
 }
 
 /// 条件表达式（#13）：结构化 JSON 表达式树 + Lua 兜底（与 #12「声明式核心 + Lua 钩子」同构）。
@@ -329,6 +338,10 @@ pub enum DeltaDomain {
     Relationship,
     Resource,
     Flag,
+    /// 全量状态检查点（#14 新原点 / 升级基座）：value = 序列化的世界状态。
+    /// 唯一用途是让「日志被归档后的重放」与「故事书换版后的重放」有确定基线；
+    /// 历史日志里的旧 delta 仍照常逐条应用。
+    Origin,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS)]
@@ -338,6 +351,31 @@ pub enum DeltaOp {
     Set,
     Add,
     Remove,
+}
+
+/// 场景切换事件的规范名（决策 #11：引擎内部事件与演出流事件 scene 统一）。
+///
+/// 旧故事书把场景切换事件写作 scene_change（#13 原文），为不静默丢引用，
+/// 读写两侧统一经此函数归一：声明、触发匹配、校验都认两种写法，新数据只写 scene。
+pub fn normalize_event_name(name: &str) -> &str {
+    match name {
+        "scene_change" => "scene",
+        other => other,
+    }
+}
+
+/// 关系边端点 id：规范字段 from / to（#01），兼容旧字段 from_id / to_id（决策 #11）。
+///
+/// 关系边在故事书里是 raw JSON（没有强类型结构），读写两侧都经此取值，
+/// 保证用旧字段写的历史故事书不会静默失效；新数据只写规范字段。
+pub fn relationship_endpoint<'a>(
+    edge: &'a Value,
+    canonical: &str,
+    legacy: &str,
+) -> Option<&'a str> {
+    edge.get(canonical)
+        .or_else(|| edge.get(legacy))
+        .and_then(Value::as_str)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -536,9 +574,25 @@ pub struct SystemPayload {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct IntentEnvelope {
-    pub intent_id: String,
+    /// 意图幂等 id（#04 ⑨）：同一回合内重复的 id 只结算一次。
+    /// 缺省 = 旧协议 / 老模型没给 id，此时保持既有行为（不去重）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_id: Option<String>,
     #[serde(flatten)]
     pub intent: Intent,
+}
+
+impl IntentEnvelope {
+    /// 包一层无幂等 id 的意图（引擎内部与测试构造用；不改变任何既有语义）。
+    pub fn new(intent: Intent) -> Self {
+        Self { intent_id: None, intent }
+    }
+}
+
+impl From<Intent> for IntentEnvelope {
+    fn from(intent: Intent) -> Self {
+        Self::new(intent)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -567,6 +621,9 @@ pub enum Intent {
     Move { destination_id: String },
     UseSkill { skill_id: String, #[serde(default)] target_id: Option<String> },
     UseItem { item_id: String, #[serde(default)] target_id: Option<String> },
+    /// 与场景物件交互（#04 / #01 objects）：object_id 引用故事书 objects 的 id，
+    /// action 必须匹配该物件声明的动作 key；两者都在引擎侧校验。
+    Interact { object_id: String, action: String },
     Check {
         attribute: String,
         #[serde(default)]
@@ -575,6 +632,12 @@ pub enum Intent {
         actor_id: Option<String>,
     },
     QueryWorld { query: String },
+    /// 查询某个角色的私有资料（属性 / 资源 / 状态 / 物品 / 位置；#04 Query 类）。
+    /// 缺省 `character_id` = 查询发起者自己；角色 AI 只能查到自己的数据（#16 认知边界）。
+    QueryCharacter { #[serde(default)] character_id: Option<String> },
+    /// 查询与某实体相关的关系边（#04 Query 类）。
+    /// 角色 AI 只得到触及自己的边；缺省 `entity_id` = 自己（#04 §6）。
+    QueryRelationships { #[serde(default)] entity_id: Option<String> },
     AdvanceScene { #[serde(default)] target_scene_id: Option<String>, #[serde(default)] abandon: bool },
     Intervene { content: String },
     /// 导演专属：新增一个运行时任务（来源=故事，不属于骨架）。
@@ -612,6 +675,11 @@ pub enum Intent {
         #[serde(default)]
         remove: bool,
     },
+    /// 本回合微摘要（#05 §3.2）：主线 AI 在同一轮顺手产出的一两句 recap。
+    ///
+    /// 派生数据：引擎**不产生叙事事件、不改世界状态**，只写派生表 round_summaries；
+    /// 重放忽略它，删掉也能从回合重建（最坏退化为空）。提示词里属可选但鼓励。
+    Summary { text: String },
     FinishTurn,
 }
 
@@ -806,6 +874,27 @@ pub struct SaveDetail {
     /// 内嵌冻结故事书（#14）；当前里程碑以 JSON 直存。
     #[ts(type = "unknown")]
     pub storybook: Value,
+    /// 存档遗留区（#14）：版次升级时被删除、但玩家选择「遗留冻结」的旧定义。
+    /// 空时不序列化，旧存档包 / 旧客户端不受影响。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub legacy: Vec<LegacyDefinition>,
+}
+
+/// 遗留区条目（#14 / CONTEXT.md「遗留区」）：旧故事书里已被删除的实体定义，
+/// 只读保留在存档内，让运行时实例（角色 / 物品引用）在升级后仍可解释。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+#[ts(export)]
+pub struct LegacyDefinition {
+    /// 实体种类：character / skill / item / faction / location / status
+    pub kind: String,
+    /// 实体 id（编辑器纪律：一经发布 id 不可变，所以 id 足以定位）
+    pub id: String,
+    pub name: String,
+    /// 原定义本体（故事书内该实体的完整 JSON）
+    #[ts(type = "unknown")]
+    pub definition: Value,
+    /// 冻结时的内嵌版次（可追溯来源）
+    pub frozen_at_revision: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -1116,4 +1205,96 @@ pub struct SavePackage {
     pub commands: Vec<CommandRecord>,
     pub archived_commands: Vec<ArchivedCommandRecord>,
     pub maintenance: Vec<MaintenanceRow>,
+}
+
+// ============================================================
+// 存档版次迁移（#14 ②）：dry-run 报告 → 逐项裁决 → 执行
+// ============================================================
+
+/// 人物消失时的处置方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum UpgradeDisposition {
+    /// 遗留冻结：旧定义挪入存档遗留区，实例继续可用。
+    Freeze,
+    /// 叙事离场：实例标记已离场，由主线 AI 在后续叙事中交代。
+    Departure,
+}
+
+/// dry-run 报告里一条自动处理的结构变更（技能 / 物品 / 势力 / 地点消失或定义改变）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+#[ts(export)]
+pub struct UpgradeChange {
+    /// 实体种类：skill / item / faction / location / status / character（定义变化）
+    pub kind: String,
+    pub id: String,
+    pub label: String,
+    /// 引擎将采取的动作（人类可读；人物裁决不属于此类）
+    pub action: String,
+}
+
+/// dry-run 报告里一个「新版故事书已删除」的人物：必须逐项裁决后才能升级。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+#[ts(export)]
+pub struct UpgradeGoneCharacter {
+    pub character_id: String,
+    pub name: String,
+    /// 消失原因的提示（供 UI 展示）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, TS)]
+#[ts(export)]
+pub struct UpgradeReportGroup {
+    /// 自动处理项（参考信息）
+    pub changes: Vec<UpgradeChange>,
+    /// 需逐项裁决的人物消失
+    pub gone_characters: Vec<UpgradeGoneCharacter>,
+}
+
+/// 两段式升级的第一段产物：纯读、无副作用。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+#[ts(export)]
+pub struct UpgradeReport {
+    pub from_revision: u32,
+    pub to_revision: u32,
+    pub groups: UpgradeReportGroup,
+}
+
+/// 执行升级时的一项人物裁决。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+#[ts(export)]
+pub struct DispositionItem {
+    pub character_id: String,
+    pub disposition: UpgradeDisposition,
+}
+
+/// 执行升级请求体（缺省空数组 = 无人物消失；有人物消失时由引擎严格校验必须齐全）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct UpgradeRequest {
+    #[serde(default)]
+    pub dispositions: Vec<DispositionItem>,
+}
+
+/// 执行升级结果：升级后的存档 + 自动备份包的磁盘文件名。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct UpgradeResult {
+    pub detail: SaveDetail,
+    /// 自动备份文件名（同数据目录 backups/）；幂等无操作时为空串。
+    pub backup_name: String,
+}
+
+/// 新原点结果（#14 ④ / 决策 3）：旧日志已移入库内归档表。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct NewOriginResult {
+    pub ok: bool,
+    /// 移入归档表的命令条数
+    pub archived_count: u64,
+    /// 新原点的 seq（检查点所在序号；无事件时为 0）
+    pub origin_seq: u64,
 }

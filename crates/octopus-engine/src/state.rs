@@ -6,9 +6,14 @@ use octopus_types::{
     CharacterInstance, EncounterView, ProjectionMeta, QuestView, Seq, SkeletonProgress,
     StatusInstance, WorldProjection,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone)]
+/// 运行时世界状态。
+///
+/// 序列化用于「新原点 / 升级基座」的全量检查点（#14）：把当前状态写进命令日志
+/// 的一条 delta，重放时原样恢复。日志被归档或故事书换版后，检查点保证重放有确定基线。
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorldState {
     pub seq: Seq,
     pub scene_id: String,
@@ -23,6 +28,12 @@ pub struct WorldState {
     pub locations: Vec<Value>,
     pub meta: ProjectionMeta,
     pub rng_seed: u64,
+    /// 已消耗的 RNG 取值次数（#06 ②）：由命令日志的 rng_consume 事件重放累加。
+    ///
+    /// 随世界状态一起物化，快照 / 新原点检查点据此把 RNG 拨回同一位置，保证跨重启
+    /// 与「快照 + 其后命令」两条路径的骰序一致。旧快照 / 检查点缺省为 0。
+    #[serde(default)]
+    pub rng_position: u64,
 }
 
 impl WorldState {

@@ -177,7 +177,10 @@ fn skill_checker<'a>(skill: &'a SkillDef, global: Option<&'a CheckerDef>) -> Opt
 }
 
 /// 跑一次判定：Lua 判定器不持锁（其内部 engine_rng 会自己加锁）；声明式才短暂加锁。
-fn run_check(
+///
+/// 公开给 session 的 check 意图复用（#04/#12：check 与技能走同一判定器路径），
+/// 避免两套判定语义。
+pub(crate) fn run_check(
     checker: &CheckerDef,
     attribute: &str,
     value: f64,

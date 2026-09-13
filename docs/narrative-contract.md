@@ -198,7 +198,7 @@ B 文档 | 叙述段按文档块渲染 |
 
 | 现有 | 改造 |
 |---|---|
-`STORY_PREAMBLE` / `CHARACTER_PREAMBLE` | 拆为内置**默认协议** + 极简默认叙述段 |
+`SYSTEM_PREAMBLE` | 内置**默认协议** + 极简默认叙述段 |
 `turn_prompt()` | 改为按 §6 槽位渲染 |
 `TurnContext` | 新增解析后的 `narrative`（含变体选择）与 `protocol` 模式 |
 `lua_host` | 新增协议插件宿主（复用沙箱与限额） |

@@ -17,30 +17,37 @@ use std::sync::{Arc, Mutex, RwLock};
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use futures::Stream;
 use octopus_engine::{
-    AiProvider, AssetStore, EmbeddingBackend, EngineError, EventSink, LuaHost, LuaHostContext,
-    LuaMount, ModelRef, NewPairMessage, PairThreadRow, Session, SqliteStore, StorybookRow, WorldState,
-    content_type_of, lint_script, new_lint_state, pack_bundle, unpack_bundle,
+    AiProvider, AssetStore, ConversationStore, ConvRecord, EmbeddingBackend, EngineError, EventSink, HybridMemoryRetriever,
+    LuaHost, LuaHostContext, LuaMount, MemoryIndexer, ModelRef, NewPairMessage, PairThreadRow,
+    SaveUpgradeWrite, Session, SnapshotBase, SnapshotRow, SqliteStore, StorybookRow,
+    SummaryStore, VectorIndex, WorldState, compute_upgrade_report, content_type_of, event_kind,
+    is_narrative_event,
+    lint_script, narrative_text, new_lint_state, pack_bundle, unpack_bundle,
+    validate_dispositions,
 };
 #[allow(unused_imports)]
 use octopus_types::ApiErrorBody;
 use octopus_types::{
-    CharacterInstance, ConfirmRequest, CreateSaveRequest, CreateStorybookRequest,
-    EntityRef, EventEnvelope, FocusEntity, HistoryPage, IssueSeverity, MaintenanceRow, PairMessageRecord,
-    PairThreadRecord, PlaytestRequest, ProjectionMeta, PublishRequest, RoundInput, SaveDetail,
-    SaveDraftRequest, SaveListItem, SaveSettings, SkeletonProgress, StorybookDocument,
-    SubmitRoundRequest, ValidateResult, ValidationIssue,
+    CharacterInstance, ConfirmRequest, CreateSaveRequest, CreateStorybookRequest, DeltaDomain,
+    DeltaOp, EntityRef, EventEnvelope, FocusEntity, HistoryPage, IssueSeverity,
+    LegacyDefinition, MaintenanceRow, NewOriginResult, PairMessageRecord, PairThreadRecord,
+    PlayEvent, PlaytestRequest, ProjectionMeta, PublishRequest, RoundInput, SaveDetail,
+    SaveDraftRequest, SaveListItem, SaveSettings, SkeletonProgress, StateDelta,
+    StateUpdatePayload, StatusInstance, StorybookDocument, SubmitRoundRequest, SystemLevel,
+    SystemPayload, UpgradeDisposition, UpgradeReport, UpgradeRequest, UpgradeResult, ValidateResult,
+    ValidationIssue,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::broadcast;
-use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::BroadcastStream;
 
 use crate::error::ApiError;
 
@@ -52,6 +59,22 @@ use crate::error::ApiError;
 enum SinkMsg {
     Event(EventEnvelope),
     Barrier(tokio::sync::oneshot::Sender<()>),
+}
+
+/// 记忆索引写队列消息（#05 §3.1）：叙事事件或派生摘要，交给同一个单消费者。
+///
+/// 摘要没有权威 seq，用负数派生编号（见 octopus_engine::storage），与叙事事件共用
+/// 这条有界 best-effort 队列，队列满即丢弃（索引可重建）。
+enum MemoryIndexMsg {
+    /// 权威命令日志里的叙事事件。
+    Event(EventEnvelope),
+    /// 派生摘要：回合微摘要 / 场景摘要。
+    Summary {
+        seq: i64,
+        round: u32,
+        kind: &'static str,
+        text: String,
+    },
 }
 
 /// 演出流出口：事件先进入单消费者队列，由写任务**先落库、后广播**。
@@ -76,6 +99,130 @@ impl EventSink for PersistingSink {
     }
 }
 
+/// 记忆索引写队列容量：有界（满则丢弃，索引可重建），单消费者处理，避免任务无界增长。
+const MEMORY_INDEX_QUEUE: usize = 256;
+
+/// 把一条叙事事件 best-effort 写入派生向量索引（#05 §3.1）。
+///
+/// 索引是派生数据：embedding / upsert 任何失败都只 warn，不影响权威落库与回合。
+async fn index_narrative_event(
+    embedding: &Arc<dyn EmbeddingBackend>,
+    index: &Arc<dyn VectorIndex>,
+    save_id: &str,
+    env: &EventEnvelope,
+) {
+    let Some(text) = narrative_text(&env.event) else {
+        return;
+    };
+    if text.trim().is_empty() {
+        return;
+    }
+    let vector = match embedding.embed(&text).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(save_id = %save_id, seq = env.seq, error = %e,
+                "叙事事件 embedding 失败，跳过向量写入（索引可重建）");
+            return;
+        }
+    };
+    if let Err(e) = index
+        .upsert(save_id, env.seq as i64, env.round, event_kind(&env.event), &text, &vector)
+        .await
+    {
+        tracing::warn!(save_id = %save_id, seq = env.seq, error = %e,
+            "叙事事件写入向量索引失败（索引可重建）");
+    }
+}
+
+/// 把一条派生摘要 best-effort 写入向量索引（#05 §3.2/§3.3）。
+///
+/// 与叙事事件同一套语义：任何失败都只 warn，索引可重建；seq 为负数派生编号。
+async fn index_summary_text(
+    embedding: &Arc<dyn EmbeddingBackend>,
+    index: &Arc<dyn VectorIndex>,
+    save_id: &str,
+    seq: i64,
+    round: u32,
+    kind: &str,
+    text: &str,
+) {
+    if text.trim().is_empty() {
+        return;
+    }
+    let vector = match embedding.embed(text).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(save_id = %save_id, seq, error = %e,
+                "摘要 embedding 失败，跳过向量写入（索引可重建）");
+            return;
+        }
+    };
+    if let Err(e) = index.upsert(save_id, seq, round, kind, text, &vector).await {
+        tracing::warn!(save_id = %save_id, seq, error = %e,
+            "摘要写入向量索引失败（索引可重建）");
+    }
+}
+
+/// 摘要落库端口实现（#05 §3.2/§3.3）：写派生表 + FTS5，向量索引走同一 best-effort 队列。
+///
+/// 组合根在建立会话时注入；端口方法返回错误由 Session 只记 warn，绝不影响权威回合。
+struct StoreSummaryStore {
+    store: Arc<SqliteStore>,
+    mem_tx: Option<tokio::sync::mpsc::Sender<MemoryIndexMsg>>,
+}
+
+impl StoreSummaryStore {
+    /// 把摘要的向量写入排进有界队列；队列满 / 未启用都只记 warn（索引可重建）。
+    fn enqueue_vector(&self, seq: i64, round: u32, kind: &'static str, text: &str) {
+        let Some(tx) = &self.mem_tx else { return };
+        if tx
+            .try_send(MemoryIndexMsg::Summary {
+                seq,
+                round,
+                kind,
+                text: text.to_string(),
+            })
+            .is_err()
+        {
+            tracing::warn!("记忆索引写队列已满，丢弃摘要向量（索引可重建）");
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl SummaryStore for StoreSummaryStore {
+    async fn put_round_summary(
+        &self,
+        save_id: &str,
+        round: u32,
+        text: &str,
+    ) -> Result<(), EngineError> {
+        let seq = self.store.upsert_round_summary(save_id, round, text).await?;
+        self.enqueue_vector(seq, round, "summary", text);
+        Ok(())
+    }
+
+    async fn round_summaries_after(
+        &self,
+        save_id: &str,
+        after_round: u32,
+    ) -> Result<Vec<(u32, String)>, EngineError> {
+        self.store.round_summaries_after(save_id, after_round).await
+    }
+
+    async fn put_scene_summary(
+        &self,
+        save_id: &str,
+        scene_id: &str,
+        round: u32,
+        text: &str,
+    ) -> Result<(), EngineError> {
+        let seq = self.store.upsert_scene_summary(save_id, scene_id, round, text).await?;
+        self.enqueue_vector(seq, round, "scene_summary", text);
+        Ok(())
+    }
+}
+
 pub struct AppState {
     store: Arc<SqliteStore>,
     /// 资产库（#28）：图片内容寻址存于文件系统，不占数据库
@@ -83,30 +230,137 @@ pub struct AppState {
     /// AI provider 槽：保存配置后热替换，后续回合立即用新模型（无需重启）。
     ai: Arc<RwLock<Arc<dyn AiProvider>>>,
     embedding: Arc<dyn EmbeddingBackend>,
+    /// 派生向量索引（#27/#05 M2）：best-effort 打开，失败则为 None，应用照常启动。
+    index: Option<Arc<dyn VectorIndex>>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     senders: Mutex<HashMap<String, broadcast::Sender<EventEnvelope>>>,
     /// 每回合 token 预算（0 = 不限）：保存配置后热更新到所有会话。
     token_budget: AtomicU32,
+    /// 模型会话持久化（派生数据）：热替换 AI provider 时重新注入。
+    conv_store: Arc<dyn ConversationStore>,
+}
+
+/// 旧 model_* 三列 → 单一模型；provider / model 任一缺失 → None（回落全局默认）。
+fn model_from_legacy(
+    provider_id: Option<String>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+) -> Option<ModelRef> {
+    match (provider_id, model) {
+        (Some(provider_id), Some(model)) => Some(ModelRef {
+            provider_id,
+            model,
+            reasoning_effort,
+        }),
+        _ => None,
+    }
+}
+
+/// ConversationStore 的 SQLite 实现：每存档一行的会话 JSON 快照（派生数据）。
+struct SqliteConversationStore {
+    store: Arc<SqliteStore>,
+}
+
+#[async_trait::async_trait]
+impl ConversationStore for SqliteConversationStore {
+    async fn load(&self, save_id: &str) -> Result<Vec<ConvRecord>, EngineError> {
+        self.store.load_ai_conversation(save_id).await
+    }
+    async fn save(&self, save_id: &str, records: &[ConvRecord]) -> Result<(), EngineError> {
+        self.store.save_ai_conversation(save_id, records).await
+    }
+    async fn clear(&self, save_id: &str) -> Result<(), EngineError> {
+        self.store.clear_ai_conversation(save_id).await
+    }
 }
 
 impl AppState {
+    /// 组装应用状态。
+    ///
+    /// `vector_index_path` = Some 时 best-effort 打开派生向量索引；打开失败只 warn，
+    /// 应用照常启动（M2 不消费索引，M3 检索会降级到 FTS5）。
     pub fn new(
         store: Arc<SqliteStore>,
         ai: Arc<dyn AiProvider>,
         embedding: Arc<dyn EmbeddingBackend>,
         assets: Arc<AssetStore>,
+        vector_index_path: Option<String>,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        let (index, index_reset): (Option<Arc<dyn VectorIndex>>, bool) = match vector_index_path {
+            Some(path) => match octopus_index::DuckDbVectorIndex::open(&path, embedding.clone()) {
+                Ok(idx) => {
+                    // 指纹/维度变化 ⇒ open 已丢弃旧表；旧向量需要重灌，放在**启动期**做。
+                    let reset = idx.was_reset();
+                    if reset {
+                        tracing::warn!(
+                            path = %path,
+                            dim = embedding.dimension(),
+                            "向量索引因 embedding 后端/维度变化被重建；启动后会重灌（派生数据，不影响权威日志）"
+                        );
+                    } else {
+                        tracing::info!(
+                            path = %path,
+                            dim = embedding.dimension(),
+                            "向量索引已打开（派生数据，可重建）"
+                        );
+                    }
+                    (Some(Arc::new(idx) as Arc<dyn VectorIndex>), reset)
+                }
+                Err(e) => {
+                    // 索引是派生且可选的：打开失败不阻断应用启动，只禁用向量检索。
+                    tracing::warn!(path = %path, error = %e, "向量索引打开失败，已禁用（应用继续启动）");
+                    (None, false)
+                }
+            },
+            None => (None, false),
+        };
+        // 会话持久化端口：让「每存档一条会话」跨重启保持缓存前缀（派生数据）。
+        let conv_store: Arc<dyn ConversationStore> =
+            Arc::new(SqliteConversationStore { store: store.clone() });
+        ai.set_conversation_store(conv_store.clone());
+        let app = Arc::new(Self {
             store,
             assets,
             ai: Arc::new(RwLock::new(ai)),
             embedding,
+            index,
             sessions: Mutex::new(HashMap::new()),
             senders: Mutex::new(HashMap::new()),
             token_budget: AtomicU32::new(
-                crate::config::load_config_from_disk().turn_token_budget.unwrap_or(0),
+                crate::config::load_config_from_disk()
+                    .turn_token_budget
+                    .unwrap_or(0),
             ),
-        })
+            conv_store,
+        });
+        // 启动期重灌：向量库因 fingerprint/维度变化刚被清空时，这里把它重灌回来。
+        // **只在启动期做**——此刻还没有任何会话（也就没有写队列），是唯一不会与
+        // 写路径抢同一批行的时机；放到 session_for 里做会与增量索引竞态丢行。
+        if index_reset {
+            if let Some(idx) = app.index.as_ref() {
+                let store = app.store.clone();
+                let idx = idx.clone();
+                tokio::spawn(async move {
+                    let saves = match store.list_saves().await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "启动期读取存档列表失败，跳过向量索引重灌");
+                            return;
+                        }
+                    };
+                    let indexer = MemoryIndexer::new(store, idx);
+                    let mut total = 0usize;
+                    for s in &saves {
+                        match indexer.rebuild_memory_index(&s.id).await {
+                            Ok(n) => total += n,
+                            Err(e) => tracing::warn!(save_id = %s.id, error = %e, "启动期重灌向量索引失败（该存档检索降级为 FTS）"),
+                        }
+                    }
+                    tracing::info!(saves = saves.len(), rows = total, "启动期向量索引重灌完成（派生数据）");
+                });
+            }
+        }
+        app
     }
 
     pub fn store(&self) -> &Arc<SqliteStore> {
@@ -121,8 +375,28 @@ impl AppState {
         &self.embedding
     }
 
+    /// 派生向量索引；None = 未启用（路径未配置或 DuckDB 打不开）。
+    pub fn index(&self) -> Option<&Arc<dyn VectorIndex>> {
+        self.index.as_ref()
+    }
+
+    /// 重建某存档的向量索引（读命令日志 → 覆盖式重建，返回写入条数）。
+    ///
+    /// 派生数据入口：换 embedding 模型 / 维度变更 / 手动重建时调用。索引未启用时
+    /// 返回明确错误（调用方可忽略，不影响回合）。
+    pub async fn rebuild_memory_index(&self, save_id: &str) -> Result<usize, EngineError> {
+        let index = self
+            .index
+            .as_ref()
+            .ok_or_else(|| EngineError::Internal("向量索引未启用，无法重建".into()))?;
+        MemoryIndexer::new(self.store.clone(), index.clone())
+            .rebuild_memory_index(save_id)
+            .await
+    }
+
     /// 热替换 AI provider：保存配置后调用，后续回合立即用新模型（无需重启进程/重建会话）。
     pub fn set_ai(&self, ai: Arc<dyn AiProvider>) {
+        ai.set_conversation_store(self.conv_store.clone());
         *self.ai.write().expect("ai poisoned") = ai;
     }
 
@@ -139,9 +413,20 @@ impl AppState {
         }
     }
 
+    /// 解析本存档生效的单一模型：旧 model_* 兼容列；缺失 → None，由 provider 回落全局默认。
+    pub async fn resolve_save_model(&self, save_id: &str) -> Result<Option<ModelRef>, EngineError> {
+        let (pid, mid, effort) = self.store.get_save_model(save_id).await?;
+        Ok(model_from_legacy(pid, mid, effort))
+    }
+
     /// 惰性建立会话（内存状态 + 事件日志 + 广播出口）。
     pub async fn session_for(&self, save_id: &str) -> Result<Arc<Session>, EngineError> {
-        if let Some(s) = self.sessions.lock().expect("sessions poisoned").get(save_id) {
+        if let Some(s) = self
+            .sessions
+            .lock()
+            .expect("sessions poisoned")
+            .get(save_id)
+        {
             return Ok(s.clone());
         }
         let save = self
@@ -153,12 +438,48 @@ impl AppState {
 
         // 先读回命令日志，再建会话并重放；重放完成前不对外暴露会话。
         let persisted = self.store.load_events(save_id).await?;
+        // 启动缓存（#06 ②）：有可用快照就只重放其后的命令；任何异常一律回退全量重放。
+        let max_seq = persisted.last().map(|p| p.envelope.seq).unwrap_or(0);
+        let snapshot_base = load_snapshot_base(
+            self.store.as_ref(),
+            save_id,
+            save.item.embedded_revision,
+            max_seq,
+        )
+        .await;
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<SinkMsg>();
         let (tx, _rx) = broadcast::channel(1024);
         let store = self.store.clone();
         let sid = save_id.to_string();
         let btx = tx.clone();
+
+        // 记忆写入侧（#05 §3.1）：派生向量索引 best-effort 增量写入。
+        // 有界队列 + 单消费者，避免「每条事件 spawn 一个任务」的无界增长：
+        // 队列满即丢弃（索引可重建），embedding 慢也不会拖住权威落库 / 广播。
+        let mem_tx = self.index.clone().map(|index| {
+            let embedding = self.embedding.clone();
+            let sid_mem = sid.clone();
+            let (mem_tx, mut mem_rx) =
+                tokio::sync::mpsc::channel::<MemoryIndexMsg>(MEMORY_INDEX_QUEUE);
+            tokio::spawn(async move {
+                while let Some(msg) = mem_rx.recv().await {
+                    match msg {
+                        MemoryIndexMsg::Event(env) => {
+                            index_narrative_event(&embedding, &index, &sid_mem, &env).await;
+                        }
+                        MemoryIndexMsg::Summary { seq, round, kind, text } => {
+                            index_summary_text(&embedding, &index, &sid_mem, seq, round, kind, &text)
+                                .await;
+                        }
+                    }
+                }
+            });
+            mem_tx
+        });
+        // 摘要落库端口复用上面那条队列做向量写入；队列未启用（无向量库）时只写派生表 + FTS。
+        let summary_mem_tx = mem_tx.clone();
+
         // 单消费者串行落库：保证「先落库、后广播」的顺序不变式。
         tokio::spawn(async move {
             while let Some(msg) = event_rx.recv().await {
@@ -177,6 +498,17 @@ impl AppState {
                         error = %e,
                         "演出事件落库失败；事件仍会广播，但该条未持久化"
                     );
+                } else if is_narrative_event(&env.event) {
+                    if let Some(mem_tx) = &mem_tx {
+                        // 只入队叙事事件；try_send 不阻塞权威写路径，满则丢弃。
+                        if mem_tx.try_send(MemoryIndexMsg::Event(env.clone())).is_err() {
+                            tracing::warn!(
+                                save_id = %sid,
+                                seq = env.seq,
+                                "记忆索引写队列已满，丢弃该条（索引可重建）"
+                            );
+                        }
+                    }
                 }
                 let _ = btx.send(env);
             }
@@ -191,20 +523,32 @@ impl AppState {
             auto_confirm,
             save.storybook.clone(),
         ));
-        session.replay(&persisted);
+        session.replay_from(&persisted, snapshot_base);
         // 每回合 token 预算：构造后按当前配置套用。
         session.set_token_budget(self.token_budget());
-        // 本存档覆盖的模型（存 saves 表）：会话建立后立刻套用，后续回合即可用。
-        if let Ok((pid, mid, effort)) = self.store.get_save_model(save_id).await {
-            if let (Some(provider_id), Some(model)) = (pid, mid) {
-                session.set_model(Some(ModelRef { provider_id, model, reasoning_effort: effort }));
-            }
+        // 本存档的模型（存 saves 表）：会话建立后立刻套用，后续回合即可用。
+        if let Ok(model) = self.resolve_save_model(save_id).await {
+            session.set_model(model);
         }
         // 叙述段玩家偏好（存 saves 表）：同样在会话建立后套用；不影响已重放的历史。
         if let Some(overrides) = self.store.get_save_narrative(save_id).await? {
             session.set_narrative_overrides(overrides);
         }
-        self.senders.lock().expect("senders poisoned").insert(save_id.to_string(), tx);
+        // 摘要派生落库（#05 §3.2/§3.3）：写派生表 + FTS，向量走同一条 best-effort 队列。
+        session.set_summary_store(Some(Arc::new(StoreSummaryStore {
+            store: self.store.clone(),
+            mem_tx: summary_mem_tx,
+        })));
+        // 相关往事检索（#05 §3.4）：向量 + FTS 混合；索引缺失 / 失败由检索器内部降级到 FTS。
+        session.set_memory_retriever(Some(Arc::new(HybridMemoryRetriever::new(
+            self.store.clone(),
+            self.embedding.clone(),
+            self.index.clone(),
+        ))));
+        self.senders
+            .lock()
+            .expect("senders poisoned")
+            .insert(save_id.to_string(), tx);
         self.sessions
             .lock()
             .expect("sessions poisoned")
@@ -212,9 +556,21 @@ impl AppState {
         Ok(session)
     }
 
-    fn drop_session(&self, save_id: &str) {
-        self.sessions.lock().expect("sessions poisoned").remove(save_id);
-        self.senders.lock().expect("senders poisoned").remove(save_id);
+    async fn drop_session(&self, save_id: &str) {
+        // 会话被重建（新原点 / 升级 / 导入 / 删除）时，连带丢弃该存档的追加式模型会话：
+        // 否则重建后的 AI 会把已归档的旧对话继续当上下文发出，缓存前缀也会残留。
+        let ai = self.ai.read().ok().map(|g| g.clone());
+        if let Some(ai) = ai {
+            ai.clear_conversation(save_id).await;
+        }
+        self.sessions
+            .lock()
+            .expect("sessions poisoned")
+            .remove(save_id);
+        self.senders
+            .lock()
+            .expect("senders poisoned")
+            .remove(save_id);
     }
 }
 
@@ -237,21 +593,99 @@ fn is_initially_present(sb: &Value, id: &str, kind: &str) -> bool {
     }
 }
 
+/// 自动快照间隔（回合）：一回合通常产生多条命令，10 回合约等于设计里的「每 ~100 条命令」。
+/// 手动存档另有强制快照；这是最便宜的正确答案——保留 5 份，磁盘有界。
+const SNAPSHOT_EVERY_ROUNDS: u32 = 10;
+
+/// 解析快照 state_json（OriginCheckpoint 形态）为回放基座；坏数据返回 None。
+fn decode_snapshot_base(row: &SnapshotRow) -> Option<SnapshotBase> {
+    let v: Value = serde_json::from_str(&row.state_json).ok()?;
+    let state: WorldState = serde_json::from_value(v.get("state")?.clone()).ok()?;
+    let scene_start_round = v.get("scene_start_round").and_then(Value::as_u64).unwrap_or(0) as u32;
+    Some(SnapshotBase { seq: row.seq.max(0) as u64, state, scene_start_round })
+}
+
+/// 载入最新可用快照作为回放基座（#06 ②）；没有 / 过期 / 坏数据一律返回 None → 全量重放。
+async fn load_snapshot_base(
+    store: &SqliteStore,
+    save_id: &str,
+    revision: u32,
+    max_seq: u64,
+) -> Option<SnapshotBase> {
+    let row = match store.latest_snapshot(save_id).await {
+        Ok(r) => r?,
+        Err(e) => {
+            tracing::warn!(save_id = %save_id, error = %e, "读取快照失败，回退全量重放");
+            return None;
+        }
+    };
+    if !row.usable_for(revision) {
+        tracing::info!(save_id = %save_id, "快照格式 / 版次过期，回退全量重放");
+        return None;
+    }
+    if row.seq.max(0) as u64 > max_seq {
+        tracing::warn!(save_id = %save_id, "快照 seq 超出日志，视为过期，回退全量重放");
+        return None;
+    }
+    decode_snapshot_base(&row)
+}
+
+/// 回合结束后按间隔落一份全量快照（#06 ②）：派生缓存，失败只 warn，绝不影响回合。
+async fn maybe_snapshot(app: &AppState, session: &Session, save_id: &str) {
+    let round = session.current_round();
+    if round == 0 || round % SNAPSHOT_EVERY_ROUNDS != 0 {
+        return;
+    }
+    write_snapshot(app, session, save_id).await;
+}
+
+/// 把当前会话状态物化为一份快照。先 flush 事件再取状态，保证快照 seq 已在库里；
+/// 写入 / 裁剪（保留最新 5 份）由存储层在同一事务完成。
+async fn write_snapshot(app: &AppState, session: &Session, save_id: &str) {
+    session.flush_events().await;
+    let seq = session.current_seq() as i64;
+    let revision = session.projection().meta.revision;
+    let state_json = session.snapshot_value().to_string();
+    if let Err(e) = app.store().put_snapshot(save_id, seq, revision, &state_json).await {
+        tracing::warn!(save_id = %save_id, error = %e, "快照写入失败（派生缓存，忽略）");
+    }
+}
+
 fn build_state(save: &SaveDetail) -> WorldState {
     let sb = &save.storybook;
     let scene = sb.pointer("/skeleton/0/scenes/0");
     let mut characters: BTreeMap<String, CharacterInstance> = BTreeMap::new();
     if let Some(arr) = sb.get("characters").and_then(|v| v.as_array()) {
         for c in arr {
-            let id = c.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            let id = c
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
             if id.is_empty() {
                 continue;
             }
-            let name = c.get("name").and_then(|v| v.as_str()).unwrap_or(&id).to_string();
-            let kind = c.get("kind").and_then(|v| v.as_str()).unwrap_or("npc").to_string();
+            let name = c
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&id)
+                .to_string();
+            let kind = c
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("npc")
+                .to_string();
             let present = is_initially_present(sb, &id, &kind);
-            let attributes = c.get("attributes").and_then(|v| v.as_object()).cloned().unwrap_or_default();
-            let resources = c.get("resources").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+            let attributes = c
+                .get("attributes")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+            let resources = c
+                .get("resources")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
             // 物品栏（#01）：characters[].inventory = [{ id, quantity? }] → id → 数量
             let mut inventory = serde_json::Map::new();
             if let Some(entries) = c.get("inventory").and_then(|v| v.as_array()) {
@@ -282,7 +716,71 @@ fn build_state(save: &SaveDetail) -> WorldState {
             );
         }
     }
-    let scene_id = scene.and_then(|s| s.get("id")).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    // 存档遗留区（#14）：新版故事书删掉的人物旧定义仍存于存档；实例继续可用，
+    // 因此按旧定义补建缺失的角色实例（升级检查点会再精确覆盖运行时数值）。
+    for legacy in &save.legacy {
+        if legacy.kind != "character" {
+            continue;
+        }
+        let id = legacy.id.clone();
+        if id.is_empty() {
+            continue;
+        }
+        let instance_id = format!("inst-{id}");
+        if characters.contains_key(&instance_id) {
+            continue;
+        }
+        let c = &legacy.definition;
+        let name = c
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(&id)
+            .to_string();
+        let kind = c
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("npc")
+            .to_string();
+        let attributes = c
+            .get("attributes")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let resources = c
+            .get("resources")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let mut inventory = serde_json::Map::new();
+        if let Some(entries) = c.get("inventory").and_then(Value::as_array) {
+            for entry in entries {
+                if let Some(item_id) = entry.get("id").and_then(Value::as_str) {
+                    let qty = entry.get("quantity").and_then(Value::as_i64).unwrap_or(1);
+                    inventory.insert(item_id.to_string(), Value::from(qty));
+                }
+            }
+        }
+        characters.insert(
+            instance_id.clone(),
+            CharacterInstance {
+                instance_id,
+                template_id: id,
+                name,
+                kind,
+                attributes,
+                resources,
+                inventory,
+                location_id: None,
+                present: true,
+                statuses: vec![],
+            },
+        );
+    }
+    let scene_id = scene
+        .and_then(|s| s.get("id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
     let scene_title = scene
         .and_then(|s| s.get("title"))
         .and_then(|v| v.as_str())
@@ -323,6 +821,8 @@ fn build_state(save: &SaveDetail) -> WorldState {
         locations,
         meta,
         rng_seed: fnv1a(&save.item.id),
+        // 新档 RNG 从 0 起；快照 / 检查点会在重放时覆盖它（#06 ②）。
+        rng_position: 0,
     }
 }
 
@@ -342,7 +842,10 @@ fn fnv1a(s: &str) -> u64 {
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/health", get(health))
-        .route("/api/config", get(config::get_config).put(config::put_config))
+        .route(
+            "/api/config",
+            get(config::get_config).put(config::put_config),
+        )
         .route("/api/assets", post(upload_asset))
         .route("/api/assets/{name}", get(get_asset))
         .route("/api/providers/probe", post(providers::probe_models))
@@ -355,7 +858,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/storybooks/{id}",
-            get(get_storybook).put(save_storybook_draft).delete(delete_storybook),
+            get(get_storybook)
+                .put(save_storybook_draft)
+                .delete(delete_storybook),
         )
         .route("/api/storybooks/{id}/publish", post(publish_storybook))
         .route("/api/storybooks/{id}/sandbox", post(playtest_storybook))
@@ -403,6 +908,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/saves/{id}/export", get(export_save))
         .route("/api/saves/import", post(import_save))
         .route("/api/saves/{id}/save", post(manual_save))
+        .route("/api/saves/{id}/upgrade/dry-run", post(upgrade_dry_run))
+        .route("/api/saves/{id}/upgrade", post(upgrade_execute))
         .route("/api/saves/{id}/origin", post(new_origin))
         .layer(tower_http::cors::CorsLayer::permissive())
         .layer(logging::http_trace_layer())
@@ -427,22 +934,38 @@ async fn run_lua(Json(req): Json<Value>) -> Result<Json<Value>, ApiError> {
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "lua_init", e.to_string()))?;
     let mode = req.get("mode").and_then(Value::as_str).unwrap_or("check");
     let lua_ctx = LuaHostContext {
-        script_id: req.get("script_id").and_then(Value::as_str).unwrap_or("editor").to_string(),
+        script_id: req
+            .get("script_id")
+            .and_then(Value::as_str)
+            .unwrap_or("editor")
+            .to_string(),
         actor_id: req
             .get("actor_id")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .or_else(|| req.pointer("/actor/id").and_then(Value::as_str).map(str::to_string))
+            .or_else(|| {
+                req.pointer("/actor/id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
             .unwrap_or_default(),
         actor: req.get("actor").cloned().unwrap_or(json!({})),
         target_id: req
             .get("target_id")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .or_else(|| req.pointer("/target/id").and_then(Value::as_str).map(str::to_string)),
+            .or_else(|| {
+                req.pointer("/target/id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            }),
         target: req.get("target").cloned(),
         skill: req.get("skill").cloned(),
-        scene_id: req.get("scene_id").and_then(Value::as_str).unwrap_or("").to_string(),
+        scene_id: req
+            .get("scene_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         round: req.get("round").and_then(Value::as_u64).unwrap_or(0) as u32,
         difficulty: req.get("difficulty").and_then(Value::as_i64),
         relationships: req
@@ -454,7 +977,12 @@ async fn run_lua(Json(req): Json<Value>) -> Result<Json<Value>, ApiError> {
         present: req
             .get("present")
             .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
             .unwrap_or_default(),
         controlled: req
             .get("controlled")
@@ -469,7 +997,9 @@ async fn run_lua(Json(req): Json<Value>) -> Result<Json<Value>, ApiError> {
             .map_err(|e| e.to_string()),
         "hook" => {
             let mount = LuaMount::from_str(
-                req.get("mount").and_then(Value::as_str).unwrap_or("pre_resolve"),
+                req.get("mount")
+                    .and_then(Value::as_str)
+                    .unwrap_or("pre_resolve"),
             );
             host.run_hook(script, mount, &lua_ctx)
                 .map(|_| json!({}))
@@ -515,7 +1045,10 @@ async fn get_asset(
 ) -> Result<impl IntoResponse, ApiError> {
     let bytes = app.assets().read(&name).await?;
     let headers = [
-        (axum::http::header::CONTENT_TYPE, content_type_of(&name).to_string()),
+        (
+            axum::http::header::CONTENT_TYPE,
+            content_type_of(&name).to_string(),
+        ),
         // 内容寻址 → 同一名字的字节永不变，可长期强缓存
         (
             axum::http::header::CACHE_CONTROL,
@@ -561,11 +1094,9 @@ async fn get_storybook(
     State(app): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<StorybookDocument>, ApiError> {
-    let row = app
-        .store()
-        .get_storybook(&id)
-        .await?
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "storybook_not_found", "故事书不存在"))?;
+    let row = app.store().get_storybook(&id).await?.ok_or_else(|| {
+        ApiError::new(StatusCode::NOT_FOUND, "storybook_not_found", "故事书不存在")
+    })?;
     Ok(Json(row_to_doc(row)))
 }
 
@@ -593,7 +1124,10 @@ async fn create_storybook_draft(
         "relationship_types": [],
         "target_types": [],
     });
-    let row = app.store().create_storybook_draft(req.title.as_deref(), &initial).await?;
+    let row = app
+        .store()
+        .create_storybook_draft(req.title.as_deref(), &initial)
+        .await?;
     Ok((StatusCode::CREATED, Json(row_to_doc(row))))
 }
 
@@ -602,7 +1136,10 @@ async fn save_storybook_draft(
     Path(id): Path<String>,
     Json(req): Json<SaveDraftRequest>,
 ) -> Result<Json<StorybookMutationResponse>, ApiError> {
-    let row = app.store().save_draft(&id, &req.draft, req.base_version).await?;
+    let row = app
+        .store()
+        .save_draft(&id, &req.draft, req.base_version)
+        .await?;
     let issues = octopus_engine::validate_storybook(&req.draft);
     Ok(Json(StorybookMutationResponse {
         doc: row_to_doc(row),
@@ -615,11 +1152,9 @@ async fn publish_storybook(
     Path(id): Path<String>,
     Json(req): Json<PublishRequest>,
 ) -> Result<Json<StorybookMutationResponse>, ApiError> {
-    let row = app
-        .store()
-        .get_storybook(&id)
-        .await?
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "storybook_not_found", "故事书不存在"))?;
+    let row = app.store().get_storybook(&id).await?.ok_or_else(|| {
+        ApiError::new(StatusCode::NOT_FOUND, "storybook_not_found", "故事书不存在")
+    })?;
     let mut issues = octopus_engine::validate_storybook(&row.draft);
     // P2：Lua 协议的动态一致性检查只在发布门跑（草稿保存不跑，避免每次自动保存都执行 Lua）。
     if let Some(spec) = octopus_engine::ProtocolSpec::from_storybook(&row.draft) {
@@ -629,7 +1164,10 @@ async fn publish_storybook(
             }
         }
     }
-    if issues.iter().any(|i| matches!(i.severity, IssueSeverity::Error)) {
+    if issues
+        .iter()
+        .any(|i| matches!(i.severity, IssueSeverity::Error))
+    {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "validation_failed",
@@ -651,7 +1189,11 @@ async fn delete_storybook(
     if app.store().delete_storybook(&id).await? {
         Ok(StatusCode::NO_CONTENT)
     } else {
-        Err(ApiError::new(StatusCode::NOT_FOUND, "storybook_not_found", "故事书不存在"))
+        Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "storybook_not_found",
+            "故事书不存在",
+        ))
     }
 }
 
@@ -671,11 +1213,16 @@ async fn create_save(
         .store()
         .get_storybook(&req.storybook_id)
         .await?
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "storybook_not_found", "故事书不存在"))?;
+        .ok_or_else(|| {
+            ApiError::new(StatusCode::NOT_FOUND, "storybook_not_found", "故事书不存在")
+        })?;
     let is_sandbox = req.is_sandbox.unwrap_or(false);
     let (storybook_content, revision) = if is_sandbox {
         let issues = octopus_engine::validate_storybook(&sb.draft);
-        if issues.iter().any(|i| matches!(i.severity, IssueSeverity::Error)) {
+        if issues
+            .iter()
+            .any(|i| matches!(i.severity, IssueSeverity::Error))
+        {
             return Err(ApiError::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "validation_failed",
@@ -685,10 +1232,13 @@ async fn create_save(
         }
         (sb.draft.clone(), sb.revision)
     } else {
-        let released = sb
-            .released
-            .clone()
-            .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "storybook_unpublished", "故事书尚未发布"))?;
+        let released = sb.released.clone().ok_or_else(|| {
+            ApiError::new(
+                StatusCode::CONFLICT,
+                "storybook_unpublished",
+                "故事书尚未发布",
+            )
+        })?;
         (released, sb.revision)
     };
     let now = octopus_engine::storage::now_iso();
@@ -716,9 +1266,17 @@ async fn create_save(
         updated_at: now.clone(),
         last_played_at: now,
     };
-    let mut detail = SaveDetail { item, storybook: storybook_content };
+    let mut detail = SaveDetail {
+        item,
+        storybook: storybook_content,
+        legacy: Vec::new(),
+    };
     if let Some(cid) = &req.controlled_character_id {
-        if let Some(arr) = detail.storybook.get_mut("characters").and_then(|v| v.as_array_mut()) {
+        if let Some(arr) = detail
+            .storybook
+            .get_mut("characters")
+            .and_then(|v| v.as_array_mut())
+        {
             for c in arr {
                 if c.get("id").and_then(|v| v.as_str()) == Some(cid.as_str()) {
                     c["kind"] = json!("pc");
@@ -779,7 +1337,11 @@ async fn rename_save(
 ) -> Result<Json<SaveListItem>, ApiError> {
     let title = body.title.trim();
     if title.is_empty() {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "empty_title", "标题不能为空"));
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "empty_title",
+            "标题不能为空",
+        ));
     }
     app.store()
         .rename_save(&id, title)
@@ -793,10 +1355,14 @@ async fn delete_save(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     if app.store().delete_save(&id).await? {
-        app.drop_session(&id);
+        app.drop_session(&id).await;
         Ok(StatusCode::NO_CONTENT)
     } else {
-        Err(ApiError::new(StatusCode::NOT_FOUND, "save_not_found", "存档不存在"))
+        Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "save_not_found",
+            "存档不存在",
+        ))
     }
 }
 
@@ -821,7 +1387,9 @@ async fn get_history(
     Query(q): Query<HistoryQuery>,
 ) -> Result<Json<HistoryPage>, ApiError> {
     let session = app.session_for(&id).await?;
-    Ok(Json(session.history(q.before_seq, q.limit.unwrap_or(50).min(200))))
+    Ok(Json(
+        session.history(q.before_seq, q.limit.unwrap_or(50).min(200)),
+    ))
 }
 
 async fn submit_round(
@@ -830,6 +1398,20 @@ async fn submit_round(
     Json(req): Json<SubmitRoundRequest>,
 ) -> Result<StatusCode, ApiError> {
     let session = app.session_for(&id).await?;
+    // 设计决策 #6：非 idle（thinking / resolving / waiting_confirm）提交必须**同步**返回 409，
+    // 而不是 202 之后在 spawn 里静默吞掉——否则前端永远等不到 round_in_progress。
+    // request_id 幂等去重仍在 `run_round` 内（重复提交同一 id 会正常返回 202）。
+    if !session.is_idle() {
+        // 幂等重复（同一 request_id）放行；否则视为并发的新回合 → 409。
+        let duplicate = req
+            .request_id
+            .as_deref()
+            .map(|rid| session.has_seen_request(rid))
+            .unwrap_or(false);
+        if !duplicate {
+            return Err(EngineError::RoundInProgress.into());
+        }
+    }
     let input = RoundInput {
         channel: req.channel,
         text: req.text,
@@ -838,11 +1420,13 @@ async fn submit_round(
     let request_id = req.request_id;
     let focus = req.focus.unwrap_or_default();
     let sid = id.clone();
+    let app_for_snap = app.clone();
     // 202 立即返回，事件经 SSE 流出（#24 ①）
     tokio::spawn(async move {
         if let Err(e) = session.run_round(input, request_id, focus).await {
             tracing::warn!(save_id = %sid, error = %e, "回合执行失败");
         }
+        maybe_snapshot(&app_for_snap, &session, &sid).await;
     });
     Ok(StatusCode::ACCEPTED)
 }
@@ -872,15 +1456,25 @@ async fn rerun_round(
         ));
     }
     let Some(plan) = session.rewind_plan() else {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "no_round", "没有可重跑的回合"));
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "no_round",
+            "没有可重跑的回合",
+        ));
     };
     // 先等旧回合全部落库，再归档：否则写队列里未落库的旧事件可能在归档后又写回。
     session.flush_events().await;
-    app.store().archive_commands_from(&id, plan.from_seq).await?;
+    app.store()
+        .archive_commands_from(&id, plan.from_seq)
+        .await?;
     session.apply_rewind(plan.from_seq, plan.round);
     let _ = app
         .store()
-        .append_maintenance(&id, "重跑本轮", &format!("重跑第 {} 回合，旧输出已归档", plan.round))
+        .append_maintenance(
+            &id,
+            "重跑本轮",
+            &format!("重跑第 {} 回合，旧输出已归档", plan.round),
+        )
         .await;
 
     let focus = req.focus.unwrap_or_default();
@@ -890,10 +1484,12 @@ async fn rerun_round(
     if let Some(t) = req.text.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         input.text = t.to_string();
     }
+    let app_for_snap = app.clone();
     tokio::spawn(async move {
         if let Err(e) = session.run_round(input, None, focus).await {
             tracing::warn!(save_id = %sid, error = %e, "重跑回合执行失败");
         }
+        maybe_snapshot(&app_for_snap, &session, &sid).await;
     });
     Ok(StatusCode::ACCEPTED)
 }
@@ -926,7 +1522,13 @@ async fn get_settings(
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "save_not_found", "存档不存在"))?;
     let (model_provider_id, model, reasoning_effort) = app.store().get_save_model(&id).await?;
     let narrative = app.store().get_save_narrative(&id).await?;
-    Ok(Json(SaveSettings { auto_confirm: v, model_provider_id, model, reasoning_effort, narrative }))
+    Ok(Json(SaveSettings {
+        auto_confirm: v,
+        model_provider_id,
+        model,
+        reasoning_effort,
+        narrative,
+    }))
 }
 
 async fn put_settings(
@@ -935,6 +1537,7 @@ async fn put_settings(
     Json(body): Json<SaveSettings>,
 ) -> Result<Json<SaveSettings>, ApiError> {
     app.store().set_auto_confirm(&id, body.auto_confirm).await?;
+    // 本存档的单一模型（旧 model_* 兼容列）：直接写入。
     app.store()
         .set_save_model(
             &id,
@@ -948,14 +1551,12 @@ async fn put_settings(
     app.store().set_save_narrative(&id, &narrative).await?;
     if let Ok(session) = app.session_for(&id).await {
         session.set_auto_confirm(body.auto_confirm);
-        let model = match (&body.model_provider_id, &body.model) {
-            (Some(provider_id), Some(model)) => Some(ModelRef {
-                provider_id: provider_id.clone(),
-                model: model.clone(),
-                reasoning_effort: body.reasoning_effort.clone(),
-            }),
-            _ => None,
-        };
+        // 直接用刚写入的 body 计算，避免再查库。
+        let model = model_from_legacy(
+            body.model_provider_id.clone(),
+            body.model.clone(),
+            body.reasoning_effort.clone(),
+        );
         session.set_model(model);
         session.set_narrative_overrides(narrative);
     }
@@ -998,7 +1599,7 @@ async fn rest_save(
                 StatusCode::BAD_REQUEST,
                 "invalid_rest_kind",
                 format!("未知休息种类 {other}（expected short/long）"),
-            ))
+            ));
         }
     };
     let changes = session.rest(kind)?;
@@ -1056,9 +1657,10 @@ async fn ensure_storybook(app: &AppState, id: &str) -> Result<(), ApiError> {
 }
 
 async fn ensure_thread(app: &AppState, id: &str) -> Result<PairThreadRow, ApiError> {
-    app.store().get_pair_thread(id).await?.ok_or_else(|| {
-        ApiError::new(StatusCode::NOT_FOUND, "thread_not_found", "会话不存在")
-    })
+    app.store()
+        .get_pair_thread(id)
+        .await?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "thread_not_found", "会话不存在"))
 }
 
 fn thread_record(t: PairThreadRow) -> PairThreadRecord {
@@ -1107,7 +1709,10 @@ async fn create_pair_thread(
     Json(body): Json<CreatePairThreadRequest>,
 ) -> Result<(StatusCode, Json<PairThreadRecord>), ApiError> {
     ensure_storybook(&app, &id).await?;
-    let t = app.store().create_pair_thread(&id, body.title.as_deref()).await?;
+    let t = app
+        .store()
+        .create_pair_thread(&id, body.title.as_deref())
+        .await?;
     Ok((StatusCode::CREATED, Json(thread_record(t))))
 }
 
@@ -1118,7 +1723,11 @@ async fn rename_pair_thread(
 ) -> Result<Json<PairThreadRecord>, ApiError> {
     let title = body.title.trim();
     if title.is_empty() {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "empty_title", "标题不能为空"));
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "empty_title",
+            "标题不能为空",
+        ));
     }
     let t = app
         .store()
@@ -1135,7 +1744,11 @@ async fn delete_pair_thread(
     if app.store().delete_pair_thread(&thread_id).await? {
         Ok(StatusCode::NO_CONTENT)
     } else {
-        Err(ApiError::new(StatusCode::NOT_FOUND, "thread_not_found", "会话不存在"))
+        Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "thread_not_found",
+            "会话不存在",
+        ))
     }
 }
 
@@ -1182,7 +1795,9 @@ async fn append_pair_messages(
                 model: m.model,
                 is_error: m.is_error,
                 tools: m.tools,
-                refs: m.refs.map(|r| serde_json::to_value(r).unwrap_or(Value::Null)),
+                refs: m
+                    .refs
+                    .map(|r| serde_json::to_value(r).unwrap_or(Value::Null)),
                 reasoning: m.reasoning,
                 attachments: m.attachments,
             })
@@ -1206,9 +1821,19 @@ async fn manual_save(
     Path(id): Path<String>,
 ) -> Result<Json<SaveListItem>, ApiError> {
     app.store().touch_save(&id).await?;
-    // v1 不落快照：历史与世界状态由命令日志重放恢复，这里只标记检查点时间。
+    // 手动存档同时写一份全量快照（#06 ②）：启动缓存，权威仍是命令日志。
+    let session = app.session_for(&id).await?;
+    session.flush_events().await;
+    let seq = session.current_seq() as i64;
+    let revision = session.projection().meta.revision;
+    let state_json = session.snapshot_value().to_string();
+    app.store().put_snapshot(&id, seq, revision, &state_json).await?;
     app.store()
-        .append_maintenance(&id, "手动存档", "已标记检查点；历史由命令日志重放恢复（v1 不落快照）")
+        .append_maintenance(
+            &id,
+            "手动存档",
+            "已写入全量快照（保留最新 5 份）；历史与权威状态仍由命令日志重放恢复",
+        )
         .await?;
     app.store()
         .list_saves()
@@ -1219,17 +1844,370 @@ async fn manual_save(
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "save_not_found", "存档不存在"))
 }
 
-/// 新原点（日志压缩 + 归档）v1 未实现：重放依赖完整命令日志，压缩会破坏找回语义。
-/// 诚实返回 501，而不是假装成功。
+/// 维护操作（升级 / 新原点）占用会话 busy 位；无论成功、报错还是 panic 都释放。
+struct MaintenanceGuard {
+    session: Arc<Session>,
+}
+
+impl Drop for MaintenanceGuard {
+    fn drop(&mut self) {
+        self.session.end_maintenance();
+    }
+}
+
+/// 自动备份包落盘目录：与资产库同级的 backups/。
+/// 单库（#27）下「升级前自动备份」= 导出该存档为独立包（派生决定 2026-09-09）。
+fn backup_dir(assets: &AssetStore) -> std::path::PathBuf {
+    let root = assets.root();
+    match root.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(parent) => parent.join("backups"),
+        None => std::path::PathBuf::from("backups"),
+    }
+}
+
+/// 把当前存档导出为独立包并落盘，返回文件名。失败即中止升级（存档保持原样）。
+async fn write_upgrade_backup(app: &AppState, save_id: &str) -> Result<String, ApiError> {
+    let pkg = app.store().export_save_package(save_id).await?;
+    let assets = app.assets().clone();
+    let bytes = tokio::task::spawn_blocking(move || pack_bundle(&pkg, &assets))
+        .await
+        .map_err(|e| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                format!("备份打包任务失败: {e}"),
+            )
+        })??;
+    let dir = backup_dir(app.assets());
+    tokio::fs::create_dir_all(&dir).await.map_err(|e| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            format!("创建备份目录失败: {e}"),
+        )
+    })?;
+    // 时间戳精确到纳秒，避免同一存档连续升级覆盖前一份备份。
+    let stamp = octopus_engine::storage::now_iso().replace([':', 'T', '+'], "-");
+    let name = format!("{save_id}-backup-{stamp}.octopus.zip");
+    let path = dir.join(&name);
+    tokio::fs::write(&path, &bytes).await.map_err(|e| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            format!("写入备份失败 {}: {e}", path.display()),
+        )
+    })?;
+    Ok(name)
+}
+
+fn event_envelope(seq: u64, round: u32, ts: &str, event: PlayEvent) -> EventEnvelope {
+    EventEnvelope {
+        id: uuid::Uuid::new_v4().to_string(),
+        seq,
+        round,
+        ts: ts.to_string(),
+        actor: None,
+        intent_id: None,
+        event,
+    }
+}
+
+fn origin_delta(save_id: &str, checkpoint: Value) -> StateDelta {
+    StateDelta {
+        domain: DeltaDomain::Origin,
+        entity_id: save_id.to_string(),
+        field: "state".to_string(),
+        op: DeltaOp::Set,
+        value: checkpoint,
+    }
+}
+
+fn character_delta(character_id: &str, field: &str, value: Value) -> StateDelta {
+    StateDelta {
+        domain: DeltaDomain::Character,
+        entity_id: character_id.to_string(),
+        field: field.to_string(),
+        op: DeltaOp::Set,
+        value,
+    }
+}
+
+/// 两段式升级第一段（#14 ②）：纯读 dry-run，列出消失人物与自动处理项。
+async fn upgrade_dry_run(
+    State(app): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<UpgradeReport>, ApiError> {
+    let save = app
+        .store()
+        .get_save(&id)
+        .await?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "save_not_found", "存档不存在"))?;
+    let sb = app
+        .store()
+        .get_storybook(&save.item.storybook_id)
+        .await?
+        .ok_or_else(|| {
+            ApiError::new(StatusCode::NOT_FOUND, "storybook_not_found", "故事书不存在")
+        })?;
+    let released = sb.released.clone().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::CONFLICT,
+            "storybook_unpublished",
+            "故事书尚未发布，没有可升级的目标版次",
+        )
+    })?;
+    Ok(Json(compute_upgrade_report(
+        &save.storybook,
+        &released,
+        save.item.embedded_revision,
+        sb.revision,
+    )))
+}
+
+/// 两段式升级第二段（#14 ②）：备份 -> 换内嵌故事书 -> 应用裁决 -> 维护历史。
+///
+/// 全部数据库写入在一个事务里；升级引起的世界状态变更（全量检查点 + 人物离场）
+/// 作为引擎命令进日志，重放即得一致状态——升级本身不依赖重跑 diff。
+async fn upgrade_execute(
+    State(app): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<UpgradeRequest>,
+) -> Result<Json<UpgradeResult>, ApiError> {
+    let save = app
+        .store()
+        .get_save(&id)
+        .await?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "save_not_found", "存档不存在"))?;
+    let sb = app
+        .store()
+        .get_storybook(&save.item.storybook_id)
+        .await?
+        .ok_or_else(|| {
+            ApiError::new(StatusCode::NOT_FOUND, "storybook_not_found", "故事书不存在")
+        })?;
+    let released = sb.released.clone().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::CONFLICT,
+            "storybook_unpublished",
+            "故事书尚未发布，没有可升级的目标版次",
+        )
+    })?;
+    let from = save.item.embedded_revision;
+    let to = sb.revision;
+
+    // 幂等：已到 / 超过目标版次直接返回，不再备份、不再写历史。
+    if from >= to {
+        return Ok(Json(UpgradeResult {
+            detail: save,
+            backup_name: String::new(),
+        }));
+    }
+
+    let report = compute_upgrade_report(&save.storybook, &released, from, to);
+    if let Err(e) = validate_dispositions(&report, &req.dispositions) {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, e.code(), e.message()));
+    }
+
+    // 会话必须空闲：占住维护位，并发回合（submit_round）会拿到 409。
+    let session = app.session_for(&id).await?;
+    if !session.try_begin_maintenance() {
+        return Err(EngineError::RoundInProgress.into());
+    }
+    let _guard = MaintenanceGuard {
+        session: session.clone(),
+    };
+    session.flush_events().await;
+
+    // (a) 自动备份必须先于任何写入；失败即中止，存档不动。
+    let backup_name = write_upgrade_backup(&app, &id).await?;
+
+    // (b) 组装升级事件：全量检查点 + 人物裁决。
+    let checkpoint = session.snapshot_value();
+    let round = session.current_round();
+    let now = octopus_engine::storage::now_iso();
+    let save_id = id.clone();
+    let mut seq = session.current_seq() + 1;
+    let mut events: Vec<EventEnvelope> = Vec::new();
+    events.push(event_envelope(
+        seq,
+        round,
+        &now,
+        PlayEvent::StateUpdate(StateUpdatePayload {
+            changes: vec![origin_delta(&save_id, checkpoint)],
+        }),
+    ));
+    seq += 1;
+
+    // 消失人物的旧定义一律进遗留区：无论「遗留冻结」还是「叙事离场」，
+    // 实例都要先能按旧定义重建（检查点已含运行时数值，这里保证基线可解释）。
+    let mut old_chars: HashMap<String, Value> = HashMap::new();
+    if let Some(arr) = save.storybook.get("characters").and_then(Value::as_array) {
+        for c in arr {
+            if let Some(cid) = c.get("id").and_then(Value::as_str) {
+                old_chars.insert(cid.to_string(), c.clone());
+            }
+        }
+    }
+    let mut legacy: Vec<LegacyDefinition> = save.legacy.clone();
+    for gc in &report.groups.gone_characters {
+        if legacy
+            .iter()
+            .any(|l| l.kind == "character" && l.id == gc.character_id)
+        {
+            continue;
+        }
+        if let Some(def) = old_chars.get(&gc.character_id) {
+            legacy.push(LegacyDefinition {
+                kind: "character".to_string(),
+                id: gc.character_id.clone(),
+                name: gc.name.clone(),
+                definition: def.clone(),
+                frozen_at_revision: from,
+            });
+        }
+    }
+
+    let departure_count = req
+        .dispositions
+        .iter()
+        .filter(|d| d.disposition == UpgradeDisposition::Departure)
+        .count();
+    let freeze_count = req
+        .dispositions
+        .iter()
+        .filter(|d| d.disposition == UpgradeDisposition::Freeze)
+        .count();
+
+    for item in &req.dispositions {
+        if item.disposition != UpgradeDisposition::Departure {
+            continue;
+        }
+        let name = report
+            .groups
+            .gone_characters
+            .iter()
+            .find(|g| g.character_id == item.character_id)
+            .map(|g| g.name.clone())
+            .unwrap_or_else(|| item.character_id.clone());
+        let status = serde_json::to_value(StatusInstance {
+            id: "departed".to_string(),
+            name: "已离场".to_string(),
+            turns_left: None,
+            scenes_left: None,
+        })
+        .unwrap_or(Value::Null);
+        events.push(event_envelope(
+            seq,
+            round,
+            &now,
+            PlayEvent::StateUpdate(StateUpdatePayload {
+                changes: vec![
+                    character_delta(&item.character_id, "present", Value::Bool(false)),
+                    character_delta(&item.character_id, "status", status),
+                ],
+            }),
+        ));
+        seq += 1;
+        // 注入给主线 AI 的离场提示：作为权威 System 事件落日志，重放 / 历史可见。
+        events.push(event_envelope(
+            seq,
+            round,
+            &now,
+            PlayEvent::System(SystemPayload {
+                level: SystemLevel::Info,
+                code: Some("upgrade_departure".to_string()),
+                text: format!(
+                    "人物「{name}」因故事书版次升级已离场：请在后续叙事中自然交代其离开。"
+                ),
+            }),
+        ));
+        seq += 1;
+    }
+
+    events.push(event_envelope(
+        seq,
+        round,
+        &now,
+        PlayEvent::System(SystemPayload {
+            level: SystemLevel::Info,
+            code: Some("upgrade".to_string()),
+            text: format!(
+                "存档已从版次 {from} 升级到 {to}：{departure_count} 名人物离场，{freeze_count} 名遗留冻结。"
+            ),
+        }),
+    ));
+
+    let write = SaveUpgradeWrite {
+        storybook: released,
+        storybook_title: sb.title.clone(),
+        to_revision: to,
+        legacy,
+        events,
+        maintenance_op: format!("升级 rev{from} → rev{to}"),
+        maintenance_summary: format!(
+            "备份 {backup_name}；{departure_count} 名人物离场，{freeze_count} 名遗留冻结"
+        ),
+    };
+    app.store().apply_save_upgrade(&id, &write).await?;
+
+    // 丢弃旧会话：下次访问会按新内嵌故事书重建并重放日志（含升级检查点）。
+    app.drop_session(&id).await;
+    let detail = app
+        .store()
+        .get_save(&id)
+        .await?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "save_not_found", "存档不存在"))?;
+    Ok(Json(UpgradeResult {
+        detail,
+        backup_name,
+    }))
+}
+
+/// 新原点（#14 ④ 修订 / 决策 3）：以当前状态检查点为新起点，旧日志移入库内归档表（只读）。
+///
+/// 检查点作为活日志第一条承载全量状态，因此不依赖快照表也能保证重放正确；
+/// 检查点、归档、维护历史在一个事务里，杜绝半压缩状态。
 async fn new_origin(
-    State(_app): State<Arc<AppState>>,
-    Path(_id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    Err(ApiError::new(
-        StatusCode::NOT_IMPLEMENTED,
-        "not_implemented",
-        "「新原点」压缩尚未实现：v1 依赖完整命令日志重放来恢复会话，暂不可用。",
-    ))
+    State(app): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<NewOriginResult>, ApiError> {
+    let session = app.session_for(&id).await?;
+    if !session.try_begin_maintenance() {
+        return Err(EngineError::RoundInProgress.into());
+    }
+    let _guard = MaintenanceGuard {
+        session: session.clone(),
+    };
+    session.flush_events().await;
+
+    let max_seq = session.current_seq();
+    if max_seq == 0 {
+        // 还没有任何权威事件：无可归档，也无状态可锚定，直接如实返回。
+        return Ok(Json(NewOriginResult {
+            ok: true,
+            archived_count: 0,
+            origin_seq: 0,
+        }));
+    }
+
+    let origin_seq = max_seq + 1;
+    let now = octopus_engine::storage::now_iso();
+    let checkpoint = event_envelope(
+        origin_seq,
+        session.current_round(),
+        &now,
+        PlayEvent::StateUpdate(StateUpdatePayload {
+            changes: vec![origin_delta(&id, session.snapshot_value())],
+        }),
+    );
+    let summary = format!("以 seq {origin_seq} 为新起点；旧日志移入库内归档表（只读）");
+    let archived_count = app.store().new_origin(&id, &checkpoint, &summary).await?;
+    app.drop_session(&id).await;
+    Ok(Json(NewOriginResult {
+        ok: true,
+        archived_count,
+        origin_seq,
+    }))
 }
 
 async fn export_save(
@@ -1241,10 +2219,19 @@ async fn export_save(
     let assets = app.assets().clone();
     let bytes = tokio::task::spawn_blocking(move || pack_bundle(&pkg, &assets))
         .await
-        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", format!("打包任务失败: {e}")))??;
+        .map_err(|e| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                format!("打包任务失败: {e}"),
+            )
+        })??;
     let filename = format!("{id}.octopus.zip");
     let headers = [
-        (axum::http::header::CONTENT_TYPE, "application/zip".to_string()),
+        (
+            axum::http::header::CONTENT_TYPE,
+            "application/zip".to_string(),
+        ),
         (
             axum::http::header::CONTENT_DISPOSITION,
             format!("attachment; filename=\"{filename}\""),
@@ -1298,15 +2285,24 @@ async fn stream(
 mod tests {
     use super::*;
     use octopus_ai::{ScriptedProvider, StubEmbedding};
-    use octopus_types::{PlayEvent, StorybookListItem};
-    use serde_json::json;
+    use octopus_engine::{AiOutput, MemoryRetriever, TurnContext};
+    use octopus_types::{
+        Intent, MaintenanceRow, NewOriginResult, PlayEvent, SaveDetail,
+        StorybookListItem, UpgradeReport, UpgradeResult, WorldProjection,
+    };
+    use serde_json::{Value, json};
 
     async fn spawn_app() -> (String, Arc<AppState>) {
+        spawn_app_with_ai(Arc::new(ScriptedProvider)).await
+    }
+
+    /// 用自定义 AI 起一个测试服务（并发/阻塞场景用）。
+    async fn spawn_app_with_ai(ai: Arc<dyn AiProvider>) -> (String, Arc<AppState>) {
         let store = Arc::new(SqliteStore::open_in_memory().await.unwrap());
-        let ai = Arc::new(ScriptedProvider);
-        let assets_dir = std::env::temp_dir().join(format!("octopus-test-assets-{}", uuid::Uuid::new_v4()));
+        let assets_dir =
+            std::env::temp_dir().join(format!("octopus-test-assets-{}", uuid::Uuid::new_v4()));
         let assets = Arc::new(AssetStore::open(&assets_dir).await.unwrap());
-        let state = AppState::new(store, ai, Arc::new(StubEmbedding::default()), assets);
+        let state = AppState::new(store, ai, Arc::new(StubEmbedding::default()), assets, None);
         let app = router(state.clone());
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1318,6 +2314,24 @@ mod tests {
         (format!("http://{addr}"), state)
     }
 
+    /// 等某存档的回合彻底结算（权威日志出现 RoundEnd）再统计派生数据。
+    ///
+    /// 回合是异步处理的：test 里若一看到首个事件就统计条数，边跑边数会 flaky。
+    /// RoundEnd 在全部叙事 / 摘要意图之后落库，见到它就说明该回合的派生写已发生。
+    async fn wait_round_end(store: &SqliteStore, save_id: &str) {
+        for _ in 0..200 {
+            let events = store.load_events(save_id).await.unwrap();
+            if events
+                .iter()
+                .any(|p| matches!(&p.envelope.event, PlayEvent::RoundEnd(_)))
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("回合未在预期时间内结算（未见 RoundEnd）");
+    }
+
     /// 在指定的数据库文件上起一个 AppState（用于模拟进程重启：同一文件、空的 sessions）。
     async fn spawn_app_with_db(db_path: &std::path::Path) -> String {
         let store = Arc::new(SqliteStore::open(db_path.to_str().unwrap()).await.unwrap());
@@ -1325,7 +2339,7 @@ mod tests {
         let assets_dir =
             std::env::temp_dir().join(format!("octopus-test-assets-{}", uuid::Uuid::new_v4()));
         let assets = Arc::new(AssetStore::open(&assets_dir).await.unwrap());
-        let state = AppState::new(store, ai, Arc::new(StubEmbedding::default()), assets);
+        let state = AppState::new(store, ai, Arc::new(StubEmbedding::default()), assets, None);
         let app = router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1333,6 +2347,624 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://{addr}")
+    }
+
+    /// 测试辅助：创建故事书 -> 存草稿 -> 发布首版，返回 (storybook_id, 当前 draft_version)。
+    async fn create_published_storybook(
+        client: &reqwest::Client,
+        base: &str,
+        title: &str,
+        draft: Value,
+    ) -> (String, u32) {
+        let created: StorybookDocument = client
+            .post(format!("{base}/api/storybooks"))
+            .json(&CreateStorybookRequest { title: Some(title.to_string()) })
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let mut draft = draft;
+        if let Some(meta) = draft.get_mut("meta").and_then(Value::as_object_mut) {
+            meta.insert("id".to_string(), json!(created.id));
+            meta.insert("title".to_string(), json!(title));
+        }
+        let saved: StorybookMutationResponse = client
+            .put(format!("{base}/api/storybooks/{}", created.id))
+            .json(&SaveDraftRequest {
+                draft,
+                base_version: created.draft_version,
+            })
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let published: StorybookMutationResponse = client
+            .post(format!("{base}/api/storybooks/{}/publish", created.id))
+            .json(&PublishRequest {
+                base_version: saved.doc.draft_version,
+            })
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(published.doc.revision, 1);
+        (created.id, published.doc.draft_version)
+    }
+
+    /// 测试辅助：在既有故事书上存新草稿并发布下一版，返回新 revision。
+    async fn publish_next_revision(
+        client: &reqwest::Client,
+        base: &str,
+        sb_id: &str,
+        draft: Value,
+        base_version: u32,
+    ) -> u32 {
+        let saved: StorybookMutationResponse = client
+            .put(format!("{base}/api/storybooks/{sb_id}"))
+            .json(&SaveDraftRequest {
+                draft,
+                base_version,
+            })
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let published: StorybookMutationResponse = client
+            .post(format!("{base}/api/storybooks/{sb_id}/publish"))
+            .json(&PublishRequest {
+                base_version: saved.doc.draft_version,
+            })
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        published.doc.revision
+    }
+
+    /// #14：dry-run 列出消失人物；缺裁决执行被拒且不污染存档；正确执行后换版、备份、记历史。
+    #[tokio::test]
+    async fn test_api_save_upgrade_two_stage() {
+        let (base, state) = spawn_app().await;
+        let client = reqwest::Client::new();
+
+        let draft_v1 = json!({
+            "schema_version": 3,
+            "meta": { "title": "升级测试书" },
+            "world": { "premise": "故事开场。" },
+            "characters": [
+                { "id": "char-a", "name": "米拉", "kind": "pc" },
+                { "id": "char-kael", "name": "凯尔", "kind": "npc" }
+            ],
+            "skills": [{ "id": "sk-a", "name": "痛饮" }],
+            "skeleton": [{ "id": "ch1", "title": "第一章", "scenes": [{
+                "id": "sc1", "title": "开场", "present_char_ids": ["char-a", "char-kael"]
+            }] }]
+        });
+        let (sb_id, after_v1) =
+            create_published_storybook(&client, &base, "升级测试书", draft_v1).await;
+
+        let detail: SaveDetail = client
+            .post(format!("{base}/api/saves"))
+            .json(&CreateSaveRequest {
+                storybook_id: sb_id.clone(),
+                title: Some("升级存档".to_string()),
+                controlled_character_id: None,
+                is_sandbox: None,
+            })
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let save_id = detail.item.id.clone();
+        assert_eq!(detail.item.embedded_revision, 1);
+        assert!(!detail.item.needs_upgrade);
+
+        // 新版：删掉凯尔、改痛饮定义，发布 rev2。
+        let draft_v2 = json!({
+            "schema_version": 3,
+            "meta": { "id": sb_id, "title": "升级测试书" },
+            "world": { "premise": "故事开场。" },
+            "characters": [{ "id": "char-a", "name": "米拉", "kind": "pc" }],
+            "skills": [{ "id": "sk-a", "name": "痛饮", "cost": [{ "resource": "gold", "amount": 1 }] }],
+            "skeleton": [{ "id": "ch1", "title": "第一章", "scenes": [{
+                "id": "sc1", "title": "开场", "present_char_ids": ["char-a"]
+            }] }]
+        });
+        let rev = publish_next_revision(&client, &base, &sb_id, draft_v2, after_v1).await;
+        assert_eq!(rev, 2);
+
+        // needs_upgrade 读时计算为 true。
+        let got: SaveDetail = client
+            .get(format!("{base}/api/saves/{save_id}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(got.item.needs_upgrade);
+        assert_eq!(got.item.latest_revision, 2);
+
+        // dry-run 报告列出消失人物。
+        let rep: UpgradeReport = client
+            .post(format!("{base}/api/saves/{save_id}/upgrade/dry-run"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(rep.from_revision, 1);
+        assert_eq!(rep.to_revision, 2);
+        assert!(
+            rep.groups
+                .gone_characters
+                .iter()
+                .any(|g| g.character_id == "char-kael"),
+            "dry-run 必须列出消失的凯尔"
+        );
+
+        // 缺裁决执行 -> 400，且存档未变（升级前自动备份前就拒绝）。
+        let res = client
+            .post(format!("{base}/api/saves/{save_id}/upgrade"))
+            .json(&json!({ "dispositions": [] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let err: Value = res.json().await.unwrap();
+        assert_eq!(err["code"], "missing_dispositions");
+        let untouched: SaveDetail = client
+            .get(format!("{base}/api/saves/{save_id}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(untouched.item.embedded_revision, 1, "失败的升级不得改动存档");
+
+        // 正确裁决 -> 执行。
+        let res = client
+            .post(format!("{base}/api/saves/{save_id}/upgrade"))
+            .json(&json!({
+                "dispositions": [{ "character_id": "char-kael", "disposition": "departure" }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let result: UpgradeResult = res.json().await.unwrap();
+        assert_eq!(result.detail.item.embedded_revision, 2);
+        assert!(!result.detail.item.needs_upgrade);
+        assert!(
+            result.detail.legacy.iter().any(|l| l.id == "char-kael"),
+            "消失人物旧定义应进遗留区"
+        );
+        assert!(!result.backup_name.is_empty(), "应返回备份文件名");
+        assert!(
+            backup_dir(state.assets()).join(&result.backup_name).exists(),
+            "自动备份包必须已落盘"
+        );
+
+        // 维护历史记录升级。
+        let m: Vec<MaintenanceRow> = client
+            .get(format!("{base}/api/saves/{save_id}/maintenance"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(m.iter().any(|r| r.op.contains("升级")));
+
+        // 升级引起的世界变更进了命令日志（检查点 + 离场提示）。
+        let events = state.store().load_events(&save_id).await.unwrap();
+        assert!(events.iter().any(|p| matches!(&p.envelope.event, PlayEvent::StateUpdate(u) if u.changes.iter().any(|d| d.domain == DeltaDomain::Origin))));
+        assert!(events.iter().any(|p| matches!(&p.envelope.event, PlayEvent::System(s) if s.code.as_deref() == Some("upgrade_departure"))));
+
+        // 离场人物在投影中 present=false。
+        let st: WorldProjection = client
+            .get(format!("{base}/api/saves/{save_id}/state"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let kael = st.characters.get("inst-char-kael").expect("遗留实例应存在");
+        assert_eq!(kael["present"], json!(false));
+        assert!(st.characters.contains_key("inst-char-a"));
+
+        // 幂等：重复执行不再备份、不再写历史。
+        let history_len = m.len();
+        let res = client
+            .post(format!("{base}/api/saves/{save_id}/upgrade"))
+            .json(&json!({
+                "dispositions": [{ "character_id": "char-kael", "disposition": "departure" }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let again: UpgradeResult = res.json().await.unwrap();
+        assert!(again.backup_name.is_empty(), "幂等重放不应再产生备份");
+        let m2: Vec<MaintenanceRow> = client
+            .get(format!("{base}/api/saves/{save_id}/maintenance"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(m2.len(), history_len, "幂等重放不应重复记历史");
+    }
+
+    /// #14：新原点把旧日志移入库内归档表，检查点保证重启后重放一致。
+    #[tokio::test]
+    async fn test_api_new_origin_archives_and_replays_across_restart() {
+        let db_path =
+            std::env::temp_dir().join(format!("octopus-origin-{}.db", uuid::Uuid::new_v4()));
+        let base1 = spawn_app_with_db(&db_path).await;
+        let client = reqwest::Client::new();
+
+        let detail: SaveDetail = client
+            .post(format!("{base1}/api/saves"))
+            .json(&CreateSaveRequest {
+                storybook_id: "sb-fallingstar".to_string(),
+                title: Some("新原点测试".to_string()),
+                controlled_character_id: None,
+                is_sandbox: None,
+            })
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let save_id = detail.item.id.clone();
+
+        let before: WorldProjection = client
+            .get(format!("{base1}/api/saves/{save_id}/state"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let history_before: HistoryPage = client
+            .get(format!("{base1}/api/saves/{save_id}/history?limit=200"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let n_before = history_before.events.len();
+        assert!(n_before > 0, "开档应至少产出开场事件");
+
+        let origin: NewOriginResult = client
+            .post(format!("{base1}/api/saves/{save_id}/origin"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(origin.ok);
+        assert_eq!(origin.archived_count as usize, n_before);
+        assert_eq!(origin.origin_seq, before.seq + 1);
+
+        // 活日志只剩检查点。
+        let history_after: HistoryPage = client
+            .get(format!("{base1}/api/saves/{save_id}/history?limit=200"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(history_after.events.len(), 1);
+
+        let after: WorldProjection = client
+            .get(format!("{base1}/api/saves/{save_id}/state"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(after.seq, origin.origin_seq);
+        assert_eq!(after.scene_id, before.scene_id, "新原点不改变世界状态");
+
+        // 重启（同一库文件、空会话）：只用检查点也能恢复。
+        let base2 = spawn_app_with_db(&db_path).await;
+        let restored: WorldProjection = client
+            .get(format!("{base2}/api/saves/{save_id}/state"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(restored.seq, after.seq, "重启后 seq 应延续");
+        assert_eq!(restored.scene_id, after.scene_id);
+        assert_eq!(restored.characters.len(), after.characters.len());
+
+        let m: Vec<MaintenanceRow> = client
+            .get(format!("{base2}/api/saves/{save_id}/maintenance"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(m.iter().any(|r| r.op.contains("新原点")));
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// #05 §3.1：回合产生的叙事事件被 best-effort 写入派生向量索引。
+    #[tokio::test]
+    async fn round_narrative_events_are_indexed_best_effort() {
+        let store = Arc::new(SqliteStore::open_in_memory().await.unwrap());
+        let assets_dir =
+            std::env::temp_dir().join(format!("octopus-test-assets-{}", uuid::Uuid::new_v4()));
+        let assets = Arc::new(AssetStore::open(&assets_dir).await.unwrap());
+        let vec_path =
+            std::env::temp_dir().join(format!("octopus-vec-{}.duckdb", uuid::Uuid::new_v4()));
+        let state = AppState::new(
+            store.clone(),
+            Arc::new(ScriptedProvider),
+            Arc::new(StubEmbedding::default()),
+            assets,
+            Some(vec_path.to_string_lossy().into_owned()),
+        );
+        let app = router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base = format!("http://{addr}");
+        let client = reqwest::Client::new();
+
+        let detail: SaveDetail = client
+            .post(format!("{base}/api/saves"))
+            .json(&CreateSaveRequest {
+                storybook_id: "sb-fallingstar".to_string(),
+                title: Some("索引写入测试".to_string()),
+                controlled_character_id: None,
+                is_sandbox: Some(true),
+            })
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let save_id = detail.item.id.clone();
+
+        let res = client
+            .post(format!("{base}/api/saves/{save_id}/rounds"))
+            .json(&json!({ "channel": "character", "text": "你好" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+
+        // 等回合彻底结算（RoundEnd）后再统计，避免边跑边数。
+        wait_round_end(&store, &save_id).await;
+        let expected = store.load_narrative_events(&save_id).await.unwrap().len();
+        assert!(expected > 0, "回合应产生叙事事件");
+
+        // 等派生索引追上（异步 best-effort）；用任意向量查全量。
+        let probe = state.embedding().embed("probe").await.unwrap();
+        let index = state.index().expect("测试已启用向量索引");
+        let mut got = 0usize;
+        for _ in 0..200 {
+            got = index.search(&save_id, &probe, 100).await.unwrap().len();
+            if got >= expected {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(got, expected, "每条叙事事件都应写入向量索引");
+
+        let _ = std::fs::remove_file(&vec_path);
+        let _ = std::fs::remove_file(vec_path.with_extension("duckdb.wal"));
+    }
+
+    /// 只产出「叙事 + 回合微摘要」的确定性 provider（验证摘要进索引与检索）。
+    struct SummaryProvider;
+
+    #[async_trait::async_trait]
+    impl AiProvider for SummaryProvider {
+        async fn story_intents(&self, _ctx: &TurnContext) -> Result<AiOutput, EngineError> {
+            Ok(AiOutput {
+                intents: vec![
+                    Intent::Narrate { content: "矿洞里有一点微光。".into(), actor_id: None }.into(),
+                    Intent::Summary { text: "在矿洞里发现微光".into() }.into(),
+                ],
+                reasoning: None,
+                intent_warnings: vec![],
+            })
+        }
+        
+    }
+
+    /// #05 §3.2 / §3.1：微摘要写派生表、进 FTS5 与向量索引，并能被检索器召回。
+    #[tokio::test]
+    async fn round_summary_is_indexed_and_retrievable() {
+        let store = Arc::new(SqliteStore::open_in_memory().await.unwrap());
+        let assets_dir =
+            std::env::temp_dir().join(format!("octopus-test-assets-{}", uuid::Uuid::new_v4()));
+        let assets = Arc::new(AssetStore::open(&assets_dir).await.unwrap());
+        let vec_path =
+            std::env::temp_dir().join(format!("octopus-vec-{}.duckdb", uuid::Uuid::new_v4()));
+        let state = AppState::new(
+            store.clone(),
+            Arc::new(SummaryProvider),
+            Arc::new(StubEmbedding::default()),
+            assets,
+            Some(vec_path.to_string_lossy().into_owned()),
+        );
+        let app = router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base = format!("http://{addr}");
+        let client = reqwest::Client::new();
+
+        let detail: SaveDetail = client
+            .post(format!("{base}/api/saves"))
+            .json(&CreateSaveRequest {
+                storybook_id: "sb-fallingstar".to_string(),
+                title: Some("摘要索引测试".to_string()),
+                controlled_character_id: None,
+                is_sandbox: Some(true),
+            })
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let save_id = detail.item.id.clone();
+
+        let res = client
+            .post(format!("{base}/api/saves/{save_id}/rounds"))
+            .json(&json!({ "channel": "character", "text": "四处看看" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+
+        // 等回合彻底结算（RoundEnd 在 summary 意图之后落库），再校验派生表。
+        wait_round_end(&store, &save_id).await;
+        let rounds = store.round_summaries_after(&save_id, 0).await.unwrap();
+        assert_eq!(rounds.len(), 1, "summary 意图应写入 round_summaries");
+        assert_eq!(rounds[0].1, "在矿洞里发现微光");
+
+        // FTS 命中摘要（与叙事事件共用 events_fts）。
+        let fts = store.search_events_fts(&save_id, "微光", 10).await.unwrap();
+        assert!(!fts.is_empty(), "摘要应进 FTS5");
+
+        // 向量索引：叙事 + 摘要都应写入（等 best-effort 队列追上）。
+        let expected = store.load_narrative_events(&save_id).await.unwrap().len();
+        assert!(expected >= 2, "至少叙事 + 摘要");
+        let probe = state.embedding().embed("probe").await.unwrap();
+        let index = state.index().expect("测试已启用向量索引");
+        let mut got = 0usize;
+        for _ in 0..200 {
+            got = index.search(&save_id, &probe, 100).await.unwrap().len();
+            if got >= expected {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(got, expected, "摘要也应写入向量索引");
+
+        // 混合检索器无需特判即可召回摘要。
+        let retriever = HybridMemoryRetriever::new(
+            store.clone(),
+            state.embedding().clone(),
+            state.index().cloned(),
+        );
+        let hits = retriever.retrieve(&save_id, "微光", 5).await.unwrap();
+        assert!(
+            hits.iter().any(|h| h.kind == "summary" && h.text.contains("微光")),
+            "摘要应可被检索: {hits:?}"
+        );
+
+        let _ = std::fs::remove_file(&vec_path);
+        let _ = std::fs::remove_file(vec_path.with_extension("duckdb.wal"));
+    }
+
+    /// #24 决策 6：非 idle 提交必须**同步**拿到 409 round_in_progress，而不是 202 之后被吞掉。
+    #[tokio::test]
+    async fn concurrent_round_submission_returns_409() {
+        struct BlockingAi {
+            started: Arc<tokio::sync::Semaphore>,
+            gate: Arc<tokio::sync::Semaphore>,
+        }
+        #[async_trait::async_trait]
+        impl AiProvider for BlockingAi {
+            async fn story_intents(&self, _ctx: &TurnContext) -> Result<AiOutput, EngineError> {
+                self.started.add_permits(1);
+                let _ = self.gate.acquire().await;
+                Ok(AiOutput {
+                    intents: vec![Intent::Narrate { content: "……".into(), actor_id: None }.into()],
+                    reasoning: None,
+                    intent_warnings: vec![],
+                })
+            }
+            
+        }
+
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (base, _state) = spawn_app_with_ai(Arc::new(BlockingAi {
+            started: started.clone(),
+            gate: gate.clone(),
+        }))
+        .await;
+        let client = reqwest::Client::new();
+        let detail: SaveDetail = client
+            .post(format!("{base}/api/saves"))
+            .json(&CreateSaveRequest {
+                storybook_id: "sb-fallingstar".to_string(),
+                title: Some("并发测试".to_string()),
+                controlled_character_id: None,
+                is_sandbox: Some(true),
+            })
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let save_id = detail.item.id.clone();
+
+        // 第一回合：AI 进入后挂起，会话进入非 idle
+        let first = client
+            .post(format!("{base}/api/saves/{save_id}/rounds"))
+            .json(&json!({ "channel": "character", "text": "我看看周围" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first.status().as_u16(), 202);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), started.acquire())
+            .await
+            .expect("第一回合应进入 AI");
+
+        // 第二回合：非 idle → 409 round_in_progress
+        let second = client
+            .post(format!("{base}/api/saves/{save_id}/rounds"))
+            .json(&json!({ "channel": "character", "text": "再来一次" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(second.status().as_u16(), 409, "非 idle 提交应返回 409");
+        let body: serde_json::Value = second.json().await.unwrap();
+        assert_eq!(body["code"], "round_in_progress");
+
+        // 放行第一回合，避免测试结束时悬挂任务
+        gate.add_permits(1);
     }
 
     /// 无骨架的角色卡故事书：NPC 也要在场，否则角色 AI 无人可演、剧情不推进。
@@ -1354,8 +2986,8 @@ mod tests {
     /// 验收锚点：杀掉后端进程 → 重启 → 打开存档，叙事历史与世界状态原样还在，且不重跑 AI。
     #[tokio::test]
     async fn test_session_survives_restart_via_command_log() {
-        let db_path = std::env::temp_dir()
-            .join(format!("octopus-restart-{}.db", uuid::Uuid::new_v4()));
+        let db_path =
+            std::env::temp_dir().join(format!("octopus-restart-{}.db", uuid::Uuid::new_v4()));
         let base1 = spawn_app_with_db(&db_path).await;
         let client = reqwest::Client::new();
 
@@ -1415,7 +3047,9 @@ mod tests {
                     matches!(&e.event, PlayEvent::System(p) if p.code.as_deref() == Some("confirm_toggle"))
                 })
                 && h.events.iter().any(|e| {
-                    matches!(&e.event, PlayEvent::RoundEnd(_))
+                    // 必须等**第二个（角色）回合**的 RoundEnd：只等任意 RoundEnd 会在
+                    // 元指令回合后就提前 break，捕获到不完整的历史（flaky）。
+                    matches!(&e.event, PlayEvent::RoundEnd(p) if p.round >= 2)
                 });
             history = Some(h);
             if enough {
@@ -1589,7 +3223,12 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            threads.iter().find(|x| x.id == t.id).unwrap().pending_suggestions.is_none(),
+            threads
+                .iter()
+                .find(|x| x.id == t.id)
+                .unwrap()
+                .pending_suggestions
+                .is_none(),
             "清空后应为 None"
         );
     }
@@ -1619,7 +3258,9 @@ mod tests {
 
         // 给它建一条结对线程
         client
-            .post(format!("{base_url}/api/storybooks/sb-fallingstar/pair/threads"))
+            .post(format!(
+                "{base_url}/api/storybooks/sb-fallingstar/pair/threads"
+            ))
             .json(&json!({}))
             .send()
             .await
@@ -1641,7 +3282,9 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
         let res = client
-            .get(format!("{base_url}/api/storybooks/sb-fallingstar/pair/threads"))
+            .get(format!(
+                "{base_url}/api/storybooks/sb-fallingstar/pair/threads"
+            ))
             .send()
             .await
             .unwrap();
@@ -2007,7 +3650,9 @@ mod tests {
         let client = reqwest::Client::new();
         let res = client
             .post(format!("{base_url}/api/storybooks"))
-            .json(&CreateStorybookRequest { title: Some("协议一致性".to_string()) })
+            .json(&CreateStorybookRequest {
+                title: Some("协议一致性".to_string()),
+            })
             .send()
             .await
             .unwrap();
@@ -2022,7 +3667,10 @@ mod tests {
         });
         let res = client
             .put(format!("{base_url}/api/storybooks/{}", doc.id))
-            .json(&SaveDraftRequest { draft: bad, base_version: 1 })
+            .json(&SaveDraftRequest {
+                draft: bad,
+                base_version: 1,
+            })
             .send()
             .await
             .unwrap();
@@ -2039,7 +3687,11 @@ mod tests {
         assert_eq!(err.code, "validation_failed");
         let issues = err.detail.unwrap()["issues"].clone();
         assert!(
-            issues.as_array().unwrap().iter().any(|i| i["code"] == "protocol_conformance_failed"),
+            issues
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|i| i["code"] == "protocol_conformance_failed"),
             "发布必须跑动态一致性：{issues}"
         );
 
@@ -2053,7 +3705,10 @@ mod tests {
         });
         let res = client
             .put(format!("{base_url}/api/storybooks/{}", doc.id))
-            .json(&SaveDraftRequest { draft: good, base_version: 2 })
+            .json(&SaveDraftRequest {
+                draft: good,
+                base_version: 2,
+            })
             .send()
             .await
             .unwrap();
@@ -2065,7 +3720,11 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::OK, "通过一致性的 Lua 协议应可发布");
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "通过一致性的 Lua 协议应可发布"
+        );
     }
 
     #[tokio::test]
@@ -2224,7 +3883,14 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(res.headers().get("content-type").unwrap(), "image/png");
-        assert!(res.headers().get("cache-control").unwrap().to_str().unwrap().contains("immutable"));
+        assert!(
+            res.headers()
+                .get("cache-control")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("immutable")
+        );
         assert_eq!(res.bytes().await.unwrap().as_ref(), png.as_slice());
 
         // 非图片内容被拒
@@ -2319,6 +3985,7 @@ mod tests {
             .unwrap();
         assert_eq!(broken_sbx.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
+
 }
 
 #[cfg(test)]
@@ -2334,7 +4001,8 @@ mod lua_run_tests {
 
     #[tokio::test]
     async fn lua_run_supports_check_condition_and_hook() {
-        let check = call(json!({ "script": "return { total = 18, margin = 6 }", "mode": "check" })).await;
+        let check =
+            call(json!({ "script": "return { total = 18, margin = 6 }", "mode": "check" })).await;
         assert_eq!(check["ok"], json!(true));
         assert_eq!(check["result"]["total"], json!(18));
         assert_eq!(check["result"]["margin"], json!(6));
@@ -2373,5 +4041,63 @@ mod lua_run_tests {
         let empty = call(json!({ "script": "  ", "mode": "check" })).await;
         assert_eq!(empty["ok"], json!(false));
     }
-}
 
+    /// #06 ② 启动缓存门禁：没有 / 版次过期 / 坏 JSON / seq 越界一律回退全量重放。
+    #[tokio::test]
+    async fn snapshot_base_loads_valid_and_rejects_absent_stale_corrupt() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        // 没有快照 → None（启动走全量重放）。
+        assert!(load_snapshot_base(&store, "sv", 1, 0).await.is_none());
+
+        // 造一份可解析的真实 WorldState 作为快照内容。
+        let state = WorldState {
+            seq: 5,
+            scene_id: "sc".into(),
+            scene_title: "场景".into(),
+            scene_description: None,
+            controlled: vec!["c".into()],
+            characters: Default::default(),
+            flags: Default::default(),
+            encounters: Default::default(),
+            progress: Default::default(),
+            locations: vec![],
+            meta: ProjectionMeta {
+                save_id: "sv".into(),
+                save_title: "t".into(),
+                storybook_title: "sb".into(),
+                revision: 1,
+                needs_upgrade: false,
+                auto_confirm: false,
+            },
+            rng_seed: 7,
+            rng_position: 0,
+        };
+        let state_value = serde_json::to_value(&state).unwrap();
+        let good = json!({ "state": state_value, "scene_start_round": 3 }).to_string();
+        store.put_snapshot("sv", 5, 1, &good).await.unwrap();
+
+        let base = load_snapshot_base(&store, "sv", 1, 10)
+            .await
+            .expect("同版次的有效快照应被采用");
+        assert_eq!(base.seq, 5);
+        assert_eq!(base.scene_start_round, 3);
+
+        // 版次过期（存储层升级后旧快照）→ 回退。
+        assert!(
+            load_snapshot_base(&store, "sv", 2, 10).await.is_none(),
+            "版次不一致的快照必须作废"
+        );
+        // 坏 JSON（同版次、同 seq 覆盖）→ 回退。
+        store.put_snapshot("sv", 5, 1, "{not json").await.unwrap();
+        assert!(
+            load_snapshot_base(&store, "sv", 1, 10).await.is_none(),
+            "无法解析的快照必须作废"
+        );
+        // seq 超出日志 → 回退。
+        store.put_snapshot("sv", 50, 1, &good).await.unwrap();
+        assert!(
+            load_snapshot_base(&store, "sv", 1, 10).await.is_none(),
+            "seq 超出命令日志的快照必须作废"
+        );
+    }
+}

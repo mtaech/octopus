@@ -242,6 +242,36 @@ pub fn apply_check_bonus(
 }
 
 /// 声明式判定：掷骰（可选）+ 属性修正 → total / margin / 档位。
+/// 判定骰式：显式 dice 优先；否则把 type（如 "d20"）规范成骰式。
+///
+/// 返回 None = 无骰（被动判定 / 由 AI 依属性叙事裁决）。
+pub fn checker_dice(checker: &CheckerDef) -> Option<String> {
+    if let Some(d) = checker.dice.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(d.to_string());
+    }
+    let t = checker.r#type.as_deref()?.trim().to_ascii_lowercase();
+    if t.is_empty() {
+        return None;
+    }
+    // "d20" / "d100"：补默认骰数 1。
+    if let Some(n) = t.strip_prefix('d') {
+        if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) {
+            return Some(format!("1d{n}"));
+        }
+    }
+    // "3d6" / "1d100"：已是骰式，原样。
+    if let Some((a, b)) = t.split_once('d') {
+        if !a.is_empty()
+            && a.chars().all(|c| c.is_ascii_digit())
+            && !b.is_empty()
+            && b.chars().all(|c| c.is_ascii_digit())
+        {
+            return Some(t);
+        }
+    }
+    None
+}
+
 pub fn resolve_declarative_check(
     checker: &CheckerDef,
     attribute: &str,
@@ -258,14 +288,9 @@ pub fn resolve_declarative_check(
     let (expr, rolls, dice_total, rolled) = if kind == CheckKind::Passive {
         (None, Vec::new(), 0, false)
     } else {
-        match checker
-            .dice
-            .as_deref()
-            .map(str::trim)
-            .filter(|d| !d.is_empty())
-        {
+        match checker_dice(checker) {
             Some(dice) => {
-                let roll = roll_dice(dice, rng)?;
+                let roll = roll_dice(&dice, rng)?;
                 (Some(roll.expr), roll.rolls, roll.total, true)
             }
             None => (None, Vec::new(), 0, false),
@@ -401,6 +426,42 @@ mod tests {
         assert_eq!(modifier_for(&checker, "str", 0.0, ModifierProfile::default()), -10);
         checker.attribute_modifier = Some([("str".to_string(), 7)].into_iter().collect());
         assert_eq!(modifier_for(&checker, "str", 30.0, ModifierProfile::default()), 7);
+    }
+
+    /// B：故事书写 type: "d20" 也要掷骰（不再静默无骰 → 0 分必失败）。
+    #[test]
+    fn checker_dice_accepts_type_alias() {
+        assert_eq!(checker_dice(&CheckerDef::default()), None);
+        assert_eq!(
+            checker_dice(&CheckerDef { r#type: Some("d20".into()), ..Default::default() }),
+            Some("1d20".to_string())
+        );
+        assert_eq!(
+            checker_dice(&CheckerDef { r#type: Some("3d6".into()), ..Default::default() }),
+            Some("3d6".to_string())
+        );
+        assert_eq!(
+            checker_dice(&CheckerDef { r#type: Some("attribute".into()), ..Default::default() }),
+            None,
+            "非骰式类型名不当作骰式"
+        );
+        assert_eq!(
+            checker_dice(&CheckerDef {
+                dice: Some("1d100".into()),
+                r#type: Some("d20".into()),
+                ..Default::default()
+            }),
+            Some("1d100".to_string()),
+            "显式 dice 优先于 type 别名"
+        );
+
+        let checker = CheckerDef { r#type: Some("d20".into()), ..Default::default() };
+        let mut rng = DeterministicRng::new(7);
+        let r = resolve_declarative_check(&checker, "agi", 14.0, 12, ModifierProfile::default(), &mut rng)
+            .unwrap();
+        assert_eq!(r.expr.as_deref(), Some("1d20"));
+        assert_eq!(r.rolls.len(), 1);
+        assert!(r.rolled);
     }
 
     #[test]

@@ -3,6 +3,7 @@
 // 编辑器的草稿是活的 Storybook；游玩页的是存档内冻结 Storybook——同一套形状。
 // ============================================================
 import type { EntityRef, FocusEntity, Storybook } from '@/types'
+import { relationshipEnd } from '@/types'
 
 /** 实体类型的中文标签（引用 chip 显示用）。 */
 export const REF_KIND_LABEL: Record<string, string> = {
@@ -88,7 +89,7 @@ export function listEntityRefs(d: Storybook): EntityRef[] {
   d.items?.forEach(i => push('item', i.name, i.id))
   d.objects?.forEach(o => push('object', o.name, o.id))
   d.factions?.forEach(f => push('faction', f.name, f.id))
-  d.relationships?.forEach(r => push('relationship', r.from_id + ' → ' + r.to_id + ' · ' + r.type, r.id))
+  d.relationships?.forEach(r => push('relationship', relationshipEnd(r, 'from') + ' → ' + relationshipEnd(r, 'to') + ' · ' + r.type, r.id))
   d.skeleton?.forEach(ch => {
     push('chapter', ch.title, ch.id)
     ch.scenes?.forEach(sc => {

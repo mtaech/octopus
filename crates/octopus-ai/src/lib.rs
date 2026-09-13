@@ -7,6 +7,6 @@ pub mod embedding;
 pub mod rig_provider;
 pub mod scripted;
 
-pub use embedding::{RigEmbedding, StubEmbedding};
+pub use embedding::{FastEmbedBackend, RigEmbedding, StubEmbedding};
 pub use rig_provider::{RigParams, RigProvider, RigProviderParams, RigRoleParams};
 pub use scripted::ScriptedProvider;

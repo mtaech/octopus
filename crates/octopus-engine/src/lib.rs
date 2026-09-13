@@ -12,6 +12,7 @@ pub mod entities;
 pub mod error;
 pub mod lua_host;
 pub mod lua_lint;
+pub mod memory;
 pub mod modifiers;
 pub mod ports;
 pub mod protocol;
@@ -22,7 +23,9 @@ pub mod seed;
 pub mod session;
 pub mod state;
 pub mod storage;
+pub mod text_index;
 pub mod upcast;
+pub mod upgrade;
 pub mod validate;
 
 pub use assets::{
@@ -47,12 +50,13 @@ pub use lua_host::{
     SandboxLimits,
 };
 pub use modifiers::{attribute_modifiers, AttrModifier};
-pub use ports::{AiOutput, AiProvider, AiSlot, EmbeddingBackend, EventSink, LoreView, ModelRef, NarrativeView, PersonaView, SceneBrief, TurnContext};
+pub use memory::{HybridMemoryRetriever, MemoryIndexer};
+pub use ports::{AiOutput, AiProvider, AiSlot, ConvRecord, ConversationStore, EmbeddingBackend, EventSink, LoreView, MemoryHit, MemoryRetriever, ModelRef, NarrativeView, PersonaView, SceneBrief, SummaryStore, TurnContext, VectorIndex};
 pub use protocol::{
     build_protocol_adapter, check_protocol_conformance, intent_kind, is_known_intent,
-    parse_intents, protocol_sandbox_limits, DeclarativeProtocol, DefaultProtocol, LuaProtocol,
-    ProtocolAdapter, ProtocolMode, ProtocolRole, ProtocolSpec, CHARACTER_PREAMBLE, KNOWN_INTENTS,
-    NARRATIVE_INTENTS, STORY_PREAMBLE,
+    parse_intent_envelopes, parse_intents, protocol_sandbox_limits, DeclarativeProtocol, DefaultProtocol, LuaProtocol,
+    ProtocolAdapter, ProtocolMode, ProtocolSpec, KNOWN_INTENTS,
+    NARRATIVE_INTENTS, SYSTEM_PREAMBLE,
 };
 pub use recovery::{plan_rest, rest_deltas, RecoveryTrigger, RestKind};
 pub use resolve::{
@@ -61,10 +65,14 @@ pub use resolve::{
     DEFAULT_DEGREE_THRESHOLDS,
 };
 pub use rng::DeterministicRng;
-pub use session::{RewindPlan, Session};
+pub use session::{RewindPlan, Session, SnapshotBase};
 pub use state::WorldState;
 pub use storage::{
-    NewPairMessage, PairMessageRow, PairThreadRow, PersistedEvent, SqliteStore, StorybookRow,
+    event_kind, is_narrative_event, narrative_text, NewPairMessage, PairMessageRow,
+    PairThreadRow, PersistedEvent, SaveUpgradeWrite, SnapshotRow, SqliteStore, StorybookRow,
+    SNAPSHOT_FORMAT_VERSION, SNAPSHOT_RETENTION,
 };
+pub use text_index::{index_text, match_expression};
 pub use upcast::{ensure_skeleton_ids, upcast_event, upcast_storybook, STORYBOOK_SCHEMA_VERSION};
+pub use upgrade::{compute_upgrade_report, validate_dispositions, DispositionError};
 pub use validate::{validate_storybook, validate_storybook_result};

@@ -3,6 +3,7 @@
 // 抽成共享函数，让「发送」与「侧栏 token 计量」用同一份口径。
 // ============================================================
 import type { Storybook } from '@/types'
+import { relationshipEnd } from '@/types'
 
 export function buildStorybookContext(d: Storybook | null | undefined): Record<string, unknown> | undefined {
   if (!d) return undefined
@@ -39,7 +40,7 @@ export function buildStorybookContext(d: Storybook | null | undefined): Record<s
     items: d.items.map(it => ({ id: it.id, name: it.name, description: it.description, type: it.type })),
     objects: d.objects.map(o => ({ id: o.id, name: o.name, location_id: o.location_id })),
     factions: d.factions.map(f => ({ id: f.id, name: f.name, description: f.description })),
-    relationships: d.relationships.map(r => ({ id: r.id, from_kind: r.from_kind, from_id: r.from_id, to_kind: r.to_kind, to_id: r.to_id, type: r.type, value: r.value })),
+    relationships: d.relationships.map(r => ({ id: r.id, from_kind: r.from_kind, from: relationshipEnd(r, 'from'), to_kind: r.to_kind, to: relationshipEnd(r, 'to'), type: r.type, value: r.value })),
     statuses: (d.statuses ?? []).map(s => ({ id: s.id, name: s.name, duration: s.duration, unit: s.unit, stack: s.stack ?? null })),
     lore: (d.lore ?? []).map(l => ({ id: l.id, title: l.title, content: l.content, keys: l.keys ?? [], priority: l.priority ?? 0, constant: l.constant ?? false, recursive: l.recursive ?? false, enabled: l.enabled ?? true })),
     narrative: (d.narrative?.sections ?? []).map(s => ({ id: s.id, title: s.title, slot: s.slot, scope: s.scope, text: s.text ?? '', enabled: s.enabled !== false })),

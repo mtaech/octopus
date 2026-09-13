@@ -54,7 +54,7 @@ pub trait ProtocolAdapter: Send + Sync {
 
 | 实现 | preamble | parse |
 |---|---|---|
-| `DefaultProtocol` | 现有 `STORY_PREAMBLE`/`CHARACTER_PREAMBLE` 的协议段 | `rig_provider::parse_intents`（下沉到 engine，供复用） |
+| `DefaultProtocol` | 现有 `SYSTEM_PREAMBLE` 的协议段 | `rig_provider::parse_intents`（下沉到 engine，供复用） |
 | `DeclarativeProtocol` | 引擎模板（按 `intents` 渲染）+ `instructions` | `parse_intents` + 白名单过滤（含白名单外的意图 → 记该意图为拒绝） |
 | `LuaProtocol` | Lua `protocol.preamble(ctx)` | Lua `protocol.parse(raw)` + 可选 `normalize` |
 

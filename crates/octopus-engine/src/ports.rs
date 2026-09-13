@@ -1,7 +1,7 @@
 //! 端口层（#20 ②）：engine 只依赖这些 trait，实现由 ai / api 注入。
 
 use async_trait::async_trait;
-use octopus_types::{ActorRef, EncounterView, FocusEntity, Intent, QuestView, RoundChannel};
+use octopus_types::{ActorRef, EncounterView, FocusEntity, Intent, IntentEnvelope, QuestView, RoundChannel};
 
 use crate::error::EngineError;
 use crate::protocol::ProtocolSpec;
@@ -94,21 +94,30 @@ pub struct TurnContext {
     pub narrative: Vec<NarrativeView>,
     /// 本回合命中的世界词条（关键词触发注入）。
     pub lore: Vec<LoreView>,
+    /// 本回合检索到的相关往事（#05 §3.4）：只用于主线 AI 提示词；为空则整段不注入。
+    pub memories: Vec<MemoryHit>,
     /// 每回合 token 预算（0 = 不限）：用于裁剪 lore / 人物设定等可选注入。
     pub token_budget: usize,
-    /// 主线 AI 本回合已叙述的文本（旁白/台词/神态）：只给角色 AI，用于接着演、避免重描同一场景。
-    pub story_narration: Option<String>,
     /// 玩家显式引用的实体（完整定义）：AI 应据此聚焦本次演绎。
     pub focus: Vec<FocusEntity>,
     /// 导演（人）已裁定的事实：AI 必须当作既定前提，不得推翻。
     pub canon: Vec<String>,
+    /// #04 ⑦ 回合内续轮时回喂的「新引擎信息」：模型自己在本回合触发的
+    /// query_world / check / interact 结果。
+    ///
+    /// 只装这些结果本身（查询答案已按关键词收窄），不重发世界全量。首轮恒为空，
+    /// 所以单轮路径的提示词与 turn_feedback 加入前逐字一致。
+    pub turn_feedback: Vec<String>,
     /// 当前任务（含骨架目标与导演新增），供 AI 推进与闭环。
     pub quests: Vec<QuestView>,
     /// 正在进行的结构化遭遇（导演创建）。
     pub encounters: Vec<EncounterView>,
     /// 骨架里的全部场景（含当前场景）：给 AI 合法可切的 advance_scene 目标。
     pub scenes: Vec<SceneBrief>,
-    /// 本存档指定的模型（覆盖角色默认）。
+    /// 故事书声明的合法判定属性 key（attribute_dimensions + world.check.attributes）：
+    /// check 意图的 attribute 只能填这些，必须列进提示词，避免模型拿英文别名瞎猜。
+    pub attributes: Vec<String>,
+    /// 本存档指定的单一模型（覆盖全局默认）；None = 用全局默认。
     pub model: Option<ModelRef>,
     /// 故事书声明的输出协议（叙事契约 P2）；None = 引擎默认协议。
     pub protocol: Option<ProtocolSpec>,
@@ -117,23 +126,75 @@ pub struct TurnContext {
 /// 可热替换的 AI provider 槽：改配置后，后续回合立即用新模型，无需重启进程或重建会话。
 pub type AiSlot = std::sync::Arc<std::sync::RwLock<std::sync::Arc<dyn AiProvider>>>;
 
-/// 一次 AI 调用的产物：意图 + 可选的思考链文本（reasoning_content）。
+/// 一次 AI 调用的产物：意图包络 + 可选的思考链文本（reasoning_content）。
 #[derive(Debug, Clone, Default)]
 pub struct AiOutput {
-    pub intents: Vec<Intent>,
+    /// 意图包络（#04 ⑨）：每个元素带可选的 intent_id，供回合内幂等去重。
+    pub intents: Vec<IntentEnvelope>,
     /// 供应商返回的思考链；None 表示该模型 / 供应商没给。
     pub reasoning: Option<String>,
     /// 协议适配器产生的警告（如 declarative 白名单过滤掉的意图）；引擎落 System 事件。
     pub intent_warnings: Vec<String>,
 }
 
+impl AiOutput {
+    /// 由纯意图列表构造（每个包一层无幂等 id 的包络）：脚本化 / 测试 provider 常用。
+    /// reasoning / intent_warnings 取缺省；需要时再就地覆盖字段。
+    pub fn from_intents(intents: Vec<Intent>) -> Self {
+        Self {
+            intents: intents.into_iter().map(IntentEnvelope::from).collect(),
+            reasoning: None,
+            intent_warnings: Vec::new(),
+        }
+    }
+}
+
+/// 追加式模型会话里的一条消息（持久化 / 重建用）。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ConvRecord {
+    pub round: u32,
+    /// "user" | "assistant"
+    pub role: String,
+    pub content: String,
+}
+
+/// 每存档一行的模型会话持久化端口：让追加式会话（缓存前缀）跨重启稳定。
+///
+/// 派生数据：读 / 写失败都只影响缓存命中与跨重启连续感，调用方必须静默降级，
+/// 绝不因此让回合失败；权威回合与 replay 都不依赖它。
+#[async_trait]
+pub trait ConversationStore: Send + Sync {
+    /// 读回某存档的会话；无记录返回空。
+    async fn load(&self, save_id: &str) -> Result<Vec<ConvRecord>, EngineError>;
+    /// 覆盖写入某存档的会话快照。
+    async fn save(&self, save_id: &str, records: &[ConvRecord]) -> Result<(), EngineError>;
+    /// 删除某存档的会话。
+    async fn clear(&self, save_id: &str) -> Result<(), EngineError>;
+}
+
 /// AI 只产生「意图」，引擎负责结算（#03/#04）。
 #[async_trait]
 pub trait AiProvider: Send + Sync {
-    /// 主线 AI：旁白 / 场景推进 / 世界响应。
+    /// 单一 AI：负责旁白 / 场景推进 / 世界响应，并扮演所有非玩家角色。
     async fn story_intents(&self, ctx: &TurnContext) -> Result<AiOutput, EngineError>;
-    /// 角色 AI：相关角色言行（引擎可并行调用多个）。
-    async fn character_intents(&self, ctx: &TurnContext) -> Result<AiOutput, EngineError>;
+
+    /// 注入会话持久化端口（仅 RigProvider 会用；其它实现忽略即可）。
+    fn set_conversation_store(&self, _store: std::sync::Arc<dyn ConversationStore>) {}
+
+    /// 丢弃某存档的追加式模型会话（内存 + 持久层）。
+    ///
+    /// 会话被重建时调用（新原点 / 升级 / 导入 / 删除）：不清理的话，重建后的会话会把
+    /// 已归档的旧对话继续当上下文发出去，缓存前缀也会包含已丢弃内容。
+    async fn clear_conversation(&self, _save_id: &str) {}
+
+    /// 把一段文本压缩成更短的摘要（#05 §3.3 场景压缩）。
+    ///
+    /// 默认返回 `Ok(None)` = 不做 AI 压缩，调用方退化为确定性拼接：这样既有实现与
+    /// 测试 mock 无需改动即可编译，离线 / 默认行为也可复现。真实实现走便宜角色（pair）；
+    /// 返回 None / 出错都由调用方回退，绝不把摘要失败传导给权威回合。
+    async fn summarize(&self, _text: &str) -> Result<Option<String>, EngineError> {
+        Ok(None)
+    }
 }
 
 /// 演出流出口（#17）：结算即推。api 层实现为 SSE。
@@ -146,10 +207,110 @@ pub trait EventSink: Send + Sync {
     async fn flush(&self) {}
 }
 
+/// 一条被检索到的往事（#05 §3.4）：派生视图——文本来自权威日志 / 派生摘要表，命中来自派生索引。
+///
+/// 注入提示词前引擎不再回读状态；`text` 就是当时的叙事原文或摘要文本。
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryHit {
+    /// 定位键（同存档内唯一，用于去重与定位原文）：叙事事件为正的命令日志 seq，
+    /// 派生摘要为负数编号（见 octopus-engine::storage 的 seq 编码）。
+    pub seq: i64,
+    pub round: u32,
+    pub kind: String,
+    pub text: String,
+    /// 相关性分数：向量命中为余弦（越大越相关），FTS 命中为 -bm25（越大越相关）。
+    pub score: f32,
+}
+
+/// 相关往事检索（#05 §3.4）：组合根注入；None = 不检索，行为与今天一致。
+///
+/// 这是**派生数据**端口：实现可以失败（无向量库 / 维度不符 / embedding 挂了），
+/// 调用方（Session）必须静默降级，绝不因此让回合失败。
+#[async_trait]
+pub trait MemoryRetriever: Send + Sync {
+    /// 以 `query` 召回该存档至多 `k` 条相关往事（按相关性排序，越靠前越相关）。
+    async fn retrieve(
+        &self,
+        save_id: &str,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<MemoryHit>, EngineError>;
+}
+
+/// 摘要持久化端口（#05 §3.2/§3.3）：回合微摘要与场景摘要都写派生表。
+///
+/// 实现负责落库 + best-effort 同步 FTS5 / 向量索引；调用方（Session）把任何失败
+/// 只当 warn——摘要是派生数据，丢了 / 失败了都不该影响权威回合与 `replay()`。
+#[async_trait]
+pub trait SummaryStore: Send + Sync {
+    /// 写入某回合的微摘要（同存档同回合覆盖）。
+    async fn put_round_summary(&self, save_id: &str, round: u32, text: &str) -> Result<(), EngineError>;
+    /// 读回 `round > after_round` 的微摘要（场景压缩输入），按 round 升序。
+    async fn round_summaries_after(
+        &self,
+        save_id: &str,
+        after_round: u32,
+    ) -> Result<Vec<(u32, String)>, EngineError>;
+    /// 写入某场景的压缩摘要（同存档同场景覆盖）。
+    async fn put_scene_summary(
+        &self,
+        save_id: &str,
+        scene_id: &str,
+        round: u32,
+        text: &str,
+    ) -> Result<(), EngineError>;
+}
+
 /// 向量化（#15/#27）：默认本地 bge-small-zh-v1.5，512 维。
 /// `embed` 为异步，以支持 rig 等网络 provider。
 #[async_trait]
 pub trait EmbeddingBackend: Send + Sync {
     async fn embed(&self, text: &str) -> Result<Vec<f32>, EngineError>;
     fn dimension(&self) -> usize;
+    /// 后端标识（stub / fastembed / rig…）：日志与测试用。
+    ///
+    /// 有些后端维度相同（Stub 与 bge-small 都是 512），只靠 `dimension()` 区分不出来，
+    /// 而「到底退到了哪个后端」正是配置排障最需要的信息。
+    fn backend_name(&self) -> &'static str {
+        "unknown"
+    }
+    /// 向量库指纹：后端 + 模型 + 维度。
+    ///
+    /// **换 embedding 但维度相同时**（例如 Stub(512) → bge-small(512)）维度校验发现不了，
+    /// 只有指纹能识别出「旧向量不能再用」，从而触发索引重建——否则新旧向量会混在一起。
+    fn fingerprint(&self) -> String {
+        format!("{}:{}", self.backend_name(), self.dimension())
+    }
+}
+
+/// 派生向量索引（#27/#05 M2）：只服务检索，不参与权威路径。
+///
+/// 不变量：索引是可重建的派生数据——删掉它不影响命令日志与 replay；
+/// 写索引失败只记 warn，绝不阻断权威写入。实现（如 DuckDB）可按自身存储
+/// 决定物理布局，engine 只认这里的语义。
+#[async_trait]
+pub trait VectorIndex: Send + Sync {
+    /// 某存档当前索引条数：自愈判断用（索引为空但日志有叙事事件 ⇒ 需要重建）。
+    fn indexed_count(&self, save_id: &str) -> Result<usize, EngineError>;
+    /// 写入/覆盖一条向量（save_id + seq 唯一）。
+    async fn upsert(
+        &self,
+        save_id: &str,
+        seq: i64,
+        round: u32,
+        kind: &str,
+        text: &str,
+        embedding: &[f32],
+    ) -> Result<(), EngineError>;
+    /// 余弦 top-K；返回 (seq, score)，score 越大越相似。
+    async fn search(&self, save_id: &str, query: &[f32], k: usize) -> Result<Vec<(i64, f32)>, EngineError>;
+    /// 当前索引的向量维度（换 embedding 模型时用于校验/重建判断）。
+    async fn dimension(&self) -> Result<usize, EngineError>;
+    /// 用一批叙事事件 (seq, round, kind, text) **覆盖式**重建某存档的向量。
+    /// 实现负责把这些文本生成 embedding（重建时调用方未必已有向量）。
+    async fn rebuild_from(
+        &self,
+        save_id: &str,
+        rows: &[(i64, u32, String, String)],
+    ) -> Result<(), EngineError>;
 }

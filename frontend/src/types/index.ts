@@ -258,11 +258,35 @@ export interface FactionDef {
 export interface RelationshipDef {
   id: string
   from_kind: 'character' | 'faction'
-  from_id: string
+  /** 主体 id（规范字段，决策 #11 对齐 #01 的 from/to） */
+  from: string
   to_kind: 'character' | 'faction'
-  to_id: string
+  /** 客体 id（规范字段） */
+  to: string
   type: string
   value: number
+}
+
+/**
+ * 读取侧兼容（决策 #11）：旧故事书的关系边写作 from_id / to_id，规范字段是
+ * from / to。编辑器载入草稿时归一为规范字段，之后只写规范字段；旧数据原位读取
+ * 兜底，绝不静默丢引用。原地改动 draft（与其它编辑操作一致）。
+ */
+export function normalizeRelationshipFields(d: Storybook): void {
+  for (const rel of d.relationships ?? []) {
+    const legacy = rel as RelationshipDef & { from_id?: string; to_id?: string }
+    if (legacy.from == null && legacy.from_id != null) legacy.from = legacy.from_id
+    if (legacy.to == null && legacy.to_id != null) legacy.to = legacy.to_id
+    delete legacy.from_id
+    delete legacy.to_id
+  }
+}
+
+/** 读取关系边端点：规范字段 from/to，兼容旧 from_id/to_id（决策 #11），无值返回空串。 */
+export function relationshipEnd(rel: RelationshipDef, end: 'from' | 'to'): string {
+  const legacy = rel as RelationshipDef & { from_id?: string; to_id?: string }
+  const value = end === 'from' ? rel.from ?? legacy.from_id : rel.to ?? legacy.to_id
+  return value ?? ''
 }
 
 // ---------- 开放内容元模型（元模型探针） ----------
@@ -594,6 +618,17 @@ export interface SaveListItem {
 export interface SaveDetail extends SaveListItem {
   /** 内嵌冻结模板 */
   storybook: Storybook
+  /** 存档遗留区（#14）：版次升级时被删除、旧定义仍可解释的实体；无遗留时不返回 */
+  legacy?: SaveLegacy[]
+}
+
+/** 遗留区条目（#14）：旧故事书里已删除的实体定义 */
+export interface SaveLegacy {
+  kind: string
+  id: string
+  name: string
+  definition: unknown
+  frozen_at_revision: number
 }
 
 export type Disposition = 'freeze' | 'departure'
@@ -741,7 +776,7 @@ export interface CheckResultPayload {
 }
 
 export interface StateDelta {
-  domain: 'character' | 'goal' | 'trigger' | 'location' | 'relationship' | 'resource' | 'flag'
+  domain: 'character' | 'goal' | 'trigger' | 'location' | 'relationship' | 'resource' | 'flag' | 'origin'
   entity_id: string
   field: string
   op: 'set' | 'add' | 'remove'
@@ -783,6 +818,13 @@ export interface HistoryPage {
 }
 
 /** 存档级设置（#24 修订：免确认） */
+/** 单存档模型选择（单一 AI）：供应商 + 模型 + 思考强度（undefined = 供应商默认）。 */
+export interface SaveModelChoice {
+  provider_id: string
+  model: string
+  reasoning_effort?: string
+}
+
 export interface SaveSettings {
   auto_confirm: boolean
   /** 本存档使用的模型；缺省 = 用全局角色默认 */
@@ -800,7 +842,7 @@ export interface MaintenanceRow { at: string; op: string; summary: string }
 // ---------- 应用配置 / AI Provider（#26） ----------
 
 // 类型 = 协议方言（不是厂商）；DeepSeek/Moonshot/Groq 等走 openai-compatible
-export type ProviderKind = 'openai' | 'anthropic' | 'ollama' | 'openai-compatible'
+export type ProviderKind = 'openai' | 'anthropic' | 'ollama' | 'openai-compatible' | 'local-embedding'
 
 export interface ModelEntry {
   id: string
@@ -845,12 +887,11 @@ export interface RoleConfig {
   reasoning_effort?: string
 }
 
-/** 三类模型分工各自可配（#26 ③） */
+/** 全局模型配置（#26 ③）：单一 AI（story）+ 结对（pair）+ 向量化（embedding） */
 export interface AppConfig {
   providers: ProviderConfig[]
   roles: {
     story: RoleConfig
-    character: RoleConfig
     pair?: RoleConfig
     embedding: RoleConfig
   }
@@ -899,3 +940,4 @@ export type { SavePackage } from './generated/SavePackage'
 export type { PlaytestRequest } from './generated/PlaytestRequest'
 export type { EntityRef } from './generated/EntityRef'
 export type { FocusEntity } from './generated/FocusEntity'
+

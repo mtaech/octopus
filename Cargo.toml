@@ -5,6 +5,7 @@ members = [
   "crates/octopus-engine",
   "crates/octopus-ai",
   "crates/octopus-api",
+  "crates/octopus-index",
   "crates/octopus-bin",
   "crates/octopus-launcher",
   "migration",

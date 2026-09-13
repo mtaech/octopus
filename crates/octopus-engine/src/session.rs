@@ -4,7 +4,7 @@
 //! 回合串行（#24 ④）：非 idle 提交返回 `RoundInProgress`。
 
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 
@@ -12,10 +12,12 @@ use octopus_types::{
     ActorRef, CheckKind, CheckResultPayload, CheckerDef, CondExpr, ConfirmDecision, DeltaDomain, DeltaOp,
     DialoguePayload,
     EmotePayload, EventEnvelope, FocusEntity, HistoryPage, Intent, NarrativeOverride, NarratePayload, PendingPayload, PhasePayload,
+    normalize_event_name,
+    relationship_endpoint,
     PhaseStage, PlayEvent, RejectionCode, ResolutionPayload, ResolutionStatus, RoundChannel,
     EncounterView, EnemyView, QuestView, RoundEndPayload, RoundInput, RoundStartPayload, ScenePayload, Seq,
     SkillDef, StateDelta, StateUpdatePayload, StatusUnit,
-    EffectTrigger, StatusDef, StatusInstance, SuccessLevel, SystemLevel, SystemPayload,
+    EffectTrigger, StatusDef, StatusInstance, SystemLevel, SystemPayload,
     ReasoningPayload,
     WorldProjection,
 };
@@ -30,9 +32,12 @@ use crate::{
     error::EngineError,
     lua_host::{LuaHost, LuaHostContext, LuaMount, LuaRegistry, LuaRequest, SandboxLimits},
     modifiers::AttrModifier,
-    ports::{AiOutput, AiSlot, EventSink, LoreView, ModelRef, NarrativeView, PersonaView, SceneBrief, TurnContext},
+    ports::{
+        AiSlot, EventSink, LoreView, MemoryHit, MemoryRetriever, ModelRef, NarrativeView, PersonaView,
+        SceneBrief, SummaryStore, TurnContext,
+    },
     protocol::ProtocolSpec,
-    resolve::ModifierProfile,
+    resolve::{level_for_margin, ModifierProfile, ResolvedCheck, DEFAULT_DEGREE_THRESHOLDS},
     rng::DeterministicRng,
     state::WorldState,
     storage::{now_iso, PersistedEvent},
@@ -43,26 +48,53 @@ struct Pending {
     tx: oneshot::Sender<ConfirmDecision>,
 }
 
-/// 抽出主线 AI 本回合的叙事文本（旁白/台词/神态），交给角色 AI 接着演。
-fn story_intent_text(intents: &[Intent]) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    for intent in intents {
-        let content = match intent {
-            Intent::Narrate { content, .. }
-            | Intent::Speak { content, .. }
-            | Intent::Emote { content, .. } => content,
-            _ => continue,
-        };
-        let t = content.trim();
-        if !t.is_empty() {
-            parts.push(t.to_string());
-        }
+/// 全量状态检查点（#14）：世界状态 + 场景压缩窗口左界。
+///
+/// 场景压缩左界是派生态（不进 WorldState），但删掉它会让新原点后的场景摘要
+/// 从错误窗口重压；随检查点一起携带即可让重放继续可复现。
+#[derive(serde::Serialize, serde::Deserialize)]
+struct OriginCheckpoint {
+    state: WorldState,
+    #[serde(default)]
+    scene_start_round: u32,
+}
+
+/// 回合内 intent_id 幂等登记（#04 ⑨）：非空且首次出现返回 true 可结算；
+/// 重复 id 返回 false 跳过；缺省 / 空 id 恒 true，保持旧模型行为。
+fn register_intent_id(seen: &mut std::collections::HashSet<String>, id: &Option<String>) -> bool {
+    match id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(id) => seen.insert(id.to_string()),
+        None => true,
     }
-    parts.join("\n")
+}
+
+/// 把 map（serde_json Map 或 BTreeMap）渲染成紧凑的 `k=v` 文本（只读查询答案用）。
+fn compact_map<'a, I: IntoIterator<Item = (&'a String, &'a Value)>>(entries: I) -> String {
+    entries
+        .into_iter()
+        .map(|(k, v)| format!("{k}={}", compact_value(v)))
+        .collect::<Vec<_>>()
+        .join("，")
+}
+
+fn compact_value(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Null => "null".to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// 单回合最多注入多少个人物的人格档案（防止上下文被设定撑爆）。
 const PERSONA_LIMIT: usize = 6;
+
+/// 单回合最多注入多少条「相关往事」（#05 §3.4 的 K=5）。
+const MEMORY_TOP_K: usize = 5;
+
+/// 一个玩家回合内主线 AI 最多调用几次（#04 ⑦：首轮 + 最多 2 轮续写 = 3）。
+/// 达到上限即收束，防止「查询—再查询」无限循环；不产出引擎可见信息的模型
+/// 第一轮后自然停止，行为与单轮路径一致。
+const MAX_STORY_AI_ROUNDS: usize = 3;
 
 /// token 预算 → lore 注入的字符预算（0 = 不限）。中文约 1.5–2 字符/token，取 2 保守估计。
 fn lore_budget_chars(token_budget: usize) -> usize {
@@ -459,12 +491,28 @@ pub struct RewindPlan {
     pub input: RoundInput,
 }
 
+/// 全量快照基座（#06 ② 启动缓存）：以 seq 处的世界状态替代「从零重放」。
+///
+/// 快照永远是派生缓存——它必须与「全量重放同一日志」逐位等价；载入失败或过期一律回退
+/// 全量重放。rng_position 随 state 一起携带，保证骰序也接得上。
+#[derive(Debug, Clone)]
+pub struct SnapshotBase {
+    pub seq: Seq,
+    pub state: WorldState,
+    pub scene_start_round: u32,
+}
+
 pub struct Session {
     pub save_id: String,
     state: Mutex<WorldState>,
-    /// 开档时的世界状态（重放日志之前）：回滚时以它为基线重放保留的事件。
-    base_state: WorldState,
+    /// 重放基线（开档初值或快照状态）：回滚时以它为基线重放保留的事件。
+    base_state: Mutex<WorldState>,
+    /// 基线覆盖到的命令 seq：回滚只重放 seq 之后的保留事件（快照之前的已在基线里）。
+    base_seq: AtomicU64,
     rng: Arc<Mutex<DeterministicRng>>,
+    /// 已经写进命令日志的 RNG 消耗条数（水位线）：emit 前把新增的消耗补成 rng_consume
+    /// 事件，保证日志与 RNG 位置不漂移，重放可精确恢复（#06 ②）。
+    rng_recorded: AtomicUsize,
     rules: SessionRules,
     lua: LuaHost,
     lua_registry: Mutex<LuaRegistry>,
@@ -477,12 +525,18 @@ pub struct Session {
     pending: Mutex<Option<Pending>>,
     event_log: Mutex<Vec<EventEnvelope>>,
     request_ids: Mutex<Vec<String>>,
-    /// 本存档使用的模型（None = 全局角色默认）。
+    /// 本存档指定的单一模型；None = 用全局默认。
     model: Mutex<Option<ModelRef>>,
     /// 每回合 token 预算（0 = 不限）：裁剪 lore 等可选注入。
     token_budget: AtomicU32,
     /// 存档级叙述段玩家偏好（section id → 开关 | 变体 key）；只作用于之后的回合。
     narrative_overrides: Mutex<std::collections::BTreeMap<String, NarrativeOverride>>,
+    /// 相关往事检索器（#05 §3.4）：None = 不检索，行为与今天一致。
+    memory: Mutex<Option<Arc<dyn MemoryRetriever>>>,
+    /// 摘要落库端口（#05 §3.2/§3.3）：None = 不写派生摘要（离线 / 测试默认）。
+    summary_store: Mutex<Option<Arc<dyn SummaryStore>>>,
+    /// 当前场景起始回合（场景压缩窗口的左界）：replay 时按最后的 advance_scene 事件重建。
+    scene_start_round: AtomicU32,
     confirmation_timeout_ms: u64,
     /// 事件广播递归深度（防止 Lua 事件脚本互相触发形成死循环）。
     dispatch_depth: AtomicU32,
@@ -500,7 +554,11 @@ impl Session {
         // 存档级设置先落地到投影，重放再以日志中的 confirm_toggle 事件为准修正。
         state.meta.auto_confirm = auto_confirm;
         let seed = state.rng_seed;
-        let rng = Arc::new(Mutex::new(DeterministicRng::new(seed)));
+        let initial_position = state.rng_position as usize;
+        // 快照基线可能自带 RNG 位置（#06 ②）：构造时先拨到位，replay 再在其上推进。
+        let mut initial_rng = DeterministicRng::new(seed);
+        initial_rng.restore(initial_position);
+        let rng = Arc::new(Mutex::new(initial_rng));
         // Lua 宿主与引擎共享同一 RNG 序列（#12 ④：engine_rng 走确定性序列）。
         let lua = LuaHost::with_rng(rng.clone(), SandboxLimits::default())
             .expect("初始化 Lua 沙箱宿主失败");
@@ -508,8 +566,10 @@ impl Session {
         Self {
             save_id,
             state: Mutex::new(state),
-            base_state,
+            base_state: Mutex::new(base_state),
+            base_seq: AtomicU64::new(0),
             rng,
+            rng_recorded: AtomicUsize::new(initial_position),
             rules: SessionRules::from_storybook(storybook),
             lua,
             lua_registry: Mutex::new(LuaRegistry::new()),
@@ -525,6 +585,9 @@ impl Session {
             model: Mutex::new(None),
             token_budget: AtomicU32::new(0),
             narrative_overrides: Mutex::new(std::collections::BTreeMap::new()),
+            memory: Mutex::new(None),
+            summary_store: Mutex::new(None),
+            scene_start_round: AtomicU32::new(0),
             confirmation_timeout_ms: 20_000,
             dispatch_depth: AtomicU32::new(0),
         }
@@ -546,9 +609,135 @@ impl Session {
             .expect("narrative overrides poisoned") = overrides;
     }
 
+    /// 注入相关往事检索器（#05 §3.4）：由组合根在会话建立后调用。
+    ///
+    /// None = 不检索——直接 `Session::new` 构造的测试 / 离线场景保持与今天逐字一致。
+    pub fn set_memory_retriever(&self, retriever: Option<Arc<dyn MemoryRetriever>>) {
+        *self.memory.lock().expect("memory retriever poisoned") = retriever;
+    }
+
+    /// 注入摘要落库端口（#05 §3.2/§3.3）：由组合根在会话建立后调用。
+    ///
+    /// None = 不写摘要：直接 Session::new 构造的测试 / 离线场景保持与今天逐字一致
+    /// （摘要是派生数据，缺失只少一段记忆，绝不影响回合与重放）。
+    pub fn set_summary_store(&self, store: Option<Arc<dyn SummaryStore>>) {
+        *self.summary_store.lock().expect("summary store poisoned") = store;
+    }
+
+    /// 检索本回合相关往事：query = 玩家输入 + 当前场景标题，取 top-K。
+    ///
+    /// 派生数据：检索器内部已做「向量失败 → FTS → 空」的降级；这里再兜一层，
+    /// 任何错误只 warn 并返回空，绝不把失败传导给权威回合。
+    async fn retrieve_memories(&self, query: &str) -> Vec<MemoryHit> {
+        // 先把 Arc 克隆出来，避免跨 await 持有锁。
+        let retriever = self
+            .memory
+            .lock()
+            .expect("memory retriever poisoned")
+            .clone();
+        let Some(retriever) = retriever else {
+            return Vec::new();
+        };
+        match retriever.retrieve(&self.save_id, query, MEMORY_TOP_K).await {
+            Ok(hits) => hits,
+            Err(e) => {
+                tracing::warn!(
+                    save_id = %self.save_id,
+                    error = %e,
+                    "相关往事检索失败，本回合不注入（回合照常）"
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// 场景压缩（#05 §3.3）：把当前场景期间的回合微摘要合成一条场景摘要。
+    ///
+    /// 派生数据：读摘要 / AI 压缩 / 写摘要任何一步失败都只 warn，本回合照常结算。
+    /// AI 用便宜角色（AiProvider::summarize）；默认实现返回 None → 退化为确定性拼接，
+    /// 保证默认配置与测试可复现。
+    async fn compress_scene(&self, leaving_scene_id: &str, round: u32) {
+        let store = self
+            .summary_store
+            .lock()
+            .expect("summary store poisoned")
+            .clone();
+        let Some(store) = store else { return };
+        // 窗口左界是当前场景起始回合：只压缩本场景期间产生的微摘要。
+        let start = self.scene_start_round.load(Ordering::SeqCst);
+        let rounds = match store.round_summaries_after(&self.save_id, start).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(save_id = %self.save_id, error = %e, "读取回合微摘要失败，跳过场景压缩");
+                return;
+            }
+        };
+        let joined = rounds
+            .iter()
+            .map(|(_, t)| t.trim())
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if joined.is_empty() {
+            return;
+        }
+        // AI 压缩失败 / 返回空 → 直接拼接（确定性兜底），绝不因此让回合失败。
+        let ai = self.ai.read().expect("ai poisoned").clone();
+        let text = match ai.summarize(&joined).await {
+            Ok(Some(s)) if !s.trim().is_empty() => s,
+            Ok(_) => joined,
+            Err(e) => {
+                tracing::warn!(save_id = %self.save_id, error = %e, "场景摘要 AI 压缩失败，退化为拼接");
+                joined
+            }
+        };
+        if let Err(e) = store
+            .put_scene_summary(&self.save_id, leaving_scene_id, round, &text)
+            .await
+        {
+            tracing::warn!(save_id = %self.save_id, error = %e, "场景摘要写入失败（派生数据，忽略）");
+        }
+    }
+
     // ---------- 事件 ----------
 
+    /// 发事件的统一入口：先把自上次记录以来新增的 RNG 消耗补成 rng_consume 事件
+    /// （#06 ②），再发本事件。这样任何掷骰都必然落在其后的权威日志里。
     fn emit(&self, event: PlayEvent, actor: Option<ActorRef>, intent_id: Option<String>) -> EventEnvelope {
+        self.flush_rng_consumption();
+        self.emit_raw(event, actor, intent_id)
+    }
+
+    /// 把 RNG 自水位线以来新消耗的原始输出写成一条 rng_consume 事件。
+    ///
+    /// 事件只承载「消耗了什么」，不改变世界状态（apply_event 只累计 rng_position）。
+    /// 重放时据此把 RNG 复位到同一位置，未来的骰序与不重启一致。
+    fn flush_rng_consumption(&self) {
+        let values = {
+            let rng = self.rng.lock().expect("rng poisoned");
+            let total = rng.consumed.len();
+            let recorded = self.rng_recorded.load(Ordering::SeqCst);
+            if total <= recorded {
+                return;
+            }
+            let values = rng.consumed[recorded..].to_vec();
+            // 先推进水位线：emit_raw 不会再触发 flush，不会递归。
+            self.rng_recorded.store(total, Ordering::SeqCst);
+            values
+        };
+        self.emit_raw(
+            PlayEvent::System(SystemPayload {
+                level: SystemLevel::Info,
+                code: Some("rng_consume".into()),
+                text: serde_json::to_string(&values).unwrap_or_default(),
+            }),
+            None,
+            None,
+        );
+    }
+
+    /// 真正构造并广播事件（不做 RNG 补记，供 flush 自身调用以防递归）。
+    fn emit_raw(&self, event: PlayEvent, actor: Option<ActorRef>, intent_id: Option<String>) -> EventEnvelope {
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
         let env = EventEnvelope {
             id: uuid::Uuid::new_v4().to_string(),
@@ -664,6 +853,55 @@ impl Session {
         out
     }
 
+    /// 当前权威日志的最大 seq（写检查点 / 新原点时据此分配新序号）。
+    pub fn current_seq(&self) -> Seq {
+        self.seq.load(Ordering::SeqCst)
+    }
+
+    /// 当前回合号（检查点事件沿用它，保证 history 展示的回合归属连续）。
+    pub fn current_round(&self) -> u32 {
+        self.round.load(Ordering::SeqCst)
+    }
+
+    /// 取出检查点两部分：世界状态（含已进日志的 RNG 位置）+ 场景压缩左界。
+    ///
+    /// RNG 位置以水位线为准（已进日志的消耗）：快照是日志的缓存，绝不能包含未落日志的
+    /// 掷骰，否则「快照 + 其后命令」会与全量重放分叉（#06 ②）。
+    fn checkpoint_parts(&self) -> (WorldState, u32) {
+        let mut st = self.state.lock().expect("state poisoned");
+        st.rng_position = self.rng_recorded.load(Ordering::SeqCst) as u64;
+        (st.clone(), self.scene_start_round.load(Ordering::SeqCst))
+    }
+
+    /// 把当前世界状态序列化为全量检查点 JSON（#14）。
+    ///
+    /// 供「新原点」把状态写成新起点、供「版次升级」在换故事书前钉住运行时状态——
+    /// 否则重放会用新故事书的初值重建，已有的属性 / 位置 / 物品栏会漂移。
+    pub fn snapshot_value(&self) -> Value {
+        let (state, scene_start_round) = self.checkpoint_parts();
+        serde_json::to_value(OriginCheckpoint { state, scene_start_round })
+            .unwrap_or(Value::Null)
+    }
+
+    /// 当前状态的全量快照基座（#06 ② 启动缓存），seq 为当前权威日志最大序号。
+    pub fn snapshot_base(&self) -> SnapshotBase {
+        let (state, scene_start_round) = self.checkpoint_parts();
+        SnapshotBase { seq: self.seq.load(Ordering::SeqCst), state, scene_start_round }
+    }
+
+    /// 维护操作（升级 / 新原点）抢占会话：成功即占住 busy，并发的 run_round
+    /// 与 submit_round（经 is_idle）都会被挡住；失败表示已有回合在跑。
+    pub fn try_begin_maintenance(&self) -> bool {
+        self.busy
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// 释放维护占用。维护路径无论成败都必须调用（见 API 层的 Drop guard）。
+    pub fn end_maintenance(&self) {
+        self.busy.store(false, Ordering::SeqCst);
+    }
+
     pub fn history(&self, before_seq: Option<Seq>, limit: usize) -> HistoryPage {
         let log = self.event_log.lock().expect("event log poisoned");
         let all: Vec<EventEnvelope> = log
@@ -678,15 +916,56 @@ impl Session {
     /// 从命令日志重放：纯投影重建世界状态与事件日志，**不调用 AI、不重新结算**。
     /// 必须在任何 `emit` 之前调用一次。
     pub fn replay(&self, persisted: &[PersistedEvent]) {
+        self.replay_from(persisted, None)
+    }
+
+    /// 从命令日志重放，可选以一份全量快照为基线（#06 ② 启动缓存）。
+    ///
+    /// 快照只是缓存：seq <= base.seq 的命令不再重新投影（状态已物化在快照里），
+    /// 但**全部**命令仍进内存 event_log（history 分页照旧）。传 None 等价于全量重放。
+    /// 重放末尾把 RNG 拨回日志 / 快照累计的消耗位置，保证跨重启骰序连续。
+    pub fn replay_from(&self, persisted: &[PersistedEvent], base: Option<SnapshotBase>) {
         let mut max_seq: Seq = 0;
         let mut max_round: u32 = 0;
+        // 场景压缩窗口左界：从权威日志里最后一次 advance_scene 结算重建，
+        // 保证重启后不会把旧场景的微摘要重复压进新场景摘要（派生数据也要可复现）。
+        let mut scene_start_round: u32 =
+            base.as_ref().map(|b| b.scene_start_round).unwrap_or(0);
         {
             let mut st = self.state.lock().expect("state poisoned");
             let mut log = self.event_log.lock().expect("event log poisoned");
             let mut reqs = self.request_ids.lock().expect("request ids poisoned");
+            // 快照基线：直接放回物化状态，只有其后的命令需要重新投影。
+            let apply_after = match &base {
+                Some(b) => {
+                    *st = b.state.clone();
+                    Some(b.seq)
+                }
+                None => None,
+            };
             for p in persisted {
                 let env = &p.envelope;
-                apply_event(&mut st, &env.event);
+                // 快照之前的命令不再投影（状态已在快照里），但仍进日志供 history 回读。
+                if apply_after.is_none_or(|seq| env.seq > seq) {
+                    apply_event(&mut st, &env.event);
+                }
+                if let PlayEvent::Resolution(r) = &env.event {
+                    if r.outcome.as_deref() == Some("advance_scene") {
+                        scene_start_round = env.round;
+                    }
+                }
+                // 新原点 / 升级检查点携带场景压缩左界：从权威日志恢复派生态基线。
+                if let PlayEvent::StateUpdate(p) = &env.event {
+                    for d in &p.changes {
+                        if d.domain == DeltaDomain::Origin {
+                            if let Ok(cp) =
+                                serde_json::from_value::<OriginCheckpoint>(d.value.clone())
+                            {
+                                scene_start_round = cp.scene_start_round;
+                            }
+                        }
+                    }
+                }
                 max_seq = max_seq.max(env.seq);
                 max_round = max_round.max(env.round);
                 if let Some(rid) = &p.request_id {
@@ -697,20 +976,48 @@ impl Session {
                 log.push(env.clone());
             }
             st.seq = max_seq;
+            // #06 ①：重放不做结算，必须显式把 RNG 拨回日志记录的消耗位置。
+            let position = st.rng_position as usize;
+            self.rng.lock().expect("rng poisoned").restore(position);
+            self.rng_recorded.store(position, Ordering::SeqCst);
         }
         self.seq.store(max_seq, Ordering::SeqCst);
         self.round.store(max_round, Ordering::SeqCst);
+        self.scene_start_round.store(scene_start_round, Ordering::SeqCst);
+        // 快照基线同时成为回滚基线：快照之前的命令不再重复叠加。
+        if let Some(b) = base {
+            *self.base_state.lock().expect("base state poisoned") = b.state;
+            self.base_seq.store(b.seq, Ordering::SeqCst);
+        }
     }
 
     /// 等待此前 emit 的事件全部落库（回滚前保证读写一致）。
     pub async fn flush_events(&self) {
+        // 先把尚未记录的 RNG 消耗补进日志，再等屏障：屏障之后读到的都是持久化事实。
+        self.flush_rng_consumption();
         self.sink.flush().await;
     }
 
-    /// 是否空闲到可以回滚：没有进行中的回合，也没有待确认动作。
-    pub fn can_rewind(&self) -> bool {
+    /// 是否空闲到可以接受新回合：没有进行中的回合，也没有待确认动作。
+    ///
+    /// 设计决策 #6：非 idle（thinking / resolving / waiting_confirm）提交新回合应当被拒，
+    /// 而不是排进队列。API 层据此在 `tokio::spawn` **之前**返回 409。
+    pub fn is_idle(&self) -> bool {
         !self.busy.load(Ordering::SeqCst)
             && self.pending.lock().map(|p| p.is_none()).unwrap_or(false)
+    }
+
+    /// 是否空闲到可以回滚（与「可接受新回合」同一条判据）。
+    pub fn can_rewind(&self) -> bool {
+        self.is_idle()
+    }
+
+    /// 该 request_id 是否已受理过（#24 幂等去重）：重复提交放行，新工作在被拒时返回 409。
+    pub fn has_seen_request(&self, request_id: &str) -> bool {
+        self.request_ids
+            .lock()
+            .map(|ids| ids.iter().any(|x| x == request_id))
+            .unwrap_or(false)
     }
 
     /// 最后一个玩家回合的回滚计划；没有任何回合时返回 None。
@@ -726,19 +1033,25 @@ impl Session {
         })
     }
 
-    /// 回滚到 from_seq 之前：世界状态以开档基线重放保留的事件重建，事件日志就地截断。
+    /// 回滚到 from_seq 之前：世界状态以重放基线重建保留的事件，事件日志就地截断。
     /// seq 计数器**不复位**（重跑事件用新 seq，避免与旧广播 / 归档冲突）；
     /// round 回退到 round-1，让重跑复用同一回合号。
     pub fn apply_rewind(&self, from_seq: Seq, round: u32) {
         {
             let mut st = self.state.lock().expect("state poisoned");
-            *st = self.base_state.clone();
+            *st = self.base_state.lock().expect("base state poisoned").clone();
+            let base_seq = self.base_seq.load(Ordering::SeqCst);
             let mut log = self.event_log.lock().expect("event log poisoned");
             log.retain(|e| e.seq < from_seq);
-            for env in log.iter() {
+            // 基线覆盖到的命令不重复投影（有快照时它们已物化在基线里）。
+            for env in log.iter().filter(|e| e.seq > base_seq) {
                 apply_event(&mut st, &env.event);
             }
             st.seq = self.seq.load(Ordering::SeqCst);
+            // #06 ①：回滚截断了事件，RNG 也必须退回保留命令记录的消耗位置。
+            let position = st.rng_position as usize;
+            self.rng.lock().expect("rng poisoned").restore(position);
+            self.rng_recorded.store(position, Ordering::SeqCst);
         }
         self.round.store(round.saturating_sub(1), Ordering::SeqCst);
     }
@@ -763,12 +1076,12 @@ impl Session {
         }
     }
 
-    /// 本存档使用的模型（None = 全局角色默认）。
+    /// 本存档指定的单一模型；None = 用全局默认。
     pub fn model(&self) -> Option<ModelRef> {
         self.model.lock().ok().and_then(|m| m.clone())
     }
 
-    /// 设置本存档使用的模型；None 表示回落到全局角色默认。
+    /// 设置本存档的单一模型；只影响之后的回合，不重写历史。
     pub fn set_model(&self, model: Option<ModelRef>) {
         if let Ok(mut slot) = self.model.lock() {
             *slot = model;
@@ -776,7 +1089,12 @@ impl Session {
     }
 
     pub fn set_auto_confirm(&self, v: bool) {
-        self.auto_confirm.store(v, Ordering::SeqCst);
+        // 只在真的改变时落事件：存档设置端点每次都会回写 auto_confirm（改模型 / 叙述偏好等），
+        // 无条件 emit 会让「每写一次设置就多一条 confirm_toggle」刷屏并污染命令日志。
+        let prev = self.auto_confirm.swap(v, Ordering::SeqCst);
+        if prev == v {
+            return;
+        }
         self.emit_simple(PlayEvent::System(SystemPayload {
             level: SystemLevel::Info,
             code: Some("confirm_toggle".into()),
@@ -959,6 +1277,11 @@ impl Session {
                 present_actors(&st),
             )
         };
+        // 检索相关往事（#05 §3.4）：query = 玩家输入 + 当前场景标题。
+        // 检索是派生数据，失败已在 retrieve_memories 内吞掉，回合照常。
+        let memories = self
+            .retrieve_memories(&format!("{} {}", input.text, scene_title))
+            .await;
         // 在场人物的人格档案（背景/性格/外观/对话示例）注入提示词；作者注释不在此列。
         let persona_ids: Vec<String> = chars.iter().map(|c| c.id.clone()).collect();
         let personas = self.rules.personas(&persona_ids, PERSONA_LIMIT);
@@ -996,13 +1319,16 @@ impl Session {
             premise: self.rules.premise(),
             narrative,
             lore,
+            memories,
             token_budget,
-            story_narration: None,
             focus,
             canon: self.canon_lines(8),
+            // 首轮恒为空：续轮结果由循环就地填入（#04 ⑦）。
+            turn_feedback: Vec::new(),
             quests: live.quests,
             encounters: live.encounters,
             scenes: self.scene_briefs(),
+            attributes: self.attribute_keys(),
             model: self.model(),
             protocol: self.rules.protocol_spec(),
         };
@@ -1010,35 +1336,87 @@ impl Session {
         self.phase(PhaseStage::StoryThinking, None);
         // 每回合取一次当前 provider：配置热替换后下一个回合立即生效。
         let ai = self.ai.read().expect("ai poisoned").clone();
-        let story_out = ai.story_intents(&ctx).await?;
-        if let Some(reasoning) = story_out.reasoning.clone() {
-            self.emit_reasoning("story_thinking", reasoning);
-        }
-        self.emit_intent_warnings(&story_out.intent_warnings);
-        let story = story_out.intents;
-        // 主线 AI 本回合的叙事：稍后并入角色 AI 的上下文，避免两个 AI 重描同一段场景。
-        let story_narration = story_intent_text(&story);
-        // 导演通道：人代替 GM 推进剧情，事件归「故事本身」；不跑角色 AI。
+        // 导演通道：人代替 GM 推进剧情，事件归「故事本身」；本回合不额外扮演 NPC。
         let is_gm = ctx.channel == RoundChannel::Gm;
         let story_fallback = if is_gm { Some(story_actor()) } else { self.controlled_actor() };
+        // 单一 AI 同时扮演 NPC：未署名 actor_id 的 speak / emote 回落到首个在场 NPC，
+        // 而不是玩家角色（玩家的话由玩家自己输入）。narrate 等仍回落到阶段默认。
+        let npc_fallback = self.present_npcs().into_iter().next();
         // 输入里点名的武器（伤害/命中加值）：AI 漏给 skill_id 时也要用上
         let actor_key = self.controlled_actor().map(|a| a.id.clone()).unwrap_or_default();
         let text_choice = self.attack_choice_in_text(&input.text, &actor_key);
         let mut struck = false;
-        for intent in story {
-            // 归属优先级：意图自带的 actor_id → 台词里提到的角色 → 阶段默认。
-            // 普通回合默认归玩家角色（是你在行动）；导演回合默认归故事本身。
-            let actor = self.resolve_intent_actor(&intent).or_else(|| story_fallback.clone());
-            if let Intent::Strike { enemy_id, skill_id } = intent {
-                struck = true;
-                let mut choice = text_choice.clone();
-                if skill_id.is_some() {
-                    choice.skill_id = skill_id;
+        // #04 ⑨ 回合内 intent_id 幂等集合：主线 + 角色两个阶段的重复意图都只结算一次。
+        // 缺省 / 空 intent_id 不入集合，保持旧模型「同一意图出现两次照常结算」的行为。
+        let mut seen_intent_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // #04 ⑦：回合内最多 MAX_STORY_AI_ROUNDS 轮主线 AI 工具调用。
+        // 第一轮 `turn_feedback` 为空、上下文与旧单轮路径逐字一致；只有模型自己触发了
+        // query_world / check / interact 且引擎产出了新结果，才追加一轮把结果回喂。
+        // 模型输出 finish_turn、没有新结果可回喂、或达到轮次上限时收束。
+        let mut turn_feedback: Option<Vec<String>> = None;
+        for _story_round in 0..MAX_STORY_AI_ROUNDS {
+            // 后续轮只替换「本轮工具结果」字段；其余上下文照旧，模型才能据实续写合法意图。
+            let call_ctx = match turn_feedback.take() {
+                Some(feedback) => {
+                    let mut follow = ctx.clone();
+                    follow.turn_feedback = feedback;
+                    follow
                 }
-                self.strike_enemy(enemy_id, choice, actor).await;
-                continue;
+                None => ctx.clone(),
+            };
+            let out = ai.story_intents(&call_ctx).await?;
+            if let Some(reasoning) = out.reasoning.clone() {
+                self.emit_reasoning("story_thinking", reasoning);
             }
-            self.handle_intent(intent, actor).await;
+            self.emit_intent_warnings(&out.intent_warnings);
+            let mut finished = false;
+            let mut next_feedback: Vec<String> = Vec::new();
+            for envelope in out.intents {
+                if !register_intent_id(&mut seen_intent_ids, &envelope.intent_id) {
+                    continue;
+                }
+                let intent = envelope.intent;
+                // finish_turn 是循环终止信号：不算意图、不校验、不进日志（#04 修订）。
+                if matches!(intent, Intent::FinishTurn) {
+                    finished = true;
+                    continue;
+                }
+                // #04 ④：显式 actor_id 必须指向在场且合法的角色；否则驳回，绝不静默改判给他人。
+                if let Some((bad, code)) = self.invalid_explicit_actor(&intent) {
+                    let message = match code {
+                        RejectionCode::ActorNotControlled => {
+                            format!("不能以玩家受控角色「{bad}」的身份代说台词")
+                        }
+                        _ => format!("意图指定的行动者不在场或不存在：{bad}"),
+                    };
+                    self.reject(message, code);
+                    continue;
+                }
+                // 归属优先级：意图自带的 actor_id → 台词里提到的角色 → 阶段默认。
+                // narrate 等默认归玩家角色（是你在行动）；导演回合归故事本身；
+                // 未署名的 speak / emote 归首个在场 NPC（AI 扮演的才是 NPC）。
+                let actor = self.resolve_intent_actor(&intent).or_else(|| match &intent {
+                    Intent::Speak { .. } | Intent::Emote { .. } => npc_fallback.clone(),
+                    _ => story_fallback.clone(),
+                });
+                if let Intent::Strike { enemy_id, skill_id } = intent {
+                    struck = true;
+                    let mut choice = text_choice.clone();
+                    if skill_id.is_some() {
+                        choice.skill_id = skill_id;
+                    }
+                    self.strike_enemy(enemy_id, choice, actor).await;
+                    continue;
+                }
+                // 只有 query_world / check / interact 会返回「新引擎信息」供下一轮回喂。
+                if let Some(info) = self.handle_intent(intent, actor).await {
+                    next_feedback.push(info);
+                }
+            }
+            if finished || next_feedback.is_empty() {
+                break;
+            }
+            turn_feedback = Some(next_feedback);
         }
         // 兜底：玩家明确攻击了遭遇中的敌人，但 AI 没给 strike → 引擎自己结算一次。
         // 战斗必须有权威结果，不能取决于模型这次记不记得用 strike。
@@ -1055,31 +1433,6 @@ impl Session {
             self.evaluate_turn_end();
             self.emit_simple(PlayEvent::RoundEnd(RoundEndPayload { round }));
             return Ok(());
-        }
-
-        self.phase(PhaseStage::CharacterThinking, None);
-        // 角色 AI 看到主线 AI 本回合已叙述的内容：接着演，而不是重复描写。
-        let mut char_ctx = ctx.clone();
-        if !story_narration.is_empty() {
-            char_ctx.story_narration = Some(story_narration);
-        }
-        let character_out = ai.character_intents(&char_ctx).await?;
-        if let Some(reasoning) = character_out.reasoning.clone() {
-            self.emit_reasoning("character_thinking", reasoning);
-        }
-        self.emit_intent_warnings(&character_out.intent_warnings);
-        let character = character_out.intents;
-        // 里程碑：角色意图暂统一归属首个 NPC（真正的 actor 归属随 #04 意图 actor_id 补全）。
-        let npc = {
-            let st = self.state.lock().expect("state poisoned");
-            st.characters
-                .values()
-                .find(|c| c.kind != "pc")
-                .map(|c| ActorRef { id: c.template_id.clone(), name: c.name.clone() })
-        };
-        for intent in character {
-            let actor = self.resolve_intent_actor(&intent).or_else(|| npc.clone());
-            self.handle_intent(intent, actor).await;
         }
 
         // 回合末骨架求值（#13）：标记新达成目标 / 新触发触发点，提示主线 AI，不自动切场景。
@@ -1245,6 +1598,20 @@ impl Session {
             }
         }
         None
+    }
+
+    /// 合法判定属性 key：属性维度 + world.check.attributes（去重、稳定排序）。
+    fn attribute_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.rules.profiles().keys().cloned().collect();
+        if let Some(list) = self.rules.global_checker().and_then(|c| c.attributes) {
+            for k in list {
+                if !keys.contains(&k) {
+                    keys.push(k);
+                }
+            }
+        }
+        keys.sort();
+        keys
     }
 
     /// 骨架里全部场景摘要（含当前场景）：主线 AI 只能在这些 id 里选 advance_scene 目标。
@@ -1660,6 +2027,11 @@ impl Session {
                 PlayEvent::Narrate(p) => Some(p.content.clone()),
                 PlayEvent::Dialogue(p) => Some(p.content.clone()),
                 PlayEvent::Emote(p) => Some(p.content.clone()),
+                // 只读查询（query_world）的答案作为权威世界事实回填上下文（#04 查询类）：
+                // 多轮工具调用循环未实现前，用 canon 通道让后续回合的 AI 读到查询结果。
+                PlayEvent::Resolution(p) if p.outcome.as_deref() == Some("query_world") => {
+                    p.narrative.clone()
+                }
                 _ => None,
             })
             .collect();
@@ -1677,14 +2049,117 @@ impl Session {
         Some(ActorRef { id: c.template_id.clone(), name: c.name.clone() })
     }
 
-    /// 按任意一种 id（实例键 / 模板 id / 角色名）找角色。
+    /// 模型回填 actor_id 的容错候选：原串，以及 `名字(id)` / `名字（id）` 括号内的 id。
+    ///
+    /// 提示词把在场角色渲染为 `名字(id)`（见 `present_actors`），并说明 actor_id
+    /// 「形如 名字(id)」，模型常把整个 `名字(id)` 当作 id 回填。除原串外补上括号内的 id，
+    /// 显式归属仍能命中本人，而不是被误判成「不存在」而驳回。
+    fn actor_id_candidates(id: &str) -> Vec<&str> {
+        let mut out = vec![id];
+        for (open, close) in [('(', ')'), ('（', '）')] {
+            let Some(start) = id.rfind(open) else { continue };
+            let after = start + open.len_utf8();
+            let Some(rel) = id[after..].find(close) else { continue };
+            let inner = id[after..after + rel].trim();
+            if !inner.is_empty() && inner != id {
+                out.push(inner);
+            }
+        }
+        out
+    }
+
+    /// 在角色表里按任意一种 id（实例键 / 模板 id / 角色名 / 实例 id）查人。
+    /// 兼容模型把 `名字(id)` 整串当 id 回填的形式。
+    fn find_character<'a>(
+        chars: &'a std::collections::BTreeMap<String, octopus_types::CharacterInstance>,
+        id: &str,
+    ) -> Option<(&'a String, &'a octopus_types::CharacterInstance)> {
+        Self::actor_id_candidates(id).into_iter().find_map(|cand| {
+            chars.iter().find(|(key, c)| {
+                c.template_id == cand
+                    || c.name == cand
+                    || c.instance_id == cand
+                    || key.as_str() == cand
+            })
+        })
+    }
+
+    /// 按任意一种 id（实例键 / 模板 id / 角色名 / 实例 id）找角色。
     fn actor_by_id(&self, id: &str) -> Option<ActorRef> {
         let st = self.state.lock().ok()?;
-        let found = st
+        Self::find_character(&st.characters, id)
+            .map(|(_, c)| ActorRef { id: c.template_id.clone(), name: c.name.clone() })
+    }
+
+    /// 本场在演的非玩家角色（未署名 speak / emote 的回落对象）。
+    ///
+    /// 按模板 id 排序：并行调用完成后按此顺序结算，事件顺序与完成顺序无关。
+    fn present_npcs(&self) -> Vec<ActorRef> {
+        let Ok(st) = self.state.lock() else {
+            return Vec::new();
+        };
+        let mut out: Vec<ActorRef> = st
             .characters
-            .get(id)
-            .or_else(|| st.characters.values().find(|c| c.template_id == id || c.name == id));
-        found.map(|c| ActorRef { id: c.template_id.clone(), name: c.name.clone() })
+            .values()
+            .filter(|c| c.kind != "pc" && c.present)
+            .map(|c| ActorRef { id: c.template_id.clone(), name: c.name.clone() })
+            .collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
+    }
+
+    /// 角色作用域下的「本人标识集合」：模板 id / 名字 / 实例键 / instance_id。
+    /// 关系边端点通常写故事书人物 id（= 模板 id），这里一并带上实例标识，
+    /// 防止同一角色在故事书与存档用不同 id 时丢边（#04 §6）。
+    fn character_identifiers(&self, actor: &ActorRef) -> Vec<String> {
+        let mut ids = vec![actor.id.clone(), actor.name.clone()];
+        if let Ok(st) = self.state.lock() {
+            if let Some((key, c)) = st.characters.iter().find(|(key, c)| {
+                c.template_id == actor.id || c.name == actor.id || key.as_str() == actor.id
+            }) {
+                ids.push(key.clone());
+                ids.push(c.instance_id.clone());
+            }
+        }
+        ids.retain(|s| !s.trim().is_empty());
+        ids.dedup();
+        ids
+    }
+
+    /// 单个角色的私有资料卡（#04 query_character）：属性 / 资源 / 状态 / 物品 / 位置。
+    /// 只读、不产生状态变更；调用方负责保证只有本人（或主线 AI）能取到。
+    fn character_sheet(&self, key: &str) -> Option<String> {
+        let st = self.state.lock().ok()?;
+        let c = st.characters.get(key)?;
+        let mut parts = vec![format!("{}（{}）", c.name, c.template_id)];
+        if !c.attributes.is_empty() {
+            parts.push(format!("属性：{}", compact_map(&c.attributes)));
+        }
+        if !c.resources.is_empty() {
+            parts.push(format!("资源：{}", compact_map(&c.resources)));
+        }
+        if !c.statuses.is_empty() {
+            let list: Vec<String> = c
+                .statuses
+                .iter()
+                .map(|s| {
+                    let left = s
+                        .turns_left
+                        .map(|t| format!("（剩 {t} 回合）"))
+                        .or_else(|| s.scenes_left.map(|t| format!("（剩 {t} 场景）")))
+                        .unwrap_or_default();
+                    format!("{}{}", if s.name.is_empty() { &s.id } else { &s.name }, left)
+                })
+                .collect();
+            parts.push(format!("状态：{}", list.join("、")));
+        }
+        if !c.inventory.is_empty() {
+            parts.push(format!("物品：{}", compact_map(&c.inventory)));
+        }
+        if let Some(loc) = &c.location_id {
+            parts.push(format!("位置：{loc}"));
+        }
+        Some(parts.join("\n"))
     }
 
     /// 从台词/神态文本里认人：取**最长**的名字匹配，避免「诺德罗」被更短的别名抢先。
@@ -1694,6 +2169,9 @@ impl Session {
         let mut best: Option<(usize, ActorRef)> = None;
         for c in st.characters.values() {
             if c.name.is_empty() || !text.contains(&c.name) { continue }
+            // 玩家角色（PC）不由 AI 代说：意图文本里出现的「你 / PC 名」是**称呼**，不是说话人。
+            // 否则 PC 名恰好是「你」时，「你带伞了吗？」这类 NPC 台词会被判给玩家。
+            if c.kind == "pc" { continue }
             let len = c.name.chars().count();
             if best.as_ref().is_none_or(|(l, _)| len > *l) {
                 best = Some((len, ActorRef { id: c.template_id.clone(), name: c.name.clone() }));
@@ -1717,7 +2195,419 @@ impl Session {
         self.actor_in_text(content)
     }
 
-    async fn handle_intent(&self, intent: Intent, actor: Option<ActorRef>) {
+    /// 显式 actor_id 的合法性校验（#04 ④）：
+    /// - None / 空串 = 未提供 → 合法（保持既有的文本推断与阶段回落）；
+    /// - 指向不存在 / 不在场的角色 → ActorNotFound，调用方驳回，绝不静默改判给他人；
+    /// - 指向玩家受控角色（PC）且意图是 speak → ActorNotControlled：
+    ///   玩家的**台词**由玩家自己输入，AI 不代说。
+    ///   注意 emote / narrate 不在此列：单一 AI 描写玩家角色的动作 / 环境属正常旁白，
+    ///   早先「PC 一律禁止说演」过严，会把这类叙述整条丢掉并弹出驳回卡片。
+    fn invalid_explicit_actor(&self, intent: &Intent) -> Option<(String, RejectionCode)> {
+        let id = match intent {
+            Intent::Speak { actor_id, .. }
+            | Intent::Emote { actor_id, .. }
+            | Intent::Check { actor_id, .. }
+            | Intent::Narrate { actor_id, .. } => actor_id.as_deref()?,
+            _ => return None,
+        };
+        let id = id.trim();
+        if id.is_empty() {
+            return None;
+        }
+        let st = self.state.lock().ok()?;
+        let Some((key, c)) = Self::find_character(&st.characters, id) else {
+            return Some((id.to_string(), RejectionCode::ActorNotFound));
+        };
+        // 在场判定与 present_actors 保持一致：受控角色即便 present=false 也算在场。
+        let controlled = st.controlled.contains(key)
+            || st.controlled.contains(&c.instance_id)
+            || st.controlled.contains(&c.template_id);
+        if !c.present && !controlled {
+            return Some((id.to_string(), RejectionCode::ActorNotFound));
+        }
+        if controlled && matches!(intent, Intent::Speak { .. }) {
+            return Some((id.to_string(), RejectionCode::ActorNotControlled));
+        }
+        None
+    }
+
+    /// 取某角色实例的属性值（判定修正用）；找不到人物或维度时回落中心基线。
+    fn actor_attribute_value(&self, actor: &ActorRef, attribute: &str) -> f64 {
+        let Ok(st) = self.state.lock() else {
+            return crate::resolve::DEFAULT_BASELINE;
+        };
+        st.characters
+            .values()
+            .find(|c| c.template_id == actor.id || c.name == actor.id || c.instance_id == actor.id)
+            .and_then(|c| c.attributes.get(attribute))
+            .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64)))
+            .unwrap_or(crate::resolve::DEFAULT_BASELINE)
+    }
+
+    /// 取某角色实例的 JSON（Lua 判定上下文用）；找不到时 Null。
+    fn actor_json_of(&self, actor: &ActorRef) -> Value {
+        let Ok(st) = self.state.lock() else {
+            return Value::Null;
+        };
+        st.characters
+            .values()
+            .find(|c| c.template_id == actor.id || c.name == actor.id || c.instance_id == actor.id)
+            .map(|c| serde_json::to_value(c).unwrap_or(Value::Null))
+            .unwrap_or(Value::Null)
+    }
+
+    /// 只读查询（#04 Query 类）：对权威世界状态做只读汇总，供回喂模型。
+    /// 按查询关键词收窄；无法识别时给一份紧凑快照，绝不返回空。
+    fn answer_query(&self, query: &str, scope_ids: Option<&[String]>) -> String {
+        let q = query.trim().to_lowercase();
+        let wants = |keys: &[&str]| q.is_empty() || keys.iter().any(|k| q.contains(k));
+        let st = self.state.lock().expect("state poisoned");
+        // 角色 AI 作用域（#04 §6 / #16 认知边界）：scope_ids = 发起查询的角色本人标识，
+        // 只返回它自己的私有数据；None = 主线 AI 全量。在场名单是公开信息，恒返回。
+        let sees_all = scope_ids.is_none();
+        let is_self = |key: &str, c: &octopus_types::CharacterInstance| {
+            scope_ids.is_some_and(|ids| {
+                ids.iter().any(|id| {
+                    id == key || id == &c.template_id || id == &c.instance_id || id == &c.name
+                })
+            })
+        };
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(format!("场景：{}（{}）", st.scene_title, st.scene_id));
+        if let Some(d) = st
+            .scene_description
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+        {
+            lines.push(format!("场景描述：{d}"));
+        }
+        // 在场角色恒返回：「有谁 / 谁在」是最常见的世界查询。
+        let present: Vec<String> = st
+            .characters
+            .iter()
+            .filter(|(key, c)| {
+                c.present || st.controlled.contains(key) || st.controlled.contains(&c.instance_id)
+            })
+            .map(|(_, c)| format!("{}（{}）", c.name, c.template_id))
+            .collect();
+        lines.push(if present.is_empty() {
+            "在场角色：无".to_string()
+        } else {
+            format!("在场角色：{}", present.join("、"))
+        });
+        if wants(&["属性", "数值", "资源", "血量", "法力", "attribute", "resource", "stat", "hp", "mana"]) {
+            // 只报在场（含受控）角色：减少对未出场角色的信息泄露；
+            // 角色 AI 作用域再收窄到本人（#16 认知边界）。
+            for (_key, c) in st.characters.iter().filter(|(key, c)| {
+                (c.present || st.controlled.contains(key) || st.controlled.contains(&c.instance_id))
+                    && (sees_all || is_self(key, c))
+            }) {
+                if !c.attributes.is_empty() {
+                    lines.push(format!("{} 属性：{}", c.name, compact_map(&c.attributes)));
+                }
+                if !c.resources.is_empty() {
+                    lines.push(format!("{} 资源：{}", c.name, compact_map(&c.resources)));
+                }
+            }
+        }
+        if sees_all && wants(&["标记", "旗", "flag"]) {
+            lines.push(format!(
+                "世界标记：{}",
+                if st.flags.is_empty() { "无".to_string() } else { compact_map(&st.flags) }
+            ));
+        }
+        if sees_all && wants(&["任务", "目标", "quest", "goal"]) {
+            let quests: Vec<String> = st
+                .progress
+                .goals
+                .iter()
+                .filter(|(_, v)| !v.get("hidden").and_then(Value::as_bool).unwrap_or(false))
+                .map(|(id, v)| {
+                    let text = v.get("text").and_then(Value::as_str).unwrap_or(id);
+                    let done = v.get("done").and_then(Value::as_bool).unwrap_or(false);
+                    format!("{}（{}）", text, if done { "已达成" } else { "进行中" })
+                })
+                .collect();
+            lines.push(format!(
+                "任务/目标：{}",
+                if quests.is_empty() { "无".to_string() } else { quests.join("；") }
+            ));
+        }
+        if sees_all && wants(&["遭遇", "敌人", "战斗", "encounter", "enemy", "combat"]) {
+            let enc: Vec<String> = st
+                .encounters
+                .values()
+                .map(|v| v.get("name").and_then(Value::as_str).unwrap_or("遭遇").to_string())
+                .collect();
+            lines.push(format!(
+                "遭遇：{}",
+                if enc.is_empty() { "无".to_string() } else { enc.join("；") }
+            ));
+        }
+        if sees_all && wants(&["地点", "位置", "场景", "location", "scene"]) && !st.locations.is_empty() {
+            let locs: Vec<String> = st
+                .locations
+                .iter()
+                .map(|l| {
+                    l.get("name")
+                        .and_then(Value::as_str)
+                        .or_else(|| l.get("id").and_then(Value::as_str))
+                        .unwrap_or("?")
+                        .to_string()
+                })
+                .collect();
+            lines.push(format!("已知地点：{}", locs.join("、")));
+        }
+        if wants(&["关系", "relationship"]) {
+            // 角色作用域只给触及自己的边（#04 §6 query_relationships 语义）。
+            let rels = self.rules.relationships();
+            let rels: Vec<Value> = match scope_ids {
+                Some(ids) => rels.into_iter().filter(|r| edge_touches(r, ids)).collect(),
+                None => rels,
+            };
+            let text = if rels.is_empty() {
+                "无".to_string()
+            } else {
+                serde_json::to_string(&rels).unwrap_or_default()
+            };
+            lines.push(format!("关系：{text}"));
+        }
+        if wants(&["物件", "object", "物品", "item", "背包", "inventory"]) {
+            if let Some(objects) = self.rules.storybook.get("objects").and_then(Value::as_array) {
+                let names: Vec<String> = objects
+                    .iter()
+                    .map(|o| o.get("name").and_then(Value::as_str).unwrap_or("?").to_string())
+                    .collect();
+                lines.push(format!(
+                    "场景物件：{}",
+                    if names.is_empty() { "无".to_string() } else { names.join("、") }
+                ));
+            }
+            for (_key, c) in st.characters.iter().filter(|(key, c)| sees_all || is_self(key, c)) {
+                if !c.inventory.is_empty() {
+                    lines.push(format!("{} 物品栏：{}", c.name, compact_map(&c.inventory)));
+                }
+            }
+        }
+        lines.join("\n")
+    }
+
+    /// 与场景物件交互（#04 / #01 objects）：校验物件与动作后落一条 Resolution。
+    /// 故事书未声明 objects 时优雅降级（明确说明，不报错、不改状态）。
+    /// 成功（含降级）返回该 Resolution 的文本，供回合内续轮回喂模型（#04 ⑦）。
+    fn handle_interact(&self, object_id: &str, action: &str, actor: Option<ActorRef>) -> Option<String> {
+        let Some(objects) = self.rules.storybook.get("objects").and_then(Value::as_array) else {
+            let narrative = "这本故事书未声明「物件（objects）」，交互请求已忽略。".to_string();
+            self.emit(
+                PlayEvent::Resolution(ResolutionPayload {
+                    intent_id: None,
+                    status: ResolutionStatus::Ok,
+                    rejection_code: None,
+                    narrative: Some(narrative.clone()),
+                    outcome: Some("interact".into()),
+                    triggered_events: None,
+                    state_changes: vec![],
+                }),
+                actor,
+                None,
+            );
+            return Some(narrative);
+        };
+        let Some(object) = objects
+            .iter()
+            .find(|o| o.get("id").and_then(Value::as_str) == Some(object_id))
+        else {
+            self.reject(format!("找不到物件：{object_id}"), RejectionCode::TargetInvalid);
+            return None;
+        };
+        let name = object.get("name").and_then(Value::as_str).unwrap_or(object_id);
+        let mut label = action.to_string();
+        // 物件声明了动作列表时，action 必须命中；未声明动作列表则宽容放行（降级）。
+        if let Some(actions) = object
+            .get("actions")
+            .and_then(Value::as_array)
+            .filter(|a| !a.is_empty())
+        {
+            match actions.iter().find(|a| {
+                a.get("key").and_then(Value::as_str) == Some(action) || a.as_str() == Some(action)
+            }) {
+                Some(a) => {
+                    if let Some(l) = a.get("label").and_then(Value::as_str).filter(|l| !l.trim().is_empty()) {
+                        label = l.to_string();
+                    }
+                }
+                None => {
+                    self.reject(
+                        format!("物件「{name}」不支持动作：{action}"),
+                        RejectionCode::TargetInvalid,
+                    );
+                    return None;
+                }
+            }
+        }
+        let narrative = match object.get("description").and_then(Value::as_str).map(str::trim) {
+            Some(d) if !d.is_empty() => format!("与「{name}」交互（{label}）：{d}"),
+            _ => format!("与「{name}」交互：{label}"),
+        };
+        self.emit(
+            PlayEvent::Resolution(ResolutionPayload {
+                intent_id: None,
+                status: ResolutionStatus::Ok,
+                rejection_code: None,
+                narrative: Some(narrative.clone()),
+                outcome: Some("interact".into()),
+                triggered_events: None,
+                state_changes: vec![],
+            }),
+            actor,
+            None,
+        );
+        Some(narrative)
+    }
+
+    /// #04 Query 类：查询某角色的私有资料（属性 / 资源 / 状态 / 物品 / 位置）。
+    ///
+    /// 作用域规则（#16 认知边界）：角色 AI（scope = Some）只能查自己——缺省查自己，
+    /// 显式查他人一律驳回，绝不泄露他人私有数据；主线 AI（scope = None）可查任意角色，
+    /// 缺省查受控角色。答案落一条 Resolution，并回喂调用方（续轮 / 事件流）。
+    fn handle_query_character(
+        &self,
+        character_id: Option<String>,
+        actor: Option<ActorRef>,
+        scope: Option<&ActorRef>,
+    ) -> Option<String> {
+        let requested = character_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        // 锁内只做定位 / 判定，锁外再落事件，避免与 character_sheet 的加锁嵌套。
+        let (target, denied) = {
+            let st = self.state.lock().expect("state poisoned");
+            match scope {
+                Some(myself) => {
+                    let self_key = character_key_in(&st, &myself.id)
+                        .or_else(|| character_key_in(&st, &myself.name));
+                    match &requested {
+                        None => (self_key, None),
+                        Some(id) => {
+                            if self_key.is_some()
+                                && character_key_in(&st, id).as_deref() == self_key.as_deref()
+                            {
+                                (self_key, None)
+                            } else {
+                                (None, Some(id.clone()))
+                            }
+                        }
+                    }
+                }
+                None => {
+                    let target = requested
+                        .as_deref()
+                        .and_then(|id| character_key_in(&st, id))
+                        .or_else(|| st.controlled.first().cloned())
+                        .or_else(|| st.characters.keys().next().cloned());
+                    (target, None)
+                }
+            }
+        };
+        if let Some(id) = denied {
+            self.reject(
+                format!("角色 AI 只能查询自身资料，不能查询「{id}」"),
+                RejectionCode::TargetInvalid,
+            );
+            return None;
+        }
+        let Some(key) = target else {
+            self.reject(
+                format!("查询角色不存在：{}", requested.as_deref().unwrap_or("")),
+                RejectionCode::TargetInvalid,
+            );
+            return None;
+        };
+        let answer = self
+            .character_sheet(&key)
+            .unwrap_or_else(|| "（无此人资料）".to_string());
+        self.emit(
+            PlayEvent::Resolution(ResolutionPayload {
+                intent_id: None,
+                status: ResolutionStatus::Ok,
+                rejection_code: None,
+                narrative: Some(answer.clone()),
+                outcome: Some("query_character".into()),
+                triggered_events: None,
+                state_changes: vec![],
+            }),
+            actor.or_else(|| scope.cloned()).or_else(|| Some(story_actor())),
+            None,
+        );
+        Some(answer)
+    }
+
+    /// #04 Query 类：查询与某实体相关的关系边。
+    ///
+    /// 作用域规则（#04 §6）：角色 AI（scope = Some）只得到触及自己的边；主线 AI
+    /// （scope = None）给全集，显式 `entity_id` 时收窄到该实体。只读、不改状态。
+    fn handle_query_relationships(
+        &self,
+        entity_id: Option<String>,
+        actor: Option<ActorRef>,
+        scope: Option<&ActorRef>,
+    ) -> Option<String> {
+        let requested = entity_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let ids: Option<Vec<String>> = match scope {
+            // 角色 AI：无论它请求谁的关系，都只返回触及自己的边。
+            Some(myself) => Some(self.character_identifiers(myself)),
+            None => requested.as_deref().map(|id| {
+                self.character_identifiers(&ActorRef { id: id.to_string(), name: id.to_string() })
+            }),
+        };
+        let rels = self.rules.relationships();
+        let rels: Vec<Value> = match ids.as_deref() {
+            Some(ids) => rels.into_iter().filter(|r| edge_touches(r, ids)).collect(),
+            None => rels,
+        };
+        let answer = if rels.is_empty() {
+            "（无相关关系）".to_string()
+        } else {
+            serde_json::to_string(&rels).unwrap_or_default()
+        };
+        self.emit(
+            PlayEvent::Resolution(ResolutionPayload {
+                intent_id: None,
+                status: ResolutionStatus::Ok,
+                rejection_code: None,
+                narrative: Some(answer.clone()),
+                outcome: Some("query_relationships".into()),
+                triggered_events: None,
+                state_changes: vec![],
+            }),
+            actor.or_else(|| scope.cloned()).or_else(|| Some(story_actor())),
+            None,
+        );
+        Some(answer)
+    }
+
+    /// 结算一个意图。返回值 = 本意图新产生的、模型应据以续写的引擎信息
+    /// （#04 ⑦）：只有 query_world / check / interact 这类「模型自己发起的读取」才返回，
+    /// 其余意图的结算结果不需要模型再反应，返回 None。
+    async fn handle_intent(&self, intent: Intent, actor: Option<ActorRef>) -> Option<String> {
+        self.handle_intent_scoped(intent, actor, None).await
+    }
+
+    /// 结算一个意图，并按发起者作用域过滤只读查询（#04 §6 / #16 认知边界）。
+    /// `scope` = 角色 AI 本次只扮演 / 只代表的那一个角色；None = 主线 AI（全量视野）。
+    async fn handle_intent_scoped(
+        &self,
+        intent: Intent,
+        actor: Option<ActorRef>,
+        scope: Option<&ActorRef>,
+    ) -> Option<String> {
         match intent {
             // 模型写在正文里的思考（P3）：只落一条思考事件（source=model），
             // 不进叙事条目、不改世界状态；前端沿用同一个「思考」折叠组件。
@@ -1740,7 +2630,7 @@ impl Session {
                 self.emit(PlayEvent::Emote(EmotePayload { content, emotion, gesture: None }), actor, None);
             }
             Intent::Check { attribute, difficulty, .. } => {
-                self.run_check(attribute, difficulty.unwrap_or(12), actor).await;
+                return self.run_check(attribute, difficulty, actor).await;
             }
             Intent::Quest { text, hidden, primary } => {
                 let id = format!("quest-{}", uuid::Uuid::new_v4().simple());
@@ -1857,7 +2747,7 @@ impl Session {
                             format!("找不到状态：{status_id}"),
                             RejectionCode::RuleViolation,
                         );
-                        return;
+                        return None;
                     };
                     let unit = if def.unit == StatusUnit::Scenes { "scenes" } else { "turns" };
                     let inst =
@@ -1877,6 +2767,24 @@ impl Session {
                     Some(story_actor()),
                     None,
                 );
+            }
+            Intent::Summary { text } => {
+                // 回合微摘要（#05 §3.2）：派生数据，不落叙事事件、不改世界状态。
+                // 端口缺失 / 写失败都只 warn，本回合照常。
+                let text = text.trim();
+                if text.is_empty() {
+                    return None;
+                }
+                let store = self
+                    .summary_store
+                    .lock()
+                    .expect("summary store poisoned")
+                    .clone();
+                let Some(store) = store else { return None };
+                let round = self.round.load(Ordering::SeqCst);
+                if let Err(e) = store.put_round_summary(&self.save_id, round, text).await {
+                    tracing::warn!(save_id = %self.save_id, round, error = %e, "回合微摘要写入失败（派生数据，忽略）");
+                }
             }
             Intent::Intervene { content } => {
                 self.emit_simple(PlayEvent::System(SystemPayload {
@@ -1911,6 +2819,9 @@ impl Session {
                 }));
             }
             Intent::AdvanceScene { target_scene_id, abandon } => {
+                // 离开的是**切换前**的场景：场景压缩按它归档本场景期间的微摘要。
+                let leaving_scene = self.state.lock().expect("state poisoned").scene_id.clone();
+                let round = self.round.load(Ordering::SeqCst);
                 // 场景切换：先落「在场名单」增量，再落权威 Scene 事件（更新场景元信息）。
                 if let Some(target) = target_scene_id.as_deref() {
                     self.switch_scene(target);
@@ -1926,10 +2837,44 @@ impl Session {
                 }));
                 // 场景切换：scenes 单位的持续状态 tick（#12 ④）
                 self.tick_statuses_scene();
-                // 事件广播：declarative triggers + Lua Event 挂载点
-                self.dispatch_event("scene_change");
+                // 事件广播：declarative triggers + Lua Event 挂载点。
+                // 规范事件名 scene（决策 #11，与演出流事件统一）；旧名 scene_change 由别名匹配兜底。
+                self.dispatch_event("scene");
+                // 场景压缩（#05 §3.3）：派生数据，任何失败都只 warn，绝不阻断本回合。
+                self.compress_scene(&leaving_scene, round).await;
+                // 新场景从本回合起：下次压缩窗口左界。
+                self.scene_start_round.store(round, Ordering::SeqCst);
             }
-            Intent::QueryWorld { .. } => {}
+            Intent::QueryWorld { query } => {
+                // #04 Query 类：只读、不产生状态变更；答案作为 Resolution 落事件流，
+                // 既供 canon_lines 注入后续回合，也作为本回合续写的工具结果回喂（#04 ⑦）。
+                // 角色 AI 作用域：按该角色收窄，不泄露他人私有数据（#04 §6 / #16）。
+                let scope_ids = scope.map(|a| self.character_identifiers(a));
+                let answer = self.answer_query(&query, scope_ids.as_deref());
+                self.emit(
+                    PlayEvent::Resolution(ResolutionPayload {
+                        intent_id: None,
+                        status: ResolutionStatus::Ok,
+                        rejection_code: None,
+                        narrative: Some(answer.clone()),
+                        outcome: Some("query_world".into()),
+                        triggered_events: None,
+                        state_changes: vec![],
+                    }),
+                    actor.clone().or_else(|| scope.cloned()).or_else(|| Some(story_actor())),
+                    None,
+                );
+                return Some(answer);
+            }
+            Intent::QueryCharacter { character_id } => {
+                return self.handle_query_character(character_id, actor, scope);
+            }
+            Intent::QueryRelationships { entity_id } => {
+                return self.handle_query_relationships(entity_id, actor, scope);
+            }
+            Intent::Interact { object_id, action } => {
+                return self.handle_interact(&object_id, &action, actor);
+            }
             Intent::UseSkill { skill_id, target_id } => {
                 self.handle_use_skill(&skill_id, target_id.as_deref(), actor);
             }
@@ -1938,6 +2883,8 @@ impl Session {
             }
             Intent::FinishTurn => {}
         }
+        // 其余意图只落叙事 / 状态，不需要模型据新信息续写。
+        None
     }
 
     // ---------- 机制结算（#04 四阶段 / #12 判定与效果） ----------
@@ -1960,6 +2907,14 @@ impl Session {
     }
 
     fn reject(&self, narrative: String, code: RejectionCode) {
+        // 驳回属于「引擎内部 QA 信息」：不渲染成玩家卡片（前端过滤），但一律进服务端日志，
+        // 并照样落一条 Resolution 事件——按 save_id 查命令日志就能复盘。
+        tracing::warn!(
+            save_id = %self.save_id,
+            code = code.as_str(),
+            reason = %narrative,
+            "AI 意图被驳回"
+        );
         self.emit_simple(PlayEvent::Resolution(ResolutionPayload {
             intent_id: None,
             status: ResolutionStatus::Rejected,
@@ -2051,14 +3006,8 @@ impl Session {
             self.reject(format!("使用「{}」被驳回", skill.name), code);
             return;
         }
-        // RNG 消耗进命令日志（#12 ④：重放时直接复用记录值）。
-        if !outcome.rng_consumed.is_empty() {
-            self.emit_simple(PlayEvent::System(SystemPayload {
-                level: SystemLevel::Info,
-                code: Some("rng_consume".into()),
-                text: serde_json::to_string(&outcome.rng_consumed).unwrap_or_default(),
-            }));
-        }
+        // RNG 消耗不再在此单独落条：emit 统一在发事件前把新增消耗补成 rng_consume
+        // 事件（#06 ②），技能 / 判定 / 状态 tick / Lua 等所有路径一视同仁、不漏不重。
         let actor_ref = actor.clone().unwrap_or_else(|| ActorRef {
             id: actor_id.clone(),
             name: actor_json
@@ -2174,6 +3123,8 @@ impl Session {
         if !changes.is_empty() {
             self.emit_simple(PlayEvent::StateUpdate(StateUpdatePayload { changes }));
         }
+        // 状态 tick 也可能掷骰（每 tick 效果）：即使没有状态变更也要补记消耗（#06 ②）。
+        self.flush_rng_consumption();
     }
 
     /// 注册 Lua 挂载点脚本（供 API / 测试接线）。
@@ -2206,7 +3157,9 @@ impl Session {
             .rules
             .effect_triggers()
             .into_iter()
-            .filter(|(_, trigger)| trigger.event == event)
+            // 事件名归一：规范 scene 与旧 scene_change 互为别名（决策 #11），
+            // 无论派发名还是故事书里写的是哪个，都能命中。
+            .filter(|(_, trigger)| normalize_event_name(&trigger.event) == normalize_event_name(event))
             .collect();
         if triggers.is_empty() {
             return;
@@ -2274,6 +3227,8 @@ impl Session {
         if !changes.is_empty() {
             self.emit_simple(PlayEvent::StateUpdate(StateUpdatePayload { changes }));
         }
+        // 触发效果也可能掷骰：没有状态变更时同样要补记 RNG 消耗（#06 ②）。
+        self.flush_rng_consumption();
     }
 
     fn dispatch_lua_event(&self, event: &str) {
@@ -2376,12 +3331,33 @@ impl Session {
         }
     }
 
-    async fn run_check(&self, attribute: String, target: i64, actor: Option<ActorRef>) {
+    /// 结算一次判定。成功结算时返回结果摘要，供回合内续轮回喂模型（#04 ⑦）；
+    /// 取消 / 出错没有可续写的信息，返回 None。
+    async fn run_check(&self, attribute: String, difficulty: Option<i64>, actor: Option<ActorRef>) -> Option<String> {
         // 判定归属：意图指定 → 受控角色（是玩家在掷骰）。
         // 绝不回落到种子/测试角色；真找不到人时用中性占位。
         let actor = actor
             .or_else(|| self.controlled_actor())
             .unwrap_or(ActorRef { id: String::new(), name: "未知角色".into() });
+        // 判定器来源（#12）：优先故事书 world.check；未声明时保持 1d20 默认（纯骰、无修正）。
+        let declared = self.rules.global_checker();
+        // #12 ④：属性必须在故事书声明的判定属性白名单里，否则明确驳回——绝不静默 0 分必失败。
+        if let Some(list) = declared
+            .as_ref()
+            .and_then(|c| c.attributes.as_ref())
+            .filter(|l| !l.is_empty())
+        {
+            if !list.iter().any(|k| k == &attribute) {
+                self.reject(
+                    format!(
+                        "判定属性「{attribute}」不在故事书声明的判定属性里（可用：{}）",
+                        list.join("、")
+                    ),
+                    RejectionCode::RuleViolation,
+                );
+                return None;
+            }
+        }
         if !self.auto_confirm.load(Ordering::SeqCst) {
             self.phase(PhaseStage::WaitingConfirm, None);
             let action_id = uuid::Uuid::new_v4().to_string();
@@ -2420,72 +3396,136 @@ impl Session {
                     Some(actor),
                     None,
                 );
-                return;
+                return None;
             }
             self.phase(PhaseStage::Resolving, None);
         }
 
-        let roll = {
-            let mut rng = self.rng.lock().expect("rng poisoned");
-            rng.range_inclusive(1, 20)
+        // 难度：意图给的优先 → 故事书 default_dc → 12。
+        let target = difficulty
+            .or_else(|| declared.as_ref().and_then(|c| c.default_dc))
+            .unwrap_or(12);
+        let resolved = match &declared {
+            Some(checker) => {
+                let value = self.actor_attribute_value(&actor, &attribute);
+                let profile = self
+                    .rules
+                    .profiles()
+                    .get(&attribute)
+                    .copied()
+                    .unwrap_or_default();
+                let lua_ctx = LuaHostContext {
+                    script_id: format!("check:{attribute}"),
+                    actor_id: actor.id.clone(),
+                    actor: self.actor_json_of(&actor),
+                    scene_id: self.state.lock().map(|st| st.scene_id.clone()).unwrap_or_default(),
+                    round: self.round.load(Ordering::SeqCst),
+                    difficulty: Some(target),
+                    ..Default::default()
+                };
+                let lua = if checker
+                    .lua
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|s| !s.is_empty())
+                {
+                    Some((&self.lua, &lua_ctx))
+                } else {
+                    None
+                };
+                match crate::command::run_check(
+                    checker,
+                    &attribute,
+                    value,
+                    target,
+                    profile,
+                    &self.rng,
+                    lua,
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        self.emit_simple(PlayEvent::System(SystemPayload {
+                            level: SystemLevel::Error,
+                            code: Some("check_error".into()),
+                            text: e.to_string(),
+                        }));
+                        return None;
+                    }
+                }
+            }
+            None => {
+                // 缺省路径与历史逐字一致：1d20，无修正，默认成功度阈值。
+                let roll = {
+                    let mut rng = self.rng.lock().expect("rng poisoned");
+                    rng.range_inclusive(1, 20)
+                };
+                let margin = roll - target;
+                ResolvedCheck {
+                    attribute: attribute.clone(),
+                    expr: Some("1d20".into()),
+                    rolls: vec![roll],
+                    r#mod: 0,
+                    total: roll,
+                    target,
+                    margin,
+                    result: roll >= target,
+                    level: level_for_margin(margin, &DEFAULT_DEGREE_THRESHOLDS),
+                    rolled: true,
+                    kind: CheckKind::Attribute,
+                }
+            }
         };
-        let total = roll;
-        let margin = total - target;
-        let level = if margin >= 10 {
-            SuccessLevel::Great
-        } else if margin >= 0 {
-            SuccessLevel::Success
-        } else if margin >= -10 {
-            SuccessLevel::Barely
-        } else {
-            SuccessLevel::Fail
-        };
+
         self.emit(
             PlayEvent::CheckResult(CheckResultPayload {
                 intent_id: None,
                 actor: actor.clone(),
-                attribute: attribute.clone(),
-                expr: Some("1d20".into()),
-                rolls: Some(vec![roll]),
-                r#mod: 0,
-                total,
-                target,
-                margin,
-                result: total >= target,
-                level,
+                attribute: resolved.attribute.clone(),
+                expr: resolved.expr.clone(),
+                rolls: if resolved.rolls.is_empty() { None } else { Some(resolved.rolls.clone()) },
+                r#mod: resolved.r#mod,
+                total: resolved.total,
+                target: resolved.target,
+                margin: resolved.margin,
+                result: resolved.result,
+                level: resolved.level,
                 opponent: None,
-                kind: Some(CheckKind::Attribute),
+                kind: Some(resolved.kind),
             }),
             Some(actor.clone()),
             None,
         );
-
-        let ok = total >= target;
-        let mut changes = Vec::new();
-        if ok {
-            let delta = StateDelta {
-                domain: octopus_types::DeltaDomain::Flag,
-                entity_id: "mine_foreshadow".into(),
-                field: "flag".into(),
-                op: octopus_types::DeltaOp::Set,
-                value: Value::Bool(true),
-            };
-            changes.push(delta);
-            self.emit_simple(PlayEvent::StateUpdate(StateUpdatePayload { changes: changes.clone() }));
-        }
+        // 判定结果只进 CheckResult 与 Resolution；不再硬编码写 demo flag（mine_foreshadow），
+        // 结果如何演绎交给叙事层/AI（#04/#12 缺口 2）。
         self.emit(
             PlayEvent::Resolution(ResolutionPayload {
                 intent_id: None,
                 status: ResolutionStatus::Ok,
                 rejection_code: None,
-                narrative: Some(if ok { "你注意到了些线索。".into() } else { "你什么也没看清。".into() }),
-                outcome: None,
+                narrative: Some(if resolved.result { "判定成功。".into() } else { "判定失败。".into() }),
+                outcome: Some("check".into()),
                 triggered_events: None,
-                state_changes: changes,
+                state_changes: vec![],
             }),
             Some(actor),
             None,
         );
+        // #04 ⑦：把判定结果摘要回喂模型，让它据此续写（失败时改换策略、成功时顺势推进）。
+        let dice = if resolved.rolls.is_empty() {
+            resolved.expr.clone().unwrap_or_else(|| "无骰".to_string())
+        } else {
+            resolved.rolls.iter().map(i64::to_string).collect::<Vec<_>>().join("+")
+        };
+        let level = match resolved.level {
+            octopus_types::SuccessLevel::Great => "大成功",
+            octopus_types::SuccessLevel::Success => "成功",
+            octopus_types::SuccessLevel::Barely => "险胜",
+            octopus_types::SuccessLevel::Fail => "失败",
+        };
+        Some(format!(
+            "判定「{}」：{level}（骰 {dice}，修正 {}，总值 {}，难度 {}）",
+            resolved.attribute, resolved.r#mod, resolved.total, resolved.target
+        ))
     }
 }
 
@@ -2504,6 +3544,25 @@ const STORY_ACTOR_ID: &str = "__story__";
 
 fn story_actor() -> ActorRef {
     ActorRef { id: STORY_ACTOR_ID.into(), name: "故事".into() }
+}
+
+/// 按任意一种 id（实例键 / 模板 id / 名字 / instance_id）在状态里定位角色实例键。
+/// 关系边端点用模板 id，实例状态用实例键；查询两类都得能互相解析。
+fn character_key_in(st: &WorldState, id: &str) -> Option<String> {
+    st.characters
+        .iter()
+        .find(|(key, c)| {
+            key.as_str() == id || c.template_id == id || c.name == id || c.instance_id == id
+        })
+        .map(|(key, _)| key.clone())
+}
+
+/// 关系边是否触及给定的一组实体 id（端点兼容 from/to 与旧 from_id/to_id）。
+fn edge_touches(edge: &Value, ids: &[String]) -> bool {
+    ["from", "to"].iter().any(|canonical| {
+        let legacy = if *canonical == "from" { "from_id" } else { "to_id" };
+        relationship_endpoint(edge, canonical, legacy).is_some_and(|e| ids.iter().any(|id| id == e))
+    })
 }
 
 /// 提示词里的「在场角色」：只列本场在场者（受控角色恒在场）。
@@ -2545,6 +3604,13 @@ fn apply_event(state: &mut WorldState, event: &PlayEvent) {
         PlayEvent::System(p) => {
             if p.code.as_deref() == Some("confirm_toggle") {
                 state.meta.auto_confirm = p.text.contains("开启");
+            }
+            // rng_consume 不改世界事实，只累加「已消耗的掷骰次数」（#06 ②）：
+            // 重放据此把 RNG 拨回日志记录的位置，未来骰序与不重启一致。
+            if p.code.as_deref() == Some("rng_consume") {
+                if let Ok(vals) = serde_json::from_str::<Vec<u64>>(&p.text) {
+                    state.rng_position = state.rng_position.saturating_add(vals.len() as u64);
+                }
             }
         }
         _ => {}
@@ -2645,6 +3711,17 @@ fn apply_delta(state: &mut WorldState, d: &StateDelta) {
                 }
             }
         }
+        DeltaDomain::Origin => {
+            // 全量检查点：整体替换状态，但保留重放推进的 seq 与当前存档元信息
+            // （revision / needs_upgrade 以存档列为准，不回到检查点时的旧值）。
+            if let Ok(cp) = serde_json::from_value::<OriginCheckpoint>(d.value.clone()) {
+                let seq = state.seq;
+                let meta = state.meta.clone();
+                *state = cp.state;
+                state.seq = seq;
+                state.meta = meta;
+            }
+        }
         // v1 游玩页没有地点 / 关系 / 资源面板，保持 no-op。
         DeltaDomain::Location | DeltaDomain::Relationship | DeltaDomain::Resource => {}
     }
@@ -2669,8 +3746,8 @@ fn apply_map_value(map: &mut serde_json::Map<String, Value>, key: &str, d: &Stat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ports::AiProvider;
-    use octopus_types::{CharacterInstance, ProjectionMeta};
+    use crate::ports::{AiOutput, AiProvider, MemoryHit, MemoryRetriever, ModelRef};
+    use octopus_types::{CharacterInstance, IntentEnvelope, ProjectionMeta, SuccessLevel};
     use serde_json::json;
     use std::sync::Mutex as StdMutex;
     use std::sync::RwLock;
@@ -2690,9 +3767,7 @@ mod tests {
         async fn story_intents(&self, _ctx: &TurnContext) -> Result<AiOutput, EngineError> {
             Ok(AiOutput::default())
         }
-        async fn character_intents(&self, _ctx: &TurnContext) -> Result<AiOutput, EngineError> {
-            Ok(AiOutput::default())
-        }
+        
     }
 
     fn state_with_pc() -> WorldState {
@@ -2736,6 +3811,7 @@ mod tests {
                 auto_confirm: true,
             },
             rng_seed: 42,
+            rng_position: 0,
         }
     }
 
@@ -2803,6 +3879,102 @@ mod tests {
         let proj = session.projection();
         assert_eq!(proj.characters["char-a"]["resources"]["mana"].as_f64(), Some(15.0));
         assert!(proj.characters["char-a"]["resources"]["hp"].as_f64().unwrap() < 30.0);
+    }
+
+    /// #06 ① 回归（修复前应失败）：进程重启后从日志重放必须恢复 RNG 位置，
+    /// 否则未来的骰值会从序列头重演，违背「严格事件溯源」承诺。
+    #[tokio::test]
+    async fn restart_replay_restores_rng_position() {
+        let sb = json!({
+            "skills": [{
+                "id": "sk-fire", "name": "火球",
+                "check": { "dice": "1d20" },
+                "effect": { "immediate": [{ "kind": "damage", "amount": "2d6", "resource": "hp" }] }
+            }],
+            "world": { "check": { "dice": "1d20" } }
+        });
+        // 实时会话：消耗 RNG 并把消耗记录进日志。
+        let (live, live_sink) = session_with(sb.clone());
+        let skill = live.rules.skill("sk-fire").cloned().unwrap();
+        live.resolve_skill(None, &skill, None, None);
+        let live_next = live.rng.lock().unwrap().range_inclusive(1, 20);
+        let events: Vec<EventEnvelope> = live_sink.0.lock().unwrap().clone();
+        assert!(events.iter().any(|e| matches!(
+            &e.event,
+            PlayEvent::System(p) if p.code.as_deref() == Some("rng_consume")
+        )));
+
+        // 重启：同一初始状态，从命令日志重建会话。
+        let (restarted, _sink) = session_with(sb);
+        let persisted: Vec<PersistedEvent> = events
+            .into_iter()
+            .map(|envelope| PersistedEvent { request_id: None, envelope })
+            .collect();
+        restarted.replay(&persisted);
+        let restarted_next = restarted.rng.lock().unwrap().range_inclusive(1, 20);
+        assert_eq!(
+            live_next, restarted_next,
+            "重启重放后 RNG 必须停在日志记录的位置，未来骰序与不重启一致"
+        );
+
+        // 重启后再结算一次同一技能：骰值、资源与不重启的会话逐位一致。
+        live.resolve_skill(None, &skill, None, None);
+        restarted.resolve_skill(None, &skill, None, None);
+        assert_eq!(
+            serde_json::to_value(live.projection()).unwrap(),
+            serde_json::to_value(restarted.projection()).unwrap(),
+            "重启后的继续结算必须产生同一世界状态"
+        );
+    }
+
+    /// #06 ② 核心不变量：快照 + 其后命令 必须与全量重放得到同一状态、同一 seq、同一 RNG 位置。
+    #[test]
+    fn snapshot_plus_later_events_equals_full_replay() {
+        let sb = json!({
+            "skills": [{
+                "id": "sk-fire", "name": "火球",
+                "check": { "dice": "1d20" },
+                "effect": { "immediate": [{ "kind": "damage", "amount": "2d6", "resource": "hp" }] }
+            }],
+            "world": { "check": { "dice": "1d20" } }
+        });
+        let (live, live_sink) = session_with(sb.clone());
+        let skill = live.rules.skill("sk-fire").cloned().unwrap();
+        // 前两轮之后取一份快照（覆盖「快照基线」分支）。
+        live.resolve_skill(None, &skill, None, None);
+        live.resolve_skill(None, &skill, None, None);
+        let snapshot = live.snapshot_base();
+        assert!(snapshot.seq > 0, "快照必须带一个有效 seq");
+        // 快照之后再跑两轮，制造「其后命令」。
+        live.resolve_skill(None, &skill, None, None);
+        live.resolve_skill(None, &skill, None, None);
+        let events: Vec<PersistedEvent> = live_sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .map(|envelope| PersistedEvent { request_id: None, envelope })
+            .collect();
+
+        // 全量重放（不带快照）
+        let (full, _s1) = session_with(sb.clone());
+        full.replay(&events);
+        // 快照 + 只投影其后的命令
+        let (cached, _s2) = session_with(sb);
+        cached.replay_from(&events, Some(snapshot));
+
+        assert_eq!(
+            serde_json::to_value(full.projection()).unwrap(),
+            serde_json::to_value(cached.projection()).unwrap(),
+            "快照 + 其后命令必须与全量重放得到同一世界状态"
+        );
+        assert_eq!(full.current_seq(), cached.current_seq(), "seq 必须一致");
+        assert_eq!(
+            full.rng.lock().unwrap().range_inclusive(1, 1000),
+            cached.rng.lock().unwrap().range_inclusive(1, 1000),
+            "RNG 位置必须一致"
+        );
     }
 
     #[test]
@@ -2890,6 +4062,32 @@ mod tests {
         let events = sink.0.lock().unwrap().clone();
         assert!(events.iter().any(|e| matches!(&e.event,
             PlayEvent::System(p) if p.code.as_deref() == Some("event_lua_error"))));
+    }
+
+    /// 场景切换事件命名统一（决策 #11）：派发规范名 scene 时，旧名 scene_change
+    /// 声明的触发器与规范名 scene 声明的触发器都应命中——旧故事书不静默失效。
+    #[test]
+    fn scene_event_canonical_and_legacy_are_aliases() {
+        let sb = json!({
+            "skills": [{
+                "id": "sk-react", "name": "反应",
+                "effect": { "triggers": [
+                    { "id": "tr-canonical", "event": "scene",
+                      "effects": [{ "kind": "set_flag", "flag": "canonical_fired" }] },
+                    { "id": "tr-legacy", "event": "scene_change",
+                      "effects": [{ "kind": "set_flag", "flag": "legacy_fired" }] }
+                ] }
+            }]
+        });
+        let (session, _sink) = session_with(sb);
+        session.dispatch_event("scene");
+        let proj = session.projection();
+        assert_eq!(proj.flags.get("canonical_fired"), Some(&json!(true)));
+        assert_eq!(
+            proj.flags.get("legacy_fired"),
+            Some(&json!(true)),
+            "派发规范名 scene 时旧名 scene_change 触发器也应命中"
+        );
     }
 
     #[test]
@@ -3195,11 +4393,9 @@ mod tests {
     impl AiProvider for CapturingAi {
         async fn story_intents(&self, ctx: &TurnContext) -> Result<AiOutput, EngineError> {
             self.0.lock().unwrap().push(ctx.clone());
-            Ok(AiOutput { intents: vec![Intent::FinishTurn], reasoning: None, intent_warnings: vec![] })
+            Ok(AiOutput { intents: vec![Intent::FinishTurn.into()], reasoning: None, intent_warnings: vec![] })
         }
-        async fn character_intents(&self, _ctx: &TurnContext) -> Result<AiOutput, EngineError> {
-            Ok(AiOutput { intents: vec![Intent::FinishTurn], reasoning: None, intent_warnings: vec![] })
-        }
+        
     }
 
     #[tokio::test]
@@ -3337,32 +4533,143 @@ mod tests {
 
 
 
-    struct NarrationCapturingAi(StdMutex<Vec<(String, TurnContext)>>);
+    struct FakeRetriever {
+        hits: Vec<MemoryHit>,
+    }
 
     #[async_trait::async_trait]
-    impl AiProvider for NarrationCapturingAi {
-        async fn story_intents(&self, ctx: &TurnContext) -> Result<AiOutput, EngineError> {
-            self.0.lock().unwrap().push(("story".into(), ctx.clone()));
-            Ok(AiOutput { intents: vec![Intent::Narrate { content: "雨云压得极低。".into(), actor_id: None }], reasoning: None, intent_warnings: vec![] })
-        }
-        async fn character_intents(&self, ctx: &TurnContext) -> Result<AiOutput, EngineError> {
-            self.0.lock().unwrap().push(("character".into(), ctx.clone()));
-            Ok(AiOutput { intents: vec![Intent::FinishTurn], reasoning: None, intent_warnings: vec![] })
+    impl MemoryRetriever for FakeRetriever {
+        async fn retrieve(
+            &self,
+            _save_id: &str,
+            _query: &str,
+            _k: usize,
+        ) -> Result<Vec<MemoryHit>, EngineError> {
+            Ok(self.hits.clone())
         }
     }
 
-    #[tokio::test]
-    async fn character_ai_sees_story_narration_from_same_round() {
-        let sb = json!({ "world": {} });
+    struct FailingRetriever;
+
+    #[async_trait::async_trait]
+    impl MemoryRetriever for FailingRetriever {
+        async fn retrieve(
+            &self,
+            _save_id: &str,
+            _query: &str,
+            _k: usize,
+        ) -> Result<Vec<MemoryHit>, EngineError> {
+            Err(EngineError::Internal("检索器炸了".into()))
+        }
+    }
+
+    fn session_with_capturing_ai() -> (Arc<Session>, Arc<CapturingAi>) {
         let sink = Arc::new(CaptureSink(StdMutex::new(vec![])));
-        let ai = Arc::new(NarrationCapturingAi(StdMutex::new(vec![])));
+        let ai = Arc::new(CapturingAi(StdMutex::new(vec![])));
         let session = Arc::new(Session::new(
             "s".into(),
             state_with_pc(),
             sink as Arc<dyn EventSink>,
             ai_slot(ai.clone() as Arc<dyn AiProvider>),
             true,
-            sb,
+            json!({ "world": {} }),
+        ));
+        (session, ai)
+    }
+
+    /// #05 §3.4：注入的检索器把命中填进 TurnContext.memories。
+    #[tokio::test]
+    async fn wired_retriever_fills_round_memories() {
+        let (session, ai) = session_with_capturing_ai();
+        session.set_memory_retriever(Some(Arc::new(FakeRetriever {
+            hits: vec![MemoryHit {
+                seq: 7,
+                round: 2,
+                kind: "narrate".into(),
+                text: "旧事".into(),
+                score: 0.8,
+            }],
+        })));
+        session
+            .run_round(
+                RoundInput { channel: RoundChannel::Character, text: "还记得吗".into(), refs: vec![] },
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let captured = ai.0.lock().unwrap();
+        let ctx = captured.last().expect("story AI 收到上下文");
+        assert_eq!(ctx.memories.len(), 1);
+        assert_eq!(ctx.memories[0].seq, 7);
+        assert_eq!(ctx.memories[0].text, "旧事");
+    }
+
+    /// 检索失败静默降级：回合照常结束，memories 为空。
+    #[tokio::test]
+    async fn retrieval_failure_degrades_silently() {
+        let (session, ai) = session_with_capturing_ai();
+        session.set_memory_retriever(Some(Arc::new(FailingRetriever)));
+        session
+            .run_round(
+                RoundInput { channel: RoundChannel::Character, text: "继续".into(), refs: vec![] },
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let captured = ai.0.lock().unwrap();
+        let ctx = captured.last().expect("story AI 收到上下文");
+        assert!(ctx.memories.is_empty(), "检索失败应静默降级为空");
+    }
+
+    /// 回归：PC 名恰好是「你」时，NPC 台词里的「你」是**称呼**，不该把台词判给玩家。
+    struct NpcSpeakingAi;
+
+    #[async_trait::async_trait]
+    impl AiProvider for NpcSpeakingAi {
+        async fn story_intents(&self, _ctx: &TurnContext) -> Result<AiOutput, EngineError> {
+            Ok(AiOutput {
+                intents: vec![Intent::Speak { content: "你带伞了吗？".into(), tone: None, actor_id: None }.into()],
+                reasoning: None,
+                intent_warnings: vec![],
+            })
+        }
+        
+    }
+
+    fn character_instance(id: &str, name: &str, kind: &str) -> CharacterInstance {
+        CharacterInstance {
+            instance_id: format!("inst-{id}"),
+            template_id: id.to_string(),
+            name: name.to_string(),
+            kind: kind.to_string(),
+            attributes: Default::default(),
+            resources: Default::default(),
+            inventory: Default::default(),
+            location_id: None,
+            present: true,
+            statuses: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn npc_line_containing_pc_name_is_not_attributed_to_the_player() {
+        let mut state = state_with_pc();
+        let mut chars = std::collections::BTreeMap::new();
+        chars.insert("char-pc".to_string(), character_instance("char-pc", "你", "pc"));
+        chars.insert("char-lucy".to_string(), character_instance("char-lucy", "露西", "npc"));
+        state.characters = chars;
+        state.controlled = vec!["char-pc".into()];
+
+        let sink = Arc::new(CaptureSink(StdMutex::new(vec![])));
+        let session = Arc::new(Session::new(
+            "s".into(),
+            state,
+            sink.clone() as Arc<dyn EventSink>,
+            ai_slot(Arc::new(NpcSpeakingAi)),
+            true,
+            json!({ "world": {} }),
         ));
         session
             .run_round(
@@ -3372,14 +4679,20 @@ mod tests {
             )
             .await
             .unwrap();
-        let captured = ai.0.lock().unwrap();
-        let story = &captured.iter().find(|(k, _)| k == "story").expect("story AI ran").1;
-        let character = &captured.iter().find(|(k, _)| k == "character").expect("character AI ran").1;
-        assert!(story.story_narration.is_none(), "主线 AI 自己不需要已叙述字段");
+
+        let events = sink.0.lock().unwrap().clone();
+        let (actor, content) = events
+            .iter()
+            .find_map(|e| match &e.event {
+                PlayEvent::Dialogue(p) => Some((e.actor.clone(), p.content.clone())),
+                _ => None,
+            })
+            .expect("dialogue emitted");
+        assert_eq!(content, "你带伞了吗？");
         assert_eq!(
-            character.story_narration.as_deref(),
-            Some("雨云压得极低。"),
-            "角色 AI 要拿到主线 AI 本回合的叙事，才能接着演而不是重复"
+            actor.as_ref().map(|a| a.id.as_str()),
+            Some("char-lucy"),
+            "台词里的「你」是称呼，归属应是在场 NPC，而不是名为「你」的玩家"
         );
     }
 
@@ -3389,22 +4702,16 @@ mod tests {
     impl AiProvider for ReasoningAi {
         async fn story_intents(&self, _ctx: &TurnContext) -> Result<AiOutput, EngineError> {
             Ok(AiOutput {
-                intents: vec![Intent::Narrate { content: "雨。".into(), actor_id: None }],
+                intents: vec![Intent::Narrate { content: "雨。".into(), actor_id: None }.into()],
                 reasoning: Some("先想想天气。".into()),
                 intent_warnings: vec![],
             })
         }
-        async fn character_intents(&self, _ctx: &TurnContext) -> Result<AiOutput, EngineError> {
-            Ok(AiOutput {
-                intents: vec![Intent::FinishTurn],
-                reasoning: Some("露西该怎么回应。".into()),
-                intent_warnings: vec![],
-            })
-        }
+        
     }
 
     #[tokio::test]
-    async fn reasoning_events_are_emitted_for_both_stages() {
+    async fn reasoning_events_are_emitted() {
         let sb = json!({ "world": {} });
         let sink = Arc::new(CaptureSink(StdMutex::new(vec![])));
         let ai = Arc::new(ReasoningAi);
@@ -3432,8 +4739,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(stages.contains(&"story_thinking"), "主线 AI 的思考要落事件");
-        assert!(stages.contains(&"character_thinking"), "角色 AI 的思考要落事件");
+        assert!(stages.contains(&"story_thinking"), "单一 AI 的思考要落事件");
         assert!(events.iter().any(|e| matches!(&e.event, PlayEvent::Reasoning(p) if p.text.contains("天气"))));
         // 供应商 reasoning_content 的来源缺省为 provider（兼容既有事件）。
         assert!(events.iter().all(|e| !matches!(&e.event, PlayEvent::Reasoning(p) if p.source != "provider")));
@@ -3446,14 +4752,12 @@ mod tests {
     impl AiProvider for ThinkingAi {
         async fn story_intents(&self, _ctx: &TurnContext) -> Result<AiOutput, EngineError> {
             Ok(AiOutput {
-                intents: vec![Intent::Think { content: "先在心里推演一遍。".into() }],
+                intents: vec![Intent::Think { content: "先在心里推演一遍。".into() }.into()],
                 reasoning: None,
                 intent_warnings: vec![],
             })
         }
-        async fn character_intents(&self, _ctx: &TurnContext) -> Result<AiOutput, EngineError> {
-            Ok(AiOutput { intents: vec![Intent::FinishTurn], reasoning: None, intent_warnings: vec![] })
-        }
+        
     }
 
     #[tokio::test]
@@ -3498,7 +4802,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_round_passes_per_save_model_to_ai() {
+    async fn run_round_passes_save_model_to_ai() {
         let ai = Arc::new(CapturingAi(StdMutex::new(vec![])));
         let sink = Arc::new(CaptureSink(StdMutex::new(vec![])));
         let session = Arc::new(Session::new(
@@ -3509,8 +4813,8 @@ mod tests {
             true,
             json!({}),
         ));
-        // 本存档覆盖模型：应原样进 TurnContext，供 provider 解析。
-        session.set_model(Some(ModelRef { provider_id: "p1".into(), model: "m1".into(), reasoning_effort: None }));
+        // 本存档指定的单一模型应进 TurnContext，供 provider 解析。
+        session.set_model(Some(ModelRef { provider_id: "p1".into(), model: "m1".into(), reasoning_effort: Some("high".into()) }));
         session
             .run_round(
                 RoundInput { channel: RoundChannel::Character, text: "看看四周".into(), refs: vec![] },
@@ -3522,9 +4826,37 @@ mod tests {
         let captured = ai.0.lock().unwrap();
         let ctx = captured.last().expect("AI 收到上下文");
         assert_eq!(
-            ctx.model.as_ref().map(|m| (m.provider_id.as_str(), m.model.as_str())),
-            Some(("p1", "m1"))
+            ctx.model
+                .as_ref()
+                .map(|m| (m.provider_id.as_str(), m.model.as_str(), m.reasoning_effort.as_deref())),
+            Some(("p1", "m1", Some("high")))
         );
+    }
+
+    #[tokio::test]
+    async fn run_round_unset_save_model_falls_back_to_none() {
+        // 未设置 / 旧存档：None，由 provider 回落到全局默认。
+        let ai = Arc::new(CapturingAi(StdMutex::new(vec![])));
+        let sink = Arc::new(CaptureSink(StdMutex::new(vec![])));
+        let session = Arc::new(Session::new(
+            "s".into(),
+            state_with_pc(),
+            sink as Arc<dyn EventSink>,
+            ai_slot(ai.clone() as Arc<dyn AiProvider>),
+            true,
+            json!({}),
+        ));
+        session
+            .run_round(
+                RoundInput { channel: RoundChannel::Character, text: "看看四周".into(), refs: vec![] },
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let captured = ai.0.lock().unwrap();
+        let ctx = captured.last().expect("AI 收到上下文");
+        assert!(ctx.model.is_none());
     }
 
 
@@ -3574,12 +4906,14 @@ mod tests {
     impl AiProvider for ScriptedSeq {
         async fn story_intents(&self, _ctx: &TurnContext) -> Result<AiOutput, EngineError> {
             let mut q = self.0.lock().unwrap();
-            let intents = if q.is_empty() { vec![] } else { q.remove(0) };
+            let intents: Vec<IntentEnvelope> = if q.is_empty() {
+                vec![]
+            } else {
+                q.remove(0).into_iter().map(IntentEnvelope::from).collect()
+            };
             Ok(AiOutput { intents, reasoning: None, intent_warnings: vec![] })
         }
-        async fn character_intents(&self, _ctx: &TurnContext) -> Result<AiOutput, EngineError> {
-            Ok(AiOutput::default())
-        }
+        
     }
 
     #[tokio::test]
@@ -3629,4 +4963,1061 @@ mod tests {
         assert_eq!(round, 1, "重跑必须复用同一回合号");
         assert!(seq > old_start_seq, "重跑事件用新 seq");
     }
+
+    // ---------- #05 §3.2/§3.3 摘要派生数据 ----------
+
+    #[derive(Default)]
+    struct FakeSummaryStore {
+        rounds: StdMutex<Vec<(u32, String)>>,
+        scenes: StdMutex<Vec<(String, u32, String)>>,
+    }
+
+    impl FakeSummaryStore {
+        fn with_rounds(rounds: &[(u32, &str)]) -> Self {
+            Self {
+                rounds: StdMutex::new(rounds.iter().map(|(r, t)| (*r, t.to_string())).collect()),
+                scenes: StdMutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ports::SummaryStore for FakeSummaryStore {
+        async fn put_round_summary(
+            &self,
+            _save_id: &str,
+            round: u32,
+            text: &str,
+        ) -> Result<(), EngineError> {
+            self.rounds.lock().unwrap().push((round, text.to_string()));
+            Ok(())
+        }
+        async fn round_summaries_after(
+            &self,
+            _save_id: &str,
+            after_round: u32,
+        ) -> Result<Vec<(u32, String)>, EngineError> {
+            Ok(self
+                .rounds
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(r, _)| *r > after_round)
+                .cloned()
+                .collect())
+        }
+        async fn put_scene_summary(
+            &self,
+            _save_id: &str,
+            scene_id: &str,
+            round: u32,
+            text: &str,
+        ) -> Result<(), EngineError> {
+            self.scenes
+                .lock()
+                .unwrap()
+                .push((scene_id.to_string(), round, text.to_string()));
+            Ok(())
+        }
+    }
+
+    /// 写入永远失败的摘要端口：验证派生写失败也不影响回合。
+    struct FailingSummaryStore;
+
+    #[async_trait::async_trait]
+    impl crate::ports::SummaryStore for FailingSummaryStore {
+        async fn put_round_summary(&self, _s: &str, _r: u32, _t: &str) -> Result<(), EngineError> {
+            Err(EngineError::Internal("摘要库挂了".into()))
+        }
+        async fn round_summaries_after(
+            &self,
+            _s: &str,
+            _r: u32,
+        ) -> Result<Vec<(u32, String)>, EngineError> {
+            Err(EngineError::Internal("摘要库挂了".into()))
+        }
+        async fn put_scene_summary(
+            &self,
+            _s: &str,
+            _sc: &str,
+            _r: u32,
+            _t: &str,
+        ) -> Result<(), EngineError> {
+            Err(EngineError::Internal("摘要库挂了".into()))
+        }
+    }
+
+    /// #05 §3.2：summary 意图只写派生表，不产生叙事事件、不改世界状态。
+    #[tokio::test]
+    async fn summary_intent_writes_derived_store_without_narrative_or_state() {
+        let (session, sink) = session_with(json!({}));
+        let store = Arc::new(FakeSummaryStore::default());
+        session.set_summary_store(Some(store.clone() as Arc<dyn crate::ports::SummaryStore>));
+        session.round.store(3, Ordering::SeqCst);
+
+        session
+            .handle_intent(
+                Intent::Summary { text: "  米拉在酒馆听到了传闻。  ".into() },
+                None,
+            )
+            .await;
+
+        // 写进派生表，且文本已 trim。
+        assert_eq!(
+            store.rounds.lock().unwrap().clone(),
+            vec![(3, "米拉在酒馆听到了传闻。".to_string())]
+        );
+        // 不产生任何事件（含叙事事件），权威 seq / 场景状态逐字不变。
+        assert!(sink.0.lock().unwrap().is_empty(), "summary 意图不得 emit 任何事件");
+        assert_eq!(session.seq.load(Ordering::SeqCst), 0, "不得改变权威 seq");
+        assert_eq!(session.projection().scene_id, "sc-1");
+    }
+
+    /// #05 §3.3：advance_scene 结算后把本场景的回合微摘要压缩落表；
+    /// 默认 summarize（None）退化为确定性拼接。
+    #[tokio::test]
+    async fn advance_scene_compresses_scene_summaries_with_concat_fallback() {
+        let (session, _sink) = session_with(json!({}));
+        let store =
+            Arc::new(FakeSummaryStore::with_rounds(&[(1, "第1回合摘要"), (2, "第2回合摘要")]));
+        session.set_summary_store(Some(store.clone() as Arc<dyn crate::ports::SummaryStore>));
+        session.scene_start_round.store(0, Ordering::SeqCst);
+        session.round.store(4, Ordering::SeqCst);
+
+        session
+            .handle_intent(Intent::AdvanceScene { target_scene_id: None, abandon: false }, None)
+            .await;
+
+        let scenes = store.scenes.lock().unwrap().clone();
+        assert_eq!(scenes.len(), 1);
+        assert_eq!(scenes[0].0, "sc-1", "压缩离开的是切换前的场景");
+        assert_eq!(scenes[0].1, 4);
+        assert_eq!(scenes[0].2, "第1回合摘要\n第2回合摘要", "None → 拼接兜底");
+        assert_eq!(session.scene_start_round.load(Ordering::SeqCst), 4, "窗口左界推进到本回合");
+    }
+
+    struct FailingSummaryAi;
+
+    #[async_trait::async_trait]
+    impl AiProvider for FailingSummaryAi {
+        async fn story_intents(&self, _ctx: &TurnContext) -> Result<AiOutput, EngineError> {
+            Ok(AiOutput {
+                intents: vec![
+                    Intent::Narrate { content: "你们离开了矿洞。".into(), actor_id: None }.into(),
+                    Intent::Summary { text: "本回合离开了矿洞".into() }.into(),
+                    Intent::AdvanceScene { target_scene_id: None, abandon: false }.into(),
+                ],
+                reasoning: None,
+                intent_warnings: vec![],
+            })
+        }
+        
+        async fn summarize(&self, _text: &str) -> Result<Option<String>, EngineError> {
+            Err(EngineError::Ai("压缩挂了".into()))
+        }
+    }
+
+    /// #05 硬不变量：AI 压缩失败 / 摘要写库失败都只 warn，绝不失败回合。
+    #[tokio::test]
+    async fn summary_failures_never_fail_round() {
+        let sink = Arc::new(CaptureSink(StdMutex::new(vec![])));
+        let session = Arc::new(Session::new(
+            "s".into(),
+            state_with_pc(),
+            sink as Arc<dyn EventSink>,
+            ai_slot(Arc::new(FailingSummaryAi)),
+            true,
+            json!({}),
+        ));
+        let store = Arc::new(FakeSummaryStore::with_rounds(&[(1, "旧摘要")]));
+        session.set_summary_store(Some(store.clone() as Arc<dyn crate::ports::SummaryStore>));
+
+        let res = session
+            .run_round(
+                RoundInput { channel: RoundChannel::Character, text: "离开".into(), refs: vec![] },
+                None,
+                vec![],
+            )
+            .await;
+        assert!(res.is_ok(), "压缩失败不得让回合失败");
+        // summarize 返回 Err → 拼接兜底仍落一条场景摘要（含本回合摘要意图的文本）。
+        let scenes = store.scenes.lock().unwrap().clone();
+        assert_eq!(scenes.len(), 1);
+        assert!(scenes[0].2.contains("旧摘要"), "失败也要退化为拼接: {:?}", scenes[0].2);
+        assert!(store.rounds.lock().unwrap().iter().any(|(_, t)| t == "本回合离开了矿洞"));
+
+        // 摘要端口整体故障：写微摘要 / 读窗口都报错，回合照常。
+        let sink2 = Arc::new(CaptureSink(StdMutex::new(vec![])));
+        let session2 = Arc::new(Session::new(
+            "s".into(),
+            state_with_pc(),
+            sink2 as Arc<dyn EventSink>,
+            ai_slot(Arc::new(FailingSummaryAi)),
+            true,
+            json!({}),
+        ));
+        session2.set_summary_store(Some(Arc::new(FailingSummaryStore)));
+        assert!(
+            session2
+                .run_round(
+                    RoundInput { channel: RoundChannel::Character, text: "离开".into(), refs: vec![] },
+                    None,
+                    vec![],
+                )
+                .await
+                .is_ok(),
+            "摘要库故障不得让回合失败"
+        );
+    }
+
+    /// #05 硬不变量：replay 不读摘要（摘要非权威），
+    /// 但据权威 advance_scene 事件重建场景压缩窗口左界。
+    #[tokio::test]
+    async fn replay_ignores_summaries_and_rebuilds_scene_window() {
+        let (session, _sink) = session_with(json!({}));
+        let store =
+            Arc::new(FakeSummaryStore::with_rounds(&[(1, "旧场景摘要"), (2, "新场景摘要")]));
+        session.set_summary_store(Some(store.clone() as Arc<dyn crate::ports::SummaryStore>));
+
+        session.replay(&[PersistedEvent {
+            request_id: None,
+            envelope: EventEnvelope {
+                id: "ev-1".into(),
+                seq: 1,
+                round: 1,
+                ts: "t".into(),
+                actor: None,
+                intent_id: None,
+                event: PlayEvent::Resolution(ResolutionPayload {
+                    intent_id: None,
+                    status: ResolutionStatus::Ok,
+                    rejection_code: None,
+                    narrative: Some("场景推进。".into()),
+                    outcome: Some("advance_scene".into()),
+                    triggered_events: None,
+                    state_changes: vec![],
+                }),
+            },
+        }]);
+
+        // 重放后按最后的 advance_scene（round 1）设定窗口：只压缩 round > 1 的摘要。
+        session.round.store(2, Ordering::SeqCst);
+        session
+            .handle_intent(Intent::AdvanceScene { target_scene_id: None, abandon: false }, None)
+            .await;
+        assert_eq!(
+            store.scenes.lock().unwrap()[0].2,
+            "新场景摘要",
+            "重放不读摘要表，但窗口左界来自权威 advance_scene 事件"
+        );
+    }
+
+    // ============================================================
+    // #04 / #12 本切片测试：声明式判定 / intent_id 去重 / 查询 / 物件交互 / actor 约束
+    // ============================================================
+
+    /// #04/#12：check 意图走故事书 world.check（骰式 / 修正 / 分档）；
+    /// 未声明 world.check 时回落今天的 1d20（无修正）。
+    #[tokio::test]
+    async fn check_intent_uses_declarative_checker_and_defaults_to_1d20() {
+        let sb = json!({
+            "world": { "check": {
+                "dice": "1d20",
+                "attribute_modifier": { "str": 7 },
+                "degree_thresholds": [100, -100, -100]
+            } }
+        });
+        let (session, sink) = session_with(sb);
+        session
+            .handle_intent(
+                Intent::Check { attribute: "str".into(), difficulty: Some(10), actor_id: None },
+                None,
+            )
+            .await;
+        let events = sink.0.lock().unwrap().clone();
+        let check = events
+            .iter()
+            .find_map(|e| match &e.event {
+                PlayEvent::CheckResult(p) => Some(p.clone()),
+                _ => None,
+            })
+            .expect("check result");
+        assert_eq!(check.expr.as_deref(), Some("1d20"));
+        assert_eq!(check.r#mod, 7, "故事书 attribute_modifier 必须生效");
+        assert_eq!(check.target, 10);
+        assert_eq!(check.total, check.rolls.as_ref().unwrap()[0] + 7);
+        assert_eq!(check.level, SuccessLevel::Success, "按 degree_thresholds 分档");
+        assert_eq!(check.result, check.total >= 10);
+
+        // 缺省故事书：仍按 1d20、无修正（不套中心偏移公式）。
+        let (session2, sink2) = session_with(json!({ "world": {} }));
+        session2
+            .handle_intent(
+                Intent::Check { attribute: "str".into(), difficulty: Some(12), actor_id: None },
+                None,
+            )
+            .await;
+        let events2 = sink2.0.lock().unwrap().clone();
+        let check2 = events2
+            .iter()
+            .find_map(|e| match &e.event {
+                PlayEvent::CheckResult(p) => Some(p.clone()),
+                _ => None,
+            })
+            .expect("default check result");
+        assert_eq!(check2.expr.as_deref(), Some("1d20"));
+        assert_eq!(check2.r#mod, 0, "无 world.check 时不应用属性修正");
+        assert_eq!(check2.rolls.as_ref().unwrap().len(), 1);
+    }
+
+    /// 主线 AI 输出重复 intent_id：只结算一次；缺省 id 保持旧行为（都结算）。
+    struct DuplicateIntentAi;
+
+    #[async_trait::async_trait]
+    impl AiProvider for DuplicateIntentAi {
+        async fn story_intents(&self, _ctx: &TurnContext) -> Result<AiOutput, EngineError> {
+            let quest = |id: Option<&str>, text: &str| IntentEnvelope {
+                intent_id: id.map(str::to_string),
+                intent: Intent::Quest { text: text.into(), hidden: false, primary: false },
+            };
+            Ok(AiOutput {
+                intents: vec![
+                    quest(Some("q-1"), "任务A"),
+                    quest(Some("q-1"), "任务B"),
+                    quest(None, "任务C"),
+                    quest(None, "任务D"),
+                ],
+                reasoning: None,
+                intent_warnings: vec![],
+            })
+        }
+        
+    }
+
+    #[tokio::test]
+    async fn duplicate_intent_id_is_applied_once() {
+        let sink = Arc::new(CaptureSink(StdMutex::new(vec![])));
+        let session = Arc::new(Session::new(
+            "s".into(),
+            state_with_pc(),
+            sink as Arc<dyn EventSink>,
+            ai_slot(Arc::new(DuplicateIntentAi)),
+            true,
+            json!({ "world": {} }),
+        ));
+        session
+            .run_round(
+                RoundInput { channel: RoundChannel::Character, text: "开始".into(), refs: vec![] },
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let quests = session.projection().quests;
+        let texts: Vec<&str> = quests.iter().map(|q| q.text.as_str()).collect();
+        assert!(texts.contains(&"任务A"));
+        assert!(!texts.contains(&"任务B"), "同 intent_id 的第二次必须被跳过");
+        assert!(texts.contains(&"任务C") && texts.contains(&"任务D"), "缺省 id 不参与去重");
+        assert_eq!(quests.len(), 3);
+    }
+
+    /// #04 Query：query_world 对权威状态作答，并进入 canon 供后续回合回喂模型。
+    #[tokio::test]
+    async fn query_world_answers_from_state_and_feeds_canon() {
+        let (session, sink) = session_with(json!({ "world": {} }));
+        session
+            .handle_intent(Intent::QueryWorld { query: "当前场景有谁".into() }, None)
+            .await;
+        let events = sink.0.lock().unwrap().clone();
+        let answer = events
+            .iter()
+            .find_map(|e| match &e.event {
+                PlayEvent::Resolution(p) if p.outcome.as_deref() == Some("query_world") => {
+                    p.narrative.clone()
+                }
+                _ => None,
+            })
+            .expect("query answer event");
+        assert!(answer.contains("米拉"), "答案须来自权威状态：{answer}");
+        assert!(answer.contains("场景"), "应包含当前场景：{answer}");
+        assert!(
+            session.canon_lines(8).iter().any(|l| l.contains("米拉")),
+            "查询结果必须进入 canon，才能被后续回合的 AI 读到"
+        );
+    }
+
+    // ---------- #04 ⑦ 回合内续轮（最多 3 轮工具调用） ----------
+
+    /// 构造一个用指定 AI provider 的会话（续轮测试用）。
+    fn session_with_provider(ai: Arc<dyn AiProvider>, sb: Value) -> (Arc<Session>, Arc<CaptureSink>) {
+        let sink = Arc::new(CaptureSink(StdMutex::new(vec![])));
+        let session = Session::new(
+            "s".into(),
+            state_with_pc(),
+            sink.clone() as Arc<dyn EventSink>,
+            ai_slot(ai),
+            true,
+            sb,
+        );
+        (Arc::new(session), sink)
+    }
+
+    /// 第一轮查询世界，第二轮据查询结果续写并 finish_turn。
+    struct QueryThenFinishAi {
+        story_calls: StdMutex<usize>,
+        contexts: StdMutex<Vec<TurnContext>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AiProvider for QueryThenFinishAi {
+        async fn story_intents(&self, ctx: &TurnContext) -> Result<AiOutput, EngineError> {
+            let call = {
+                let mut n = self.story_calls.lock().unwrap();
+                *n += 1;
+                *n
+            };
+            self.contexts.lock().unwrap().push(ctx.clone());
+            if call == 1 {
+                Ok(AiOutput::from_intents(vec![
+                    Intent::Narrate { content: "第一轮旁白。".into(), actor_id: None },
+                    Intent::QueryWorld { query: "当前场景有谁".into() },
+                ]))
+            } else {
+                Ok(AiOutput::from_intents(vec![
+                    Intent::Narrate { content: "第二轮据查询结果续写。".into(), actor_id: None },
+                    Intent::FinishTurn,
+                ]))
+            }
+        }
+        
+    }
+
+    #[tokio::test]
+    async fn story_loop_feeds_query_result_and_applies_both_rounds() {
+        let ai = Arc::new(QueryThenFinishAi {
+            story_calls: StdMutex::new(0),
+            contexts: StdMutex::new(vec![]),
+        });
+        let (session, sink) =
+            session_with_provider(ai.clone() as Arc<dyn AiProvider>, json!({ "world": {} }));
+        session
+            .run_round(
+                RoundInput { channel: RoundChannel::Character, text: "看看周围".into(), refs: vec![] },
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(*ai.story_calls.lock().unwrap(), 2, "查询后必须追加一轮");
+        let contexts = ai.contexts.lock().unwrap();
+        assert!(contexts[0].turn_feedback.is_empty(), "首轮不携带工具结果");
+        assert!(
+            contexts[1].turn_feedback.iter().any(|f| f.contains("米拉")),
+            "续轮必须带上本轮查询结果：{:?}",
+            contexts[1].turn_feedback
+        );
+        drop(contexts);
+        let narrations: Vec<String> = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match &e.event {
+                PlayEvent::Narrate(p) => Some(p.content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(narrations.iter().any(|t| t == "第一轮旁白。"), "首轮效果要落地");
+        assert!(
+            narrations.iter().any(|t| t == "第二轮据查询结果续写。"),
+            "续轮效果也要落地：{narrations:?}"
+        );
+    }
+
+    /// 永远只查询、从不 finish_turn：必须在轮次上限处停下。
+    struct QueryForeverAi {
+        story_calls: StdMutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl AiProvider for QueryForeverAi {
+        async fn story_intents(&self, _ctx: &TurnContext) -> Result<AiOutput, EngineError> {
+            *self.story_calls.lock().unwrap() += 1;
+            Ok(AiOutput::from_intents(vec![Intent::QueryWorld { query: "场景".into() }]))
+        }
+        
+    }
+
+    #[tokio::test]
+    async fn story_loop_stops_at_round_cap() {
+        let ai = Arc::new(QueryForeverAi { story_calls: StdMutex::new(0) });
+        let (session, sink) =
+            session_with_provider(ai.clone() as Arc<dyn AiProvider>, json!({ "world": {} }));
+        session
+            .run_round(
+                RoundInput { channel: RoundChannel::Character, text: "看看".into(), refs: vec![] },
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(*ai.story_calls.lock().unwrap(), MAX_STORY_AI_ROUNDS, "查询到上限必须停下");
+        let queries = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(&e.event, PlayEvent::Resolution(p) if p.outcome.as_deref() == Some("query_world")))
+            .count();
+        assert_eq!(queries, MAX_STORY_AI_ROUNDS, "每轮查询都已结算");
+    }
+
+    /// finish_turn 是循环终止信号：不产生任何事件，与空意图列表逐事件同构。
+    struct FinishTurnOnlyAi;
+    struct EmptyAi;
+
+    #[async_trait::async_trait]
+    impl AiProvider for FinishTurnOnlyAi {
+        async fn story_intents(&self, _ctx: &TurnContext) -> Result<AiOutput, EngineError> {
+            Ok(AiOutput::from_intents(vec![Intent::FinishTurn]))
+        }
+        
+    }
+
+    #[async_trait::async_trait]
+    impl AiProvider for EmptyAi {
+        async fn story_intents(&self, _ctx: &TurnContext) -> Result<AiOutput, EngineError> {
+            Ok(AiOutput::default())
+        }
+        
+    }
+
+    #[tokio::test]
+    async fn finish_turn_emits_no_event_and_terminates_loop() {
+        let (s_ft, sink_ft) =
+            session_with_provider(Arc::new(FinishTurnOnlyAi), json!({ "world": {} }));
+        s_ft.run_round(
+            RoundInput { channel: RoundChannel::Character, text: "开始".into(), refs: vec![] },
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+        let (s_empty, sink_empty) =
+            session_with_provider(Arc::new(EmptyAi), json!({ "world": {} }));
+        s_empty
+            .run_round(
+                RoundInput { channel: RoundChannel::Character, text: "开始".into(), refs: vec![] },
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let kinds = |sink: &Arc<CaptureSink>| -> Vec<std::mem::Discriminant<PlayEvent>> {
+            sink.0
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|e| std::mem::discriminant(&e.event))
+                .collect()
+        };
+        assert_eq!(
+            kinds(&sink_ft),
+            kinds(&sink_empty),
+            "finish_turn 不得产生任何事件，必须与空意图列表逐事件同构"
+        );
+    }
+
+    /// 立即 finish 的模型只调用一次主线 AI，行为与单轮路径一致。
+    struct NarrateThenFinishAi {
+        story_calls: StdMutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl AiProvider for NarrateThenFinishAi {
+        async fn story_intents(&self, _ctx: &TurnContext) -> Result<AiOutput, EngineError> {
+            *self.story_calls.lock().unwrap() += 1;
+            Ok(AiOutput::from_intents(vec![
+                Intent::Narrate { content: "一轮讲完。".into(), actor_id: None },
+                Intent::FinishTurn,
+            ]))
+        }
+        
+    }
+
+    #[tokio::test]
+    async fn immediate_finish_keeps_single_story_call() {
+        let ai = Arc::new(NarrateThenFinishAi { story_calls: StdMutex::new(0) });
+        let (session, sink) =
+            session_with_provider(ai.clone() as Arc<dyn AiProvider>, json!({ "world": {} }));
+        session
+            .run_round(
+                RoundInput { channel: RoundChannel::Character, text: "继续".into(), refs: vec![] },
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert_eq!(*ai.story_calls.lock().unwrap(), 1, "没有新信息不应续轮");
+        assert!(sink.0.lock().unwrap().iter().any(|e| matches!(
+            &e.event, PlayEvent::Narrate(p) if p.content == "一轮讲完。"
+        )));
+    }
+
+    /// 多轮回合的权威日志重放必须得到同一世界状态。
+    #[tokio::test]
+    async fn replay_of_multi_round_turn_is_identical() {
+        let ai = Arc::new(QueryThenFinishAi {
+            story_calls: StdMutex::new(0),
+            contexts: StdMutex::new(vec![]),
+        });
+        let (session, _sink) =
+            session_with_provider(ai as Arc<dyn AiProvider>, json!({ "world": {} }));
+        session
+            .run_round(
+                RoundInput { channel: RoundChannel::Character, text: "看看周围".into(), refs: vec![] },
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let persisted: Vec<PersistedEvent> = session
+            .event_log
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .map(|envelope| PersistedEvent { request_id: None, envelope })
+            .collect();
+        assert!(persisted.len() > 1, "多轮回合应产生多条权威命令");
+
+        let (restarted, _sink2) =
+            session_with_provider(Arc::new(EmptyAi), json!({ "world": {} }));
+        restarted.replay(&persisted);
+        assert_eq!(
+            serde_json::to_value(session.projection()).unwrap(),
+            serde_json::to_value(restarted.projection()).unwrap(),
+            "多轮日志重放必须得到同一世界状态"
+        );
+        assert_eq!(session.current_seq(), restarted.current_seq());
+    }
+
+    /// #04 interact：命中故事书 objects 定义即结算；未知物件/动作驳回；无 objects 优雅降级。
+    #[tokio::test]
+    async fn interact_resolves_object_and_degrades_without_objects() {
+        let sb = json!({ "objects": [ {
+            "id": "door-1", "name": "石门", "description": "厚重的石门",
+            "actions": [ { "key": "open", "label": "推开" } ]
+        } ] });
+        let (session, sink) = session_with(sb);
+        session
+            .handle_intent(Intent::Interact { object_id: "door-1".into(), action: "open".into() }, None)
+            .await;
+        let events = sink.0.lock().unwrap().clone();
+        let ok = events
+            .iter()
+            .find_map(|e| match &e.event {
+                PlayEvent::Resolution(p) if p.outcome.as_deref() == Some("interact") => Some(p.clone()),
+                _ => None,
+            })
+            .expect("interact resolution");
+        assert_eq!(ok.status, ResolutionStatus::Ok);
+        let narrative = ok.narrative.unwrap();
+        assert!(narrative.contains("石门") && narrative.contains("推开"), "{narrative}");
+
+        // 物件不支持的动作 → target_invalid。
+        session
+            .handle_intent(Intent::Interact { object_id: "door-1".into(), action: "read".into() }, None)
+            .await;
+        let events = sink.0.lock().unwrap().clone();
+        assert!(events.iter().any(|e| matches!(
+            &e.event,
+            PlayEvent::Resolution(p) if p.rejection_code.as_deref() == Some("target_invalid")
+        )));
+
+        // 找不到物件 → target_invalid。
+        session
+            .handle_intent(Intent::Interact { object_id: "nope".into(), action: "open".into() }, None)
+            .await;
+        let events = sink.0.lock().unwrap().clone();
+        assert!(events.iter().filter(|e| matches!(
+            &e.event,
+            PlayEvent::Resolution(p) if p.rejection_code.as_deref() == Some("target_invalid")
+        )).count() >= 2);
+
+        // 故事书完全没声明 objects → 优雅降级（Ok + 明确说明），不报错。
+        let (session2, sink2) = session_with(json!({ "world": {} }));
+        session2
+            .handle_intent(Intent::Interact { object_id: "door-1".into(), action: "open".into() }, None)
+            .await;
+        let events2 = sink2.0.lock().unwrap().clone();
+        let degraded = events2
+            .iter()
+            .find_map(|e| match &e.event {
+                PlayEvent::Resolution(p) => Some(p.clone()),
+                _ => None,
+            })
+            .expect("degrade resolution");
+        assert_eq!(degraded.status, ResolutionStatus::Ok);
+        assert!(degraded.narrative.unwrap().contains("未声明"));
+    }
+
+    /// #04 ④：显式 actor_id 指向不在场/不存在者必须驳回，绝不静默改判；
+    /// 在场合法的 actor_id 正常归属。
+    struct ActorScopeAi;
+
+    #[async_trait::async_trait]
+    impl AiProvider for ActorScopeAi {
+        async fn story_intents(&self, _ctx: &TurnContext) -> Result<AiOutput, EngineError> {
+            Ok(AiOutput::from_intents(vec![
+                Intent::Speak { content: "我来也".into(), tone: None, actor_id: Some("char-ghost".into()) },
+                Intent::Speak { content: "你好呀".into(), tone: None, actor_id: Some("char-lucy".into()) },
+            ]))
+        }
+        
+    }
+
+    #[tokio::test]
+    async fn explicit_actor_id_out_of_scope_is_rejected_not_reassigned() {
+        let mut state = state_with_pc();
+        let mut chars = state.characters.clone();
+        chars.insert("char-lucy".into(), character_instance("char-lucy", "露西", "npc"));
+        let mut ghost = character_instance("char-ghost", "幽灵", "npc");
+        ghost.present = false;
+        chars.insert("char-ghost".into(), ghost);
+        state.characters = chars;
+
+        let sink = Arc::new(CaptureSink(StdMutex::new(vec![])));
+        let session = Arc::new(Session::new(
+            "s".into(),
+            state,
+            sink.clone() as Arc<dyn EventSink>,
+            ai_slot(Arc::new(ActorScopeAi)),
+            true,
+            json!({ "world": {} }),
+        ));
+        session
+            .run_round(
+                RoundInput { channel: RoundChannel::Character, text: "打招呼".into(), refs: vec![] },
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let events = sink.0.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.event,
+                PlayEvent::Resolution(p) if p.rejection_code.as_deref() == Some("actor_not_found")
+            )),
+            "不在场的 actor_id 必须驳回并落日志"
+        );
+        let dialogues: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.event {
+                PlayEvent::Dialogue(p) => Some((e.actor.clone(), p.content.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dialogues.len(), 1, "只有合法的在场 actor 台词落事件");
+        assert_eq!(dialogues[0].1, "你好呀");
+        assert_eq!(dialogues[0].0.as_ref().map(|a| a.id.as_str()), Some("char-lucy"));
+    }
+
+    /// #04 ④：单一 AI 不能替玩家受控角色（PC）说台词。
+    struct PcPuppetAi;
+
+    #[async_trait::async_trait]
+    impl AiProvider for PcPuppetAi {
+        async fn story_intents(&self, _ctx: &TurnContext) -> Result<AiOutput, EngineError> {
+            Ok(AiOutput::from_intents(vec![Intent::Speak {
+                content: "我替玩家说话".into(),
+                tone: None,
+                actor_id: Some("char-a".into()),
+            }]))
+        }
+    }
+
+    #[tokio::test]
+    async fn single_ai_cannot_speak_as_the_controlled_pc() {
+        let sink = Arc::new(CaptureSink(StdMutex::new(vec![])));
+        let session = Arc::new(Session::new(
+            "s".into(),
+            state_with_pc(),
+            sink.clone() as Arc<dyn EventSink>,
+            ai_slot(Arc::new(PcPuppetAi)),
+            true,
+            json!({ "world": {} }),
+        ));
+        session
+            .run_round(
+                RoundInput { channel: RoundChannel::Character, text: "你好".into(), refs: vec![] },
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let events = sink.0.lock().unwrap().clone();
+        assert!(events.iter().any(|e| matches!(
+            &e.event,
+            PlayEvent::Resolution(p) if p.rejection_code.as_deref() == Some("actor_not_controlled")
+        )));
+        assert!(
+            !events.iter().any(|e| matches!(&e.event, PlayEvent::Dialogue(_))),
+            "不得以受控 PC 身份落到对话事件"
+        );
+    }
+
+    /// PC 的 emote 是正常旁白（描写玩家动作 / 环境），不得被驳回。
+    /// 早先「PC 一律禁止说演」过严：会把这类叙述整条丢掉并弹驳回卡片。
+    struct PcEmoteAi;
+
+    #[async_trait::async_trait]
+    impl AiProvider for PcEmoteAi {
+        async fn story_intents(&self, _ctx: &TurnContext) -> Result<AiOutput, EngineError> {
+            Ok(AiOutput::from_intents(vec![Intent::Emote {
+                content: "你握紧了武器。".into(),
+                emotion: None,
+                actor_id: Some("char-a".into()),
+            }]))
+        }
+    }
+
+    #[tokio::test]
+    async fn controlled_pc_emote_is_accepted_as_narration() {
+        let sink = Arc::new(CaptureSink(StdMutex::new(vec![])));
+        let session = Arc::new(Session::new(
+            "s".into(),
+            state_with_pc(),
+            sink.clone() as Arc<dyn EventSink>,
+            ai_slot(Arc::new(PcEmoteAi)),
+            true,
+            json!({ "world": {} }),
+        ));
+        session
+            .run_round(
+                RoundInput { channel: RoundChannel::Character, text: "我看看".into(), refs: vec![] },
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let events = sink.0.lock().unwrap().clone();
+        assert!(
+            !events.iter().any(|e| matches!(
+                &e.event,
+                PlayEvent::Resolution(p) if p.rejection_code.is_some()
+            )),
+            "PC 的 emote 不应被驳回"
+        );
+        let emote = events
+            .iter()
+            .find_map(|e| match &e.event {
+                PlayEvent::Emote(p) => Some((e.actor.clone(), p.content.clone())),
+                _ => None,
+            })
+            .expect("emote emitted");
+        assert_eq!(emote.1, "你握紧了武器。");
+        assert_eq!(emote.0.as_ref().map(|a| a.id.as_str()), Some("char-a"));
+    }
+
+    /// 提示词把在场角色渲染成 `名字(id)`，模型常整串回填 actor_id。
+    /// 引擎应据括号内的 id 归属到本人，而不是因为原串匹配不到就驳回。
+    struct PaddedActorIdAi;
+
+    #[async_trait::async_trait]
+    impl AiProvider for PaddedActorIdAi {
+        async fn story_intents(&self, _ctx: &TurnContext) -> Result<AiOutput, EngineError> {
+            Ok(AiOutput::from_intents(vec![Intent::Speak {
+                content: "你好呀".into(),
+                tone: None,
+                actor_id: Some("露西(char-lucy)".into()),
+            }]))
+        }
+    }
+
+    #[tokio::test]
+    async fn actor_id_in_name_paren_form_is_resolved_not_rejected() {
+        let mut state = state_with_pc();
+        let mut chars = state.characters.clone();
+        chars.insert("char-lucy".into(), character_instance("char-lucy", "露西", "npc"));
+        state.characters = chars;
+
+        let sink = Arc::new(CaptureSink(StdMutex::new(vec![])));
+        let session = Arc::new(Session::new(
+            "s".into(),
+            state,
+            sink.clone() as Arc<dyn EventSink>,
+            ai_slot(Arc::new(PaddedActorIdAi)),
+            true,
+            json!({ "world": {} }),
+        ));
+        session
+            .run_round(
+                RoundInput { channel: RoundChannel::Character, text: "打招呼".into(), refs: vec![] },
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let events = sink.0.lock().unwrap().clone();
+        assert!(
+            !events.iter().any(|e| matches!(
+                &e.event,
+                PlayEvent::Resolution(p) if p.rejection_code.is_some()
+            )),
+            "`名字(id)` 形式的 actor_id 不应被驳回"
+        );
+        let dialogues: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.event {
+                PlayEvent::Dialogue(p) => Some((e.actor.clone(), p.content.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dialogues.len(), 1, "台词应归属到 Lucy");
+        assert_eq!(dialogues[0].1, "你好呀");
+        assert_eq!(dialogues[0].0.as_ref().map(|a| a.id.as_str()), Some("char-lucy"));
+    }
+    /// B/D：type 别名掷骰、attributes 白名单驳回、default_dc 兜底难度。
+    #[tokio::test]
+    async fn check_uses_type_alias_whitelist_and_default_dc() {
+        let sb = || json!({ "world": { "check": {
+            "type": "d20",
+            "attributes": ["str", "agi"],
+            "default_dc": 15
+        } } });
+
+        // 白名单外的属性：明确驳回，且不产生 CheckResult。
+        let (session, sink) = session_with(sb());
+        session
+            .handle_intent(
+                Intent::Check { attribute: "dexterity".into(), difficulty: None, actor_id: None },
+                None,
+            )
+            .await;
+        let events = sink.0.lock().unwrap().clone();
+        let msg = events
+            .iter()
+            .find_map(|e| match &e.event {
+                PlayEvent::Resolution(p)
+                    if p.rejection_code.as_deref() == Some("rule_violation") =>
+                {
+                    p.narrative.clone()
+                }
+                _ => None,
+            })
+            .expect("白名单外的判定属性必须驳回");
+        assert!(msg.contains("str") && msg.contains("agi"), "驳回信息要列出可用属性: {msg}");
+        assert!(!events.iter().any(|e| matches!(&e.event, PlayEvent::CheckResult(_))));
+
+        // 白名单内 + type 别名：真的掷 1d20，target 用 default_dc。
+        let (session2, sink2) = session_with(sb());
+        session2
+            .handle_intent(
+                Intent::Check { attribute: "agi".into(), difficulty: None, actor_id: None },
+                None,
+            )
+            .await;
+        let events2 = sink2.0.lock().unwrap().clone();
+        let check = events2
+            .iter()
+            .find_map(|e| match &e.event {
+                PlayEvent::CheckResult(p) => Some(p.clone()),
+                _ => None,
+            })
+            .expect("check result");
+        assert_eq!(check.expr.as_deref(), Some("1d20"), "type 别名要变成骰式");
+        assert!(check.rolls.as_ref().is_some_and(|r| r.len() == 1), "必须真的掷骰");
+        assert_eq!(check.target, 15, "difficulty 缺省用 default_dc");
+        assert_eq!(check.attribute, "agi");
+    }
+
+    /// 存档设置来回写 auto_confirm：同值写入不应落 confirm_toggle（否则改模型也会刷屏）。
+    #[tokio::test]
+    async fn set_auto_confirm_only_emits_on_change() {
+        // session_with 建会话时 auto_confirm = true。
+        let (session, sink) = session_with(json!({ "world": {} }));
+        session.set_auto_confirm(true);
+        assert!(
+            !sink.0.lock().unwrap().iter().any(|e| matches!(
+                &e.event,
+                PlayEvent::System(p) if p.code.as_deref() == Some("confirm_toggle")
+            )),
+            "同值写入不得落 confirm_toggle"
+        );
+
+        session.set_auto_confirm(false);
+        let events = sink.0.lock().unwrap().clone();
+        let n = events
+            .iter()
+            .filter(|e| matches!(
+                &e.event,
+                PlayEvent::System(p) if p.code.as_deref() == Some("confirm_toggle")
+            ))
+            .count();
+        assert_eq!(n, 1, "真正切换才落一条");
+
+        session.set_auto_confirm(false);
+        let n2 = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(
+                &e.event,
+                PlayEvent::System(p) if p.code.as_deref() == Some("confirm_toggle")
+            ))
+            .count();
+        assert_eq!(n2, 1, "再次同值写入仍不落事件");
+    }
+
+    /// #12 比较模式：world.check.mode = lte 时，最终值 ≤ 目标值才算成功。
+    #[tokio::test]
+    async fn check_intent_honors_lte_mode() {
+        let sb = || json!({ "world": { "check": { "dice": "1d20", "mode": "lte" } } });
+        // 目标 30：1d20 + 修正 恒 ≤ 30 → 必成功。
+        let (session, sink) = session_with(sb());
+        session
+            .handle_intent(
+                Intent::Check { attribute: "str".into(), difficulty: Some(30), actor_id: None },
+                None,
+            )
+            .await;
+        let events = sink.0.lock().unwrap().clone();
+        let check = events
+            .iter()
+            .find_map(|e| match &e.event {
+                PlayEvent::CheckResult(p) => Some(p.clone()),
+                _ => None,
+            })
+            .expect("check result");
+        assert!(check.result, "lte 模式 total<=target 必成功: total={}", check.total);
+
+        // 目标 -100：1d20 + 修正 恒 > -100 → 必失败。
+        let (session2, sink2) = session_with(sb());
+        session2
+            .handle_intent(
+                Intent::Check { attribute: "str".into(), difficulty: Some(-100), actor_id: None },
+                None,
+            )
+            .await;
+        let events2 = sink2.0.lock().unwrap().clone();
+        let check2 = events2
+            .iter()
+            .find_map(|e| match &e.event {
+                PlayEvent::CheckResult(p) => Some(p.clone()),
+                _ => None,
+            })
+            .expect("check result 2");
+        assert!(!check2.result, "lte 模式 total>target 必失败");
+    }
+
 }
+
+

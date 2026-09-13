@@ -36,7 +36,7 @@ function nameOf(kind: 'character' | 'faction', id: string): string {
 const list = computed<RelationshipDef[]>(() => d.value?.relationships ?? [])
 const items = computed<WorkbenchItem[]>(() => list.value.map(r => ({
   id: entityKey(r),
-  title: nameOf(r.from_kind, r.from_id) + ' → ' + nameOf(r.to_kind, r.to_id),
+  title: nameOf(r.from_kind, r.from) + ' → ' + nameOf(r.to_kind, r.to),
   sub: r.type,
   badge: (r.value > 0 ? '+' : '') + r.value,
   tone: r.value > 0 ? 'ok' : r.value < 0 ? 'warn' : 'default',
@@ -48,8 +48,8 @@ function add(): void {
   const arr = d.value?.relationships
   if (!arr) return
   const rel: RelationshipDef = {
-    id: uid('rel'), from_kind: 'character', from_id: charOptions.value[0]?.value ?? '',
-    to_kind: 'character', to_id: charOptions.value[0]?.value ?? '', type: relTypeOptions.value[0]?.value ?? '好感', value: 0,
+    id: uid('rel'), from_kind: 'character', from: charOptions.value[0]?.value ?? '',
+    to_kind: 'character', to: charOptions.value[0]?.value ?? '', type: relTypeOptions.value[0]?.value ?? '好感', value: 0,
   }
   arr.unshift(rel)
   selected.value = entityKey(rel)
@@ -77,7 +77,7 @@ function remove(rel: RelationshipDef): void {
   >
     <template v-if="current">
       <EntityFormHeader
-        :title="nameOf(current.from_kind, current.from_id) + ' → ' + nameOf(current.to_kind, current.to_id)"
+        :title="nameOf(current.from_kind, current.from) + ' → ' + nameOf(current.to_kind, current.to)"
         :sub="'关系边 · ' + current.type"
         :icon="IconLink"
         :meta="(current.value > 0 ? '+' : '') + current.value"
@@ -86,9 +86,9 @@ function remove(rel: RelationshipDef): void {
       />
       <FieldGrid class="mt-4">
         <FieldSelect label="起点类型" :model-value="current.from_kind" :options="[{ value: 'character', label: '人物' }, { value: 'faction', label: '势力' }]" @update:model-value="current.from_kind = $event as 'character' | 'faction'" />
-        <FieldSelect label="起点实体" :model-value="current.from_id" :options="entityOptions(current.from_kind)" @update:model-value="current.from_id = $event" />
+        <FieldSelect label="起点实体" :model-value="current.from" :options="entityOptions(current.from_kind)" @update:model-value="current.from = $event" />
         <FieldSelect label="终点类型" :model-value="current.to_kind" :options="[{ value: 'character', label: '人物' }, { value: 'faction', label: '势力' }]" @update:model-value="current.to_kind = $event as 'character' | 'faction'" />
-        <FieldSelect label="终点实体" :model-value="current.to_id" :options="entityOptions(current.to_kind)" @update:model-value="current.to_id = $event" />
+        <FieldSelect label="终点实体" :model-value="current.to" :options="entityOptions(current.to_kind)" @update:model-value="current.to = $event" />
         <FieldSelect v-if="relTypeOptions.length" label="类型" :model-value="current.type" :options="relTypeOptions" hint="来自「声明」tab 的关系类型" @update:model-value="current.type = $event" />
         <FieldText v-else label="类型" placeholder="好感 / 敌意 / 同盟…" hint="可在「声明」tab 定义候选" :model-value="current.type" @update:model-value="current.type = $event" />
         <FieldNum label="强度" :min="-100" :max="100" hint="正 = 亲近，负 = 敌对" :model-value="current.value" @update:model-value="current.value = $event" />

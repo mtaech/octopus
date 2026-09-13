@@ -12,21 +12,21 @@ use rig::completion::{CompletionModel, CompletionRequest, FinishReason, ToolDefi
 use rig::providers::openai;
 use rig::streaming::{StreamedAssistantContent, ToolCallDeltaContent};
 
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::Json;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
 use octopus_types::FocusEntity;
 
 use crate::ai::sampling_params;
-use crate::config::{load_config_from_disk, ProviderConfig};
+use crate::config::{ProviderConfig, load_config_from_disk};
 use crate::error::ApiError;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -157,7 +157,10 @@ fn resolve_provider_and_model(
     let mut resolved_provider = if let Some(cp) = &req.custom_provider {
         cp.clone()
     } else if let Some(pid) = &req.provider_id {
-        cfg.providers.iter().find(|p| &p.id == pid).cloned()
+        cfg.providers
+            .iter()
+            .find(|p| &p.id == pid)
+            .cloned()
             .or_else(|| cfg.providers.first().cloned())
             .unwrap_or_else(|| ProviderConfig {
                 id: pid.clone(),
@@ -168,22 +171,34 @@ fn resolve_provider_and_model(
                 models: vec![],
             })
     } else if let Some(role) = &cfg.roles.pair {
-        cfg.providers.iter().find(|p| p.id == role.provider_id).cloned()
+        cfg.providers
+            .iter()
+            .find(|p| p.id == role.provider_id)
+            .cloned()
             .or_else(|| cfg.providers.first().cloned())
             .unwrap_or_else(|| cfg.providers[0].clone())
     } else {
-        cfg.providers.first().cloned().unwrap_or_else(|| ProviderConfig {
-            id: "deepseek".into(),
-            label: "DeepSeek".into(),
-            kind: "openai-compatible".into(),
-            base_url: Some("https://api.deepseek.com".into()),
-            api_key: None,
-            models: vec![],
-        })
+        cfg.providers
+            .first()
+            .cloned()
+            .unwrap_or_else(|| ProviderConfig {
+                id: "deepseek".into(),
+                label: "DeepSeek".into(),
+                kind: "openai-compatible".into(),
+                base_url: Some("https://api.deepseek.com".into()),
+                api_key: None,
+                models: vec![],
+            })
     };
 
     // 如果客户端在 custom_provider 没传 api_key，但本地 config 有存储过，则补全
-    if resolved_provider.api_key.as_deref().unwrap_or("").trim().is_empty() {
+    if resolved_provider
+        .api_key
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .is_empty()
+    {
         if let Some(matched) = cfg.providers.iter().find(|p| p.id == resolved_provider.id) {
             if let Some(k) = &matched.api_key {
                 if !k.trim().is_empty() {
@@ -193,22 +208,39 @@ fn resolve_provider_and_model(
         }
     }
 
-    let base_url = resolved_provider.base_url.as_deref().unwrap_or("").trim().trim_end_matches('/').to_string();
+    let base_url = resolved_provider
+        .base_url
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
     if base_url.is_empty() {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "empty_base_url",
-            format!("供应商「{}」未配置 Base URL，请在设置中填写。", resolved_provider.label),
+            format!(
+                "供应商「{}」未配置 Base URL，请在设置中填写。",
+                resolved_provider.label
+            ),
         ));
     }
 
     let is_local = base_url.contains("127.0.0.1") || base_url.contains("localhost");
-    let key = resolved_provider.api_key.as_deref().unwrap_or("").trim().to_string();
+    let key = resolved_provider
+        .api_key
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_string();
     if resolved_provider.kind != "ollama" && !is_local && key.is_empty() {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "missing_api_key",
-            format!("供应商「{}」未配置 API Key。请点击右上角「设置」填入 API Key 后保存再试。", resolved_provider.label),
+            format!(
+                "供应商「{}」未配置 API Key。请点击右上角「设置」填入 API Key 后保存再试。",
+                resolved_provider.label
+            ),
         ));
     }
 
@@ -226,8 +258,18 @@ fn resolve_provider_and_model(
         "deepseek-chat".to_string()
     };
 
-    let temp = cfg.roles.pair.as_ref().and_then(|r| r.temperature).unwrap_or(0.8);
-    let max_tokens = cfg.roles.pair.as_ref().and_then(|r| r.max_tokens).unwrap_or(4096);
+    let temp = cfg
+        .roles
+        .pair
+        .as_ref()
+        .and_then(|r| r.temperature)
+        .unwrap_or(0.8);
+    let max_tokens = cfg
+        .roles
+        .pair
+        .as_ref()
+        .and_then(|r| r.max_tokens)
+        .unwrap_or(4096);
     let sampling = cfg
         .roles
         .pair
@@ -248,7 +290,7 @@ fn build_system_prompt(
         "你是 Octopus 故事书编辑器的「AI 结对创作搭档」(Octo 结对)。\n\
         你的任务是与创作者边聊边成型故事书内容，协助构思世界观设定、丰满人物、推演剧情走向、设计技能与物品。\n\
         \n\
-        【当前故事书草稿上下文】\n"
+        【当前故事书草稿上下文】\n",
     );
 
     if let Some(ctx) = sb {
@@ -271,11 +313,14 @@ fn build_system_prompt(
             }
         }
         if let Some(chars) = &ctx.characters {
-            let names: Vec<String> = chars.iter().filter_map(|c| {
-                let name = c.get("name").and_then(Value::as_str)?;
-                let kind = c.get("kind").and_then(Value::as_str).unwrap_or("npc");
-                Some(format!("{name}({kind})"))
-            }).collect();
+            let names: Vec<String> = chars
+                .iter()
+                .filter_map(|c| {
+                    let name = c.get("name").and_then(Value::as_str)?;
+                    let kind = c.get("kind").and_then(Value::as_str).unwrap_or("npc");
+                    Some(format!("{name}({kind})"))
+                })
+                .collect();
             if !names.is_empty() {
                 s.push_str(&format!("- 已有人物: {}\n", names.join(", ")));
             }
@@ -318,25 +363,37 @@ fn build_system_prompt(
             }
         }
         if let Some(locs) = &ctx.locations {
-            let names: Vec<&str> = locs.iter().filter_map(|l| l.get("name").and_then(Value::as_str)).collect();
+            let names: Vec<&str> = locs
+                .iter()
+                .filter_map(|l| l.get("name").and_then(Value::as_str))
+                .collect();
             if !names.is_empty() {
                 s.push_str(&format!("- 已有地点: {}\n", names.join(", ")));
             }
         }
         if let Some(sk) = &ctx.skills {
-            let names: Vec<&str> = sk.iter().filter_map(|x| x.get("name").and_then(Value::as_str)).collect();
+            let names: Vec<&str> = sk
+                .iter()
+                .filter_map(|x| x.get("name").and_then(Value::as_str))
+                .collect();
             if !names.is_empty() {
                 s.push_str(&format!("- 已有技能: {}\n", names.join(", ")));
             }
         }
         if let Some(it) = &ctx.items {
-            let names: Vec<&str> = it.iter().filter_map(|x| x.get("name").and_then(Value::as_str)).collect();
+            let names: Vec<&str> = it
+                .iter()
+                .filter_map(|x| x.get("name").and_then(Value::as_str))
+                .collect();
             if !names.is_empty() {
                 s.push_str(&format!("- 已有物品: {}\n", names.join(", ")));
             }
         }
         if let Some(fac) = &ctx.factions {
-            let names: Vec<&str> = fac.iter().filter_map(|x| x.get("name").and_then(Value::as_str)).collect();
+            let names: Vec<&str> = fac
+                .iter()
+                .filter_map(|x| x.get("name").and_then(Value::as_str))
+                .collect();
             if !names.is_empty() {
                 s.push_str(&format!("- 已有势力/阵营: {}\n", names.join(", ")));
             }
@@ -396,16 +453,25 @@ fn build_system_prompt(
             if let Some(list) = items {
                 let mut parts: Vec<String> = Vec::new();
                 for it in list {
-                    let id = it.get("id").and_then(Value::as_str)
+                    let id = it
+                        .get("id")
+                        .and_then(Value::as_str)
                         .or_else(|| it.get("key").and_then(Value::as_str))
                         .unwrap_or("");
-                    if id.is_empty() { continue; }
-                    let name = it.get("name").and_then(Value::as_str)
+                    if id.is_empty() {
+                        continue;
+                    }
+                    let name = it
+                        .get("name")
+                        .and_then(Value::as_str)
                         .or_else(|| it.get("title").and_then(Value::as_str))
                         .or_else(|| it.get("label").and_then(Value::as_str))
                         .unwrap_or("");
-                    if name.is_empty() { parts.push(id.to_string()); }
-                    else { parts.push(format!("{name}({id})")); }
+                    if name.is_empty() {
+                        parts.push(id.to_string());
+                    } else {
+                        parts.push(format!("{name}({id})"));
+                    }
                 }
                 if !parts.is_empty() {
                     s.push_str(&format!("- {label}: {}\n", parts.join(", ")));
@@ -441,14 +507,18 @@ fn build_system_prompt(
                             for g in goals {
                                 let gid = g.get("id").and_then(Value::as_str).unwrap_or("");
                                 let gt = g.get("text").and_then(Value::as_str).unwrap_or("");
-                                if !gid.is_empty() { s.push_str(&format!("    - 目标({gid}) {gt}\n")); }
+                                if !gid.is_empty() {
+                                    s.push_str(&format!("    - 目标({gid}) {gt}\n"));
+                                }
                             }
                         }
                         if let Some(triggers) = sc.get("triggers").and_then(Value::as_array) {
                             for t in triggers {
                                 let tid = t.get("id").and_then(Value::as_str).unwrap_or("");
                                 let tt = t.get("title").and_then(Value::as_str).unwrap_or("");
-                                if !tid.is_empty() { s.push_str(&format!("    - 触发点({tid}) {tt}\n")); }
+                                if !tid.is_empty() {
+                                    s.push_str(&format!("    - 触发点({tid}) {tt}\n"));
+                                }
                             }
                         }
                     }
@@ -497,7 +567,7 @@ fn build_system_prompt(
 - item: { "name", "description", "type", "quantity", "skills": [技能id] }
 - object: { "name", "description", "location_id": 地点id, "actions": [{ "key", "label" }], "skills": [技能id] }
 - faction: { "name", "description", "goals": [字符串], "default_attitude": -100..100 }
-- relationship: { "from_kind": "character"|"faction", "from_id", "to_kind", "to_id", "type": 关系类型key, "value": -100..100 }
+- relationship: { "from_kind": "character"|"faction", "from", "to_kind", "to", "type": 关系类型key, "value": -100..100 }
 - chapter: { "title", "description", "scenes": [ 场景对象 ] }
 
 嵌套实体：
@@ -513,7 +583,7 @@ fn build_system_prompt(
 - flag / event / relationship_type / target_type: { "key", "label" }
 
 规则：
-1. from_id / to_id / location_id / skills / parent_id / 维度key / 资源id / 关系类型 / 状态id 等所有引用，必须来自上面的 id 目录；目录里没有就先 create 建好，再在后续建议里引用。
+1. from / to / location_id / skills / parent_id / 维度key / 资源id / 关系类型 / 状态id 等所有引用，必须来自上面的 id 目录；目录里没有就先 create 建好，再在后续建议里引用。
 2. update 为浅合并：数组 / 对象字段必须给出完整新值（例如改 attributes 要带全所有维度）。
 3. 图片（封面 / 立绘 / 插图 / 图标）属于资产，由玩家上传；禁止在 patch 里产出图片 / asset 字段。
 4. goal / trigger 的 parent_id 不确定时不要猜；可先提 scene 建议或直接询问创作者。
@@ -559,25 +629,58 @@ pub fn extract_suggestions(raw: &str) -> (String, Vec<PairSuggestion>) {
                     if let Some(arr) = val.as_array() {
                         let mut sugs = Vec::new();
                         for item in arr {
-                            let action = item.get("action").and_then(Value::as_str).unwrap_or("create").to_string();
-                            let kind = item.pointer("/target/kind").and_then(Value::as_str).unwrap_or("character").to_string();
-                            let target_id = item.pointer("/target/id").and_then(Value::as_str).map(str::to_string);
-                            let target_parent_id = item.pointer("/target/parent_id").and_then(Value::as_str).map(str::to_string);
-                            let label = item.get("label").and_then(Value::as_str).unwrap_or("未命名建议").to_string();
-                            let summary = item.get("summary").and_then(Value::as_str).unwrap_or("").to_string();
-                            let patch = item.get("patch").cloned().unwrap_or_else(|| serde_json::json!({}));
+                            let action = item
+                                .get("action")
+                                .and_then(Value::as_str)
+                                .unwrap_or("create")
+                                .to_string();
+                            let kind = item
+                                .pointer("/target/kind")
+                                .and_then(Value::as_str)
+                                .unwrap_or("character")
+                                .to_string();
+                            let target_id = item
+                                .pointer("/target/id")
+                                .and_then(Value::as_str)
+                                .map(str::to_string);
+                            let target_parent_id = item
+                                .pointer("/target/parent_id")
+                                .and_then(Value::as_str)
+                                .map(str::to_string);
+                            let label = item
+                                .get("label")
+                                .and_then(Value::as_str)
+                                .unwrap_or("未命名建议")
+                                .to_string();
+                            let summary = item
+                                .get("summary")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            let patch = item
+                                .get("patch")
+                                .cloned()
+                                .unwrap_or_else(|| serde_json::json!({}));
                             let id = format!("sug-{}", Uuid::new_v4().simple());
                             sugs.push(PairSuggestion {
                                 id,
                                 action,
-                                target: PairSuggestionTarget { kind, id: target_id, parent_id: target_parent_id },
+                                target: PairSuggestionTarget {
+                                    kind,
+                                    id: target_id,
+                                    parent_id: target_parent_id,
+                                },
                                 patch,
                                 label,
                                 summary,
                             });
                         }
                         if !sugs.is_empty() {
-                            let clean_text = format!("{}{}", raw[..start_idx].trim_end(), after_prefix[end_rel + 3..].trim_start());
+                            let clean_text = format!(
+                                "{}{}",
+                                raw[..start_idx].trim_end(),
+                                after_prefix[end_rel + 3..].trim_start()
+                            );
                             return (clean_text.trim().to_string(), sugs);
                         }
                     }
@@ -590,17 +693,30 @@ pub fn extract_suggestions(raw: &str) -> (String, Vec<PairSuggestion>) {
 
 /// 从 ProviderConfig 构造 rig 的 OpenAI 兼容 Chat Completions 客户端。
 fn build_pair_client(provider: &ProviderConfig) -> Result<openai::CompletionsClient, ApiError> {
-    let base_url = provider.base_url.as_deref().unwrap_or("").trim().trim_end_matches('/').to_string();
+    let base_url = provider
+        .base_url
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
     if base_url.is_empty() {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "empty_base_url",
-            format!("供应商「{}」未配置 Base URL，请在设置中填写。", provider.label),
+            format!(
+                "供应商「{}」未配置 Base URL，请在设置中填写。",
+                provider.label
+            ),
         ));
     }
     let key = provider.api_key.as_deref().unwrap_or("").trim().to_string();
     openai::CompletionsClient::builder()
-        .api_key(if key.is_empty() { "not-needed".to_string() } else { key })
+        .api_key(if key.is_empty() {
+            "not-needed".to_string()
+        } else {
+            key
+        })
         .base_url(base_url)
         .build()
         .map_err(|e| {
@@ -617,7 +733,10 @@ fn tool_call_from_wire(wire_id: &str, name: String, arguments: Value) -> ToolCal
     let provider = if wire_id.is_empty() {
         None
     } else {
-        Some(ProviderCallId { call_id: wire_id.to_string(), item_id: None })
+        Some(ProviderCallId {
+            call_id: wire_id.to_string(),
+            item_id: None,
+        })
     };
     ToolCall {
         id: ToolCallId::new_or_mint(wire_id),
@@ -633,7 +752,10 @@ fn tool_result_from_wire(wire_id: &str, name: &str, content: &str) -> ToolResult
     let provider = if wire_id.is_empty() {
         None
     } else {
-        Some(ProviderCallId { call_id: wire_id.to_string(), item_id: None })
+        Some(ProviderCallId {
+            call_id: wire_id.to_string(),
+            item_id: None,
+        })
     };
     ToolResult {
         call: ToolCallId::new_or_mint(wire_id),
@@ -647,18 +769,28 @@ fn tool_result_from_wire(wire_id: &str, name: &str, content: &str) -> ToolResult
 fn convert_tool(v: &Value) -> Option<ToolDefinition> {
     let f = v.get("function")?;
     let name = f.get("name").and_then(Value::as_str)?.to_string();
-    let description = f.get("description").and_then(Value::as_str).unwrap_or("").to_string();
+    let description = f
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let parameters = f
         .get("parameters")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({ "type": "object", "properties": {} }));
-    Some(ToolDefinition { name, description, parameters })
+    Some(ToolDefinition {
+        name,
+        description,
+        parameters,
+    })
 }
 
 /// 前端历史消息 → rig Message（含 assistant.tool_calls 与 role=tool 结果回灌）
 fn convert_message(m: &ChatMessage, names: &mut HashMap<String, String>) -> Option<RigMessage> {
     match m.role.as_str() {
-        "system" => Some(RigMessage::System { content: m.content.clone() }),
+        "system" => Some(RigMessage::System {
+            content: m.content.clone(),
+        }),
         "user" => {
             // 附件折叠进正文：模型看到的是一条带【附件】块的用户消息。
             let mut content = m.content.clone();
@@ -685,15 +817,29 @@ fn convert_message(m: &ChatMessage, names: &mut HashMap<String, String>) -> Opti
             }
             if let Some(tcs) = m.tool_calls.as_ref().and_then(Value::as_array) {
                 for tc in tcs {
-                    let name = tc.pointer("/function/name").and_then(Value::as_str).unwrap_or("").to_string();
-                    let wire_id = tc.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+                    let name = tc
+                        .pointer("/function/name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let wire_id = tc
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
                     if name.is_empty() {
                         continue;
                     }
-                    let args_str = tc.pointer("/function/arguments").and_then(Value::as_str).unwrap_or("{}");
-                    let arguments: Value = serde_json::from_str(args_str).unwrap_or_else(|_| serde_json::json!({}));
+                    let args_str = tc
+                        .pointer("/function/arguments")
+                        .and_then(Value::as_str)
+                        .unwrap_or("{}");
+                    let arguments: Value =
+                        serde_json::from_str(args_str).unwrap_or_else(|_| serde_json::json!({}));
                     names.insert(wire_id.clone(), name.clone());
-                    content.push(AssistantContent::ToolCall(tool_call_from_wire(&wire_id, name, arguments)));
+                    content.push(AssistantContent::ToolCall(tool_call_from_wire(
+                        &wire_id, name, arguments,
+                    )));
                 }
             }
             if content.is_empty() {
@@ -704,9 +850,14 @@ fn convert_message(m: &ChatMessage, names: &mut HashMap<String, String>) -> Opti
         }
         "tool" => {
             let wire_id = m.tool_call_id.clone().unwrap_or_default();
-            let name = names.get(&wire_id).cloned().unwrap_or_else(|| "tool".to_string());
+            let name = names
+                .get(&wire_id)
+                .cloned()
+                .unwrap_or_else(|| "tool".to_string());
             Some(RigMessage::User {
-                content: vec![UserContent::ToolResult(tool_result_from_wire(&wire_id, &name, &m.content))],
+                content: vec![UserContent::ToolResult(tool_result_from_wire(
+                    &wire_id, &name, &m.content,
+                ))],
             })
         }
         _ => None,
@@ -745,12 +896,12 @@ fn build_completion_request(
         tools,
         temperature: Some(temp),
         max_tokens: Some(max_tokens as u64),
-        tool_choice: if has_tools { Some(ToolChoice::Auto) } else { None },
-        additional_params: if sampling
-            .as_object()
-            .map(|o| !o.is_empty())
-            .unwrap_or(false)
-        {
+        tool_choice: if has_tools {
+            Some(ToolChoice::Auto)
+        } else {
+            None
+        },
+        additional_params: if sampling.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
             Some(sampling)
         } else {
             None
@@ -761,7 +912,11 @@ fn build_completion_request(
 }
 
 fn completion_error(e: impl std::fmt::Display) -> ApiError {
-    ApiError::new(StatusCode::BAD_GATEWAY, "provider_error", format!("模型调用失败：{e}"))
+    ApiError::new(
+        StatusCode::BAD_GATEWAY,
+        "provider_error",
+        format!("模型调用失败：{e}"),
+    )
 }
 
 /// 非流式响应 → (展示文本, 工具调用 JSON)
@@ -772,7 +927,8 @@ fn split_choice(choice: &[AssistantContent]) -> (String, Vec<Value>) {
         match item {
             AssistantContent::Text(t) => text.push_str(&t.text),
             AssistantContent::ToolCall(tc) => {
-                let args = serde_json::to_string(&tc.function.arguments).unwrap_or_else(|_| "{}".to_string());
+                let args = serde_json::to_string(&tc.function.arguments)
+                    .unwrap_or_else(|_| "{}".to_string());
                 tool_calls.push(serde_json::json!({
                     "id": tc.wire_call_id(),
                     "name": tc.function.name,
@@ -786,13 +942,18 @@ fn split_choice(choice: &[AssistantContent]) -> (String, Vec<Value>) {
 }
 
 /// 非流式对话接口（rig CompletionModel）
-pub async fn pair_chat(Json(req): Json<PairChatRequest>) -> Result<Json<PairChatResponse>, ApiError> {
+pub async fn pair_chat(
+    Json(req): Json<PairChatRequest>,
+) -> Result<Json<PairChatResponse>, ApiError> {
     let (provider, model, temp, max_tokens, sampling) = resolve_provider_and_model(&req)?;
     let client = build_pair_client(&provider)?;
     let rig_model = client.completion_model(model);
     let request = build_completion_request(&req, temp, max_tokens, sampling);
 
-    let response = rig_model.completion(request).await.map_err(completion_error)?;
+    let response = rig_model
+        .completion(request)
+        .await
+        .map_err(completion_error)?;
     let (full_content, tool_calls) = split_choice(&response.choice);
     let (clean_text, suggestions) = if tool_calls.is_empty() {
         extract_suggestions(&full_content)
@@ -851,7 +1012,8 @@ pub async fn pair_chat_stream(
         let mut calls: HashMap<String, (String, String, String)> = HashMap::new();
         let mut finish_reason: Option<String> = None;
         let mut usage = serde_json::json!({});
-        let (mut n_text, mut n_tool, mut n_delta, mut n_reason, mut n_unknown) = (0usize, 0usize, 0usize, 0usize, 0usize);
+        let (mut n_text, mut n_tool, mut n_delta, mut n_reason, mut n_unknown) =
+            (0usize, 0usize, 0usize, 0usize, 0usize);
 
         tracing::info!(
             model = %model_id,
@@ -876,23 +1038,40 @@ pub async fn pair_chat_stream(
                         }
                     }
                 }
-                Ok(StreamedAssistantContent::ToolCall { tool_call, internal_call_id }) => {
+                Ok(StreamedAssistantContent::ToolCall {
+                    tool_call,
+                    internal_call_id,
+                }) => {
                     n_tool += 1;
                     let args = serde_json::to_string(&tool_call.function.arguments)
                         .unwrap_or_else(|_| "{}".to_string());
                     let wire = tool_call.wire_call_id().to_string();
-                    let id = if wire.is_empty() { internal_call_id.clone() } else { wire };
-                    let key = if internal_call_id.is_empty() { id.clone() } else { internal_call_id };
+                    let id = if wire.is_empty() {
+                        internal_call_id.clone()
+                    } else {
+                        wire
+                    };
+                    let key = if internal_call_id.is_empty() {
+                        id.clone()
+                    } else {
+                        internal_call_id
+                    };
                     if !calls.contains_key(&key) {
                         order.push(key.clone());
                     }
                     calls.insert(key, (tool_call.function.name, args, id));
                 }
-                Ok(StreamedAssistantContent::ToolCallDelta { internal_call_id, content }) => {
+                Ok(StreamedAssistantContent::ToolCallDelta {
+                    internal_call_id,
+                    content,
+                }) => {
                     n_delta += 1;
                     if !calls.contains_key(&internal_call_id) {
                         order.push(internal_call_id.clone());
-                        calls.insert(internal_call_id.clone(), (String::new(), String::new(), internal_call_id.clone()));
+                        calls.insert(
+                            internal_call_id.clone(),
+                            (String::new(), String::new(), internal_call_id.clone()),
+                        );
                     }
                     if let Some(entry) = calls.get_mut(&internal_call_id) {
                         match content {
@@ -952,9 +1131,9 @@ pub async fn pair_chat_stream(
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "结对：上游流中断");
-                    let ev = Event::default()
-                        .event("error")
-                        .data(serde_json::json!({ "message": format!("模型流中断：{e}") }).to_string());
+                    let ev = Event::default().event("error").data(
+                        serde_json::json!({ "message": format!("模型流中断：{e}") }).to_string(),
+                    );
                     let _ = tx.send(Ok(ev)).await;
                     return;
                 }
@@ -965,7 +1144,8 @@ pub async fn pair_chat_stream(
             .iter()
             .filter_map(|k| calls.get(k))
             .map(|(name, args, id)| {
-                let parsed: Value = serde_json::from_str(args).unwrap_or_else(|_| serde_json::json!({}));
+                let parsed: Value =
+                    serde_json::from_str(args).unwrap_or_else(|_| serde_json::json!({}));
                 serde_json::json!({ "id": id, "name": name, "arguments": parsed.to_string() })
             })
             .collect();
@@ -1019,7 +1199,9 @@ pub async fn pair_chat_stream(
             "reasoning_chars": reasoning_chars,
             "counts": counts,
         });
-        let _ = tx.send(Ok(Event::default().event("usage").data(meta.to_string()))).await;
+        let _ = tx
+            .send(Ok(Event::default().event("usage").data(meta.to_string())))
+            .await;
         let done = Event::default().event("done").data(
             serde_json::json!({
                 "full_text": clean_text,
@@ -1051,8 +1233,14 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             attachments: Some(vec![
-                ChatAttachment { name: "lore.md".into(), text: "暗影森林终年迷雾。".into() },
-                ChatAttachment { name: "empty.txt".into(), text: "   ".into() },
+                ChatAttachment {
+                    name: "lore.md".into(),
+                    text: "暗影森林终年迷雾。".into(),
+                },
+                ChatAttachment {
+                    name: "empty.txt".into(),
+                    text: "   ".into(),
+                },
             ]),
         };
         let mut names = HashMap::new();
@@ -1073,4 +1261,3 @@ mod tests {
         assert!(!text.contains("empty.txt"), "空附件不折叠");
     }
 }
-

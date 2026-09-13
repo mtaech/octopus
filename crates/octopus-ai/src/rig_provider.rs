@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 use octopus_engine::{
-    build_protocol_adapter, AiOutput, AiProvider, EngineError, ModelRef, ProtocolRole, TurnContext,
+    AiOutput, AiProvider, EngineError, ModelRef, TurnContext, build_protocol_adapter,
 };
 use octopus_types::RoundChannel;
 use rig::completion::message::{AssistantContent, ReasoningContent};
@@ -22,7 +22,7 @@ pub struct RigProviderParams {
     pub api_key: String,
 }
 
-/// 单个角色（story / character）的默认模型与采样参数。
+/// 单一 AI 的默认模型与采样参数。
 #[derive(Debug, Clone)]
 pub struct RigRoleParams {
     pub provider_id: String,
@@ -37,26 +37,76 @@ pub struct RigRoleParams {
 #[derive(Debug, Clone)]
 pub struct RigParams {
     pub providers: Vec<RigProviderParams>,
+    /// 单一 AI 的默认模型。
     pub story: RigRoleParams,
-    pub character: RigRoleParams,
+    /// 便宜角色（pair）：只用于场景摘要压缩等派生记忆。
+    pub pair: RigRoleParams,
 }
 
 pub struct RigProvider {
     /// 全部可用供应商的客户端：存档可在其中任选模型。
     clients: std::collections::HashMap<String, openai::CompletionsClient>,
     story_provider: String,
-    character_provider: String,
     story_model: String,
-    character_model: String,
     story_temperature: f64,
-    character_temperature: f64,
     story_max_tokens: u64,
-    character_max_tokens: u64,
     story_sampling: serde_json::Value,
-    character_sampling: serde_json::Value,
+    pair_provider: String,
+    pair_model: String,
+    pair_temperature: f64,
+    pair_max_tokens: u64,
+    pair_sampling: serde_json::Value,
+    /// 每存档一条追加式会话：只追加、不重写历史，前缀逐字节稳定，
+    /// 供应商据此复用 prompt / KV 缓存（#31 缓存会话）。
+    conversations: std::sync::Mutex<std::collections::HashMap<String, Vec<ConvMessage>>>,
+    /// 会话持久化端口：None = 只存内存（离线 / 测试默认）。
+    conv_store: std::sync::Mutex<Option<std::sync::Arc<dyn octopus_engine::ConversationStore>>>,
+    /// 已从持久层载入过会话的存档（懒加载去重）。
+    conv_loaded: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
-fn build_client(id: &str, base_url: &str, api_key: &str) -> Result<openai::CompletionsClient, String> {
+/// 持久化记录 ↔ 内存消息互转。
+fn conv_message_from(r: octopus_engine::ConvRecord) -> ConvMessage {
+    ConvMessage {
+        round: r.round,
+        role: if r.role == "assistant" { ConvRole::Assistant } else { ConvRole::User },
+        content: r.content,
+    }
+}
+
+fn conv_record_of(m: &ConvMessage) -> octopus_engine::ConvRecord {
+    octopus_engine::ConvRecord {
+        round: m.round,
+        role: match m.role {
+            ConvRole::User => "user".to_string(),
+            ConvRole::Assistant => "assistant".to_string(),
+        },
+        content: m.content.clone(),
+    }
+}
+
+/// 追加式会话里的一条消息（带回合号，回合重跑时据此截断）。
+#[derive(Debug, Clone)]
+struct ConvMessage {
+    round: u32,
+    role: ConvRole,
+    content: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConvRole {
+    User,
+    Assistant,
+}
+
+/// 单存档会话保留的消息上限：超出后从最旧丢弃（缓存前缀随之重建）。
+const MAX_CONV_MESSAGES: usize = 80;
+
+fn build_client(
+    id: &str,
+    base_url: &str,
+    api_key: &str,
+) -> Result<openai::CompletionsClient, String> {
     openai::CompletionsClient::builder()
         .api_key(api_key.to_string())
         .base_url(base_url.to_string())
@@ -77,15 +127,18 @@ impl RigProvider {
         Ok(Self {
             clients,
             story_provider: p.story.provider_id,
-            character_provider: p.character.provider_id,
             story_model: p.story.model,
-            character_model: p.character.model,
             story_temperature: p.story.temperature,
-            character_temperature: p.character.temperature,
             story_max_tokens: p.story.max_tokens,
-            character_max_tokens: p.character.max_tokens,
             story_sampling: p.story.sampling,
-            character_sampling: p.character.sampling,
+            pair_provider: p.pair.provider_id,
+            pair_model: p.pair.model,
+            pair_temperature: p.pair.temperature,
+            pair_max_tokens: p.pair.max_tokens,
+            pair_sampling: p.pair.sampling,
+            conversations: std::sync::Mutex::new(std::collections::HashMap::new()),
+            conv_store: std::sync::Mutex::new(None),
+            conv_loaded: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -128,7 +181,10 @@ fn sampling_with_effort(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        obj.insert("reasoning_effort".into(), serde_json::Value::String(effort.to_string()));
+        obj.insert(
+            "reasoning_effort".into(),
+            serde_json::Value::String(effort.to_string()),
+        );
     }
     if obj.is_empty() {
         None
@@ -137,7 +193,34 @@ fn sampling_with_effort(
     }
 }
 
+/// 组装一轮提示词（单一 AI）：注入【相关往事】与回合工具结果。
 fn turn_prompt(ctx: &TurnContext) -> String {
+    turn_prompt_inner(ctx, true)
+}
+
+/// 把检索到的相关往事渲染成【相关往事】块；为空则不注入。
+///
+/// 明确告诉模型这是「可能过时的历史片段」，避免把旧事当当前事实照抄。
+fn memories_block(ctx: &TurnContext) -> String {
+    if ctx.memories.is_empty() {
+        return String::new();
+    }
+    let mut b = String::from(
+        "\n【相关往事】（仅在相关时参考的历史片段，不要照抄；与当前场景冲突时以当前为准）\n",
+    );
+    for m in &ctx.memories {
+        let text = m.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        b.push_str(&format!("- [第{}回合/{}] {text}\n", m.round, m.kind));
+    }
+    b
+}
+
+fn turn_prompt_inner(ctx: &TurnContext, include_memories: bool) -> String {
+    // 相关往事按预算注入（#05 §3.4）。
+    let memories = if include_memories { memories_block(ctx) } else { String::new() };
     let channel = match ctx.channel {
         RoundChannel::Character => "角色输入",
         RoundChannel::Meta => "元指令",
@@ -147,14 +230,31 @@ fn turn_prompt(ctx: &TurnContext) -> String {
     let canon = if ctx.canon.is_empty() {
         String::new()
     } else {
-        let mut b = String::from("
+        let mut b = String::from(
+            "
 【已裁定的事实（导演给出，最高优先级：必须遵守，不得推翻）】
-");
+",
+        );
         for c in &ctx.canon {
-            b.push_str(&format!("- {c}
-"));
+            b.push_str(&format!(
+                "- {c}
+"
+            ));
         }
         b
+    };
+    // #04 ⑦ 回合内续轮：只回喂模型自己刚触发的 query_world / check / interact 结果，
+    // 不重发世界全量。首轮该字段为空 → 提示词与单轮路径逐字一致。
+    let turn_feedback = if include_memories && !ctx.turn_feedback.is_empty() {
+        let mut b = String::from(
+            "\n【本轮工具结果】（你刚发起的查询 / 判定结果，请据此继续；信息足够时可输出 finish_turn 收束）\n",
+        );
+        for f in &ctx.turn_feedback {
+            b.push_str(&format!("- {f}\n"));
+        }
+        b
+    } else {
+        String::new()
     };
     // 当前任务（含骨架目标与导演新增）
     let shown: Vec<&octopus_types::QuestView> =
@@ -162,9 +262,11 @@ fn turn_prompt(ctx: &TurnContext) -> String {
     let quests = if shown.is_empty() {
         String::new()
     } else {
-        let mut b = String::from("
+        let mut b = String::from(
+            "
 【当前任务】
-");
+",
+        );
         for q in shown {
             b.push_str(&format!(
                 "- [{}] {}{}
@@ -180,7 +282,8 @@ fn turn_prompt(ctx: &TurnContext) -> String {
     let scenes = if ctx.scenes.is_empty() {
         String::new()
     } else {
-        let mut b = String::from("\n【可推进的场景】需要换场时用 advance_scene {target_scene_id}：\n");
+        let mut b =
+            String::from("\n【可推进的场景】需要换场时用 advance_scene {target_scene_id}：\n");
         for s in &ctx.scenes {
             b.push_str(&format!(
                 "- {}{}（{}）{}\n",
@@ -191,26 +294,38 @@ fn turn_prompt(ctx: &TurnContext) -> String {
                 },
                 s.title,
                 s.id,
-                if s.id == ctx.scene_id { " ← 当前" } else { "" }
+                if s.id == ctx.scene_id {
+                    " ← 当前"
+                } else {
+                    ""
+                }
             ));
         }
         b
     };
     // 当前遭遇（结构化敌人）
     let encounters = if ctx.encounters.iter().any(|e| e.active) {
-        let mut b = String::from("
+        let mut b = String::from(
+            "
 【当前遭遇】
-");
+",
+        );
         for e in ctx.encounters.iter().filter(|e| e.active).take(3) {
             b.push_str(&format!(
                 "- {}{}
 ",
                 e.name,
-                e.note.as_ref().map(|n| format!("（{n}）")).unwrap_or_default()
+                e.note
+                    .as_ref()
+                    .map(|n| format!("（{n}）"))
+                    .unwrap_or_default()
             ));
             for en in &e.enemies {
-                b.push_str(&format!("  · {} {} HP {}/{} AC {}
-", en.id, en.name, en.hp, en.max, en.ac));
+                b.push_str(&format!(
+                    "  · {} {} HP {}/{} AC {}
+",
+                    en.id, en.name, en.hp, en.max, en.ac
+                ));
             }
         }
         b
@@ -238,14 +353,21 @@ fn turn_prompt(ctx: &TurnContext) -> String {
             .collect::<Vec<_>>()
             .join("、")
     };
-    let controlled = if ctx.controlled.is_empty() { "（未指定）" } else { ctx.controlled.as_str() };
-    // 在场人物的人格档案：角色 AI 据此扮演，主线 AI 据此保持人物一致。
+    let controlled = if ctx.controlled.is_empty() {
+        "（未指定）"
+    } else {
+        ctx.controlled.as_str()
+    };
+    // 在场人物的人格档案：单一 AI 据此扮演并保持人物一致。
     // 对话示例是 few-shot 风格样板——模仿语气句式，不照抄台词。
-    let personas = if ctx.personas.is_empty() {
+        let visible_personas: Vec<&octopus_engine::PersonaView> = ctx.personas.iter().collect();
+    let personas = if visible_personas.is_empty() {
         String::new()
     } else {
-        let mut b = String::from("【人物设定】按下列档案扮演这些人物；对话示例用于模仿语气与句式，不要照抄台词。\n");
-        for p in &ctx.personas {
+        let mut b = String::from(
+            "【人物设定】按下列档案扮演这些人物；对话示例用于模仿语气与句式，不要照抄台词。\n",
+        );
+        for p in visible_personas {
             b.push_str(&format!("▸ {}（{}）\n", p.name, p.id));
             for (label, val) in [
                 ("背景", &p.background),
@@ -280,16 +402,6 @@ fn turn_prompt(ctx: &TurnContext) -> String {
         }
         b
     };
-    // 主线 AI 本回合已叙述的内容：角色 AI 应接着演，而不是重描同一段场景。
-    let story_so_far = match ctx
-        .story_narration
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        Some(t) => format!("\n【主线 AI 本回合已叙述（不要重复这段描写，据此作出角色的回应）】\n{t}\n"),
-        None => String::new(),
-    };
     let mut scene = if ctx.scene_title.is_empty() {
         "（未命名场景）".to_string()
     } else {
@@ -319,39 +431,22 @@ fn turn_prompt(ctx: &TurnContext) -> String {
         }
         block
     };
-    // 分工（非导演回合）：台词由角色 AI 演绎，主线 AI 聚焦旁白与世界响应。
-    // 否则两个 AI 会各给同一个人写一段台词，出现「Lucy 一口气说了两遍」。
-    let division = if ctx.channel == RoundChannel::Gm {
-        String::new()
-    } else {
-        "【本回合分工】你负责旁白、环境与世界响应；在场角色的**台词**由角色 AI 演绎——你可以描写他们的动作与神态，但不必替他们说话。\n"
-            .to_string()
-    };
-    // 叙述段（故事书声明）：按渠道筛 scope、按槽位渲染。
-    let present_ids: Vec<&str> = ctx.characters.iter().map(|c| c.id.as_str()).collect();
-    let scope_ok = |scope: &str| -> bool {
-        match ctx.channel {
-            RoundChannel::Character => {
-                scope == "character"
-                    || scope == "both"
-                    || scope
-                        .strip_prefix("character:")
-                        .map(|id| present_ids.iter().any(|p| *p == id))
-                        .unwrap_or(false)
-            }
-            _ => scope == "story" || scope == "both",
-        }
-    };
+    // 单一 AI：叙述段不再按角色筛 scope，全部注入（story / character / both / character:<id> 一视同仁）。
     let sections = |slot: &str| -> String {
         let mut b = String::new();
-        for s in ctx.narrative.iter().filter(|s| s.slot == slot && scope_ok(&s.scope)) {
+        for s in ctx.narrative.iter().filter(|s| s.slot == slot) {
             b.push_str(&s.text);
             b.push('\n');
         }
         b
     };
     let mut world = String::new();
-    if let Some(p) = ctx.premise.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(p) = ctx
+        .premise
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         world.push_str("\n【世界前提】");
         world.push_str(p);
         world.push('\n');
@@ -365,7 +460,7 @@ fn turn_prompt(ctx: &TurnContext) -> String {
     for s in ctx
         .narrative
         .iter()
-        .filter(|s| (s.slot == "style" || s.slot == "behavior") && scope_ok(&s.scope))
+        .filter(|s| s.slot == "style" || s.slot == "behavior")
     {
         if directives.is_empty() {
             directives.push_str("\n【叙事要求】\n");
@@ -379,16 +474,26 @@ fn turn_prompt(ctx: &TurnContext) -> String {
     } else {
         format!("\n【收尾要求】\n{closing_sections}")
     };
+    // C：把故事书声明的判定属性 key 明给模型，避免它拿英文别名瞎猜（如 dexterity）。
+    let attributes = if ctx.attributes.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "可用判定属性（check 的 attribute 只能填这些）：{}\n",
+            ctx.attributes.join("、")
+        )
+    };
     format!(
-        "【回合 {round}】\n（各段冲突时的优先级：已裁定的事实 > 人物设定 / 世界设定 > 场景与任务 > 玩家输入）\n{division}{world}场景：{scene}\n受控角色：{controlled}\n在场角色：{chars}\n{personas}{lore}输入渠道：{channel}\n{canon}{quests}{scenes}{encounters}{directives}{story_so_far}\n输入：{text}\n{closing}{focus}{gm}\n请输出意图 JSON 数组。",
+        "【回合 {round}】\n（各段冲突时的优先级：已裁定的事实 > 人物设定 / 世界设定 > 场景与任务 > 玩家输入）\n{world}场景：{scene}\n{memories}受控角色：{controlled}\n在场角色：{chars}\n{attributes}{personas}{lore}输入渠道：{channel}\n{canon}{quests}{scenes}{encounters}{directives}{turn_feedback}\n输入：{text}\n{closing}{focus}{gm}\n请输出意图 JSON 数组。",
         round = ctx.round,
         scene = scene,
+        memories = memories,
         controlled = controlled,
         chars = chars,
+        attributes = attributes,
         personas = personas,
         lore = lore,
-        story_so_far = story_so_far,
-        division = division,
+        turn_feedback = turn_feedback,
         world = world,
         directives = directives,
         closing = closing,
@@ -426,6 +531,52 @@ fn split_response(choice: &[AssistantContent]) -> (String, String) {
 }
 
 impl RigProvider {
+    /// 懒加载：首次看到该存档时从持久层读回会话（重启后仍能维持缓存前缀）。
+    async fn ensure_loaded(&self, save_id: &str) {
+        let store = self.conv_store.lock().ok().and_then(|g| g.clone());
+        let Some(store) = store else { return };
+        let need = self
+            .conv_loaded
+            .lock()
+            .map(|s| !s.contains(save_id))
+            .unwrap_or(false);
+        if !need {
+            return;
+        }
+        match store.load(save_id).await {
+            Ok(recs) => {
+                if let Ok(mut conv) = self.conversations.lock() {
+                    let entry = conv.entry(save_id.to_string()).or_default();
+                    if entry.is_empty() && !recs.is_empty() {
+                        *entry = recs.into_iter().map(conv_message_from).collect();
+                    }
+                }
+                if let Ok(mut s) = self.conv_loaded.lock() {
+                    s.insert(save_id.to_string());
+                }
+            }
+            Err(e) => tracing::warn!(save_id = %save_id, error = %e, "读取模型会话失败，本次从空会话继续"),
+        }
+    }
+
+    /// 把当前内存会话整段写回持久层（派生数据；失败只 warn）。
+    async fn persist_conversation(&self, save_id: &str) {
+        let store = self.conv_store.lock().ok().and_then(|g| g.clone());
+        let Some(store) = store else { return };
+        let records: Vec<octopus_engine::ConvRecord> = self
+            .conversations
+            .lock()
+            .map(|conv| {
+                conv.get(save_id)
+                    .map(|v| v.iter().map(conv_record_of).collect())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        if let Err(e) = store.save(save_id, &records).await {
+            tracing::warn!(save_id = %save_id, error = %e, "写入模型会话失败（派生数据，忽略）");
+        }
+    }
+
     /// 单次补全：拿意图，并把供应商返回的思考链一并带出（供前端「思考」折叠块）。
     ///
     /// preamble 与 parse 都由故事书声明的协议适配器决定（叙事契约 P2）：
@@ -434,7 +585,6 @@ impl RigProvider {
         &self,
         client: &openai::CompletionsClient,
         model: String,
-        role: ProtocolRole,
         ctx: &TurnContext,
         temperature: f64,
         max_tokens: u64,
@@ -442,11 +592,20 @@ impl RigProvider {
         prompt: String,
     ) -> Result<AiOutput, EngineError> {
         let spec = ctx.protocol.clone().unwrap_or_default();
-        let adapter = build_protocol_adapter(&spec, role);
+        let adapter = build_protocol_adapter(&spec);
+        // 首次看到该存档时从持久层读回会话（重启后仍能维持缓存前缀）。
+        self.ensure_loaded(&ctx.save_id).await;
+        // 追加式会话：取出本存档历史（整轮开始 / 重跑时截断到本回合之前），
+        // 再把这次的 user 提示词追加为最后一条——前缀稳定，缓存才命中。
+        let chat_history = {
+            let mut conv = self.conversations.lock().expect("conversations poisoned");
+            let entry = conv.entry(ctx.save_id.clone()).or_default();
+            append_round_history(entry, ctx.round, ctx.turn_feedback.is_empty(), &prompt)
+        };
         let request = CompletionRequest {
             model: None,
             preamble: Some(adapter.preamble(ctx)),
-            chat_history: vec![Message::user(prompt)],
+            chat_history,
             documents: Vec::new(),
             tools: Vec::new(),
             temperature: Some(temperature),
@@ -462,6 +621,22 @@ impl RigProvider {
             .await
             .map_err(|e| EngineError::Ai(e.to_string()))?;
         let (text, reasoning) = split_response(&response.choice);
+        // 用量遥测：cached 是检验「缓存是否吃满」的关键指标（供应商不回传时为 0）。
+        tracing::info!(
+            save_id = %ctx.save_id,
+            round = ctx.round,
+            input = response.usage.input_tokens,
+            output = response.usage.output_tokens,
+            cached = response.usage.cached_input_tokens,
+            cache_write = response.usage.cache_creation_input_tokens,
+            "AI 调用用量"
+        );
+        // 把这次的 user 提示词与模型原文追加进会话（下次请求即成为稳定前缀）。
+        if let Ok(mut conv) = self.conversations.lock() {
+            let entry = conv.entry(ctx.save_id.clone()).or_default();
+            record_round(entry, ctx.round, prompt, text.clone());
+        }
+        self.persist_conversation(&ctx.save_id).await;
         // 协议解析 → 归一化；白名单过滤等警告随 AiOutput 交给 Session 落事件。
         let intents = adapter.parse(&text, ctx)?;
         let intents = adapter.normalize(intents, ctx);
@@ -474,14 +649,55 @@ impl RigProvider {
     }
 }
 
+/// 组装本次请求的会话历史：整轮开始 / 重跑时截断到本回合之前，再追加本次 user 提示词。
+///
+/// 只追加、不重写既有消息，因此「system, u1, a1, ..., uN」的前缀逐字节稳定，
+/// 供应商可整段复用缓存；round 用于回合重跑（重跑同一回合会先丢弃该回合的旧消息）。
+fn append_round_history(
+    entry: &mut Vec<ConvMessage>,
+    round: u32,
+    fresh_round: bool,
+    prompt: &str,
+) -> Vec<Message> {
+    if fresh_round {
+        entry.retain(|m| m.round < round);
+    }
+    let mut history: Vec<Message> = entry
+        .iter()
+        .map(|m| match m.role {
+            ConvRole::User => Message::user(m.content.clone()),
+            ConvRole::Assistant => Message::assistant(m.content.clone()),
+        })
+        .collect();
+    history.push(Message::user(prompt.to_string()));
+    history
+}
+
+/// 记录一轮模型往返（user 提示词 + assistant 原文），并裁剪到单存档上限。
+fn record_round(entry: &mut Vec<ConvMessage>, round: u32, prompt: String, assistant: String) {
+    entry.push(ConvMessage { round, role: ConvRole::User, content: prompt });
+    entry.push(ConvMessage { round, role: ConvRole::Assistant, content: assistant });
+    if entry.len() > MAX_CONV_MESSAGES {
+        let drop = entry.len() - MAX_CONV_MESSAGES;
+        entry.drain(0..drop);
+    }
+}
+
+/// 场景压缩用的系统提示词（#05 §3.3）：只让模型输出压缩后的短摘要。
+///
+/// 这是派生记忆，不参与叙事契约：所以不走故事书协议适配器，避免协议 preamble 要求
+/// 输出意图 JSON 反而污染摘要正文。
+const SUMMARY_PREAMBLE: &str = "你是 Octopus 的记忆压缩器：把给定的一串回合摘要合并压缩成一段更精炼的场景回顾。\n\
+只输出压缩后的正文，不要解释、不要 Markdown、不要标题；控制在 1-3 句，保留人物、地点、关键事件与结果。";
+
 #[async_trait]
 impl AiProvider for RigProvider {
     async fn story_intents(&self, ctx: &TurnContext) -> Result<AiOutput, EngineError> {
-        let (client, model) = self.pick(ctx.model.as_ref(), &self.story_provider, &self.story_model)?;
+        let (client, model) =
+            self.pick(ctx.model.as_ref(), &self.story_provider, &self.story_model)?;
         self.complete(
             client,
             model,
-            ProtocolRole::Story,
             ctx,
             self.story_temperature,
             self.story_max_tokens,
@@ -491,19 +707,63 @@ impl AiProvider for RigProvider {
         .await
     }
 
-    async fn character_intents(&self, ctx: &TurnContext) -> Result<AiOutput, EngineError> {
-        let (client, model) = self.pick(ctx.model.as_ref(), &self.character_provider, &self.character_model)?;
-        self.complete(
-            client,
-            model,
-            ProtocolRole::Character,
-            ctx,
-            self.character_temperature,
-            self.character_max_tokens,
-            sampling_with_effort(&self.character_sampling, ctx.model.as_ref()),
-            turn_prompt(ctx),
-        )
-        .await
+    fn set_conversation_store(&self, store: std::sync::Arc<dyn octopus_engine::ConversationStore>) {
+        if let Ok(mut slot) = self.conv_store.lock() {
+            *slot = Some(store);
+        }
+    }
+
+    /// 丢弃某存档的会话（内存 + 持久层）；新原点 / 升级 / 导入 / 删除时由 api 层调用。
+    async fn clear_conversation(&self, save_id: &str) {
+        if let Ok(mut conv) = self.conversations.lock() {
+            conv.remove(save_id);
+        }
+        if let Ok(mut s) = self.conv_loaded.lock() {
+            s.remove(save_id);
+        }
+        let store = self.conv_store.lock().ok().and_then(|g| g.clone());
+        if let Some(store) = store {
+            if let Err(e) = store.clear(save_id).await {
+                tracing::warn!(save_id = %save_id, error = %e, "清空模型会话失败（派生数据，忽略）");
+            }
+        }
+    }
+
+    /// 场景摘要压缩走 **pair 角色**（最便宜的既有角色），一次纯文本补全。
+    ///
+    /// 失败 / 空输出都返回 Err / None，由 Session 退化为确定性拼接——摘要是派生数据，
+    /// 绝不能让压缩失败影响权威回合。
+    async fn summarize(&self, text: &str) -> Result<Option<String>, EngineError> {
+        if text.trim().is_empty() {
+            return Ok(None);
+        }
+        let client = self
+            .clients
+            .get(&self.pair_provider)
+            .or_else(|| self.clients.values().next())
+            .ok_or_else(|| EngineError::Ai(format!("未找到供应商 {}", self.pair_provider)))?;
+        let request = CompletionRequest {
+            model: None,
+            preamble: Some(SUMMARY_PREAMBLE.to_string()),
+            chat_history: vec![Message::user(text.to_string())],
+            documents: Vec::new(),
+            tools: Vec::new(),
+            temperature: Some(self.pair_temperature),
+            max_tokens: Some(self.pair_max_tokens),
+            tool_choice: None,
+            additional_params: sampling_with_effort(&self.pair_sampling, None),
+            output_schema: None,
+            record_telemetry_content: false,
+        };
+        let model = client.completion_model(self.pair_model.clone());
+        let response = model
+            .completion(request)
+            .await
+            .map_err(|e| EngineError::Ai(e.to_string()))?;
+        let (out, _) = split_response(&response.choice);
+        let trimmed = out.trim();
+        // 空输出视同没有压缩结果，交给调用方回退拼接。
+        Ok((!trimmed.is_empty()).then(|| trimmed.to_string()))
     }
 }
 
@@ -511,6 +771,150 @@ impl AiProvider for RigProvider {
 mod tests {
     use octopus_engine::parse_intents;
     use octopus_types::Intent;
+
+    /// 追加式会话：前缀逐字节稳定、重跑按回合截断。
+    #[test]
+    fn conversation_appends_and_truncates_by_round() {
+        let mut entry: Vec<super::ConvMessage> = Vec::new();
+
+        // 第 1 回合：历史里只有本次 user 提示词。
+        let h = super::append_round_history(&mut entry, 1, true, "u1");
+        assert_eq!(h.len(), 1);
+        super::record_round(&mut entry, 1, "u1".into(), "a1".into());
+        assert_eq!(entry.len(), 2);
+
+        // 第 2 回合：前缀仍是 [u1, a1]，只追加 u2。
+        let h = super::append_round_history(&mut entry, 2, true, "u2");
+        assert_eq!(h.len(), 3, "第二轮请求要带上第一轮的 user + assistant");
+        super::record_round(&mut entry, 2, "u2".into(), "a2".into());
+
+        // 同一回合的续轮（turn_feedback 非空）：不截断，继续追加。
+        let h = super::append_round_history(&mut entry, 2, false, "u2b");
+        assert_eq!(h.len(), 5, "续轮保留本回合已产生的消息");
+
+        // 整轮重跑（fresh_round = true，同一回合号）：丢弃该回合旧消息，从上一回合续起。
+        let h = super::append_round_history(&mut entry, 2, true, "u2r");
+        assert_eq!(h.len(), 3, "重跑丢弃本回合旧消息，只保留 round < 2 的前缀");
+    }
+
+    /// clear_conversation 只丢弃目标存档的会话，不影响其它存档。
+    #[tokio::test]
+    async fn clear_conversation_drops_only_target_save() {
+        let p = super::RigProvider::new(super::RigParams {
+            providers: vec![super::RigProviderParams {
+                id: "p1".into(),
+                base_url: "http://127.0.0.1:1".into(),
+                api_key: "k".into(),
+            }],
+            story: test_role("p1", "m1"),
+            pair: test_role("p1", "m1"),
+        })
+        .expect("构造 provider");
+        let seed = || vec![super::ConvMessage { round: 1, role: super::ConvRole::User, content: "u1".into() }];
+        {
+            let mut conv = p.conversations.lock().unwrap();
+            conv.insert("sv-a".into(), seed());
+            conv.insert("sv-b".into(), seed());
+        }
+        octopus_engine::AiProvider::clear_conversation(&p, "sv-a").await;
+        let conv = p.conversations.lock().unwrap();
+        assert!(!conv.contains_key("sv-a"), "目标存档会话应被丢弃");
+        assert!(conv.contains_key("sv-b"), "其它存档的会话不受影响");
+    }
+
+    /// 可注入的假持久层：验证懒加载 / 写回 / 清空三条路径。
+    #[derive(Default)]
+    struct FakeConvStore {
+        rows: std::sync::Mutex<std::collections::HashMap<String, Vec<octopus_engine::ConvRecord>>>,
+        clears: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl octopus_engine::ConversationStore for FakeConvStore {
+        async fn load(
+            &self,
+            save_id: &str,
+        ) -> Result<Vec<octopus_engine::ConvRecord>, octopus_engine::EngineError> {
+            Ok(self.rows.lock().unwrap().get(save_id).cloned().unwrap_or_default())
+        }
+        async fn save(
+            &self,
+            save_id: &str,
+            records: &[octopus_engine::ConvRecord],
+        ) -> Result<(), octopus_engine::EngineError> {
+            self.rows.lock().unwrap().insert(save_id.to_string(), records.to_vec());
+            Ok(())
+        }
+        async fn clear(&self, save_id: &str) -> Result<(), octopus_engine::EngineError> {
+            self.rows.lock().unwrap().remove(save_id);
+            self.clears.lock().unwrap().push(save_id.to_string());
+            Ok(())
+        }
+    }
+
+    /// 会话懒加载 → 追加后写回 → 清空，三段都要落到持久层。
+    #[tokio::test]
+    async fn conversation_loads_persists_and_clears() {
+        let p = super::RigProvider::new(super::RigParams {
+            providers: vec![super::RigProviderParams {
+                id: "p1".into(),
+                base_url: "http://127.0.0.1:1".into(),
+                api_key: "k".into(),
+            }],
+            story: test_role("p1", "m1"),
+            pair: test_role("p1", "m1"),
+        })
+        .expect("构造 provider");
+        let fake = std::sync::Arc::new(FakeConvStore::default());
+        fake.rows.lock().unwrap().insert(
+            "sv-a".into(),
+            vec![
+                octopus_engine::ConvRecord { round: 1, role: "user".into(), content: "u1".into() },
+                octopus_engine::ConvRecord { round: 1, role: "assistant".into(), content: "a1".into() },
+            ],
+        );
+        octopus_engine::AiProvider::set_conversation_store(&p, fake.clone());
+
+        // 懒加载：首次 ensure_loaded 把持久层的历史装进内存。
+        p.ensure_loaded("sv-a").await;
+        {
+            let conv = p.conversations.lock().unwrap();
+            let entry = conv.get("sv-a").expect("会话已载入");
+            assert_eq!(entry.len(), 2);
+            assert_eq!(entry[1].content, "a1");
+        }
+        // 再调一次不会重复载入。
+        p.ensure_loaded("sv-a").await;
+        assert_eq!(p.conversations.lock().unwrap().get("sv-a").unwrap().len(), 2);
+
+        // 追加后写回：持久层应变成 3 条。
+        p.conversations
+            .lock()
+            .unwrap()
+            .entry("sv-a".into())
+            .or_default()
+            .push(super::ConvMessage { round: 2, role: super::ConvRole::User, content: "u2".into() });
+        p.persist_conversation("sv-a").await;
+        assert_eq!(fake.rows.lock().unwrap().get("sv-a").unwrap().len(), 3);
+
+        // 清空：内存与持久层都不再保留。
+        octopus_engine::AiProvider::clear_conversation(&p, "sv-a").await;
+        assert!(!p.conversations.lock().unwrap().contains_key("sv-a"));
+        assert!(fake.rows.lock().unwrap().get("sv-a").is_none());
+        assert_eq!(fake.clears.lock().unwrap().as_slice(), ["sv-a".to_string()]);
+    }
+
+    /// 会话上限：超出后丢最旧，保留最新往返。
+    #[test]
+    fn conversation_trim_keeps_newest() {
+        let mut entry: Vec<super::ConvMessage> = Vec::new();
+        for r in 0..80u32 {
+            super::record_round(&mut entry, r, format!("u{r}"), format!("a{r}"));
+        }
+        assert_eq!(entry.len(), super::MAX_CONV_MESSAGES);
+        assert_eq!(entry.last().unwrap().content, "a79");
+        assert_eq!(entry[0].content, format!("u{}", 80 - super::MAX_CONV_MESSAGES as u32 / 2));
+    }
 
     #[test]
     fn turn_prompt_carries_canon_quests_and_gm_mode() {
@@ -531,7 +935,6 @@ mod tests {
             premise: None,
             narrative: vec![],
             token_budget: 0,
-            story_narration: None,
             focus: vec![],
             canon: vec!["灌木后是幻影，底下还有一道法术".into()],
             quests: vec![QuestView {
@@ -545,7 +948,13 @@ mod tests {
             encounters: vec![octopus_types::EncounterView {
                 id: "enc-1".into(),
                 name: "狼群合围".into(),
-                enemies: vec![octopus_types::EnemyView { id: "e1".into(), name: "灰狼".into(), hp: 7, max: 11, ac: 12 }],
+                enemies: vec![octopus_types::EnemyView {
+                    id: "e1".into(),
+                    name: "灰狼".into(),
+                    hp: 7,
+                    max: 11,
+                    ac: 12,
+                }],
                 note: None,
                 active: true,
             }],
@@ -561,7 +970,10 @@ mod tests {
                     chapter: "第一章".into(),
                 },
             ],
+            attributes: vec![],
             model: None,
+            memories: vec![],
+            turn_feedback: vec![],
             protocol: None,
         };
         let p = super::turn_prompt(&ctx);
@@ -573,11 +985,23 @@ mod tests {
         assert!(p.contains("导演模式"), "导演回合要有专属说明");
         assert!(p.contains("导演指令"), "渠道要标明是导演指令");
         assert!(p.contains("当前遭遇"), "有遭遇时要带上遭遇段");
-        assert!(p.contains("e1 灰狼 HP 7/11"), "遭遇里要带敌人 id，AI 才能 strike");
+        assert!(
+            p.contains("e1 灰狼 HP 7/11"),
+            "遭遇里要带敌人 id，AI 才能 strike"
+        );
         assert!(p.contains("优先级"), "要显式声明提示词分层的优先级");
-        assert!(!p.contains("本回合分工"), "导演回合由主线 AI 自由演绎，不写分工");
-        assert!(p.contains("可推进的场景"), "要给出可 advance_scene 的场景清单");
-        assert!(p.contains("sc-2") && p.contains("← 当前"), "当前场景要被标记出来");
+        assert!(
+            !p.contains("本回合分工"),
+            "导演回合由主线 AI 自由演绎，不写分工"
+        );
+        assert!(
+            p.contains("可推进的场景"),
+            "要给出可 advance_scene 的场景清单"
+        );
+        assert!(
+            p.contains("sc-2") && p.contains("← 当前"),
+            "当前场景要被标记出来"
+        );
     }
 
     #[test]
@@ -618,7 +1042,6 @@ mod tests {
             premise: None,
             narrative: vec![],
             token_budget: 0,
-            story_narration: None,
             focus: vec![FocusEntity {
                 kind: "item".into(),
                 id: Some("it-sword".into()),
@@ -629,7 +1052,10 @@ mod tests {
             quests: vec![],
             encounters: vec![],
             scenes: vec![],
+            attributes: vec![],
             model: None,
+            memories: vec![],
+            turn_feedback: vec![],
             protocol: None,
         };
         let p = super::turn_prompt(&ctx);
@@ -637,7 +1063,6 @@ mod tests {
         assert!(p.contains("生锈短剑"));
         assert!(p.contains("it-sword"));
     }
-
 
     #[test]
     fn turn_prompt_injects_personas_and_example_dialogues() {
@@ -652,7 +1077,10 @@ mod tests {
             controlled: "米拉(char-mira)".into(),
             player_text: "「伊莎，来杯麦酒。」".into(),
             channel: RoundChannel::Character,
-            characters: vec![octopus_types::ActorRef { id: "char-isa".into(), name: "伊莎".into() }],
+            characters: vec![octopus_types::ActorRef {
+                id: "char-isa".into(),
+                name: "伊莎".into(),
+            }],
             personas: vec![PersonaView {
                 id: "char-isa".into(),
                 name: "伊莎".into(),
@@ -666,13 +1094,15 @@ mod tests {
             premise: None,
             narrative: vec![],
             token_budget: 0,
-            story_narration: None,
             focus: vec![],
             canon: vec![],
             quests: vec![],
             encounters: vec![],
             scenes: vec![],
+            attributes: vec![],
             model: None,
+            memories: vec![],
+            turn_feedback: vec![],
             protocol: None,
         };
         let p = super::turn_prompt(&ctx);
@@ -706,13 +1136,15 @@ mod tests {
             premise: None,
             narrative: vec![],
             token_budget: 2000,
-            story_narration: None,
             focus: vec![],
             canon: vec![],
             quests: vec![],
             encounters: vec![],
             scenes: vec![],
+            attributes: vec![],
             model: None,
+            memories: vec![],
+            turn_feedback: vec![],
             protocol: None,
         };
         let p = super::turn_prompt(&ctx);
@@ -720,50 +1152,60 @@ mod tests {
         assert!(p.contains("终年迷雾"), "命中词条的内容要注入");
     }
 
+    /// C：合法判定属性要列进提示词（否则模型会拿 dexterity 这类英文别名瞎猜）。
     #[test]
-    fn preambles_are_positive_first() {
-        // 正向指令为主（借鉴提示词工程的 8:2）：系统提示词避免「不要…」式表述。
-        assert!(!octopus_engine::STORY_PREAMBLE.contains("不要"), "主线 preamble 应正向表述");
-        assert!(!octopus_engine::CHARACTER_PREAMBLE.contains("不要"), "角色 preamble 应正向表述");
-        assert!(octopus_engine::STORY_PREAMBLE.contains("strike"), "攻击交给引擎结算要写明");
-        assert!(octopus_engine::CHARACTER_PREAMBLE.contains("对话示例"), "角色口吻要参考对话示例");
-    }
-
-    #[test]
-    fn turn_prompt_gives_character_ai_the_story_narration() {
+    fn turn_prompt_lists_check_attributes() {
         use octopus_engine::TurnContext;
         use octopus_types::RoundChannel;
-        let ctx = TurnContext {
+        let mut ctx = TurnContext {
             save_id: "sv-1".into(),
-            round: 2,
+            round: 1,
             scene_id: "sc-1".into(),
-            scene_title: "教室里".into(),
+            scene_title: "酒馆".into(),
             scene_description: None,
             controlled: "米拉(char-mira)".into(),
-            player_text: "我没带伞".into(),
+            player_text: "我试试".into(),
             channel: RoundChannel::Character,
             characters: vec![],
             personas: vec![],
-            lore: vec![],
             premise: None,
             narrative: vec![],
+            lore: vec![],
             token_budget: 0,
-            story_narration: Some("雨云压得极低，空气里泛着潮湿的凉意。".into()),
             focus: vec![],
             canon: vec![],
             quests: vec![],
             encounters: vec![],
             scenes: vec![],
+            attributes: vec!["agi".into(), "str".into()],
             model: None,
+            memories: vec![],
+            turn_feedback: vec![],
             protocol: None,
         };
         let p = super::turn_prompt(&ctx);
-        assert!(p.contains("已叙述"), "角色 AI 要看到主线 AI 本回合已叙述的内容");
-        assert!(p.contains("本回合分工"), "非导演回合要写明台词归角色 AI，避免同一角色说两遍");
-        assert!(p.contains("雨云压得极低"));
-        // 角色 preamble 明确不抢旁白，避免与主线 AI 重描同一场景
-        assert!(octopus_engine::CHARACTER_PREAMBLE.contains("主线 AI"));
-        assert!(octopus_engine::CHARACTER_PREAMBLE.contains("场景"));
+        assert!(p.contains("可用判定属性"), "{p}");
+        assert!(p.contains("agi") && p.contains("str"), "{p}");
+        // 未声明属性时整段不注入。
+        ctx.attributes.clear();
+        assert!(!super::turn_prompt(&ctx).contains("可用判定属性"));
+    }
+
+    #[test]
+    fn preamble_is_positive_first() {
+        // 正向指令为主（借鉴提示词工程的 8:2）：系统提示词避免「不要…」式表述。
+        assert!(
+            !octopus_engine::SYSTEM_PREAMBLE.contains("不要"),
+            "系统 preamble 应正向表述"
+        );
+        assert!(
+            octopus_engine::SYSTEM_PREAMBLE.contains("strike"),
+            "攻击交给引擎结算要写明"
+        );
+        assert!(
+            octopus_engine::SYSTEM_PREAMBLE.contains("对话示例"),
+            "扮演口吻要参考对话示例"
+        );
     }
 
     #[test]
@@ -779,25 +1221,55 @@ mod tests {
             controlled: "米拉(char-mira)".into(),
             player_text: "你好".into(),
             channel: RoundChannel::Character,
-            characters: vec![ActorRef { id: "char-isa".into(), name: "伊莎".into() }],
+            characters: vec![ActorRef {
+                id: "char-isa".into(),
+                name: "伊莎".into(),
+            }],
             personas: vec![],
             premise: Some("坠星谷的边境小镇。".into()),
             narrative: vec![
-                NarrativeView { id: "w1".into(), slot: "world".into(), scope: "both".into(), text: "补充世界设定。".into() },
-                NarrativeView { id: "s1".into(), slot: "style".into(), scope: "both".into(), text: "冷硬派文风。".into() },
-                NarrativeView { id: "b1".into(), slot: "behavior".into(), scope: "story".into(), text: "只有主线看得到。".into() },
-                NarrativeView { id: "c1".into(), slot: "closing".into(), scope: "both".into(), text: "结尾收束一句。".into() },
-                NarrativeView { id: "x1".into(), slot: "style".into(), scope: "character:char-other".into(), text: "别人专属。".into() },
+                NarrativeView {
+                    id: "w1".into(),
+                    slot: "world".into(),
+                    scope: "both".into(),
+                    text: "补充世界设定。".into(),
+                },
+                NarrativeView {
+                    id: "s1".into(),
+                    slot: "style".into(),
+                    scope: "both".into(),
+                    text: "冷硬派文风。".into(),
+                },
+                NarrativeView {
+                    id: "b1".into(),
+                    slot: "behavior".into(),
+                    scope: "story".into(),
+                    text: "只有主线看得到。".into(),
+                },
+                NarrativeView {
+                    id: "c1".into(),
+                    slot: "closing".into(),
+                    scope: "both".into(),
+                    text: "结尾收束一句。".into(),
+                },
+                NarrativeView {
+                    id: "x1".into(),
+                    slot: "style".into(),
+                    scope: "character:char-other".into(),
+                    text: "别人专属。".into(),
+                },
             ],
             lore: vec![],
             token_budget: 0,
-            story_narration: None,
             focus: vec![],
             canon: vec![],
             quests: vec![],
             encounters: vec![],
             scenes: vec![],
+            attributes: vec![],
             model: None,
+            memories: vec![],
+            turn_feedback: vec![],
             protocol: None,
         };
         let p = super::turn_prompt(&ctx);
@@ -805,8 +1277,8 @@ mod tests {
         assert!(p.contains("【世界设定补充】") && p.contains("补充世界设定。"));
         assert!(p.contains("【叙事要求】") && p.contains("冷硬派文风。"));
         assert!(p.contains("【收尾要求】") && p.contains("结尾收束一句。"));
-        assert!(!p.contains("只有主线看得到。"), "story scope 不该进角色回合");
-        assert!(!p.contains("别人专属。"), "非在场角色的专属段不该注入");
+        assert!(p.contains("只有主线看得到。"), "单一 AI 统一应用 story scope");
+        assert!(p.contains("别人专属。"), "单一 AI 统一应用 character:<id> scope");
     }
 
     #[test]
@@ -820,7 +1292,9 @@ mod tests {
     fn parses_fenced_array_with_prose() {
         let bt = '\u{60}';
         let fence: String = [bt, bt, bt].iter().collect();
-        let raw = format!("好的，这是意图：\n{fence}json\n[{{\"type\":\"speak\",\"content\":\"稀客。\"}}]\n{fence}\n就这样。");
+        let raw = format!(
+            "好的，这是意图：\n{fence}json\n[{{\"type\":\"speak\",\"content\":\"稀客。\"}}]\n{fence}\n就这样。"
+        );
         let v = parse_intents(&raw).expect("fenced array");
         assert_eq!(v.len(), 1);
     }
@@ -835,5 +1309,111 @@ mod tests {
     #[test]
     fn rejects_garbage() {
         assert!(parse_intents("我不会响应这种请求。").is_err());
+    }
+
+    fn test_role(provider_id: &str, model: &str) -> super::RigRoleParams {
+        super::RigRoleParams {
+            provider_id: provider_id.into(),
+            model: model.into(),
+            temperature: 0.8,
+            max_tokens: 1024,
+            sampling: serde_json::json!({}),
+        }
+    }
+
+    /// 按存档取单一模型：存档指定优先（可跨供应商），否则回落全局默认。
+    #[test]
+    fn pick_prefers_save_model_then_falls_back_to_global_default() {
+        use octopus_engine::ModelRef;
+        let p = super::RigProvider::new(super::RigParams {
+            providers: vec![
+                super::RigProviderParams {
+                    id: "p1".into(),
+                    base_url: "http://127.0.0.1:1".into(),
+                    api_key: "k".into(),
+                },
+                super::RigProviderParams {
+                    id: "p2".into(),
+                    base_url: "http://127.0.0.1:2".into(),
+                    api_key: "k".into(),
+                },
+            ],
+            story: test_role("p1", "m1"),
+            pair: test_role("p1", "m1"),
+        })
+        .expect("构造 provider");
+
+        // 存档指定了模型：用存档的模型（可跨供应商）。
+        let preferred = ModelRef {
+            provider_id: "p2".into(),
+            model: "custom".into(),
+            reasoning_effort: None,
+        };
+        let (_, model) = p
+            .pick(Some(&preferred), &p.story_provider, &p.story_model)
+            .unwrap();
+        assert_eq!(model, "custom");
+
+        // 指定了未知供应商：回落该角色的全局默认。
+        let unknown = ModelRef {
+            provider_id: "nope".into(),
+            model: "x".into(),
+            reasoning_effort: None,
+        };
+        let (_, model) = p
+            .pick(Some(&unknown), &p.story_provider, &p.story_model)
+            .unwrap();
+        assert_eq!(model, "m1");
+
+        // 没有存档覆盖：取全局默认。
+        let (_, story_model) = p.pick(None, &p.story_provider, &p.story_model).unwrap();
+        assert_eq!(story_model, "m1");
+    }
+
+    /// #05 §3.4：相关往事注入单一 AI 提示词。
+    #[test]
+    fn memories_are_injected_into_single_ai_prompt() {
+        use octopus_engine::{MemoryHit, TurnContext};
+        use octopus_types::RoundChannel;
+        let mut ctx = TurnContext {
+            save_id: "sv-1".into(),
+            round: 2,
+            scene_id: "sc-1".into(),
+            scene_title: "酒馆".into(),
+            scene_description: None,
+            controlled: "米拉(char-mira)".into(),
+            player_text: "你还记得那座古堡吗？".into(),
+            channel: RoundChannel::Character,
+            characters: vec![],
+            personas: vec![],
+            lore: vec![],
+            premise: None,
+            narrative: vec![],
+            memories: vec![MemoryHit {
+                seq: 7,
+                round: 1,
+                kind: "narrate".into(),
+                text: "月光下的古堡矗立在悬崖边。".into(),
+                score: 0.9,
+            }],
+            turn_feedback: vec![],
+            token_budget: 0,
+            focus: vec![],
+            canon: vec![],
+            quests: vec![],
+            encounters: vec![],
+            scenes: vec![],
+            attributes: vec![],
+            model: None,
+            protocol: None,
+        };
+        let prompt = super::turn_prompt(&ctx);
+        assert!(prompt.contains("【相关往事】"), "单一 AI 提示词要带相关往事段");
+        assert!(prompt.contains("月光下的古堡矗立在悬崖边。"));
+        assert!(prompt.contains("第1回合"));
+
+        // 无命中时不注入空段。
+        ctx.memories.clear();
+        assert!(!super::turn_prompt(&ctx).contains("【相关往事】"));
     }
 }

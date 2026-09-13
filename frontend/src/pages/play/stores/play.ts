@@ -7,7 +7,7 @@ import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import type {
   WorldProjection, PlayEvent, PhaseStage, SaveDetail, CheckResultPayload, StateDelta, CharacterInstance,
-  EntityRef, FocusEntity, Storybook
+  EntityRef, FocusEntity, Storybook, SaveModelChoice
 } from '@/types'
 import { hydrate, subscribe, submitRound, rerunRound, confirmAction, getSave, getHistory, getSaveSettings, switchCharacter, setSaveSettings, toast } from '@/api'
 import { uid } from '@/types'
@@ -26,6 +26,17 @@ export type FeedEntry =
   | { key: string; kind: 'resolution'; round: number; status: 'ok' | 'rejected'; text?: string; ts?: string }
   | { key: string; kind: 'progress'; round: number; tone: 'goal' | 'trigger' | 'quest'; label: string; ts?: string }
   | { key: string; kind: 'reasoning'; round: number; stage: string; text: string; /** P3：provider = 供应商 reasoning_content；model = think 意图 */ source: 'provider' | 'model'; ts?: string }
+
+/** 流程日志的一行：原始事件的可读摘要（含不渲染进对话的引擎内部事件，如被驳回的意图）。 */
+export interface FlowLogLine {
+  seq: number
+  round: number
+  type: string
+  ts?: string
+  text: string
+  /** UI 上色：error = 驳回 / 失败，warn = 需要注意，muted = 管线噪音 */
+  tone: 'info' | 'warn' | 'error' | 'muted'
+}
 
 const TYPE_SPEED_MS = 20
 /** 每次拉取的历史页大小（后端上限 200） */
@@ -50,10 +61,12 @@ export const usePlayStore = defineStore('play', () => {
   const triggerTexts = ref<Record<string, string>>({})
   /** 输入框待发送的实体引用（本次行动的目标） */
   const pendingRefs = ref<EntityRef[]>([])
-  /** 本存档覆盖的模型（None = 用全局角色默认） */
-  const saveModel = ref<{ provider_id: string; model: string; reasoning_effort?: string } | null>(null)
+  /** 本存档的单一 AI 模型选择；null = 继承全局 AI 默认 */
+  const saveModel = ref<SaveModelChoice | null>(null)
   /** 叙述段玩家偏好（叙事契约 P1）：section id → 开关(bool) | 变体 key(string)；只影响之后的回合 */
   const narrativePrefs = ref<Record<string, boolean | string>>({})
+  /** 完整事件流（按 seq 升序）：页面「日志」tab 用；含被驳回的意图等不渲染进对话的条目。 */
+  const flowLog = ref<FlowLogLine[]>([])
   /** 已加载的最旧事件 seq（分页游标） */
   const oldestSeq = ref<number | null>(null)
   const hasMoreOlder = ref(false)
@@ -128,6 +141,51 @@ export const usePlayStore = defineStore('play', () => {
   function isContent(e: FeedEntry): e is Extract<FeedEntry, { kind: 'content' }> { return e.kind === 'content' }
   /** 统一入口：向前分页时写入缓冲，其余写入 entries。 */
   function addEntry(e: FeedEntry): void { (entrySink ?? entries.value).push(e) }
+
+  // ---------- 流程日志（页面「日志」tab） ----------
+  /** 单存档保留的日志行上限：超出丢最旧，避免长局无限增长。 */
+  const FLOW_LOG_LIMIT = 2000
+  function flowText(e: PlayEvent): string {
+    switch (e.type) {
+      case 'round_start': return `输入（${e.payload.input.channel}）：${e.payload.input.text}`
+      case 'round_end': return '回合结束'
+      case 'scene': return `场景：${e.payload.title}`
+      case 'phase': return `阶段：${e.payload.stage}`
+      case 'reasoning': return `思考（${e.payload.stage}/${e.payload.source}）：${e.payload.text.slice(0, 100)}`
+      case 'narrate': return `${e.actor?.name ?? '旁白'}：${e.payload.content}`
+      case 'dialogue': return `${e.actor?.name ?? '?'}：${e.payload.content}`
+      case 'emote': return `${e.actor?.name ?? '?'}（神态）：${e.payload.content}`
+      case 'check_result': {
+        const p = e.payload
+        const rolls = p.rolls?.length ? p.rolls.join('+') : '无骰'
+        return `判定 ${p.attribute} ${p.expr ?? ''} 骰=${rolls} 修正=${p.mod} 合计=${p.total} 目标=${p.target} → ${p.result ? '成功' : '失败'}`
+      }
+      case 'resolution': return `${e.payload.status === 'ok' ? '结算' : '驳回'}${e.payload.rejection_code ? '[' + e.payload.rejection_code + ']' : ''} ${e.payload.narrative ?? ''}`
+      case 'state_update': return `状态变更 ${e.payload.changes.length} 项`
+      case 'system': return `[${e.payload.code ?? e.payload.level}] ${e.payload.text}`
+      case 'pending': return `等待确认：${e.payload.description}`
+      default: return ''
+    }
+  }
+  function flowTone(e: PlayEvent): FlowLogLine['tone'] {
+    switch (e.type) {
+      case 'resolution': return e.payload.status === 'ok' ? 'info' : 'error'
+      case 'check_result': return e.payload.result ? 'info' : 'warn'
+      case 'system': return e.payload.level === 'error' ? 'error' : e.payload.level === 'warn' ? 'warn' : 'muted'
+      case 'pending': return 'warn'
+      case 'narrate': case 'dialogue': case 'emote': return 'info'
+      default: return 'muted'
+    }
+  }
+  /** 记录一条原始事件（按 seq 去重、升序插入——历史分页会乱序到达）。 */
+  function recordFlow(e: PlayEvent): void {
+    const arr = flowLog.value
+    let lo = 0, hi = arr.length
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (arr[mid].seq < e.seq) lo = mid + 1; else hi = mid }
+    if (arr[lo]?.seq === e.seq) return
+    arr.splice(lo, 0, { seq: e.seq, round: e.round, type: e.type, ts: e.ts, text: flowText(e), tone: flowTone(e) })
+    if (arr.length > FLOW_LOG_LIMIT) arr.splice(0, arr.length - FLOW_LOG_LIMIT)
+  }
 
   // ---------- 实体引用（本次行动的目标） ----------
   /** 存档内冻结的故事书：引用枚举与解析的数据源。 */
@@ -361,6 +419,7 @@ export const usePlayStore = defineStore('play', () => {
     if (!replay) watermark = e.seq
     const key = e.id
     const ts = e.ts
+    recordFlow(e)
     switch (e.type) {
       case 'round_start': {
         flushAll()
@@ -418,7 +477,9 @@ export const usePlayStore = defineStore('play', () => {
         if (e.payload.status === 'ok' && e.payload.narrative) {
           addEntry({ key: key + ':res', kind: 'resolution', round: e.round, status: 'ok', text: e.payload.narrative, ts })
         } else if (e.payload.status === 'rejected') {
-          addEntry({ key: key + ':res', kind: 'resolution', round: e.round, status: 'rejected', text: e.payload.narrative ?? (e.payload.rejection_code ? '意图被驳回（' + e.payload.rejection_code + '）' : '意图被驳回'), ts })
+          // 驳回是引擎内部 QA 信息（AI 意图不合法 / 代说玩家台词 / 属性不在白名单等）：
+          // 只进日志——服务端 tracing 的 warn + 命令日志里的 Resolution 事件——不渲染成玩家的
+          // 「意图驳回」卡片。复盘：按 save_id 查 commands 表 kind='resolution' 且 status='rejected'。
         }
         break
       }
@@ -473,7 +534,11 @@ export const usePlayStore = defineStore('play', () => {
       projection.value = structuredClone(p)
       detail.value = d
       saveModel.value = settings.model_provider_id && settings.model
-        ? { provider_id: settings.model_provider_id, model: settings.model, reasoning_effort: settings.reasoning_effort }
+        ? {
+            provider_id: settings.model_provider_id,
+            model: settings.model,
+            reasoning_effort: settings.reasoning_effort ?? undefined,
+          }
         : null
       narrativePrefs.value = { ...(settings.narrative ?? {}) }
       // 骨架文案索引（goal/trigger 触发时给出友好名）
@@ -486,6 +551,8 @@ export const usePlayStore = defineStore('play', () => {
       goalTexts.value = g
       triggerTexts.value = b
       // 回放叙事历史：只重建 feed，不改投影（投影由后端重放权威给出），历史不打字机。
+      // 流程日志同样从头重建（换存档 / 重新水合时不能残留上一个存档的事件）。
+      flowLog.value = []
       watermark = 0
       hist.events.forEach(e => onEvent(e, true))
       // 水位线取「投影 seq」与「历史最大 seq」的较大者：二者并发拉取，投影可能比历史旧；
@@ -643,15 +710,12 @@ export const usePlayStore = defineStore('play', () => {
     } catch (err) { toast('error', (err as Error)?.message ?? '切换角色失败') }
   }
 
-  /** 免确认开关（#24 修订：存档级设置端点）；带模型字段一起提交，避免把本存档模型清掉 */
+  /** 免确认开关（#24 修订：存档级设置端点） */
   async function setAutoConfirm(v: boolean) {
     if (!saveId.value) return
     try {
       const s = await setSaveSettings(saveId.value, {
         auto_confirm: v,
-        model_provider_id: saveModel.value?.provider_id,
-        model: saveModel.value?.model,
-        reasoning_effort: saveModel.value?.reasoning_effort,
         narrative: narrativePrefs.value,
       })
       if (projection.value) projection.value.meta.auto_confirm = s.auto_confirm
@@ -659,20 +723,43 @@ export const usePlayStore = defineStore('play', () => {
     } catch (err) { toast('error', (err as Error)?.message ?? '设置失败') }
   }
 
-  /** 切换本存档使用的模型（story/character 一起），即时生效并持久化到该存档。 */
-  async function setModel(providerId: string, model: string, reasoningEffort?: string) {
+  /**
+   * 设置本存档的单一 AI 模型 / 思考强度；即时生效并持久化。
+   * 只影响之后的回合：后端更新会话的模型，绝不回写命令日志。
+   */
+  async function setModel(m: SaveModelChoice) {
+    if (!saveId.value) return
+    try {
+      const s = await setSaveSettings(saveId.value, {
+        auto_confirm: autoConfirm.value,
+        model_provider_id: m.provider_id || undefined,
+        model: m.model || undefined,
+        reasoning_effort: m.reasoning_effort,
+        narrative: narrativePrefs.value,
+      })
+      saveModel.value = s.model_provider_id && s.model
+        ? {
+            provider_id: s.model_provider_id,
+            model: s.model,
+            reasoning_effort: s.reasoning_effort ?? undefined,
+          }
+        : null
+    } catch (err) { toast('error', (err as Error)?.message ?? '模型保存失败') }
+  }
+
+  /** 清除本存档的模型覆盖，回到「继承全局 AI 默认」。 */
+  async function clearModel() {
     if (!saveId.value) return
     try {
       await setSaveSettings(saveId.value, {
         auto_confirm: autoConfirm.value,
-        model_provider_id: providerId,
-        model,
-        reasoning_effort: reasoningEffort,
+        model_provider_id: undefined,
+        model: undefined,
+        reasoning_effort: undefined,
         narrative: narrativePrefs.value,
       })
-      saveModel.value = { provider_id: providerId, model, reasoning_effort: reasoningEffort }
-      toast('ok', '本存档模型已切换为 ' + model)
-    } catch (err) { toast('error', (err as Error)?.message ?? '切换模型失败') }
+      saveModel.value = null
+    } catch (err) { toast('error', (err as Error)?.message ?? '模型保存失败') }
   }
 
   /**
@@ -685,9 +772,6 @@ export const usePlayStore = defineStore('play', () => {
     try {
       const s = await setSaveSettings(saveId.value, {
         auto_confirm: autoConfirm.value,
-        model_provider_id: saveModel.value?.provider_id,
-        model: saveModel.value?.model,
-        reasoning_effort: saveModel.value?.reasoning_effort,
         narrative: next,
       })
       narrativePrefs.value = { ...(s.narrative ?? next) }
@@ -740,10 +824,10 @@ export const usePlayStore = defineStore('play', () => {
   return {
     saveId, ready, error, projection, detail, entries, phase, phaseDetail, sending, confirmBusy,
     revealPulse, advancePulse, goalTexts, triggerTexts,
-    pendingRefs, addRef, removeRef, clearRefs, listRefs, saveModel, narrativePrefs,
+    pendingRefs, addRef, removeRef, clearRefs, listRefs, saveModel, narrativePrefs, flowLog,
     oldestSeq, hasMoreOlder, loadingOlder,
     autoConfirm, sceneTitle, controlledId, controlled, presentChars, allChars, busy, waitingConfirm, canRerun,
     streamingEntry, phaseLabel,
-    init, loadOlder, send, rerunLastRound, confirm, switchTo, setAutoConfirm, setModel, setNarrativeOverride, skipEntry, skipCurrent, emitSkip, flushAll, applyUpgrade, teardown
+    init, loadOlder, send, rerunLastRound, confirm, switchTo, setAutoConfirm, setModel, clearModel, setNarrativeOverride, skipEntry, skipCurrent, emitSkip, flushAll, applyUpgrade, teardown
   }
 })

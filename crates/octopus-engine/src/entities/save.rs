@@ -27,6 +27,9 @@ pub struct Model {
     /// 存档级叙述段玩家偏好（section id → 开关 | 变体 key）的 JSON；NULL 表示全用故事书默认。
     #[sea_orm(nullable, column_type = "Text")]
     pub narrative_json: Option<String>,
+    /// 存档遗留区（#14）：版次升级时被删除的旧定义（JSON 数组）；NULL 表示无遗留。
+    #[sea_orm(nullable, column_type = "Text")]
+    pub legacy_json: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub last_played_at: String,

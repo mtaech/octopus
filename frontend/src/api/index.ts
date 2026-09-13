@@ -110,6 +110,9 @@ async function fetchNoContent(url: string, init?: RequestInit): Promise<void> {
     const msg = errBody?.message ?? res.statusText ?? '请求失败'
     throw mkErr(code, msg, errBody?.detail)
   }
+  // 消费响应体（这些端点多为 202 空体）：不读的话，浏览器会把「未读 body 被丢弃」
+  // 记为 net::ERR_ABORTED，污染 Network 面板 / 自动化断言。功能本身不受影响，但顺手清掉。
+  await res.text().catch(() => {})
 }
 
 // ---- 模拟网络延迟 ----
@@ -332,15 +335,24 @@ export function createSave(storybookId: string, title?: string, controlledCharac
 }
 
 export function upgradeDryRun(saveId: string): Promise<UpgradeReport> {
-  return net(run(async () => {
-    const r = mock.upgradeDryRun(saveId)
-    if (!r) throw mkErr('NOT_FOUND', '存档不存在')
-    return r
-  }), 300)
+  if (isMockMode()) {
+    return net(run(async () => {
+      const r = mock.upgradeDryRun(saveId)
+      if (!r) throw mkErr('NOT_FOUND', '存档不存在')
+      return r
+    }), 300)
+  }
+  return fetchJson<UpgradeReport>(`/api/saves/${encodeURIComponent(saveId)}/upgrade/dry-run`, { method: 'POST' })
 }
 
 export function upgradeExecute(saveId: string, dispositions: { character_id: string; disposition: Disposition }[]): Promise<{ detail: SaveDetail; backupName: string }> {
-  return net(run(async () => mock.upgradeExecute(saveId, dispositions)), 500)
+  if (isMockMode()) {
+    return net(run(async () => mock.upgradeExecute(saveId, dispositions)), 500)
+  }
+  return fetchJson<{ detail: SaveDetail; backup_name: string }>(`/api/saves/${encodeURIComponent(saveId)}/upgrade`, {
+    method: 'POST',
+    body: JSON.stringify({ dispositions })
+  }).then(r => ({ detail: r.detail, backupName: r.backup_name }))
 }
 
 export function manualSave(saveId: string): Promise<SaveListItem> {
