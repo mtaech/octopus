@@ -109,7 +109,7 @@ async function scrollToBottom(smooth = false, force = false) {
   el.scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'auto' })
   atBottom.value = true
 }
-watch(() => [store.revealPulse, store.entries.length], () => {
+watch(() => store.entries.length, () => {
   if (store.loadingOlder) return
   void scrollToBottom()
 })
@@ -118,7 +118,7 @@ function onFeedScroll() { computeAtBottom() }
 function jumpToBottom() { void scrollToBottom(true, true) }
 
 // ---------- 贴底保持 ----------
-// 卡片内容是异步渲染/合并的（markdown、字体、流式片段并进已有卡片、instant 推送不产生 revealPulse），
+// 卡片内容是异步渲染/合并的（markdown、字体、片段并进已有卡片时不改变条目条数），
 // 单次 nextTick 的 scrollTo 会落空，最后一张卡（含「重发 / 编辑 / 重跑本轮」那行）就被输入栏压住。
 // 所以在「内容变化」与「可视区变化」之后，只要玩家本来在底部，就重新贴底。
 let feedObserver: MutationObserver | null = null
@@ -188,18 +188,6 @@ onUnmounted(() => {
   sizeObserver?.disconnect()
   if (pinFrame) clearTimeout(pinFrame)
 })
-
-// 全局空格 = 跳过打字机 / 快进（不拦截输入框内空格）
-function globalKey(e: KeyboardEvent) {
-  const tag = (e.target as HTMLElement | null)?.tagName
-  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
-  if (e.code === 'Space' || e.key === ' ') {
-    e.preventDefault()
-    store.emitSkip()
-  }
-}
-onMounted(() => window.addEventListener('keydown', globalKey))
-onUnmounted(() => window.removeEventListener('keydown', globalKey))
 
 function goBack() { void router.push('/') }
 </script>

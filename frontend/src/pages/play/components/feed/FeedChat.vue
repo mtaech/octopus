@@ -201,9 +201,9 @@ watch(lastRoundKey, () => { if (editingKey.value && editingKey.value !== lastRou
       <StreamItem v-else :entry="b.entry" />
     </template>
 
-    <!-- AI 正在输入（P1-3）：管线阶段进行中且当前没有打字机内容 -->
+    <!-- AI 正在输入（P1-3）：管线阶段进行中（正文到达前占位） -->
     <div
-      v-if="!store.streamingEntry && (store.phase === 'story_thinking' || store.phase === 'character_thinking' || store.phase === 'resolving')"
+      v-if="store.phase === 'story_thinking' || store.phase === 'character_thinking' || store.phase === 'resolving'"
       class="flex items-center gap-2 px-1 text-[12px] text-muted-foreground/70"
     >
       <IconLoader2 class="size-3.5 animate-spin text-primary" />{{ store.phaseLabel }}…

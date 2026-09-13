@@ -1,7 +1,7 @@
 <script setup lang="ts">
-// 打字机文本条目（#08 Q6）：narrate/dialogue/emote 就地逐字 reveal，
-// 点击/空格可跳过。模板 B 用自带说话人列，故支持 showSpeaker=false 去重。
-// 迁移：聊天气泡 bg-secondary、旁白 text-muted-foreground、神态 text-warning；
+// 文本条目：narrate/dialogue/emote 整段直接渲染，不做打字机逐字揭示。
+// 模板 B 用自带说话人列，故支持 showSpeaker=false 去重。
+// 迁移：聊天气泡 bg-card、旁白 text-muted-foreground、神态 text-warning；
 // 头像用 Avatar + AvatarFallback（柔和语义底，角色名散列）。
 // C 面补齐：Markdown 渲染、复制、时间戳（P1-1/2/5）。
 import { computed } from 'vue'
@@ -18,19 +18,12 @@ const props = withDefaults(defineProps<{
 }>(), { showSpeaker: true })
 
 const store = usePlayStore()
-const shown = computed(() => props.entry.text.slice(0, props.entry.reveal))
-const html = computed(() => renderMarkdownInline(shown.value))
-const isStreaming = computed(() => !props.entry.done && props.entry.reveal < props.entry.text.length)
+const html = computed(() => renderMarkdownInline(props.entry.text))
 const tint = computed(() => props.entry.actorName ? nameTintClass(props.entry.actorName) : 'bg-secondary text-muted-foreground')
 const portrait = computed(() => portraitOf(store.detail?.storybook, props.entry.actorId, props.entry.actorName))
 const clock = computed(() => fmtClock(props.entry.ts))
 /** 归属「故事本身」的事件（导演裁定）：单独渲染，不当角色台词 */
 const isStory = computed(() => props.entry.actorId === '__story__')
-
-function onTap() {
-  if (isStreaming.value) { store.skipEntry(props.entry.key) }
-  else { store.emitSkip() }
-}
 
 async function copy() {
   try {
@@ -71,46 +64,35 @@ async function copy() {
         </Avatar>
         <div class="flex min-w-0 flex-1 flex-col items-start">
           <span v-if="showSpeaker" class="mb-1 ml-1 text-[12px] font-semibold text-foreground/90">{{ entry.actorName ?? '角色' }}</span>
-          <button
-            type="button"
-            class="text-foreground bg-card hover:bg-card/100 cursor-pointer self-start max-w-[82%] rounded-2xl rounded-tl-xs border border-border px-4 py-2.5 text-left text-[14px] leading-relaxed shadow-xs transition-colors backdrop-blur-xs"
-            :class="{ 'ring-1 ring-primary/40': isStreaming }"
-            @click="onTap"
+          <div
+            class="text-foreground bg-card max-w-[82%] self-start rounded-2xl rounded-tl-xs border border-border px-4 py-2.5 text-left text-[14px] leading-relaxed shadow-xs backdrop-blur-xs"
           >
             <span v-if="entry.actionBefore" class="mb-1.5 block font-serif text-[13px] italic leading-relaxed text-muted-foreground/80">{{ entry.actionBefore }}</span>
             <span v-html="html"></span>
-            <span v-if="isStreaming" class="ml-1 inline-block text-primary font-bold animate-pulse">▎</span>
-            <span v-if="isStreaming" class="ml-2 text-[10px] text-muted-foreground/50 tracking-wider">点击快进</span>
             <span v-if="entry.actionAfter" class="mt-1.5 block font-serif text-[13px] italic leading-relaxed text-muted-foreground/80">{{ entry.actionAfter }}</span>
-          </button>
+          </div>
         </div>
       </div>
     </template>
 
     <!-- narrate：旁白窄行（A 居中窄行 / B 纸面段左对齐） -->
-    <button
+    <div
       v-else-if="entry.type === 'narrate' || entry.type === 'dialogue'"
-      type="button"
-      class="text-foreground/85 cursor-pointer self-stretch rounded-lg px-1.5 py-1.5 text-left font-serif text-[14.5px] leading-[1.9] tracking-normal transition-colors hover:text-foreground"
-      :class="{ 'font-sans text-[13.5px] leading-relaxed': !showSpeaker, 'ring-1 ring-primary/30': isStreaming }"
-      @click="onTap"
+      class="text-foreground/85 self-stretch rounded-lg px-1.5 py-1.5 text-left font-serif text-[14.5px] leading-[1.9] tracking-normal"
+      :class="{ 'font-sans text-[13.5px] leading-relaxed': !showSpeaker }"
     >
       <span v-html="html"></span>
-      <span v-if="isStreaming" class="ml-1 inline-block text-primary font-bold animate-pulse">▎</span>
-    </button>
+    </div>
 
     <!-- emote：斜体神态行 -->
-    <button
+    <div
       v-else
-      type="button"
-      class="text-warning/90 cursor-pointer self-center max-w-[88%] px-3 py-1.5 text-center font-serif text-[13.5px] italic leading-relaxed transition-colors hover:text-warning"
-      :class="{ '!self-stretch !max-w-none !text-left font-sans': !showSpeaker, 'ring-1 ring-warning/30 rounded-lg': isStreaming }"
-      @click="onTap"
+      class="text-warning/90 max-w-[88%] self-center px-3 py-1.5 text-center font-serif text-[13.5px] italic leading-relaxed"
+      :class="{ '!self-stretch !max-w-none !text-left font-sans': !showSpeaker }"
     >
       <span v-if="entry.emotion" class="text-warning/80 mr-1.5 inline-flex items-center rounded-full border border-warning/40 bg-warning/10 px-2 py-0.2 text-[10.5px] not-italic font-sans">{{ entry.emotion }}</span>
       <span v-html="html"></span>
-      <span v-if="isStreaming" class="ml-1 inline-block text-primary font-bold animate-pulse">▎</span>
-    </button>
+    </div>
 
     <!-- 消息操作 / 时间戳（悬停显示） -->
     <div

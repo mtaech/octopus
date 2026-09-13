@@ -1,7 +1,7 @@
 // ============================================================
 // 游玩页 store（#18 ② 全量共享 store + #17 事件消费）
 // 职责：世界投影（本地镜像，经 hydrate + state_changes delta 增量更新）、
-// 演出流条目数组、管线阶段、打字机调度、回合提交与确认门编排。
+// 演出流条目数组、管线阶段、回合提交与确认门编排。
 // ============================================================
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
@@ -18,7 +18,7 @@ export type ContentType = 'narrate' | 'dialogue' | 'emote'
 /** 演出流条目（渲染器数据源；kind 判别联合） */
 export type FeedEntry =
   | { key: string; kind: 'scene'; round: number; sceneId: string; title: string; description?: string; ts?: string }
-  | { key: string; kind: 'content'; round: number; type: ContentType; text: string; actorId?: string; actorName?: string; emotion?: string; reveal: number; done: boolean; ts?: string; /** 气泡内台词前的动作/神态行（同说话人的 emote 收进来，避免另起一行割裂） */ actionBefore?: string; /** 气泡内台词后的动作/神态行 */ actionAfter?: string }
+  | { key: string; kind: 'content'; round: number; type: ContentType; text: string; actorId?: string; actorName?: string; emotion?: string; ts?: string; /** 气泡内台词前的动作/神态行（同说话人的 emote 收进来，避免另起一行割裂） */ actionBefore?: string; /** 气泡内台词后的动作/神态行 */ actionAfter?: string }
   | { key: string; kind: 'round'; round: number; channel: 'character' | 'meta' | 'gm'; text: string; actorName?: string; actorId?: string; ts?: string; /** 玩家显式引用的实体 */ refs?: EntityRef[]; /** 乐观追加、尚未与 round_start 事件对账 */ pending?: boolean }
   | { key: string; kind: 'system'; round: number; level: 'info' | 'warn' | 'error'; code?: string; text: string; ts?: string }
   | { key: string; kind: 'check'; round: number; payload: CheckResultPayload; ts?: string }
@@ -38,7 +38,6 @@ export interface FlowLogLine {
   tone: 'info' | 'warn' | 'error' | 'muted'
 }
 
-const TYPE_SPEED_MS = 20
 /** 每次拉取的历史页大小（后端上限 200） */
 const HISTORY_PAGE = 200
 
@@ -53,10 +52,6 @@ export const usePlayStore = defineStore('play', () => {
   const phaseDetail = ref('')
   const sending = ref(false)
   const confirmBusy = ref(false)
-  /** 打字机每揭示一字符 +1，供自动滚动/光标闪烁监听 */
-  const revealPulse = ref(0)
-  /** C 沉浸式「点击前进」脉冲：揭示完当前条目后点击 → +1（外层渲染器据此推进） */
-  const advancePulse = ref(0)
   const goalTexts = ref<Record<string, string>>({})
   const triggerTexts = ref<Record<string, string>>({})
   /** 输入框待发送的实体引用（本次行动的目标） */
@@ -74,7 +69,6 @@ export const usePlayStore = defineStore('play', () => {
 
   let unsub: (() => void) | null = null
   let keySeq = 0
-  let ticker: ReturnType<typeof setInterval> | null = null
   let watermark = 0
   /** 非空时，事件产生的条目写入该缓冲而非 entries（用于向前分页的批量重放） */
   let entrySink: FeedEntry[] | null = null
@@ -119,13 +113,6 @@ export const usePlayStore = defineStore('play', () => {
   const canRerun = computed(() =>
     entries.value.some(e => e.kind === 'round' && !e.pending && e.channel !== 'meta')
   )
-  /** 正在打字机揭示的条目（渲染器据此画光标） */
-  const streamingEntry = computed<FeedEntry | null>(() => {
-    for (const en of entries.value) {
-      if (en.kind === 'content' && !en.done && en.reveal < en.text.length) return en
-    }
-    return null
-  })
   const phaseLabel = computed(() => {
     switch (phase.value) {
       case 'story_thinking': return '主线思考中'
@@ -216,48 +203,6 @@ export const usePlayStore = defineStore('play', () => {
     pendingRefs.value = []
   }
 
-  function ensureTicker() {
-    if (!ticker) ticker = setInterval(tick, TYPE_SPEED_MS)
-  }
-  function stopTicker() {
-    if (ticker) { clearInterval(ticker); ticker = null }
-  }
-  function findStreaming(): Extract<FeedEntry, { kind: 'content' }> | null {
-    for (const e of entries.value) {
-      if (e.kind === 'content' && !e.done && e.reveal < e.text.length) return e
-    }
-    return null
-  }
-  function tick() {
-    const cur = findStreaming()
-    if (!cur) { stopTicker(); return }
-    cur.reveal = Math.min(cur.text.length, cur.reveal + 1)
-    revealPulse.value++
-    if (cur.reveal >= cur.text.length) cur.done = true
-  }
-  /** 立即揭示全部流条目（回合开始/模板操作时清空打字机队列） */
-  function flushAll() {
-    for (const e of entries.value) {
-      if (e.kind === 'content' && !e.done) { e.reveal = e.text.length; e.done = true }
-    }
-    stopTicker()
-  }
-  /** 跳过某个仍在揭示的条目 */
-  function skipEntry(key: string) {
-    for (const e of entries.value) {
-      if (e.key === key && e.kind === 'content' && !e.done) { e.reveal = e.text.length; e.done = true; return }
-    }
-  }
-  function skipCurrent() {
-    const cur = streamingEntry.value
-    if (cur) skipEntry(cur.key)
-  }
-  /** 点击/空格语义：正在揭示 → 跳过；已揭示完 → 触发前进脉冲（供 C 逐行演出推进） */
-  function emitSkip() {
-    const cur = streamingEntry.value
-    if (cur) { skipEntry(cur.key) } else { advancePulse.value++ }
-  }
-
   // ---------- 投影增量应用（#17 共享 state_changes delta） ----------
   function applyDeltas(deltas: StateDelta[]) {
     const p = projection.value
@@ -299,7 +244,6 @@ export const usePlayStore = defineStore('play', () => {
     actor: { id: string; name: string } | null | undefined,
     round: number,
     emotion?: string,
-    instant = false,
     key?: string,
     ts?: string
   ) {
@@ -320,22 +264,16 @@ export const usePlayStore = defineStore('play', () => {
           le.type = 'dialogue'
           le.actionBefore = le.text
           le.text = text
-          le.reveal = instant ? text.length : 0
-          le.done = instant
           if (!le.actorName && actor.name) le.actorName = actor.name
           if (!le.emotion && emotion) le.emotion = emotion
           if (!le.ts && ts) le.ts = ts
-          if (!instant) ensureTicker()
           return
         }
         // 连续台词：并进同一个气泡
         if (le.type === 'dialogue') {
           le.text = le.text ? le.text + '\n' + text : text
-          if (instant) { le.reveal = le.text.length; le.done = true }
-          else { le.done = false }
           if (!le.emotion && emotion) le.emotion = emotion
           if (!le.ts && ts) le.ts = ts
-          if (!instant) ensureTicker()
           return
         }
       }
@@ -343,16 +281,12 @@ export const usePlayStore = defineStore('play', () => {
         // 神态在台词后：并进气泡的动作行
         if (le.type === 'dialogue') {
           le.actionAfter = le.actionAfter ? le.actionAfter + '\n' + text : text
-          if (!instant) ensureTicker()
           return
         }
         // 连续神态：合并
         if (le.type === 'emote') {
           le.text = le.text ? le.text + '\n' + text : text
-          if (instant) { le.reveal = le.text.length; le.done = true }
-          else { le.done = false }
           if (!le.emotion && emotion) le.emotion = emotion
-          if (!instant) ensureTicker()
           return
         }
       }
@@ -363,18 +297,12 @@ export const usePlayStore = defineStore('play', () => {
       last.type === 'narrate' && last.round === round
     ) {
       last.text = last.text ? last.text + '\n' + text : text
-      if (instant) { last.reveal = last.text.length; last.done = true }
-      else { last.done = false }
-      if (!instant) ensureTicker()
       return
     }
-    const entry: Extract<FeedEntry, { kind: 'content' }> = {
+    addEntry({
       key: key ?? nextKey(), kind: 'content', round, type, text,
-      actorId: actor?.id, actorName: actor?.name, emotion,
-      reveal: instant ? text.length : 0, done: instant, ts
-    }
-    addEntry(entry)
-    if (!instant) ensureTicker()
+      actorId: actor?.id, actorName: actor?.name, emotion, ts
+    })
   }
 
   function settlePendings(round: number, status: 'ok' | 'rejected') {
@@ -410,7 +338,7 @@ export const usePlayStore = defineStore('play', () => {
   /**
    * 消费一条演出事件。
    * `replay` = true 时只重建 feed 条目：**不改本地投影（权威由后端重放给出）**、
-   * 内容立即完整显示（历史不打字机）。实时事件才做增量与动画（规范铁律 4）。
+   * 也不把事件回写到本地投影状态。
    */
   function onEvent(e: PlayEvent, replay = false) {
     if (e.seq <= watermark) return // 丢弃已消费 / 水合前迟到事件（#17 seq 水位线）
@@ -422,7 +350,6 @@ export const usePlayStore = defineStore('play', () => {
     recordFlow(e)
     switch (e.type) {
       case 'round_start': {
-        flushAll()
         // 与乐观追加的玩家回合对账，避免出现两条。
         const opt = entries.value.find(
           (en): en is Extract<FeedEntry, { kind: 'round' }> =>
@@ -453,9 +380,9 @@ export const usePlayStore = defineStore('play', () => {
         addEntry({ key, kind: 'scene', round: e.round, sceneId: e.payload.scene_id, title: e.payload.title, description: e.payload.description, ts })
         break
       }
-      case 'narrate': pushContent('narrate', e.payload.content, e.actor, e.round, undefined, replay, key, ts); break
-      case 'dialogue': pushContent('dialogue', e.payload.content, e.actor, e.round, undefined, replay, key, ts); break
-      case 'emote': pushContent('emote', e.payload.content, e.actor, e.round, e.payload.emotion, replay, key, ts); break
+      case 'narrate': pushContent('narrate', e.payload.content, e.actor, e.round, undefined, key, ts); break
+      case 'dialogue': pushContent('dialogue', e.payload.content, e.actor, e.round, undefined, key, ts); break
+      case 'emote': pushContent('emote', e.payload.content, e.actor, e.round, e.payload.emotion, key, ts); break
       case 'pending': {
         if (phase.value !== 'waiting_confirm') phase.value = 'waiting_confirm'
         addEntry({
@@ -550,7 +477,7 @@ export const usePlayStore = defineStore('play', () => {
       }))
       goalTexts.value = g
       triggerTexts.value = b
-      // 回放叙事历史：只重建 feed，不改投影（投影由后端重放权威给出），历史不打字机。
+      // 回放叙事历史：只重建 feed，不改投影（投影由后端重放权威给出）。
       // 流程日志同样从头重建（换存档 / 重新水合时不能残留上一个存档的事件）。
       flowLog.value = []
       watermark = 0
@@ -565,7 +492,7 @@ export const usePlayStore = defineStore('play', () => {
         entries.value.push({ key: 'init:scene', kind: 'scene', round: 0, sceneId: p.scene_id, title: p.scene_title })
         // 故事开头优先，缺省回落为世界前提（#29 opening）
         const opening = d.storybook.world.opening?.trim() || d.storybook.world.premise
-        if (opening) pushContent('narrate', opening, null, 0, undefined, true, 'init:opening')
+        if (opening) pushContent('narrate', opening, null, 0, undefined, 'init:opening')
         entries.value.push({ key: 'init:hint', kind: 'system', round: 0, level: 'info', text: '直接输入想做的事（如「打听怪梦的传闻」）；以 / 开头发送元指令（/存档 /免确认 /帮助）。' })
       }
       ready.value = true
@@ -814,7 +741,6 @@ export const usePlayStore = defineStore('play', () => {
 
   function teardown() {
     if (unsub) { unsub(); unsub = null }
-    stopTicker()
     watermark = 0
     projection.value = null
     ready.value = false
@@ -823,11 +749,11 @@ export const usePlayStore = defineStore('play', () => {
 
   return {
     saveId, ready, error, projection, detail, entries, phase, phaseDetail, sending, confirmBusy,
-    revealPulse, advancePulse, goalTexts, triggerTexts,
+    goalTexts, triggerTexts,
     pendingRefs, addRef, removeRef, clearRefs, listRefs, saveModel, narrativePrefs, flowLog,
     oldestSeq, hasMoreOlder, loadingOlder,
     autoConfirm, sceneTitle, controlledId, controlled, presentChars, allChars, busy, waitingConfirm, canRerun,
-    streamingEntry, phaseLabel,
-    init, loadOlder, send, rerunLastRound, confirm, switchTo, setAutoConfirm, setModel, clearModel, setNarrativeOverride, skipEntry, skipCurrent, emitSkip, flushAll, applyUpgrade, teardown
+    phaseLabel,
+    init, loadOlder, send, rerunLastRound, confirm, switchTo, setAutoConfirm, setModel, clearModel, setNarrativeOverride, applyUpgrade, teardown
   }
 })
