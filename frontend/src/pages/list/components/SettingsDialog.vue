@@ -7,6 +7,7 @@ import type { ModelEntry, ProviderConfig, ProviderKind, RoleConfig } from '@/typ
 import { MODEL_CATALOG, PROVIDER_PRESETS } from '@/api/model-catalog'
 import { catalogEntries, catalogProvider, findModelProviders, catalogModelMeta, mergeModelMeta, thinkingLevels, levelToWire, wireToLevel, LEVEL_LABEL } from '@/api/model-catalog-utils'
 import ModelPicker from './ModelPicker.vue'
+import PromptSettings from './PromptSettings.vue'
 import { AI_PRESETS, applyPreset } from '@/lib/aiPresets'
 import { confirm } from '@/lib/confirm'
 import { Button } from '@/components/ui/button'
@@ -23,7 +24,7 @@ import {
   IconSettings, IconRobot, IconPlugConnected, IconCoin, IconInfoCircle,
   IconCircleCheck, IconAlertTriangle, IconLoader2, IconPlus, IconTrash, IconChevronRight,
   IconPalette, IconSun, IconMoon, IconDeviceDesktop,
-  IconTypography, IconSearch,
+  IconTypography, IconSearch, IconMessageChatbot,
 } from '@tabler/icons-vue'
 import { isEditorIntroHidden, setEditorIntroHidden } from '@/pages/editor/stores/pair'
 
@@ -52,11 +53,12 @@ const KINDS: { value: ProviderKind; label: string }[] = [
   { value: 'openai-compatible', label: 'OpenAI 兼容端点（DeepSeek / Moonshot / Groq…）' },
 ]
 
-type SectionKey = 'roles' | 'providers' | 'budget' | 'appearance' | 'about'
+type SectionKey = 'roles' | 'providers' | 'budget' | 'prompts' | 'appearance' | 'about'
 const NAV: { key: SectionKey; label: string; icon: unknown }[] = [
   { key: 'roles', label: 'AI 模型', icon: IconRobot },
   { key: 'providers', label: '供应商', icon: IconPlugConnected },
   { key: 'budget', label: '成本护栏', icon: IconCoin },
+  { key: 'prompts', label: '提示词', icon: IconMessageChatbot },
   { key: 'appearance', label: '外观与主题', icon: IconPalette },
   { key: 'about', label: '关于', icon: IconInfoCircle },
 ]
@@ -670,6 +672,11 @@ async function save() { if (await store.save()) close() }
                 </div>
               </div>
             </div>
+          </template>
+
+          <!-- —— 提示词 —— -->
+          <template v-else-if="active === 'prompts'">
+            <PromptSettings />
           </template>
 
           <!-- —— 外观与主题 —— -->

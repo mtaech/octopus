@@ -1373,6 +1373,19 @@ impl Session {
             // 失败也发一条 error 状态的 ai_call 留痕（pi 式 span 的 status），再向上抛错。
             let out = match ai.story_intents(&call_ctx).await {
                 Ok(out) => out,
+                // 玩家按了停止：这一回合干净收尾（System 事件 + RoundEnd），不产生任何叙事，
+                // 也不把「取消」当失败往上抛——否则前端会一直卡在「思考中」。
+                Err(EngineError::Cancelled) => {
+                    tracing::info!(save_id = %ctx.save_id, round = ctx.round, "本回合的 AI 调用已被玩家取消");
+                    self.phase(PhaseStage::Idle, None);
+                    self.emit_simple(PlayEvent::System(SystemPayload {
+                        level: SystemLevel::Info,
+                        code: Some("round_cancelled".to_string()),
+                        text: "已停止本回合的 AI 推理（未产生叙事，可以重新发送）".to_string(),
+                    }));
+                    self.emit_simple(PlayEvent::RoundEnd(RoundEndPayload { round }));
+                    return Ok(());
+                }
                 Err(e) => {
                     let model = call_ctx.model.as_ref();
                     self.emit_simple(PlayEvent::AiCall(AiCallPayload {
@@ -1398,6 +1411,17 @@ impl Session {
             };
             if let Some(trace) = out.trace.clone() {
                 self.emit_simple(PlayEvent::AiCall(trace));
+            }
+            // 自动上下文压缩只重写派生 surface：给日志留一条痕，玩家看得到发生过什么。
+            if let Some(report) = out.compaction.clone() {
+                self.emit_simple(PlayEvent::System(SystemPayload {
+                    level: SystemLevel::Info,
+                    code: Some("context_compacted".to_string()),
+                    text: format!(
+                        "上下文已压缩（{}）：把最早 {} 个回合的原文换成摘要（{} → {} 字符）；叙事与存档不受影响",
+                        report.trigger, report.shadowed_rounds, report.chars_before, report.chars_after
+                    ),
+                }));
             }
             if let Some(reasoning) = out.reasoning.clone() {
                 self.emit_reasoning("story_thinking", reasoning);
@@ -4446,7 +4470,13 @@ mod tests {
     impl AiProvider for CapturingAi {
         async fn story_intents(&self, ctx: &TurnContext) -> Result<AiOutput, EngineError> {
             self.0.lock().unwrap().push(ctx.clone());
-            Ok(AiOutput { intents: vec![Intent::FinishTurn.into()], reasoning: None, intent_warnings: vec![], trace: None })
+            Ok(AiOutput {
+                intents: vec![Intent::FinishTurn.into()],
+                reasoning: None,
+                intent_warnings: vec![],
+                trace: None,
+                compaction: None,
+            })
         }
         
     }
@@ -4687,6 +4717,7 @@ mod tests {
                 reasoning: None,
                 intent_warnings: vec![],
                 trace: None,
+                compaction: None,
             })
         }
         
@@ -4826,6 +4857,7 @@ mod tests {
                 reasoning: Some("先想想天气。".into()),
                 intent_warnings: vec![],
                 trace: None,
+                compaction: None,
             })
         }
         
@@ -4877,6 +4909,7 @@ mod tests {
                 reasoning: None,
                 intent_warnings: vec![],
                 trace: None,
+                compaction: None,
             })
         }
         
@@ -5033,7 +5066,13 @@ mod tests {
             } else {
                 q.remove(0).into_iter().map(IntentEnvelope::from).collect()
             };
-            Ok(AiOutput { intents, reasoning: None, intent_warnings: vec![], trace: None })
+            Ok(AiOutput {
+                intents,
+                reasoning: None,
+                intent_warnings: vec![],
+                trace: None,
+                compaction: None,
+            })
         }
         
     }
@@ -5232,6 +5271,7 @@ mod tests {
                 reasoning: None,
                 intent_warnings: vec![],
                 trace: None,
+                compaction: None,
             })
         }
         
@@ -5413,6 +5453,7 @@ mod tests {
                 reasoning: None,
                 intent_warnings: vec![],
                 trace: None,
+                compaction: None,
             })
         }
         
@@ -6143,5 +6184,4 @@ mod tests {
     }
 
 }
-
 

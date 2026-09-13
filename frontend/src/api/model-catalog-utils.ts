@@ -32,9 +32,18 @@ export function catalogModels(id: string): string[] {
   return providerById.get(id)?.models.map(m => m.id) ?? []
 }
 
-/** 目录里某供应商的模型条目（id + 展示名），用于「恢复默认模型」 */
+/** 目录里某供应商的模型条目（id + 展示名 + 元数据），用于「恢复默认模型」/「从目录添加」 */
 export function catalogEntries(id: string): ModelEntry[] {
-  return providerById.get(id)?.models.map(m => ({ id: m.id, name: m.name })) ?? []
+  return providerById.get(id)?.models.map(m => ({
+    id: m.id,
+    name: m.name,
+    // 元数据一起落盘：后端只读 config.json（看不见这份 TS 快照），
+    // 自动上下文压缩的阈值与保留预算都取 models[].ctx。
+    ...(m.ctx === undefined ? {} : { ctx: m.ctx }),
+    ...(m.maxOut === undefined ? {} : { max_out: m.maxOut }),
+    ...(m.reasoning === undefined ? {} : { reasoning: m.reasoning }),
+    ...(m.tl === undefined ? {} : { tl: m.tl }),
+  })) ?? []
 }
 
 export function findModelProviders(modelId: string): string[] {

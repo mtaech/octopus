@@ -1,5 +1,6 @@
 //! 应用配置管理（#26）：持久化存储 providers / roles / 预算到本地 config.json（0600 权限）。
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -83,6 +84,55 @@ pub struct RolesConfig {
     pub pair: Option<RoleConfig>,
 }
 
+/// 自动上下文压缩（派生 surface 重写；权威命令日志不动）。
+///
+/// 语义对齐 DSH `compaction-basic`：token 压力越过 `ctx × threshold_ratio` 时，把最旧的
+/// 一段原文换成一份摘要，逐字保留最近 `ctx × retain_ratio`；供应商报上下文超限时再做一次
+/// 更激进的兜底压缩并重试。`ctx` 取 `providers[].models[].ctx`（目录快照里的上下文窗口），
+/// 没声明 ctx 的模型只走溢出兜底。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactionConfig {
+    /// false = 关掉压力压缩，只保留「供应商报超限」的兜底。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 越过 `ctx × threshold_ratio` 触发（默认 0.8）。
+    #[serde(default = "default_threshold_ratio")]
+    pub threshold_ratio: f64,
+    /// 逐字保留的尾巴 = `ctx × retain_ratio`（默认 0.16）。
+    #[serde(default = "default_retain_ratio")]
+    pub retain_ratio: f64,
+    /// 摘要请求的输出上限（token）。
+    #[serde(default = "default_compaction_max_tokens")]
+    pub max_tokens: u64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_threshold_ratio() -> f64 {
+    0.8
+}
+
+fn default_retain_ratio() -> f64 {
+    0.16
+}
+
+fn default_compaction_max_tokens() -> u64 {
+    8192
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            threshold_ratio: default_threshold_ratio(),
+            retain_ratio: default_retain_ratio(),
+            max_tokens: default_compaction_max_tokens(),
+        }
+    }
+}
+
 /// AI 后端开关（#26 扩展）。
 /// 取值由 ai.rs 解析；环境变量 OCTOPUS_AI 优先于这里。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +140,9 @@ pub struct AiBackendConfig {
     /// story / character 后端：auto | rig | scripted
     #[serde(default = "default_backend_mode")]
     pub provider: String,
+    /// 自动上下文压缩。
+    #[serde(default)]
+    pub compaction: CompactionConfig,
 }
 
 fn default_backend_mode() -> String {
@@ -98,7 +151,10 @@ fn default_backend_mode() -> String {
 
 impl Default for AiBackendConfig {
     fn default() -> Self {
-        Self { provider: default_backend_mode() }
+        Self {
+            provider: default_backend_mode(),
+            compaction: CompactionConfig::default(),
+        }
     }
 }
 
@@ -111,6 +167,11 @@ pub struct AppConfig {
     /// AI 后端开关：provider = auto|rig|scripted
     #[serde(default)]
     pub ai: AiBackendConfig,
+    /// 提示词覆盖表：key → 自定义文本（空 / 缺失 = 用内置默认）。
+    ///
+    /// key 见 `crate::prompts::keys`，目录见 GET /api/prompts。
+    #[serde(default)]
+    pub prompts: BTreeMap<String, String>,
 }
 
 pub fn default_config() -> AppConfig {
@@ -193,6 +254,7 @@ pub fn default_config() -> AppConfig {
         },
         turn_token_budget: Some(0),
         ai: AiBackendConfig::default(),
+        prompts: BTreeMap::new(),
     }
 }
 
@@ -257,6 +319,31 @@ mod tests {
     /// 模型条目的自定义元数据（小中转站）落盘 schema：与 AppConfig 其余字段一致是 snake_case。
     /// 字段名一改，前端 PUT 上来的 maxOut 会被 serde 当未知字段静默忽略——用户填了却存不下，
     /// 而 GET 回读也拿不到。这个测试把键名钉死。
+    /// 提示词覆盖表落盘 / 回读：键名与 AppConfig 其余字段一致是 snake_case 的 prompts。
+    #[test]
+    fn app_config_round_trips_prompts() {
+        let raw = r#"{
+            "providers": [],
+            "roles": { "story": { "provider_id": "p", "model": "m" } },
+            "prompts": { "pair.role": "自定义结对角色", "story.turn.template": "T" }
+        }"#;
+        let cfg: AppConfig = serde_json::from_str(raw).expect("配置应能反序列化");
+        assert_eq!(cfg.prompts.get("pair.role").map(String::as_str), Some("自定义结对角色"));
+        let back = serde_json::to_value(&cfg).expect("配置应能序列化");
+        assert_eq!(back["prompts"]["story.turn.template"], "T");
+        // 旧配置没有 prompts 字段也不能失败
+        let legacy: AppConfig = serde_json::from_str(
+            r#"{ "providers": [], "roles": { "story": { "provider_id": "p", "model": "m" } } }"#,
+        )
+        .expect("缺少 prompts 的旧配置应能反序列化");
+        assert!(legacy.prompts.is_empty());
+        // 旧配置没有 ai.compaction：用 DSH 同款默认（0.8 / 0.16），且默认开启。
+        assert!(legacy.ai.compaction.enabled);
+        assert_eq!(legacy.ai.compaction.threshold_ratio, 0.8);
+        assert_eq!(legacy.ai.compaction.retain_ratio, 0.16);
+        assert_eq!(legacy.ai.compaction.max_tokens, 8192);
+    }
+
     #[test]
     fn model_entry_round_trips_custom_meta() {
         let raw = r#"{

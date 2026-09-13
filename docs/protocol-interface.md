@@ -83,6 +83,12 @@ function protocol.normalize(intents, ctx) -> intents end
 上下文：对齐判定器 Lua 的只读快照。P2 先复用 `LuaHostContext`（`scene_id` / `round` / `actor` / `target` / `relationships` 已具备），
 新增只读 `present`（在场角色 id 列表）与 `controlled`；**不**暴露世界写入口（`LuaRequest` 在协议挂载点全部拒绝）。
 
+> **缓存约束（重要）**：`protocol.preamble(ctx)` 的返回值就是请求的**系统层**，位于整个请求的最前面。
+> 供应商的上下文缓存是**前缀缓存**——系统层一变，后面（整段会话历史）全部按原价重算。
+> 所以 preamble 必须是**不含逐回合变化内容**的稳定文本：不要把 `ctx.round` / `ctx.present` / `ctx.scene_id`
+> 拼进去（哪怕看起来很方便）。逐回合信息走用户消息——`turn_prompt` 已经注入了场景、在场角色、人物设定、
+> 世界词条、相关往事等。需要「按在场角色改变可用动作」时，用工具白名单，而不是把名单拼进 preamble。
+
 错误处理：`parse` 抛错、超时（`SandboxLimits.max_instructions`）、或返回形状非法 → `EngineError::Ai`，与现有「意图解析失败」同路径（不 panic）。
 
 ## 5. 装配与调用点

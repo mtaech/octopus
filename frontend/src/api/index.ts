@@ -8,7 +8,7 @@ import type {
   ValidateResult, ValidationIssue, UpgradeReport, Disposition,
   PairSuggestion, WorldProjection, PlayEvent, StreamStatus, PhaseStage,
   HistoryPage, SaveSettings, MaintenanceRow, AppConfig, ProviderTestResult, ProviderConfig, ProbeResult,
-  EntityRef, FocusEntity
+  EntityRef, FocusEntity, PromptDef
 } from '@/types'
 import * as mock from './mock/backend'
 import { delay } from './mock/backend'
@@ -528,6 +528,21 @@ export async function saveAppConfig(config: AppConfig): Promise<AppConfig> {
   return config
 }
 
+/**
+ * 提示词目录（GET /api/prompts）：内置默认 + 当前覆盖，供设置面板逐条自定义。
+ *
+ * Mock 模式没有后端注册表：返回空数组并让 UI 提示「需连接后端」，避免在前端复制一份默认文本（必然漂移）。
+ */
+export async function getPromptCatalog(): Promise<PromptDef[]> {
+  if (isMockMode()) return []
+  try {
+    return await fetchJson<PromptDef[]>('/api/prompts')
+  } catch (e) {
+    console.warn('读取提示词目录失败', e)
+    throw e
+  }
+}
+
 export function testProvider(provider: ProviderConfig): Promise<ProviderTestResult> {
   if (!isMockMode()) {
     return fetchJson<ProviderTestResult>('/api/providers/test', {
@@ -589,6 +604,25 @@ export interface PairUsage {
   reasoning_tokens?: number
 }
 
+/** 本轮**真正发给模型**的上下文构成（token 粗估）：后端口径。
+ *  前端只知道自己发了多少展示历史；压缩之后那个数会偏大，所以状态行报这个。 */
+export interface PairContextMeta {
+  /** 稳定系统层 */
+  system_tokens: number
+  /** 检查点 + 尾巴（真正发给模型的历史部分） */
+  history_tokens: number
+  /** 本轮草稿快照 + 引用目标（易变尾巴） */
+  tail_context_tokens: number
+  tools_tokens: number
+  /** 前端发来的展示历史条数 */
+  display_messages: number
+  /** 实际发给模型的消息条数（含 system 与快照） */
+  sent_messages: number
+  /** 被压缩检查点遮蔽掉的条数（只影响模型 surface，展示历史不动） */
+  shadowed_messages: number
+  compacted: boolean
+}
+
 export interface PairChatResult {
   text: string
   deltas: string[]
@@ -608,6 +642,8 @@ export interface PairChatResult {
   reasoningForReplay?: string
   /** 各类流事件计数，用于事后诊断 */
   counts?: Record<string, number>
+  /** 本轮真正发给模型的上下文构成（状态行如实报数） */
+  context?: PairContextMeta
 }
 
 /** 故事书实体的结构化引用（精准指向「要改这个」） */
@@ -629,6 +665,10 @@ export interface PairChatOptions {
   tools?: unknown[]
   /** 本轮显式引用的目标实体（完整定义） */
   focus?: PairFocusEntity[]
+  /** 会话线程 id：后端据此持久化「上下文压缩检查点」（只影响发给模型的 surface，展示历史不动） */
+  thread_id?: string
+  /** 中止本轮生成：连接一断，服务端的在途生成随之停止 */
+  signal?: AbortSignal
   /** 本轮输出预算（tokens）：思考与正文共享，缺省由后端自适应（不低于 16384） */
   max_tokens?: number
   onDelta?: (delta: string) => void
@@ -653,6 +693,7 @@ export async function pairChat(
     const res = await fetch('/api/pair/chat/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      signal: options?.signal,
       body: JSON.stringify({
         provider_id: options?.provider_id,
         model: options?.model,
@@ -660,6 +701,7 @@ export async function pairChat(
         storybook: options?.storybook,
         tools: options?.tools,
         focus: options?.focus,
+        thread_id: options?.thread_id,
         max_tokens: options?.max_tokens,
       }),
     })
@@ -686,6 +728,7 @@ export async function pairChat(
     let reasoningChars: number | undefined
     let reasoning = ''
     let reasoningForReplay: string | undefined
+    let context: PairContextMeta | undefined
     let counts: Record<string, number> | undefined
     let currentEvent = 'message'
 
@@ -735,6 +778,7 @@ export async function pairChat(
               if (parsed.finish_reason) finishReason = String(parsed.finish_reason)
               if (typeof parsed.reasoning_chars === 'number') reasoningChars = parsed.reasoning_chars
               if (parsed.counts) counts = parsed.counts as Record<string, number>
+              if (parsed.context) context = parsed.context as PairContextMeta
             } else if (currentEvent === 'done') {
               if (parsed.full_text) fullText = parsed.full_text
               if (parsed.finish_reason) finishReason = String(parsed.finish_reason)
@@ -743,6 +787,7 @@ export async function pairChat(
               if (typeof parsed.reasoning === 'string' && parsed.reasoning) reasoning = parsed.reasoning
               if (typeof parsed.reasoning_for_replay === 'string' && parsed.reasoning_for_replay) reasoningForReplay = parsed.reasoning_for_replay
               if (parsed.counts) counts = parsed.counts as Record<string, number>
+              if (parsed.context) context = parsed.context as PairContextMeta
               if (Array.isArray(parsed.tool_calls) && parsed.tool_calls.length) {
                 for (const tc of parsed.tool_calls as PairToolCall[]) {
                   if (!toolCalls.some(ex => ex.id === tc.id)) {
@@ -780,6 +825,7 @@ export async function pairChat(
       reasoning: reasoning || undefined,
       reasoningForReplay: reasoningForReplay || reasoning || undefined,
       counts,
+      context,
     }
   } catch (err) {
     throw wrapErr(err)
@@ -939,6 +985,20 @@ export async function submitRound(
     method: 'POST',
     body: JSON.stringify({ channel, text, request_id: requestId, refs, focus })
   })
+}
+
+/**
+ * 停止本回合的 AI 推理：后端取消在途调用，随后发 System(round_cancelled) + RoundEnd，
+ * 界面据此自行收尾。回合已经结束时后端返回 409（no_round_in_progress），当作无事发生。
+ */
+export async function cancelRound(saveId: string): Promise<void> {
+  if (isMockMode()) return
+  try {
+    await fetchNoContent(`/api/saves/${encodeURIComponent(saveId)}/rounds/cancel`, { method: 'POST' })
+  } catch (e) {
+    if ((e as { code?: string })?.code === 'no_round_in_progress') return
+    throw e
+  }
 }
 
 /**

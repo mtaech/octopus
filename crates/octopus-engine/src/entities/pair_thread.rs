@@ -12,6 +12,10 @@ pub struct Model {
     /// 待审查改动（JSON 数组，前端形状）：刷新 / 切会话后可恢复，避免建议丢失。
     #[sea_orm(column_type = "Text")]
     pub pending_suggestions_json: Option<String>,
+    /// 上下文压缩检查点（JSON，`PairCompaction`）：模型 surface 只发「检查点 + 尾巴」，
+    /// 权威展示历史 `pair_messages` 永不改写。
+    #[sea_orm(column_type = "Text")]
+    pub compaction_json: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

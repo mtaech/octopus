@@ -5,7 +5,10 @@
 
 use std::sync::Arc;
 
-use octopus_ai::{RigParams, RigProvider, RigProviderParams, RigRoleParams, ScriptedProvider};
+use octopus_ai::{
+    CompactionParams, RigParams, RigProvider, RigProviderParams, RigRoleParams, ScriptedProvider,
+    StoryPrompts,
+};
 use octopus_engine::AiProvider;
 
 use crate::config::{AppConfig, RoleConfig};
@@ -92,6 +95,37 @@ fn role_defaults(cfg: &AppConfig, role: &RoleConfig) -> Result<RigRoleParams, St
     })
 }
 
+/// 每个模型声明的上下文窗口（`providers[].models[].ctx`）→ `"{provider}/{model}"`。
+///
+/// 自动压缩的阈值 / 保留预算都以它为基数；目录快照（前端 TS）里的 ctx 只有落盘到
+/// config.json 才看得见，所以后端只认这里。没声明的模型不做压力压缩（只留溢出兜底）。
+fn model_context_windows(cfg: &AppConfig) -> std::collections::HashMap<String, u64> {
+    let mut out = std::collections::HashMap::new();
+    for p in &cfg.providers {
+        for m in &p.models {
+            if let Some(ctx) = m.ctx.filter(|c| *c > 0) {
+                out.insert(format!("{}/{}", p.id, m.id), ctx as u64);
+            }
+        }
+    }
+    out
+}
+
+/// 配置里的压缩比例 → rig 参数（保守钳制：配置写歪了也不至于每回合都压）。
+fn compaction_params(c: &crate::config::CompactionConfig) -> CompactionParams {
+    let threshold = c.threshold_ratio.clamp(0.1, 1.0);
+    CompactionParams {
+        enabled: c.enabled,
+        threshold_ratio: threshold,
+        // 保留比例必须低于阈值，否则压完仍然超阈、白压一次。
+        retain_ratio: c
+            .retain_ratio
+            .clamp(0.0, 0.9)
+            .min((threshold - 0.05).max(0.0)),
+        max_tokens: c.max_tokens.clamp(512, 200_000),
+    }
+}
+
 fn build_rig(cfg: &AppConfig) -> Result<RigProvider, String> {
     let providers = provider_entries(cfg);
     if providers.is_empty() {
@@ -106,16 +140,28 @@ fn build_rig(cfg: &AppConfig) -> Result<RigProvider, String> {
         .map(|role| role_defaults(cfg, role))
         .transpose()?
         .unwrap_or_else(|| story.clone());
+    let model_ctx = model_context_windows(cfg);
+    let compaction = compaction_params(&cfg.ai.compaction);
     tracing::info!(
         providers = providers.len(),
         story_model = %story.model,
         pair_model = %pair.model,
+        windows = model_ctx.len(),
+        compaction_enabled = compaction.enabled,
+        threshold_ratio = compaction.threshold_ratio,
+        retain_ratio = compaction.retain_ratio,
         "启用 rig AiProvider（OpenAI 兼容；支持按存档覆盖模型）"
     );
+    // 提示词：内置默认 + 配置里的非空覆盖（空 = 用默认）。
+    let mut prompts = StoryPrompts::default();
+    prompts.apply_overrides(&cfg.prompts);
     RigProvider::new(RigParams {
         providers,
         story,
         pair,
+        prompts,
+        model_ctx,
+        compaction,
     })
 }
 

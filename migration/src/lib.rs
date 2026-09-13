@@ -19,6 +19,7 @@ mod m20260915_000016_add_legacy_to_saves;
 mod m20260916_000017_create_snapshots;
 mod m20260917_000018_drop_roles_from_saves;
 mod m20260918_000019_create_ai_conversations;
+mod m20260919_000020_add_compaction_to_pair_threads;
 
 pub struct Migrator;
 
@@ -45,6 +46,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260916_000017_create_snapshots::Migration),
             Box::new(m20260917_000018_drop_roles_from_saves::Migration),
             Box::new(m20260918_000019_create_ai_conversations::Migration),
+            Box::new(m20260919_000020_add_compaction_to_pair_threads::Migration),
         ]
     }
 }

@@ -131,6 +131,23 @@ pub struct PairThreadRow {
     pub pending_suggestions: Option<Value>,
 }
 
+/// 结对线程的**压缩检查点**（派生数据）。
+///
+/// 只有模型 surface 用它：请求发的是「检查点 + 尾巴」，权威展示历史 `pair_messages`
+/// 永不改写，所以压缩不会让创作者丢掉任何一条对话。语义对齐 DSH 的 compaction。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PairCompaction {
+    /// 被摘要遮蔽掉的前 N 条消息（按前端发来的顺序）。
+    pub shadowed: usize,
+    /// 遮蔽前缀的指纹：对不上（清空 / 换线程 / 改了历史）就作废重压。
+    pub fingerprint: String,
+    /// 摘要正文（逐字回放：只有重新压缩时才会变，前缀缓存才稳）。
+    pub summary: String,
+    /// 遮蔽前后的字符数（摘要必须更短才算成功）。
+    pub chars_before: u64,
+    pub chars_after: u64,
+}
+
 /// 由首条用户消息派生会话标题（单行、截断到 20 字符）。
 fn derive_thread_title(text: &str) -> String {
     let line = text
@@ -1562,6 +1579,41 @@ impl SqliteStore {
         Ok(true)
     }
 
+    /// 读线程的压缩检查点；解析失败 / 线程不存在一律当作「没有」（派生数据，静默降级）。
+    pub async fn pair_thread_compaction(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<PairCompaction>, EngineError> {
+        let row = entities::pair_thread::Entity::find_by_id(thread_id.to_string())
+            .one(&self.db)
+            .await?;
+        Ok(row
+            .and_then(|m| m.compaction_json)
+            .and_then(|s| serde_json::from_str::<PairCompaction>(&s).ok()))
+    }
+
+    /// 覆盖线程的压缩检查点；None 表示清空。线程不存在返回 false。
+    pub async fn set_pair_thread_compaction(
+        &self,
+        thread_id: &str,
+        compaction: Option<&PairCompaction>,
+    ) -> Result<bool, EngineError> {
+        let Some(m) = entities::pair_thread::Entity::find_by_id(thread_id.to_string())
+            .one(&self.db)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let json = match compaction {
+            Some(c) => Some(serde_json::to_string(c)?),
+            None => None,
+        };
+        let mut active: entities::pair_thread::ActiveModel = m.into();
+        active.compaction_json = Set(json);
+        active.update(&self.db).await?;
+        Ok(true)
+    }
+
     pub async fn list_pair_threads(
         &self,
         storybook_id: &str,
@@ -1615,6 +1667,7 @@ impl SqliteStore {
             created_at: Set(now.clone()),
             updated_at: Set(now.clone()),
             pending_suggestions_json: Set(None),
+            compaction_json: Set(None),
         };
         let inserted = active.insert(&self.db).await?;
         Ok(PairThreadRow {

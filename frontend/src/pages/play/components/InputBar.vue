@@ -14,7 +14,7 @@ import { filterRefItems, groupRefItems, playRefItems, toEntityRef, type RefItem 
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
-import { IconSend, IconTerminal2, IconUser, IconDeviceFloppy, IconHelp, IconArrowsExchange, IconCheck, IconAt, IconWand, IconSwords, IconRobot, IconSettings, IconChartHistogram } from '@tabler/icons-vue'
+import { IconSend, IconPlayerStopFilled, IconTerminal2, IconUser, IconDeviceFloppy, IconHelp, IconArrowsExchange, IconCheck, IconAt, IconWand, IconSwords, IconRobot, IconSettings, IconChartHistogram } from '@tabler/icons-vue'
 import SaveModelPicker from '@/components/SaveModelPicker.vue'
 import { catalogModelMeta, mergeModelMeta, wireToLevel, LEVEL_LABEL } from '@/api/model-catalog-utils'
 import { toast } from '@/api'
@@ -219,6 +219,16 @@ const metaHint = computed(() => {
 })
 const isMeta = computed(() => metaHint.value.startsWith('元'))
 const disabled = computed(() => !store.ready || store.sending)
+/** AI 正在推理：此时「发送」换成「停止」（后端会真正取消在途调用）。 */
+const aiThinking = computed(() => store.phase === 'story_thinking')
+/** 停止按钮已点：等事件流收尾（System round_cancelled + RoundEnd）期间不再重复点。 */
+const stopRequested = ref(false)
+watch(aiThinking, v => { if (!v) stopRequested.value = false })
+async function onStop(): Promise<void> {
+  if (stopRequested.value) return
+  stopRequested.value = true
+  await store.stopRound()
+}
 const placeholder = computed(() => {
   if (store.waitingConfirm) return '有待确认动作 — 请先在上方确认或取消…'
   return '输入你想做的事（/ 开头 = 元指令，如 /存档 /帮助）…'
@@ -534,6 +544,18 @@ function quickRun(label: string) {
         ></div>
       </div>
       <Button
+        v-if="aiThinking"
+        variant="destructive"
+        class="h-11 shrink-0 gap-1.5 rounded-xl px-5 text-[15px] font-bold shadow-sm transition-all"
+        :disabled="stopRequested"
+        title="取消这一回合的 AI 推理（在途请求会被真正中断，不再消耗 token）"
+        @click="onStop"
+      >
+        <IconPlayerStopFilled class="size-4 mr-1" />
+        <span>{{ stopRequested ? '停止中…' : '停止' }}</span>
+      </Button>
+      <Button
+        v-else
         class="h-11 shrink-0 gap-1.5 rounded-xl px-5 text-[15px] font-bold shadow-sm transition-all"
         :disabled="disabled || !input.trim()"
         @click="submit"

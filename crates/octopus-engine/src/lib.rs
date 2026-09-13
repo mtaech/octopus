@@ -51,12 +51,16 @@ pub use lua_host::{
 };
 pub use modifiers::{attribute_modifiers, AttrModifier};
 pub use memory::{FtsMemoryRetriever, MemoryIndexer};
-pub use ports::{AiOutput, AiProvider, AiSlot, ConvRecord, ConversationStore, EventSink, LoreView, MemoryHit, MemoryRetriever, ModelRef, NarrativeView, PersonaView, SceneBrief, SummaryStore, TurnContext};
+pub use ports::{
+    AiOutput, AiProvider, AiSlot, CompactionReport, ConvRecord, ConversationStore, EventSink,
+    LoreView, MemoryHit, MemoryRetriever, ModelRef, NarrativeView, PersonaView, SceneBrief,
+    SummaryStore, TurnContext,
+};
 pub use protocol::{
     build_protocol_adapter, check_protocol_conformance, intent_kind, is_known_intent,
     parse_intent_envelopes, parse_intents, protocol_sandbox_limits, DeclarativeProtocol, DefaultProtocol, LuaProtocol,
     ProtocolAdapter, ProtocolMode, ProtocolSpec, KNOWN_INTENTS,
-    NARRATIVE_INTENTS, SYSTEM_PREAMBLE,
+    NARRATIVE_INTENTS, SYSTEM_PREAMBLE, TOOL_PREAMBLE,
 };
 pub use recovery::{plan_rest, rest_deltas, RecoveryTrigger, RestKind};
 pub use resolve::{
@@ -69,7 +73,8 @@ pub use session::{RewindPlan, Session, SnapshotBase};
 pub use state::WorldState;
 pub use storage::{
     event_kind, is_narrative_event, narrative_text, NewPairMessage, PairMessageRow,
-    PairThreadRow, PersistedEvent, SaveUpgradeWrite, SnapshotRow, SqliteStore, StorybookRow,
+    PairCompaction, PairThreadRow, PersistedEvent, SaveUpgradeWrite, SnapshotRow, SqliteStore,
+    StorybookRow,
     SNAPSHOT_FORMAT_VERSION, SNAPSHOT_RETENTION,
 };
 pub use text_index::{index_text, match_expression};

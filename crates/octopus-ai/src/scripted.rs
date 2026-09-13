@@ -33,6 +33,7 @@ impl AiProvider for ScriptedProvider {
             reasoning: None,
             intent_warnings: vec![],
             trace: None,
+            compaction: None,
         })
     }
 

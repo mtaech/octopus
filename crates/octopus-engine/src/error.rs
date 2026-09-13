@@ -10,6 +10,8 @@ pub enum EngineError {
     StorybookUnpublished(String),
     #[error("回合仍在进行中")]
     RoundInProgress,
+    #[error("本回合已被取消")]
+    Cancelled,
     #[error("输入为空")]
     EmptyInput,
     #[error("冲突: {0}")]

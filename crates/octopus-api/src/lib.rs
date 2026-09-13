@@ -8,6 +8,7 @@ pub mod error;
 pub mod fetch;
 pub mod logging;
 pub mod pair;
+pub mod prompts;
 pub mod providers;
 
 use std::collections::{BTreeMap, HashMap};
@@ -618,6 +619,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/assets/{name}", get(get_asset))
         .route("/api/providers/probe", post(providers::probe_models))
         .route("/api/providers/test", post(providers::test_provider))
+        .route("/api/prompts", get(prompts::list_prompts))
         .route("/api/pair/chat", post(pair::pair_chat))
         .route("/api/fetch-url", post(fetch::fetch_url))
         .route("/api/pair/chat/stream", post(pair::pair_chat_stream))
@@ -662,6 +664,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/saves/{id}/history", get(get_history))
         .route("/api/saves/{id}/stream", get(stream))
         .route("/api/saves/{id}/rounds", post(submit_round))
+        .route("/api/saves/{id}/rounds/cancel", post(cancel_round))
         .route("/api/saves/{id}/rerun", post(rerun_round))
         .route(
             "/api/saves/{id}/rounds/{round_id}/confirmation",
@@ -1197,6 +1200,28 @@ async fn submit_round(
         }
         maybe_snapshot(&app_for_snap, &session, &sid).await;
     });
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// 停止本回合的 AI 推理：取消在途调用。
+///
+/// 回合仍在进行时才有意义（否则 409）；取消后引擎会发 System（code=round_cancelled）
+/// 与 RoundEnd，玩家可以立刻重新发送。
+async fn cancel_round(
+    State(app): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let session = app.session_for(&id).await?;
+    if session.is_idle() {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "no_round_in_progress",
+            "当前没有正在进行的回合",
+        ));
+    }
+    let ai = app.ai.read().expect("ai poisoned").clone();
+    ai.cancel(&id);
+    tracing::info!(save_id = %id, "收到停止请求：已取消在途 AI 调用");
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -2499,6 +2524,7 @@ mod tests {
                 reasoning: None,
                 intent_warnings: vec![],
                 trace: None,
+                compaction: None,
             })
         }
         
@@ -2581,6 +2607,7 @@ mod tests {
                     reasoning: None,
                     intent_warnings: vec![],
                     trace: None,
+                    compaction: None,
                 })
             }
             
@@ -2837,6 +2864,65 @@ mod tests {
         assert!(!draft.published, "草稿应带 published=false");
     }
 
+    /// 结对压缩检查点随线程落库（派生数据）：写回 → 读回一致；清空 → None。
+    #[tokio::test]
+    async fn pair_thread_compaction_round_trips() {
+        let (base_url, state) = spawn_app().await;
+        let client = reqwest::Client::new();
+        let sb = "sb-fallingstar";
+        let t: PairThreadRecord = client
+            .post(format!("{base_url}/api/storybooks/{sb}/pair/threads"))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        let c = octopus_engine::PairCompaction {
+            shadowed: 4,
+            fingerprint: "abcd1234".into(),
+            summary: "## 目标\n- 做一本轻小说".into(),
+            chars_before: 4000,
+            chars_after: 40,
+        };
+        assert!(state
+            .store()
+            .set_pair_thread_compaction(&t.id, Some(&c))
+            .await
+            .unwrap());
+        assert_eq!(
+            state.store().pair_thread_compaction(&t.id).await.unwrap().as_ref(),
+            Some(&c),
+            "检查点应原样读回"
+        );
+
+        state
+            .store()
+            .set_pair_thread_compaction(&t.id, None)
+            .await
+            .unwrap();
+        assert!(state
+            .store()
+            .pair_thread_compaction(&t.id)
+            .await
+            .unwrap()
+            .is_none());
+        // 不存在的线程：读 None、写 false。
+        assert!(state
+            .store()
+            .pair_thread_compaction("pt-nope")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!state
+            .store()
+            .set_pair_thread_compaction("pt-nope", Some(&c))
+            .await
+            .unwrap());
+    }
+
     /// 待审查改动随线程落库：刷新 / 切会话后可恢复；清空后为 None。
     #[tokio::test]
     async fn test_api_pair_thread_pending_suggestions_persist() {
@@ -2901,6 +2987,113 @@ mod tests {
                 .is_none(),
             "清空后应为 None"
         );
+    }
+
+    /// 停止按钮：取消在途 AI 调用 → 干净收尾（round_cancelled + round_end），会话回到 idle。
+    ///
+    /// 这条盯的是最容易出的毛病：取消后前端永远卡在「思考中」。
+    #[tokio::test]
+    async fn cancel_round_stops_the_inflight_ai_call() {
+        struct CancellableAi {
+            started: Arc<tokio::sync::Semaphore>,
+            gate: Arc<tokio::sync::Semaphore>,
+        }
+        #[async_trait::async_trait]
+        impl AiProvider for CancellableAi {
+            async fn story_intents(&self, _ctx: &TurnContext) -> Result<AiOutput, EngineError> {
+                self.started.add_permits(1);
+                // 等「停止」：取消后返回 Cancelled，模拟在途请求被中断。
+                let _ = self.gate.acquire().await;
+                Err(EngineError::Cancelled)
+            }
+            fn cancel(&self, _save_id: &str) {
+                self.gate.add_permits(1);
+            }
+        }
+
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (base, state) = spawn_app_with_ai(Arc::new(CancellableAi {
+            started: started.clone(),
+            gate: gate.clone(),
+        }))
+        .await;
+        let client = reqwest::Client::new();
+        let detail: SaveDetail = client
+            .post(format!("{base}/api/saves"))
+            .json(&CreateSaveRequest {
+                storybook_id: "sb-fallingstar".to_string(),
+                title: Some("停止测试".to_string()),
+                controlled_character_id: None,
+                is_sandbox: Some(true),
+            })
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let save_id = detail.item.id.clone();
+
+        let round = client
+            .post(format!("{base}/api/saves/{save_id}/rounds"))
+            .json(&json!({ "channel": "character", "text": "我看看周围" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(round.status().as_u16(), 202);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), started.acquire())
+            .await
+            .expect("回合应进入 AI");
+
+        // 空闲会话上按停止：409（没有在途回合）。
+        let other = client
+            .post(format!("{base}/api/saves/{save_id}/rounds/cancel"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(other.status().as_u16(), 202, "进行中的回合应受理停止请求");
+
+        // 取消后：日志里必须有 round_cancelled + round_end——前端就是靠它们退出「思考中」。
+        let mut saw_cancelled = false;
+        let mut saw_round_end = false;
+        for _ in 0..200 {
+            let rows = state.store().load_events(&save_id).await.unwrap_or_default();
+            saw_cancelled = rows.iter().any(|r| {
+                matches!(&r.envelope.event, PlayEvent::System(p)
+                    if p.code.as_deref() == Some("round_cancelled"))
+            });
+            saw_round_end = rows
+                .iter()
+                .any(|r| matches!(&r.envelope.event, PlayEvent::RoundEnd(_)));
+            if saw_cancelled && saw_round_end {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            saw_cancelled,
+            "日志里应有 code=round_cancelled 的 System 事件"
+        );
+        assert!(saw_round_end, "取消也要发 RoundEnd，前端才会退出「思考中」");
+
+        // 取消之后可以立刻重发（busy 已释放，不再被 409 拦住）。
+        let mut again_status = 0u16;
+        for _ in 0..100 {
+            let again = client
+                .post(format!("{base}/api/saves/{save_id}/rounds"))
+                .json(&json!({ "channel": "character", "text": "重新来" }))
+                .send()
+                .await
+                .unwrap();
+            again_status = again.status().as_u16();
+            if again_status == 202 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(again_status, 202, "取消后必须能重新提交回合");
+        let _ = state;
     }
 
     /// 删除故事书：级联清掉结对线程；既有存档因内嵌冻结副本而保持可玩（自包含）。
@@ -3395,6 +3588,42 @@ mod tests {
             StatusCode::OK,
             "通过一致性的 Lua 协议应可发布"
         );
+    }
+
+    /// 提示词目录（GET /api/prompts）：默认值非空、覆盖表能反映到目录、回合模板变量齐全。
+    #[tokio::test]
+    async fn test_api_prompts_catalog() {
+        let (base_url, _state) = spawn_app().await;
+        let client = reqwest::Client::new();
+        let res = client
+            .get(format!("{base_url}/api/prompts"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let list: serde_json::Value = res.json().await.unwrap();
+        let arr = list.as_array().expect("目录应是数组");
+        assert!(arr.len() >= 24, "游玩 + 结对两处的提示词都应登记，实际 {}", arr.len());
+        for p in arr {
+            let key = p["key"].as_str().unwrap_or_default();
+            assert!(!key.is_empty());
+            let default = p["default"].as_str().unwrap_or_default();
+            assert!(!default.trim().is_empty(), "默认文本不能为空：{key}");
+            assert!(p["override_text"].is_null(), "未覆盖时应为 null：{key}");
+        }
+        let pair = arr.iter().find(|p| p["key"] == "pair.role").expect("结对 AI 角色提示词");
+        assert!(pair["default"].as_str().unwrap().contains("结对"));
+        let turn = arr
+            .iter()
+            .find(|p| p["key"] == "story.turn.template")
+            .expect("游玩 AI 回合模板");
+        let vars = turn["variables"].as_array().unwrap();
+        for name in ["round", "personas", "text", "gm"] {
+            assert!(
+                vars.iter().any(|v| v["name"] == name),
+                "回合模板应暴露变量 {name}"
+            );
+        }
     }
 
     #[tokio::test]

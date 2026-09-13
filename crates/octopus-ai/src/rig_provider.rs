@@ -6,8 +6,11 @@
 
 use async_trait::async_trait;
 use octopus_engine::{
-    AiOutput, AiProvider, EngineError, ModelRef, TurnContext, build_protocol_adapter,
+    AiOutput, AiProvider, CompactionReport, EngineError, ModelRef, ProtocolMode, TurnContext,
+    build_protocol_adapter,
 };
+
+use crate::prompt::{StoryPrompts, render, render_block};
 use octopus_types::{
     AiCallMessage, AiCallPayload, AiCallStatus, AiCallUsage, IntentEnvelope, RoundChannel,
 };
@@ -35,6 +38,25 @@ pub struct RigRoleParams {
     pub sampling: serde_json::Value,
 }
 
+/// 自动上下文压缩参数（DSH `compaction-basic` 的同一套语义）。
+#[derive(Debug, Clone)]
+pub struct CompactionParams {
+    /// false = 关掉压力压缩，只保留「供应商报上下文超限」的兜底。
+    pub enabled: bool,
+    /// 越过 `ctx × threshold_ratio` 触发。
+    pub threshold_ratio: f64,
+    /// 逐字保留的尾巴 = `ctx × retain_ratio`。
+    pub retain_ratio: f64,
+    /// 摘要请求的输出上限。
+    pub max_tokens: u64,
+}
+
+impl Default for CompactionParams {
+    fn default() -> Self {
+        Self { enabled: true, threshold_ratio: 0.8, retain_ratio: 0.16, max_tokens: 8192 }
+    }
+}
+
 /// 构造 rig provider 所需的全部参数（由 config.json 的 providers / roles 映射而来）。
 #[derive(Debug, Clone)]
 pub struct RigParams {
@@ -43,6 +65,13 @@ pub struct RigParams {
     pub story: RigRoleParams,
     /// 便宜角色（pair）：只用于场景摘要压缩等派生记忆。
     pub pair: RigRoleParams,
+    /// 可覆盖的提示词（已解析的最终文本；Default = 引擎内置默认）。
+    pub prompts: StoryPrompts,
+    /// 每个模型声明的上下文窗口，key = `"{provider_id}/{model}"`：自动压缩的阈值基数。
+    /// 缺了就不做压力压缩（只留溢出兜底）。
+    pub model_ctx: std::collections::HashMap<String, u64>,
+    /// 自动上下文压缩参数。
+    pub compaction: CompactionParams,
 }
 
 pub struct RigProvider {
@@ -58,6 +87,8 @@ pub struct RigProvider {
     pair_temperature: f64,
     pair_max_tokens: u64,
     pair_sampling: serde_json::Value,
+    /// 玩法 / 聊天 AI 的提示词（含用户覆盖）。
+    story_prompts: StoryPrompts,
     /// 每存档一条追加式会话：只追加、不重写历史，前缀逐字节稳定，
     /// 供应商据此复用 prompt / KV 缓存（#31 缓存会话）。
     conversations: std::sync::Mutex<std::collections::HashMap<String, Vec<ConvMessage>>>,
@@ -65,6 +96,19 @@ pub struct RigProvider {
     conv_store: std::sync::Mutex<Option<std::sync::Arc<dyn octopus_engine::ConversationStore>>>,
     /// 已从持久层载入过会话的存档（懒加载去重）。
     conv_loaded: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// 每个模型声明的上下文窗口（key = `"{provider_id}/{model}"`）。
+    model_ctx: std::collections::HashMap<String, u64>,
+    /// 自动上下文压缩参数。
+    compaction: CompactionParams,
+    /// 每存档最近一次调用**供应商回传的真实 input token**：压力触发用它，不靠估算。
+    last_input: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    /// 每存档学到的「字符 / token」系数：把 token 预算换算成消息量时用它。
+    chars_per_token: std::sync::Mutex<std::collections::HashMap<String, f64>>,
+    /// 每存档上一轮请求的逐条消息指纹：缓存前缀守门用（意外失配打 WARN）。
+    last_prefix: std::sync::Mutex<std::collections::HashMap<String, Vec<u64>>>,
+    /// 每存档的「停止」信号：与在途补全赛跑，唤醒即丢弃该请求。
+    cancel_signals:
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Notify>>>,
 }
 
 /// 持久化记录 ↔ 内存消息互转。
@@ -100,9 +144,6 @@ enum ConvRole {
     User,
     Assistant,
 }
-
-/// 单存档会话保留的消息上限：超出后从最旧丢弃（缓存前缀随之重建）。
-const MAX_CONV_MESSAGES: usize = 80;
 
 /// 意图解析失败后的自动重试次数（不含首次）：重试 = 把失败原因回喂模型重新输出。
 /// 上限 2 次 = 单轮最多 3 次调用；再失败才把回合判失败（pi 式 agent 循环的 retry 上限）。
@@ -142,9 +183,16 @@ impl RigProvider {
             pair_temperature: p.pair.temperature,
             pair_max_tokens: p.pair.max_tokens,
             pair_sampling: p.pair.sampling,
+            story_prompts: p.prompts,
             conversations: std::sync::Mutex::new(std::collections::HashMap::new()),
             conv_store: std::sync::Mutex::new(None),
             conv_loaded: std::sync::Mutex::new(std::collections::HashSet::new()),
+            model_ctx: p.model_ctx,
+            compaction: p.compaction,
+            last_input: std::sync::Mutex::new(std::collections::HashMap::new()),
+            chars_per_token: std::sync::Mutex::new(std::collections::HashMap::new()),
+            last_prefix: std::sync::Mutex::new(std::collections::HashMap::new()),
+            cancel_signals: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -199,34 +247,48 @@ fn sampling_with_effort(
     }
 }
 
-/// 组装一轮提示词（单一 AI）：注入【相关往事】与回合工具结果。
+/// 组装一轮提示词（单一 AI，引擎默认提示词）：注入相关往事与回合工具结果。
+///
+/// 保留这个无参入口供默认路径与测试使用；运行期走 turn_prompt_with（提示词可被配置覆盖）。
+#[allow(dead_code)]
 fn turn_prompt(ctx: &TurnContext) -> String {
-    turn_prompt_inner(ctx, true)
+    turn_prompt_with(ctx, &StoryPrompts::default())
 }
 
-/// 把检索到的相关往事渲染成【相关往事】块；为空则不注入。
+/// 用给定（已解析）提示词组装一轮提示词。
+fn turn_prompt_with(ctx: &TurnContext, prompts: &StoryPrompts) -> String {
+    turn_prompt_inner(ctx, true, prompts)
+}
+
+/// 把检索到的相关往事渲染成相关往事块；为空则不注入。
 ///
 /// 明确告诉模型这是「可能过时的历史片段」，避免把旧事当当前事实照抄。
-fn memories_block(ctx: &TurnContext) -> String {
+fn memories_block(ctx: &TurnContext, template: &str) -> String {
     if ctx.memories.is_empty() {
         return String::new();
     }
-    let mut b = String::from(
-        "\n【相关往事】（仅在相关时参考的历史片段，不要照抄；与当前场景冲突时以当前为准）\n",
-    );
+    let mut items = String::new();
     for m in &ctx.memories {
         let text = m.text.trim();
         if text.is_empty() {
             continue;
         }
-        b.push_str(&format!("- [第{}回合/{}] {text}\n", m.round, m.kind));
+        items.push_str(&format!("- [第{}回合/{}] {text}\n", m.round, m.kind));
     }
-    b
+    if items.is_empty() {
+        return String::new();
+    }
+    render_block(template, &items)
 }
 
-fn turn_prompt_inner(ctx: &TurnContext, include_memories: bool) -> String {
+fn turn_prompt_inner(ctx: &TurnContext, include_memories: bool, prompts: &StoryPrompts) -> String {
+    let blocks = &prompts.blocks;
     // 相关往事按预算注入（#05 §3.4）。
-    let memories = if include_memories { memories_block(ctx) } else { String::new() };
+    let memories = if include_memories {
+        memories_block(ctx, &blocks.memories)
+    } else {
+        String::new()
+    };
     let channel = match ctx.channel {
         RoundChannel::Character => "角色输入",
         RoundChannel::Meta => "元指令",
@@ -236,29 +298,20 @@ fn turn_prompt_inner(ctx: &TurnContext, include_memories: bool) -> String {
     let canon = if ctx.canon.is_empty() {
         String::new()
     } else {
-        let mut b = String::from(
-            "
-【已裁定的事实（导演给出，最高优先级：必须遵守，不得推翻）】
-",
-        );
+        let mut items = String::new();
         for c in &ctx.canon {
-            b.push_str(&format!(
-                "- {c}
-"
-            ));
+            items.push_str(&format!("- {c}\n"));
         }
-        b
+        render_block(&blocks.canon, &items)
     };
     // #04 ⑦ 回合内续轮：只回喂模型自己刚触发的 query_world / check / interact 结果，
     // 不重发世界全量。首轮该字段为空 → 提示词与单轮路径逐字一致。
     let turn_feedback = if include_memories && !ctx.turn_feedback.is_empty() {
-        let mut b = String::from(
-            "\n【本轮工具结果】（你刚发起的查询 / 判定结果，请据此继续；信息足够时可输出 finish_turn 收束）\n",
-        );
+        let mut items = String::new();
         for f in &ctx.turn_feedback {
-            b.push_str(&format!("- {f}\n"));
+            items.push_str(&format!("- {f}\n"));
         }
-        b
+        render_block(&blocks.turn_feedback, &items)
     } else {
         String::new()
     };
@@ -268,30 +321,24 @@ fn turn_prompt_inner(ctx: &TurnContext, include_memories: bool) -> String {
     let quests = if shown.is_empty() {
         String::new()
     } else {
-        let mut b = String::from(
-            "
-【当前任务】
-",
-        );
+        let mut items = String::new();
         for q in shown {
-            b.push_str(&format!(
-                "- [{}] {}{}
-",
+            items.push_str(&format!(
+                "- [{}] {}{}\n",
                 if q.done { "x" } else { " " },
                 q.text,
                 if q.primary { "（主线）" } else { "" }
             ));
         }
-        b
+        render_block(&blocks.quests, &items)
     };
     // 可推进的场景清单：不给合法 id，AI 用 advance_scene 只能瞎猜目标。
     let scenes = if ctx.scenes.is_empty() {
         String::new()
     } else {
-        let mut b =
-            String::from("\n【可推进的场景】需要换场时用 advance_scene {target_scene_id}：\n");
+        let mut items = String::new();
         for s in &ctx.scenes {
-            b.push_str(&format!(
+            items.push_str(&format!(
                 "- {}{}（{}）{}\n",
                 if s.chapter.is_empty() {
                     String::new()
@@ -300,26 +347,17 @@ fn turn_prompt_inner(ctx: &TurnContext, include_memories: bool) -> String {
                 },
                 s.title,
                 s.id,
-                if s.id == ctx.scene_id {
-                    " ← 当前"
-                } else {
-                    ""
-                }
+                if s.id == ctx.scene_id { " ← 当前" } else { "" }
             ));
         }
-        b
+        render_block(&blocks.scenes, &items)
     };
     // 当前遭遇（结构化敌人）
     let encounters = if ctx.encounters.iter().any(|e| e.active) {
-        let mut b = String::from(
-            "
-【当前遭遇】
-",
-        );
+        let mut items = String::new();
         for e in ctx.encounters.iter().filter(|e| e.active).take(3) {
-            b.push_str(&format!(
-                "- {}{}
-",
+            items.push_str(&format!(
+                "- {}{}\n",
                 e.name,
                 e.note
                     .as_ref()
@@ -327,28 +365,21 @@ fn turn_prompt_inner(ctx: &TurnContext, include_memories: bool) -> String {
                     .unwrap_or_default()
             ));
             for en in &e.enemies {
-                b.push_str(&format!(
-                    "  · {} {} HP {}/{} AC {}
-",
+                items.push_str(&format!(
+                    "  · {} {} HP {}/{} AC {}\n",
                     en.id, en.name, en.hp, en.max, en.ac
                 ));
             }
         }
-        b
+        render_block(&blocks.encounters, &items)
     } else {
         String::new()
     };
     // 导演模式专属说明
     let gm = if ctx.channel == RoundChannel::Gm {
-        "
-【导演模式】本回合是「导演」（人）在代替 GM 推进剧情，不是受控角色的言行：
-         - 把导演的意图扩写成叙事（narrate）与必要的对话/神态，保持既有文风；
-         - 不要替受控角色做决定，也不要让受控角色替导演发言；
-         - 导演专属意图：quest {text, hidden?, primary?} 新增任务；encounter {name, enemies:[{name,hp?,ac?}], note?} 创建结构化遭遇（ac=防御值，越高越难打中，缺省 12）；adjust {character_id, resource, amount} 调整资源；status {character_id, status_id, remove?} 施加/移除状态。
-         - 未署名的叙事归属「故事本身」，不要挂到玩家角色头上。
-"
+        blocks.gm.clone()
     } else {
-        ""
+        String::new()
     };
     let chars = if ctx.characters.is_empty() {
         "（无）".to_string()
@@ -366,15 +397,13 @@ fn turn_prompt_inner(ctx: &TurnContext, include_memories: bool) -> String {
     };
     // 在场人物的人格档案：单一 AI 据此扮演并保持人物一致。
     // 对话示例是 few-shot 风格样板——模仿语气句式，不照抄台词。
-        let visible_personas: Vec<&octopus_engine::PersonaView> = ctx.personas.iter().collect();
+    let visible_personas: Vec<&octopus_engine::PersonaView> = ctx.personas.iter().collect();
     let personas = if visible_personas.is_empty() {
         String::new()
     } else {
-        let mut b = String::from(
-            "【人物设定】按下列档案扮演这些人物；对话示例用于模仿语气与句式，不要照抄台词。\n",
-        );
+        let mut items = String::new();
         for p in visible_personas {
-            b.push_str(&format!("▸ {}（{}）\n", p.name, p.id));
+            items.push_str(&format!("▸ {}（{}）\n", p.name, p.id));
             for (label, val) in [
                 ("背景", &p.background),
                 ("性格", &p.personality),
@@ -382,31 +411,31 @@ fn turn_prompt_inner(ctx: &TurnContext, include_memories: bool) -> String {
             ] {
                 let v = val.trim();
                 if !v.is_empty() {
-                    b.push_str(&format!("  {label}：{v}\n"));
+                    items.push_str(&format!("  {label}：{v}\n"));
                 }
             }
             let ex = p.example_dialogues.trim();
             if !ex.is_empty() {
-                b.push_str(&format!("  对话示例（模仿语气，勿照抄）：\n{ex}\n"));
+                items.push_str(&format!("  对话示例（模仿语气，勿照抄）：\n{ex}\n"));
             }
         }
-        b
+        render_block(&blocks.personas, &items)
     };
     // 世界词条：关键词命中的背景设定（引擎已按预算裁剪）。
     let lore = if ctx.lore.is_empty() {
         String::new()
     } else {
-        let mut b = String::from("【世界设定】以下事实在需要时参考，不要整段复述：\n");
+        let mut items = String::new();
         for l in &ctx.lore {
             let title = l.title.trim();
             let content = l.content.trim();
             if title.is_empty() {
-                b.push_str(&format!("- {content}\n"));
+                items.push_str(&format!("- {content}\n"));
             } else {
-                b.push_str(&format!("- {title}：{content}\n"));
+                items.push_str(&format!("- {title}：{content}\n"));
             }
         }
-        b
+        render_block(&blocks.lore, &items)
     };
     let mut scene = if ctx.scene_title.is_empty() {
         "（未命名场景）".to_string()
@@ -425,9 +454,9 @@ fn turn_prompt_inner(ctx: &TurnContext, include_memories: bool) -> String {
     let focus = if ctx.focus.is_empty() {
         String::new()
     } else {
-        let mut block = String::from("\n本次玩家明确引用了以下实体，请在演绎与意图中聚焦它们：\n");
+        let mut items = String::new();
         for f in &ctx.focus {
-            block.push_str(&format!(
+            items.push_str(&format!(
                 "- {}「{}」({})\n```json\n{}\n```\n",
                 f.kind,
                 f.name,
@@ -435,7 +464,7 @@ fn turn_prompt_inner(ctx: &TurnContext, include_memories: bool) -> String {
                 serde_json::to_string_pretty(&f.entity).unwrap_or_else(|_| "{}".to_string())
             ));
         }
-        block
+        render_block(&blocks.focus, &items)
     };
     // 单一 AI：叙述段不再按角色筛 scope，全部注入（story / character / both / character:<id> 一视同仁）。
     let sections = |slot: &str| -> String {
@@ -453,64 +482,58 @@ fn turn_prompt_inner(ctx: &TurnContext, include_memories: bool) -> String {
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        world.push_str("\n【世界前提】");
-        world.push_str(p);
-        world.push('\n');
+        world.push_str(&render(&blocks.world_premise, &[("premise", p)]));
     }
     let world_sections = sections("world");
     if !world_sections.is_empty() {
-        world.push_str("\n【世界设定补充】\n");
-        world.push_str(&world_sections);
+        world.push_str(&render_block(&blocks.world_sections, &world_sections));
     }
     let mut directives = String::new();
-    for s in ctx
+    let directive_items: String = ctx
         .narrative
         .iter()
         .filter(|s| s.slot == "style" || s.slot == "behavior")
-    {
-        if directives.is_empty() {
-            directives.push_str("\n【叙事要求】\n");
-        }
-        directives.push_str(&s.text);
-        directives.push('\n');
+        .map(|s| format!("{}\n", s.text))
+        .collect();
+    if !directive_items.is_empty() {
+        directives.push_str(&render_block(&blocks.directives, &directive_items));
     }
     let closing_sections = sections("closing");
     let closing = if closing_sections.is_empty() {
         String::new()
     } else {
-        format!("\n【收尾要求】\n{closing_sections}")
+        render_block(&blocks.closing, &closing_sections)
     };
     // C：把故事书声明的判定属性 key 明给模型，避免它拿英文别名瞎猜（如 dexterity）。
     let attributes = if ctx.attributes.is_empty() {
         String::new()
     } else {
-        format!(
-            "可用判定属性（check 的 attribute 只能填这些）：{}\n",
-            ctx.attributes.join("、")
-        )
+        render_block(&blocks.attributes, &ctx.attributes.join("、"))
     };
-    format!(
-        "【回合 {round}】\n（各段冲突时的优先级：已裁定的事实 > 人物设定 / 世界设定 > 场景与任务 > 玩家输入）\n{world}场景：{scene}\n{memories}受控角色：{controlled}\n在场角色：{chars}\n{attributes}{personas}{lore}输入渠道：{channel}\n{canon}{quests}{scenes}{encounters}{directives}{turn_feedback}\n输入：{text}\n{closing}{focus}{gm}\n请输出意图 JSON 数组。",
-        round = ctx.round,
-        scene = scene,
-        memories = memories,
-        controlled = controlled,
-        chars = chars,
-        attributes = attributes,
-        personas = personas,
-        lore = lore,
-        turn_feedback = turn_feedback,
-        world = world,
-        directives = directives,
-        closing = closing,
-        channel = channel,
-        canon = canon,
-        quests = quests,
-        scenes = scenes,
-        encounters = encounters,
-        text = ctx.player_text,
-        focus = focus,
-        gm = gm,
+    render(
+        &prompts.turn_template,
+        &[
+            ("round", &ctx.round.to_string()),
+            ("world", &world),
+            ("scene", &scene),
+            ("memories", &memories),
+            ("controlled", controlled),
+            ("chars", &chars),
+            ("attributes", &attributes),
+            ("personas", &personas),
+            ("lore", &lore),
+            ("channel", channel),
+            ("canon", &canon),
+            ("quests", &quests),
+            ("scenes", &scenes),
+            ("encounters", &encounters),
+            ("directives", &directives),
+            ("turn_feedback", &turn_feedback),
+            ("text", &ctx.player_text),
+            ("closing", &closing),
+            ("focus", &focus),
+            ("gm", &gm),
+        ],
     )
 }
 
@@ -560,9 +583,49 @@ fn intent_from_tool_call(name: &str, arguments: &serde_json::Value) -> Result<In
         .map_err(|e| format!("意图工具 {name} 参数无法解析为合法意图：{e}"))
 }
 
-/// 把工具调用渲染成可读文本（会话记录 / 日志展示）。
+/// 把工具调用渲染成可读文本（**仅供日志 / 轨迹展示**，绝不写进模型会话）。
 fn tool_call_text(name: &str, arguments: &serde_json::Value) -> String {
     format!("[工具调用] {name} {arguments}")
+}
+
+/// 原生工具调用 → 会话里记录的文本：**规范的意图 JSON 数组**。
+///
+/// 为什么不能记展示格式（`[工具调用] narrate {…}`）：模型把自己过去的输出当范本模仿，
+/// 下一轮就直接**用文字写出** `[工具调用] …`——那不是合法 JSON，协议解析在第二个字符就崩
+/// （`expected value at line 1 column 2`），于是回喂纠正消息重试，来回烧上下文（实测
+/// save sv-23ae… 的 round 82/83 就栽在这里：模型 reasoning 里明说「instead of [工具调用]」）。
+/// 记成规范意图 JSON 还顺带兜底：模型真要「用文字给意图」，那份文本本身就能被解析出意图。
+fn intent_json_text(tool_calls: &[ToolCallExtract]) -> String {
+    let items: Vec<serde_json::Value> = tool_calls
+        .iter()
+        .map(|tc| {
+            let mut v = tc.arguments.clone();
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("type".to_string(), serde_json::Value::String(tc.name.clone()));
+            }
+            v
+        })
+        .collect();
+    serde_json::to_string(&items).unwrap_or_default()
+}
+
+/// 老版本把原生工具调用记成了展示格式：读回会话时就地修成规范意图 JSON（一次性自愈）。
+/// 只有**整段都是**该格式时才改写，其它文本一律原样返回 None（不误伤）。
+fn heal_legacy_tool_calls(content: &str) -> Option<String> {
+    let mut items = Vec::new();
+    for line in content.lines() {
+        let rest = line.trim().strip_prefix("[工具调用] ")?;
+        let (name, args) = rest.split_once(' ')?;
+        let mut v: serde_json::Value = serde_json::from_str(args).ok()?;
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("type".to_string(), serde_json::Value::String(name.to_string()));
+        }
+        items.push(v);
+    }
+    if items.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&items).ok()
 }
 
 /// 把 rig Message 折叠成日志可读的 (role, content)：纯文本直出，工具调用 / 附件
@@ -618,7 +681,19 @@ impl RigProvider {
                 if let Ok(mut conv) = self.conversations.lock() {
                     let entry = conv.entry(save_id.to_string()).or_default();
                     if entry.is_empty() && !recs.is_empty() {
-                        *entry = recs.into_iter().map(conv_message_from).collect();
+                        *entry = recs
+                            .into_iter()
+                            .map(conv_message_from)
+                            // 老版本记的展示格式会教坏模型（见 heal_legacy_tool_calls）。
+                            .map(|mut m| {
+                                if m.role == ConvRole::Assistant {
+                                    if let Some(fixed) = heal_legacy_tool_calls(&m.content) {
+                                        m.content = fixed;
+                                    }
+                                }
+                                m
+                            })
+                            .collect();
                     }
                 }
                 if let Ok(mut s) = self.conv_loaded.lock() {
@@ -647,6 +722,207 @@ impl RigProvider {
         }
     }
 
+    /// 该 (provider, model) 声明的上下文窗口；没声明 → 不做压力压缩（只留溢出兜底）。
+    fn ctx_window_of(&self, provider_id: &str, model: &str) -> Option<u64> {
+        self.model_ctx
+            .get(&format!("{provider_id}/{model}"))
+            .copied()
+            .filter(|c| *c > 0)
+    }
+
+    /// 该存档的取消信号（按需创建）：`AiProvider::cancel` 用它唤醒在途请求。
+    fn cancel_signal(&self, save_id: &str) -> std::sync::Arc<tokio::sync::Notify> {
+        let mut map = self.cancel_signals.lock().expect("cancel signals poisoned");
+        map.entry(save_id.to_string()).or_default().clone()
+    }
+
+    /// 该存档的「字符 / token」系数（缺省见 `DEFAULT_CHARS_PER_TOKEN`）。
+    fn chars_per_token_of(&self, save_id: &str) -> f64 {
+        self.chars_per_token
+            .lock()
+            .ok()
+            .and_then(|m| m.get(save_id).copied())
+            .unwrap_or(DEFAULT_CHARS_PER_TOKEN)
+    }
+
+    /// 压力触发：供应商回传的真实 input token（+ 本轮新输入的估算）越过
+    /// `ctx × threshold_ratio` 就压一次。没有声明 ctx 的模型不做这件事。
+    #[allow(clippy::too_many_arguments)]
+    async fn compact_for_pressure(
+        &self,
+        client: &openai::CompletionsClient,
+        provider_id: &str,
+        model: &str,
+        ctx: &TurnContext,
+        preamble: &str,
+        tool_defs: &[ToolDefinition],
+        prompt: &str,
+    ) -> Option<CompactionReport> {
+        let window = self.ctx_window_of(provider_id, model)?;
+        let threshold = (window as f64 * self.compaction.threshold_ratio) as u64;
+        let observed = self
+            .last_input
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&ctx.save_id).copied())
+            .unwrap_or(0);
+        let projected = observed
+            + estimate_tokens(
+                prompt.chars().count(),
+                self.chars_per_token_of(&ctx.save_id),
+            );
+        if projected < threshold {
+            return None;
+        }
+        let retain = (window as f64 * self.compaction.retain_ratio) as u64;
+        tracing::info!(
+            save_id = %ctx.save_id,
+            round = ctx.round,
+            model = %model,
+            window,
+            threshold,
+            projected,
+            retain,
+            "上下文压力到阈值：压缩模型会话（只重写派生 surface）"
+        );
+        match self
+            .compact_region(client, model, ctx, preamble, tool_defs, "pressure", retain)
+            .await
+        {
+            Ok(report) => report,
+            Err(e) => {
+                tracing::warn!(save_id = %ctx.save_id, error = %e, "压力压缩失败（本轮照常继续）");
+                None
+            }
+        }
+    }
+
+    /// 自动上下文压缩：把最旧的一段原文换成一条摘要，**只重写派生 surface**。
+    ///
+    /// 摘要请求逐字重放被遮蔽的原文 + 末尾追加压缩指令 = 上一次请求的真前缀，
+    /// 供应商的热缓存直接复用，只有指令与输出未命中（DSH summarizer 的同款做法）。
+    /// 返回 None = 没得压 / 摘要没通过收缩校验（调用方照常走原路径）。
+    #[allow(clippy::too_many_arguments)]
+    async fn compact_region(
+        &self,
+        client: &openai::CompletionsClient,
+        model: &str,
+        ctx: &TurnContext,
+        preamble: &str,
+        tool_defs: &[ToolDefinition],
+        trigger: &str,
+        retain_tokens: u64,
+    ) -> Result<Option<CompactionReport>, EngineError> {
+        let cpt = self.chars_per_token_of(&ctx.save_id);
+        // 溢出兜底（retain_tokens = 0）也要留最近两个回合，别把接续的上下文压没。
+        let min_rounds = if retain_tokens == 0 { 2 } else { 1 };
+        // 1) 只读选区：够不够压、压哪一段。
+        let (shadowed, cut, chars_before, rounds) = {
+            let conv = self.conversations.lock().expect("conversations poisoned");
+            let entry = conv.get(&ctx.save_id).cloned().unwrap_or_default();
+            let Some(cut) = select_compaction_range(&entry, cpt, retain_tokens, min_rounds) else {
+                return Ok(None);
+            };
+            let shadowed: Vec<ConvMessage> = entry[..cut].to_vec();
+            if shadowed.is_empty() {
+                return Ok(None);
+            }
+            let chars_before: usize = shadowed.iter().map(|m| m.content.chars().count()).sum();
+            let rounds = {
+                let mut seen: Vec<u32> = Vec::new();
+                for m in &shadowed {
+                    if !seen.contains(&m.round) {
+                        seen.push(m.round);
+                    }
+                }
+                seen.len() as u32
+            };
+            (shadowed, cut, chars_before, rounds)
+        };
+        // 2) 摘要请求：重放被遮蔽的原文 + 末尾压缩指令（热前缀复用）。
+        let mut history: Vec<Message> = shadowed.iter().map(conv_to_rig_message).collect();
+        history.push(Message::user(self.story_prompts.compaction.clone()));
+        let request = CompletionRequest {
+            model: None,
+            preamble: Some(preamble.to_string()),
+            chat_history: history,
+            documents: Vec::new(),
+            tools: tool_defs.to_vec(),
+            temperature: Some(0.3),
+            max_tokens: Some(self.compaction.max_tokens),
+            tool_choice: None,
+            additional_params: None,
+            output_schema: None,
+            record_telemetry_content: false,
+        };
+        let started = std::time::Instant::now();
+        let response = client
+            .completion_model(model.to_string())
+            .completion(request)
+            .await
+            .map_err(|e| EngineError::Ai(e.to_string()))?;
+        let (text, _, _) = split_response(&response.choice);
+        let summary = text.trim().to_string();
+        // 3) 收缩校验：摘要必须比原文短，否则当失败（DSH 的同款 gate）。
+        let after = summary.chars().count();
+        if after == 0 || after >= chars_before {
+            tracing::warn!(
+                save_id = %ctx.save_id,
+                before = chars_before,
+                after,
+                "摘要没有比原文更短，放弃本次压缩"
+            );
+            return Ok(None);
+        }
+        // 4) 就地替换：一条摘要 + 原样保留的尾巴。
+        let last_shadowed_round = shadowed.last().map(|m| m.round).unwrap_or(0);
+        let framed = frame_summary(&summary);
+        {
+            let mut conv = self.conversations.lock().expect("conversations poisoned");
+            if let Some(entry) = conv.get_mut(&ctx.save_id) {
+                if cut <= entry.len() {
+                    let mut rebuilt: Vec<ConvMessage> = Vec::with_capacity(entry.len() - cut + 1);
+                    rebuilt.push(ConvMessage {
+                        round: last_shadowed_round,
+                        role: ConvRole::User,
+                        content: framed,
+                    });
+                    rebuilt.extend(entry[cut..].iter().cloned());
+                    *entry = rebuilt;
+                }
+            }
+        }
+        self.persist_conversation(&ctx.save_id).await;
+        let latency_ms = started.elapsed().as_millis() as u64;
+        tracing::info!(
+            save_id = %ctx.save_id,
+            round = ctx.round,
+            model = %model,
+            trigger,
+            shadowed_rounds = rounds,
+            chars_before,
+            chars_after = after,
+            input = response.usage.input_tokens,
+            cached = response.usage.cached_input_tokens,
+            latency_ms,
+            "上下文压缩完成（只重写派生 surface，权威日志不动）"
+        );
+        Ok(Some(CompactionReport {
+            trigger: trigger.to_string(),
+            shadowed_rounds: rounds,
+            chars_before: chars_before as u64,
+            chars_after: after as u64,
+            usage: octopus_types::AiCallUsage {
+                input_tokens: response.usage.input_tokens,
+                output_tokens: response.usage.output_tokens,
+                total_tokens: response.usage.total_tokens,
+                cached_input_tokens: response.usage.cached_input_tokens,
+                cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
+                ..Default::default()
+            },
+            latency_ms,
+        }))
+    }
     /// 单次补全：拿意图，并把供应商返回的思考链一并带出（供前端「思考」折叠块）。
     ///
     /// preamble 与 parse 都由故事书声明的协议适配器决定（叙事契约 P2）：
@@ -692,6 +968,12 @@ impl RigProvider {
         // 模型在下一次请求里能看到自己上一轮的输出与纠正指令。
         let mut attempts = 0u32;
         let mut current_prompt = prompt;
+        // 本次调用前做过一次自动压缩时的记账（随 AiOutput 交给引擎落日志）。
+        let mut compaction_report: Option<CompactionReport> = None;
+        // 上下文超限只兜底一次，避免「压了还超 → 再压」的死循环。
+        let mut overflow_recovered = false;
+        // 本轮前缀被改写的可归因原因（回合重跑；压缩另有 compaction_report 标记）。
+        let mut prefix_rewrite_reason: Option<&str> = None;
         // 原生工具调用是否已降级为文本协议（供应商不支持 tools 字段时自动回退）。
         let mut degraded = false;
         loop {
@@ -712,16 +994,48 @@ impl RigProvider {
             } else {
                 None
             };
-            let preamble = if tool_active {
+            // 系统提示词优先级：故事书显式声明了协议（declarative / lua）时以故事书为准；
+            // 默认协议下用配置里的覆盖文本（未覆盖 = 引擎内置默认）。
+            let preamble = if spec.mode == ProtocolMode::Default {
+                if tool_active {
+                    self.story_prompts.protocol_tool.clone()
+                } else {
+                    self.story_prompts.protocol_text.clone()
+                }
+            } else if tool_active {
                 adapter.tool_preamble(ctx).unwrap_or_else(|| adapter.preamble(ctx))
             } else {
                 adapter.preamble(ctx)
             };
+            // 自动上下文压缩（DSH 的 pressure 触发）：在**请求派生之前**看一眼用量。
+            // 只在整轮首次尝试时做一次；压缩只重写派生 surface，权威日志不动。
+            if self.compaction.enabled
+                && fresh_round
+                && attempts == 1
+                && compaction_report.is_none()
+            {
+                compaction_report = self
+                    .compact_for_pressure(
+                        client,
+                        &provider_id,
+                        &model,
+                        ctx,
+                        &preamble,
+                        tool_defs.as_deref().unwrap_or(&[]),
+                        &current_prompt,
+                    )
+                    .await;
+            }
             // 追加式会话：取出本存档历史（首次尝试按整轮语义截断），再把这次的
             // user 提示词追加为最后一条——前缀稳定，缓存才命中。
             let chat_history = {
                 let mut conv = self.conversations.lock().expect("conversations poisoned");
                 let entry = conv.entry(ctx.save_id.clone()).or_default();
+                prefix_rewrite_reason = None;
+                // 回合重跑会丢掉本回合已记录的消息 → 前缀必然重建（可归因，不是回归）。
+                if fresh_round && attempts == 1 && entry.iter().any(|m| m.round == ctx.round) {
+                    prefix_rewrite_reason = Some("turn_rerun");
+                }
                 append_round_history(
                     entry,
                     ctx.round,
@@ -734,7 +1048,8 @@ impl RigProvider {
                 preamble: Some(preamble.clone()),
                 chat_history,
                 documents: Vec::new(),
-                tools: tool_defs.unwrap_or_default(),
+                // clone：溢出兜底压缩要再用一次同一份工具定义（保持前缀对齐）。
+                tools: tool_defs.clone().unwrap_or_default(),
                 temperature: Some(temperature),
                 max_tokens: Some(max_tokens),
                 // None = 供应商默认（OpenAI 兼容端点为 auto）：允许但引导模型优先调用工具。
@@ -754,8 +1069,67 @@ impl RigProvider {
                 trace_messages.push(message_to_trace(m));
             }
 
+            // ── 缓存前缀守门 ──
+            // 供应商的上下文缓存是**前缀缓存**：只有「这一轮的请求序列是上一轮的前缀」才可能整体
+            // 命中。这里逐条比对，把「命中率为什么低」变成可归因的日志：
+            // 压缩 / 回合重跑导致的重建 = INFO（预期），其它任何改写 = WARN（回归）。
+            let digests: Vec<u64> = trace_messages
+                .iter()
+                .map(|m| message_digest(&m.role, &m.content))
+                .collect();
+            let prev_prefix = self
+                .last_prefix
+                .lock()
+                .ok()
+                .and_then(|m| m.get(&ctx.save_id).cloned());
+            if let Some(prev) = prev_prefix {
+                let common = common_prefix_len(&prev, &digests);
+                if common < prev.len() {
+                    let reason = if compaction_report.is_some() {
+                        Some("compaction")
+                    } else {
+                        prefix_rewrite_reason
+                    };
+                    match reason {
+                        Some(r) => tracing::info!(
+                            save_id = %ctx.save_id,
+                            round = ctx.round,
+                            reason = r,
+                            common,
+                            prev_len = prev.len(),
+                            "上下文前缀重建（预期）：供应商缓存需要重新预热"
+                        ),
+                        None => tracing::warn!(
+                            save_id = %ctx.save_id,
+                            round = ctx.round,
+                            common,
+                            prev_len = prev.len(),
+                            first_changed = %trace_messages
+                                .get(common)
+                                .map(|m| m.role.as_str())
+                                .unwrap_or("?"),
+                            "缓存前缀意外失配：这一轮的请求不是上一轮的前缀（整段历史将按原价重算）"
+                        ),
+                    }
+                }
+            }
+            if let Ok(mut m) = self.last_prefix.lock() {
+                m.insert(ctx.save_id.clone(), digests);
+            }
             let started = std::time::Instant::now();
-            let response = match rig_model.completion(request).await {
+            // 玩家可以随时按停止：与在途请求赛跑，取消赢了就直接丢弃这个请求
+            //（reqwest 的 future 被 drop 即中断连接，不会继续烧 token）。
+            let cancel = self.cancel_signal(&ctx.save_id);
+            let cancelled = cancel.notified();
+            tokio::pin!(cancelled);
+            let response = match tokio::select! {
+                biased;
+                _ = &mut cancelled => {
+                    tracing::info!(save_id = %ctx.save_id, round = ctx.round, "在途 AI 调用被玩家取消");
+                    return Err(EngineError::Cancelled);
+                }
+                r = rig_model.completion(request) => r,
+            } {
                 Ok(r) => r,
                 Err(e) => {
                     let latency_ms = started.elapsed().as_millis() as u64;
@@ -780,6 +1154,47 @@ impl RigProvider {
                         degraded = true;
                         continue;
                     }
+                    // 供应商确认上下文超限：更激进地压一次再重试该请求
+                    //（DSH 的 context-overflow 恢复；权威日志不动）。
+                    if self.compaction.enabled
+                        && !overflow_recovered
+                        && is_context_overflow(&e.to_string())
+                    {
+                        overflow_recovered = true;
+                        match self
+                            .compact_region(
+                                client,
+                                &model,
+                                ctx,
+                                &preamble,
+                                tool_defs.as_deref().unwrap_or(&[]),
+                                "context_overflow",
+                                0,
+                            )
+                            .await
+                        {
+                            Ok(Some(report)) => {
+                                tracing::info!(
+                                    save_id = %ctx.save_id,
+                                    round = ctx.round,
+                                    model = %model,
+                                    shadowed_rounds = report.shadowed_rounds,
+                                    "上下文超限：压缩后重试本轮"
+                                );
+                                compaction_report = Some(report);
+                                continue;
+                            }
+                            Ok(None) => tracing::warn!(
+                                save_id = %ctx.save_id,
+                                "上下文超限，但没有可安全压缩的范围（历史本身就是不可分单元）"
+                            ),
+                            Err(ce) => tracing::warn!(
+                                save_id = %ctx.save_id,
+                                error = %ce,
+                                "上下文超限后的兜底压缩失败"
+                            ),
+                        }
+                    }
                     return Err(EngineError::Ai(e.to_string()));
                 }
             };
@@ -801,14 +1216,28 @@ impl RigProvider {
                 latency_ms,
                 "AI 调用用量"
             );
-            // 把这次的 user 提示词与模型输出追加进会话（失败轮也成对保留——pi transcript
-            // 思路：模型下一轮能看到自己上轮的输出与纠正指令）。工具调用渲染成文本。
-            let assistant_text = if tool_active && !tool_calls.is_empty() {
-                tool_calls
+            // 记账：真实 input token（压力触发的依据）+ 该存档的「字符 / token」系数
+            //（把 token 预算换算成消息量时用它；首次用保守缺省）。
+            if response.usage.input_tokens > 0 {
+                if let Ok(mut m) = self.last_input.lock() {
+                    m.insert(ctx.save_id.clone(), response.usage.input_tokens);
+                }
+                let chars: usize = trace_messages
                     .iter()
-                    .map(|tc| tool_call_text(&tc.name, &tc.arguments))
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                    .map(|m| m.content.chars().count())
+                    .sum();
+                let cpt = chars as f64 / response.usage.input_tokens as f64;
+                if cpt.is_finite() && (0.5..=8.0).contains(&cpt) {
+                    if let Ok(mut m) = self.chars_per_token.lock() {
+                        m.insert(ctx.save_id.clone(), cpt);
+                    }
+                }
+            }
+            // 把这次的 user 提示词与模型输出追加进会话（失败轮也成对保留——pi transcript
+            // 思路：模型下一轮能看到自己上轮的输出与纠正指令）。
+            // 工具调用记成**规范意图 JSON**，不记展示格式（见 intent_json_text 的说明）。
+            let assistant_text = if tool_active && !tool_calls.is_empty() {
+                intent_json_text(&tool_calls)
             } else {
                 text.clone()
             };
@@ -875,6 +1304,7 @@ impl RigProvider {
                         reasoning: (!reasoning.trim().is_empty()).then_some(reasoning),
                         intent_warnings,
                         trace: Some(trace),
+                        compaction: compaction_report.take(),
                     });
                 }
                 Err(e) => {
@@ -901,15 +1331,11 @@ impl RigProvider {
                         "意图产出失败，回喂纠正消息重试"
                     );
                     // 纠正消息：明确失败原因与要求，让模型忽略上一条重新输出（pi retry 思路）。
+                    let err = e.to_string();
                     current_prompt = if tool_active {
-                        format!(
-                            "你的上一次输出未被接受（原因：{e}）。请直接调用可用的意图工具来推进剧情（一次可并行调用多个，最后调用 finish_turn 收束）；不要输出 JSON 数组。"
-                        )
+                        render(&self.story_prompts.retry_tool, &[("error", &err)])
                     } else {
-                        format!(
-                            "你的上一次输出无法被解析为合法的意图 JSON（原因：{e}）。\
-                             请忽略上一条输出，严格按照协议重新输出意图 JSON 数组。"
-                        )
+                        render(&self.story_prompts.retry_text, &[("error", &err)])
                     };
                 }
             }
@@ -941,23 +1367,173 @@ fn append_round_history(
     history
 }
 
-/// 记录一轮模型往返（user 提示词 + assistant 原文），并裁剪到单存档上限。
+/// 记录一轮模型往返（user 提示词 + assistant 原文）。**只追加、永不裁剪**。
+///
+/// 两个理由：
+/// 1. **缓存**：供应商的上下文缓存是**前缀缓存**——按请求序列的公共前缀匹配。
+///    从队首删消息会让第一条之后整段失配（octopus.db 的 ai_call 事件实测：每回合
+///    砍头时命中率 0.4%，纯追加时 ~97%），等于把整段历史按原价重算一遍。
+/// 2. **上下文**：模型窗口是百万级，早期剧情不该被静默丢掉。真超了窗口，供应商会
+///    明确报错（该回合失败并留痕），好过悄悄遗忘。
+///
+/// 唯一允许的历史改写是「回合重跑」：`append_round_history` 丢掉**本回合**的旧消息，
+/// 那只是重写队尾，不影响此前的前缀。
 fn record_round(entry: &mut Vec<ConvMessage>, round: u32, prompt: String, assistant: String) {
     entry.push(ConvMessage { round, role: ConvRole::User, content: prompt });
     entry.push(ConvMessage { round, role: ConvRole::Assistant, content: assistant });
-    if entry.len() > MAX_CONV_MESSAGES {
-        let drop = entry.len() - MAX_CONV_MESSAGES;
-        entry.drain(0..drop);
+}
+
+// ============================================================
+// 自动上下文压缩（对齐 DSH compaction-basic 的语义）
+//
+// 只重写**派生 surface**（模型会话 `ai_conversations` / 内存 entry），权威命令日志永不改写：
+// 玩家看到的叙事、回放与存档都不受影响。触发两种：
+//   ① pressure：供应商回传的真实 input token 越过 `ctx × threshold_ratio`；
+//   ② context_overflow：供应商报上下文超限 → 更激进地压一次 + 重试该请求。
+// 摘要请求复用热前缀（原系统提示词 + 被遮蔽的原文 + 末尾指令），只有指令与输出未命中缓存。
+// ============================================================
+
+/// 缺省的「字符 / token」系数：中文叙事实测约 1.8 字符/token
+///（octopus.db：83 万字符 ↔ 45 万 token）。首次调用后会被真实用量纠正。
+const DEFAULT_CHARS_PER_TOKEN: f64 = 1.8;
+
+/// 文本长度 → 估算 token。只用于把 token 预算换算成消息量；触发阈值用供应商回传的真实用量。
+fn estimate_tokens(chars: usize, chars_per_token: f64) -> u64 {
+    (chars as f64 / chars_per_token.max(0.2)).ceil() as u64
+}
+
+/// i 是不是「回合开头」（该回合第一条 user 消息）：压缩切点只能落在这里，
+/// 免得把一回合内的续轮往返劈成两半。
+fn is_round_start(entry: &[ConvMessage], i: usize) -> bool {
+    match entry.get(i) {
+        None => false,
+        Some(m) => m.role == ConvRole::User && (i == 0 || entry[i - 1].round < m.round),
     }
 }
 
-/// 场景压缩用的系统提示词（#05 §3.3）：只让模型输出压缩后的短摘要。
-///
-/// 这是派生记忆，不参与叙事契约：所以不走故事书协议适配器，避免协议 preamble 要求
-/// 输出意图 JSON 反而污染摘要正文。
-const SUMMARY_PREAMBLE: &str = "你是 Octopus 的记忆压缩器：把给定的一串回合摘要合并压缩成一段更精炼的场景回顾。\n\
-只输出压缩后的正文，不要解释、不要 Markdown、不要标题；控制在 1-3 句，保留人物、地点、关键事件与结果。";
+/// 从 i 往前找最近的回合开头。
+fn round_start_at_or_before(entry: &[ConvMessage], i: usize) -> Option<usize> {
+    if entry.is_empty() {
+        return None;
+    }
+    let mut j = i.min(entry.len() - 1);
+    loop {
+        if is_round_start(entry, j) {
+            return Some(j);
+        }
+        if j == 0 {
+            return None;
+        }
+        j -= 1;
+    }
+}
 
+/// `entry[from..]` 里覆盖了几个回合。
+fn rounds_in(entry: &[ConvMessage], from: usize) -> u32 {
+    let mut seen: Vec<u32> = Vec::new();
+    for m in entry.get(from.min(entry.len())..).unwrap_or(&[]) {
+        if !seen.contains(&m.round) {
+            seen.push(m.round);
+        }
+    }
+    seen.len() as u32
+}
+
+/// 选本次要遮蔽的范围：从尾巴往前定价，至少逐字保留 `retain_tokens`；再把切点吸附到
+/// 回合开头（只会保留更多，不会更少），并保证至少留 `min_retained_rounds` 个回合。
+/// 返回保留段的第一条下标；没得压时 None。
+///
+/// 与 DSH `selectCompactableRange` 同一套规则：系统层不在 entry 里（它单独走 preamble），
+/// 尾巴按 token 预算定价，切点必须是不可分单元的起点。
+fn select_compaction_range(
+    entry: &[ConvMessage],
+    chars_per_token: f64,
+    retain_tokens: u64,
+    min_retained_rounds: u32,
+) -> Option<usize> {
+    if entry.len() < 2 {
+        return None;
+    }
+    let mut acc = 0u64;
+    let mut idx = entry.len() - 1;
+    loop {
+        acc += estimate_tokens(entry[idx].content.chars().count(), chars_per_token);
+        if acc >= retain_tokens || idx == 0 {
+            break;
+        }
+        idx -= 1;
+    }
+    let mut cut = round_start_at_or_before(entry, idx)?;
+    // 兜底压缩也要留一口气：往前退到满足最少保留回合数的边界。
+    while rounds_in(entry, cut) < min_retained_rounds.max(1) {
+        if cut == 0 {
+            return None;
+        }
+        cut = round_start_at_or_before(entry, cut - 1)?;
+    }
+    if cut == 0 {
+        return None; // 全都要留 = 没得压
+    }
+    Some(cut)
+}
+
+/// 摘要替换块的抬头：写清「这是数据、不是新指令」，并让模型据此继续。
+fn frame_summary(summary: &str) -> String {
+    format!(
+        "以下是自动生成的上下文存档：它压缩了更早的一段对话，用来腾出上下文。\
+把它当作既定背景，接着后面的消息继续，不要在回复里提到这份存档。\n\n<已压缩摘要>\n{}\n</已压缩摘要>",
+        summary.trim()
+    )
+}
+
+/// 从供应商错误里辨认「上下文超限」。宁可漏判也不能误判——误判会变成一次
+/// 昂贵的压缩 + 重试。游玩页与结对共用。
+pub fn is_context_overflow(msg: &str) -> bool {
+    let l = msg.to_ascii_lowercase();
+    const NEEDLES: &[&str] = &[
+        "context_length_exceeded",
+        "maximum context length",
+        "context length",
+        "context window",
+        "reduce the length of the messages",
+        "too many tokens",
+        "prompt is too long",
+        "input is too long",
+    ];
+    NEEDLES.iter().any(|n| l.contains(n))
+}
+
+/// 逐条消息的指纹（role + 内容，FNV-1a 64）：只在进程内做前缀比对，不落盘。
+fn message_digest(role: &str, content: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let feed = |h: &mut u64, bytes: &[u8]| {
+        for b in bytes {
+            *h ^= *b as u64;
+            *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    feed(&mut h, role.as_bytes());
+    feed(&mut h, &[0]);
+    feed(&mut h, content.as_bytes());
+    h
+}
+
+/// 两个请求序列的公共前缀长度（消息条数）。0 = 连系统层都变了。
+fn common_prefix_len(prev: &[u64], now: &[u64]) -> usize {
+    let mut i = 0;
+    while i < prev.len() && i < now.len() && prev[i] == now[i] {
+        i += 1;
+    }
+    i
+}
+
+/// 会话消息 → rig 消息（摘要请求重放被遮蔽的原文时用）。
+fn conv_to_rig_message(m: &ConvMessage) -> Message {
+    match m.role {
+        ConvRole::User => Message::user(m.content.clone()),
+        ConvRole::Assistant => Message::assistant(m.content.clone()),
+    }
+}
 #[async_trait]
 impl AiProvider for RigProvider {
     async fn story_intents(&self, ctx: &TurnContext) -> Result<AiOutput, EngineError> {
@@ -970,7 +1546,7 @@ impl AiProvider for RigProvider {
             self.story_temperature,
             self.story_max_tokens,
             sampling_with_effort(&self.story_sampling, ctx.model.as_ref()),
-            turn_prompt(ctx),
+            turn_prompt_with(ctx, &self.story_prompts),
         )
         .await
     }
@@ -981,6 +1557,18 @@ impl AiProvider for RigProvider {
         }
     }
 
+    /// 玩家按「停止」：唤醒该存档的在途补全（没有在途调用时是空操作）。
+    fn cancel(&self, save_id: &str) {
+        let signal = self
+            .cancel_signals
+            .lock()
+            .ok()
+            .and_then(|m| m.get(save_id).cloned());
+        if let Some(signal) = signal {
+            signal.notify_waiters();
+        }
+    }
+
     /// 丢弃某存档的会话（内存 + 持久层）；新原点 / 升级 / 导入 / 删除时由 api 层调用。
     async fn clear_conversation(&self, save_id: &str) {
         if let Ok(mut conv) = self.conversations.lock() {
@@ -988,6 +1576,9 @@ impl AiProvider for RigProvider {
         }
         if let Ok(mut s) = self.conv_loaded.lock() {
             s.remove(save_id);
+        }
+        if let Ok(mut m) = self.last_prefix.lock() {
+            m.remove(save_id);
         }
         let store = self.conv_store.lock().ok().and_then(|g| g.clone());
         if let Some(store) = store {
@@ -1012,7 +1603,7 @@ impl AiProvider for RigProvider {
             .ok_or_else(|| EngineError::Ai(format!("未找到供应商 {}", self.pair_provider)))?;
         let request = CompletionRequest {
             model: None,
-            preamble: Some(SUMMARY_PREAMBLE.to_string()),
+            preamble: Some(self.story_prompts.memory_summary.clone()),
             chat_history: vec![Message::user(text.to_string())],
             documents: Vec::new(),
             tools: Vec::new(),
@@ -1077,7 +1668,42 @@ mod tests {
         assert!(super::intent_from_tool_call("narrate", &serde_json::json!(42)).is_err());
     }
 
-    /// 工具调用渲染成可读文本（会话记录 / 日志展示用）。
+    /// 原生工具调用记进会话时必须落成**可解析的规范意图 JSON**，不能落展示格式——
+    /// 展示格式会被模型当范本模仿成无法解析的文本（实测 round 82/83 的坑）。
+    #[test]
+    fn tool_calls_are_recorded_as_canonical_intent_json() {
+        let calls = vec![
+            super::ToolCallExtract {
+                name: "narrate".into(),
+                arguments: serde_json::json!({ "content": "夜色沉下来。" }),
+            },
+            super::ToolCallExtract {
+                name: "speak".into(),
+                arguments: serde_json::json!({ "content": "别走。", "actor_id": "char-isa" }),
+            },
+        ];
+        let text = super::intent_json_text(&calls);
+        assert!(
+            !text.contains("工具调用"),
+            "记录文本里不能出现展示格式：{text}"
+        );
+        let parsed = octopus_engine::parse_intents(&text).expect("记录文本必须能解析回意图");
+        assert_eq!(parsed.len(), 2);
+    }
+
+    /// 老存档里已经写进去的展示格式：读回会话时自愈成规范意图 JSON，其它文本不误伤。
+    #[test]
+    fn legacy_tool_call_text_is_healed_into_intent_json() {
+        let legacy = "[工具调用] narrate {\"content\":\"夜色沉下来。\"}\n[工具调用] speak {\"content\":\"别走。\",\"actor_id\":\"char-isa\"}";
+        let healed = super::heal_legacy_tool_calls(legacy).expect("整段都是老格式时应能修复");
+        let parsed = octopus_engine::parse_intents(&healed).expect("修复后必须可解析");
+        assert_eq!(parsed.len(), 2);
+        // 正常文本 / 混合内容一律不动。
+        assert!(super::heal_legacy_tool_calls("夜色沉下来。").is_none());
+        assert!(super::heal_legacy_tool_calls("先说一句\n[工具调用] narrate {}").is_none());
+    }
+
+    /// 工具调用渲染成可读文本（日志展示用）。
     #[test]
     fn tool_call_text_is_readable() {
         let t = super::tool_call_text("check", &serde_json::json!({ "attribute": "wit" }));
@@ -1121,6 +1747,9 @@ mod tests {
             }],
             story: test_role("p1", "m1"),
             pair: test_role("p1", "m1"),
+            prompts: Default::default(),
+            model_ctx: Default::default(),
+            compaction: Default::default(),
         })
         .expect("构造 provider");
         let seed = || vec![super::ConvMessage { round: 1, role: super::ConvRole::User, content: "u1".into() }];
@@ -1176,6 +1805,9 @@ mod tests {
             }],
             story: test_role("p1", "m1"),
             pair: test_role("p1", "m1"),
+            prompts: Default::default(),
+            model_ctx: Default::default(),
+            compaction: Default::default(),
         })
         .expect("构造 provider");
         let fake = std::sync::Arc::new(FakeConvStore::default());
@@ -1217,16 +1849,44 @@ mod tests {
         assert_eq!(fake.clears.lock().unwrap().as_slice(), ["sv-a".to_string()]);
     }
 
-    /// 会话上限：超出后丢最旧，保留最新往返。
+    /// 会话历史只追加、**永不裁剪**：模型窗口是百万级，早期剧情不该被静默丢掉。
+    ///
+    /// 供应商的上下文缓存是**前缀缓存**，队首一变后面整段按原价重算
+    ///（octopus.db 实测：每回合砍头时命中率 0.4%，纯追加时 ~97%）。
     #[test]
-    fn conversation_trim_keeps_newest() {
+    fn conversation_history_is_never_truncated() {
         let mut entry: Vec<super::ConvMessage> = Vec::new();
-        for r in 0..80u32 {
+        for r in 0..300u32 {
             super::record_round(&mut entry, r, format!("u{r}"), format!("a{r}"));
         }
-        assert_eq!(entry.len(), super::MAX_CONV_MESSAGES);
-        assert_eq!(entry.last().unwrap().content, "a79");
-        assert_eq!(entry[0].content, format!("u{}", 80 - super::MAX_CONV_MESSAGES as u32 / 2));
+        assert_eq!(entry.len(), 600, "只追加，不裁剪");
+        assert_eq!(entry[0].content, "u0", "最早期的那一轮必须还在");
+        assert_eq!(entry[599].content, "a299");
+    }
+
+    /// 第 N 轮发出去的历史必须是第 N-1 轮的**前缀 + 追加**。
+    ///
+    /// 这是缓存命中的充要条件：只要每轮都是「上一轮 + 新往返」，供应商就能把
+    /// 整段历史按缓存价复用；一旦某轮从中间改了序列，从改动点起全部失效。
+    #[test]
+    fn conversation_history_is_always_append_only() {
+        let mut entry: Vec<super::ConvMessage> = Vec::new();
+        let mut prev: Vec<String> = Vec::new();
+        for round in 1..200u32 {
+            let sent = super::append_round_history(&mut entry, round, true, &format!("u{round}"));
+            let sent: Vec<String> = sent
+                .iter()
+                .map(|m| super::message_to_trace(m).content)
+                .collect();
+            assert!(
+                sent.starts_with(&prev[..]),
+                "第 {round} 轮的历史不再是上一轮的前缀（前缀缓存会整段失效）"
+            );
+            assert_eq!(sent.len(), 2 * round as usize - 1, "历史必须完整保留");
+            prev = sent;
+            super::record_round(&mut entry, round, format!("u{round}"), format!("a{round}"));
+        }
+        assert_eq!(entry.len(), 398, "199 轮往返全部留在会话里");
     }
 
     #[test]
@@ -1653,6 +2313,9 @@ mod tests {
             ],
             story: test_role("p1", "m1"),
             pair: test_role("p1", "m1"),
+            prompts: Default::default(),
+            model_ctx: Default::default(),
+            compaction: Default::default(),
         })
         .expect("构造 provider");
 
@@ -1728,5 +2391,87 @@ mod tests {
         // 无命中时不注入空段。
         ctx.memories.clear();
         assert!(!super::turn_prompt(&ctx).contains("【相关往事】"));
+    }
+
+    /// 缓存前缀守门：公共前缀长度算准（0 = 连系统层都变了）。
+    #[test]
+    fn prefix_guard_measures_the_common_prefix() {
+        let d = |r: &str, c: &str| super::message_digest(r, c);
+        let a = [d("system", "S"), d("user", "u1"), d("assistant", "a1")];
+        assert_eq!(super::common_prefix_len(&a, &a), 3);
+        // 追加：整段前缀都在（健康回合）。
+        let b = [
+            d("system", "S"),
+            d("user", "u1"),
+            d("assistant", "a1"),
+            d("user", "u2"),
+        ];
+        assert_eq!(super::common_prefix_len(&a, &b), 3);
+        // 系统层变了：0——逐回合会变的内容进 preamble 就是这个下场。
+        let c = [d("system", "S2"), d("user", "u1"), d("assistant", "a1")];
+        assert_eq!(super::common_prefix_len(&a, &c), 0);
+        // 队首被丢：从第 1 条起失配——正是「每回合砍头」的病。
+        let e = [d("system", "S"), d("user", "u2"), d("assistant", "a2")];
+        assert_eq!(super::common_prefix_len(&a, &e), 1);
+        // 角色也参与指纹。
+        assert_ne!(d("user", "u1"), d("assistant", "u1"));
+    }
+
+    /// token 估算：用学到的「字符 / token」系数，且有下限保护（不会除零）。
+    #[test]
+    fn token_estimate_uses_the_learned_factor() {
+        assert_eq!(super::estimate_tokens(0, 1.8), 0);
+        assert_eq!(super::estimate_tokens(180, 1.8), 100);
+        assert_eq!(super::estimate_tokens(1, 0.0), 5);
+    }
+
+    /// 压缩范围：切点只落在回合开头（不劈开一回合内的续轮往返），
+    /// 且至少逐字保留 token 预算那么多的尾巴；全都要留时返回 None。
+    #[test]
+    fn compaction_range_keeps_the_priced_tail_and_cuts_at_round_starts() {
+        let mut entry: Vec<super::ConvMessage> = Vec::new();
+        for r in 1..=10u32 {
+            super::record_round(&mut entry, r, "u".repeat(1000), "a".repeat(1000));
+        }
+        // 预算 0：只留最后一轮（2 条）。
+        let cut = super::select_compaction_range(&entry, 1.8, 0, 1).expect("有得压");
+        assert_eq!(entry.len() - cut, 2, "只保留最后一轮的往返");
+        assert!(super::is_round_start(&entry, cut));
+        // 预算 4000 token（≈7200 字符，每条约 556）：至少保留 2 轮。
+        let cut = super::select_compaction_range(&entry, 1.8, 4000, 1).expect("有得压");
+        assert!(super::rounds_in(&entry, cut) >= 2, "尾巴按预算保留");
+        assert!(super::is_round_start(&entry, cut), "切点必须在回合开头");
+        assert!(
+            entry[..cut].iter().all(|m| m.round < entry[cut].round),
+            "被遮蔽的必须是更早的回合"
+        );
+        // 预算大过全部历史：没得压（不能把整段都遮蔽掉）。
+        assert!(super::select_compaction_range(&entry, 1.8, 1_000_000, 1).is_none());
+    }
+
+    /// 溢出兜底（预算 0）也要至少留两个回合，别把接续的上下文压没。
+    #[test]
+    fn compaction_range_keeps_two_rounds_on_overflow() {
+        let mut entry: Vec<super::ConvMessage> = Vec::new();
+        for r in 1..=10u32 {
+            super::record_round(&mut entry, r, "u".repeat(1000), "a".repeat(1000));
+        }
+        let cut = super::select_compaction_range(&entry, 1.8, 0, 2).expect("有得压");
+        assert_eq!(super::rounds_in(&entry, cut), 2);
+    }
+
+    /// 超限错误的辨认要保守（误判 = 一次昂贵的压缩 + 重试），摘要要有可识别的框。
+    #[test]
+    fn overflow_classifier_and_summary_framing() {
+        assert!(super::is_context_overflow(
+            "Error: This model's maximum context length is 131072 tokens"
+        ));
+        assert!(super::is_context_overflow("context_length_exceeded"));
+        assert!(!super::is_context_overflow("401 invalid api key"));
+        assert!(!super::is_context_overflow("rate limit exceeded"));
+        let framed = super::frame_summary("  旧事重提  ");
+        assert!(framed.contains("<已压缩摘要>") && framed.contains("</已压缩摘要>"));
+        assert!(framed.contains("旧事重提"));
+        assert!(!framed.contains("  旧事重提  "), "摘要要去掉首尾空白");
     }
 }

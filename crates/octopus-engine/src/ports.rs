@@ -126,6 +126,24 @@ pub struct TurnContext {
 /// 可热替换的 AI provider 槽：改配置后，后续回合立即用新模型，无需重启进程或重建会话。
 pub type AiSlot = std::sync::Arc<std::sync::RwLock<std::sync::Arc<dyn AiProvider>>>;
 
+/// 一次自动上下文压缩的记账（进游玩页日志，不进对话）。
+///
+/// 压缩只重写**派生 surface**（模型会话）；权威命令日志不动，所以玩家看到的叙事、
+/// 回放与存档都不受影响。语义对齐 DSH `compaction` 的 `CompactionResult`。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CompactionReport {
+    /// 触发原因："pressure"（token 压力）| "context_overflow"（供应商报超限后的兜底）。
+    pub trigger: String,
+    /// 被摘要遮蔽掉的回合数。
+    pub shadowed_rounds: u32,
+    /// 遮蔽前后的字符数（摘要必须更短才算成功）。
+    pub chars_before: u64,
+    pub chars_after: u64,
+    /// 摘要调用本身的用量（缓存命中是关键指标）。
+    pub usage: octopus_types::AiCallUsage,
+    pub latency_ms: u64,
+}
+
 /// 一次 AI 调用的产物：意图包络 + 可选的思考链文本（reasoning_content）。
 #[derive(Debug, Clone, Default)]
 pub struct AiOutput {
@@ -138,6 +156,8 @@ pub struct AiOutput {
     /// 本次调用的完整轨迹（pi 式 span）：请求上下文 + 用量 + 延迟 + 状态。
     /// None = 该 provider 不采集（ScriptedProvider 等确定性实现）。
     pub trace: Option<octopus_types::AiCallPayload>,
+    /// 本次调用之前做过一次自动上下文压缩时的记账（None = 没压）。
+    pub compaction: Option<CompactionReport>,
 }
 
 impl AiOutput {
@@ -149,6 +169,7 @@ impl AiOutput {
             reasoning: None,
             intent_warnings: Vec::new(),
             trace: None,
+            compaction: None,
         }
     }
 }
@@ -181,6 +202,12 @@ pub trait ConversationStore: Send + Sync {
 pub trait AiProvider: Send + Sync {
     /// 单一 AI：负责旁白 / 场景推进 / 世界响应，并扮演所有非玩家角色。
     async fn story_intents(&self, ctx: &TurnContext) -> Result<AiOutput, EngineError>;
+
+    /// 请求取消某存档**正在进行**的 AI 调用（没有在途调用时是空操作）。
+    ///
+    /// 实现应立即让在途请求返回 `Err(EngineError::Cancelled)`；引擎把这一回合当作
+    /// 「玩家主动停止」干净收尾（System 事件 + RoundEnd，不产生任何叙事）。
+    fn cancel(&self, _save_id: &str) {}
 
     /// 注入会话持久化端口（仅 RigProvider 会用；其它实现忽略即可）。
     fn set_conversation_store(&self, _store: std::sync::Arc<dyn ConversationStore>) {}

@@ -9,7 +9,7 @@ import type {
   WorldProjection, PlayEvent, PhaseStage, SaveDetail, CheckResultPayload, StateDelta, CharacterInstance,
   EntityRef, FocusEntity, Storybook, SaveModelChoice, AiCallPayload
 } from '@/types'
-import { hydrate, subscribe, submitRound, rerunRound, confirmAction, getSave, getHistory, getSaveSettings, switchCharacter, setSaveSettings, toast } from '@/api'
+import { hydrate, subscribe, submitRound, cancelRound, rerunRound, confirmAction, getSave, getHistory, getSaveSettings, switchCharacter, setSaveSettings, toast } from '@/api'
 import { uid } from '@/types'
 import { listEntityRefs as listRefsFrom, resolveFocus as resolveFocusFrom } from '@/lib/entity-refs'
 
@@ -688,6 +688,20 @@ export const usePlayStore = defineStore('play', () => {
     }
   }
 
+  /**
+   * 停止本回合的 AI 推理（在途调用会被真正取消，不再烧 token）。
+   * 收尾由事件流负责：引擎发 System(round_cancelled) + RoundEnd，phase 回到 idle。
+   */
+  async function stopRound(): Promise<void> {
+    if (!saveId.value) return
+    try {
+      await cancelRound(saveId.value)
+      toast('info', '已请求停止本回合的 AI 推理…')
+    } catch (err) {
+      toast('error', (err as Error)?.message ?? String(err))
+    }
+  }
+
   /** 确认门往返（#17/#24） */
   async function confirm(actionId: string, decision: 'confirm' | 'cancel') {
     if (confirmBusy.value) return
@@ -853,6 +867,6 @@ export const usePlayStore = defineStore('play', () => {
     oldestSeq, hasMoreOlder, loadingOlder, lastAiUsage, aiUsageTotal,
     autoConfirm, sceneTitle, controlledId, controlled, presentChars, allChars, busy, waitingConfirm, canRerun,
     phaseLabel,
-    init, loadOlder, send, rerunLastRound, confirm, switchTo, setAutoConfirm, setModel, clearModel, setNarrativeOverride, applyUpgrade, teardown
+    init, loadOlder, send, stopRound, rerunLastRound, confirm, switchTo, setAutoConfirm, setModel, clearModel, setNarrativeOverride, applyUpgrade, teardown
   }
 })

@@ -32,7 +32,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import {
-  IconSend, IconSparkles, IconUser, IconCheck, IconLoader2,
+  IconSend, IconSparkles, IconUser, IconCheck, IconLoader2, IconPlayerStopFilled,
   IconListCheck, IconGlassFull, IconUsers, IconBolt, IconRobot, IconSettings,
   IconArrowBackUp, IconTool, IconPlus, IconAt, IconPaperclip, IconFileText,
   IconAlertTriangle
@@ -56,6 +56,16 @@ const tokenStats = computed(() => {
   const storybook = estimateTokensOf(buildStorybookContext(editor.draft) ?? {})
   const tools = estimateTokensOf(PAIR_TOOLS)
   return { dialog, storybook, tools, total: dialog + storybook + tools }
+})
+
+/**
+ * 上一轮**真正发给模型**的上下文构成（后端口径）：真实输入 token + 系统 / 历史 / 快照 / 工具拆分。
+ * 压缩之后前端按展示历史估的那个数会偏大，所以有真实值就报真实值。
+ */
+const measuredContext = computed(() => {
+  const s = pair.lastTurnStats
+  if (!s?.context) return null
+  return { input: s.inputTokens ?? 0, ...s.context }
 })
 
 /** 上一轮真实用量（后端 usage 优先）：出字 / 速度 / 缓存命中 / 思考量 */
@@ -326,13 +336,27 @@ const canSend = computed(() => pair.sending || !pair.input.trim())
         </div>
         <p v-if="!pair.threads.length" class="px-1 py-3 text-center text-[11px] text-muted-foreground/60">暂无会话</p>
       </div>
-      <!-- 上下文计量：直接报 token（对话 + 故事书 + 工具）；不再有固定条数窗口 -->
+      <!-- 上下文计量：有真实用量就报真实（后端口径，含压缩后的实际 surface），否则报发送前估算 -->
       <div class="flex-none border-t border-border/70 px-3 py-2 text-[10.5px] text-muted-foreground/70">
         <div class="flex items-center justify-between">
-          <span>上下文估算</span>
-          <span class="font-mono font-semibold text-foreground/85">{{ fmtTokens(tokenStats.total) }} tok</span>
+          <span
+            :title="measuredContext
+              ? '供应商回传的真实输入 token（系统层 + 会话历史 + 草稿快照 + 工具）'
+              : '发送前的本地粗估（CJK 1 字 ≈ 1 token）；首次发送后改用供应商回传的真实值'"
+          >
+            {{ measuredContext ? '上下文（上轮实际）' : '上下文估算' }}
+          </span>
+          <span class="font-mono font-semibold text-foreground/85">
+            {{ fmtTokens(measuredContext ? measuredContext.input : tokenStats.total) }} tok
+          </span>
         </div>
-        <p class="mt-0.5 font-mono text-[10px] text-muted-foreground/55">
+        <p v-if="measuredContext" class="mt-0.5 font-mono text-[10px] text-muted-foreground/55">
+          发给模型 {{ measuredContext.sent_messages }} 条 · 系统 {{ fmtTokens(measuredContext.system_tokens) }} · 历史 {{ fmtTokens(measuredContext.history_tokens) }} · 快照 {{ fmtTokens(measuredContext.tail_context_tokens) }} · 工具 {{ fmtTokens(measuredContext.tools_tokens) }}
+        </p>
+        <p v-if="measuredContext?.compacted" class="mt-0.5 font-mono text-[10px] text-muted-foreground/55">
+          展示历史 {{ measuredContext.display_messages }} 条 · 最早 {{ measuredContext.shadowed_messages }} 条已压成摘要（只影响模型上下文，对话不丢）
+        </p>
+        <p v-else-if="!measuredContext" class="mt-0.5 font-mono text-[10px] text-muted-foreground/55">
           {{ pair.messages.length }} 条 · 对话 {{ fmtTokens(tokenStats.dialog) }} · 故事书 {{ fmtTokens(tokenStats.storybook) }} · 工具 {{ fmtTokens(tokenStats.tools) }}
         </p>
         <p v-if="lastTurnLine" class="mt-0.5 font-mono text-[10px] text-muted-foreground/55">
@@ -645,10 +669,20 @@ const canSend = computed(() => pair.sending || !pair.input.trim())
             <span class="hidden min-w-0 flex-1 truncate text-[10.5px] text-muted-foreground/55 lg:inline">
               Enter 发送 · Shift+Enter 换行
             </span>
-            <Button ref="sendBtn" size="sm" class="ml-auto h-7 shrink-0 gap-1 px-3 font-semibold shadow-xs" :disabled="canSend" @click="onSend">
-              <IconLoader2 v-if="pair.sending" class="size-3.5 animate-spin" />
-              <IconSend v-else class="size-3.5" />
-              {{ pair.sending ? '发送中' : '发送' }}
+            <Button
+              v-if="pair.sending"
+              variant="destructive"
+              size="sm"
+              class="ml-auto h-7 shrink-0 gap-1 px-3 font-semibold shadow-xs"
+              title="停止本轮生成：断开连接后服务端的在途请求也会中断"
+              @click="pair.stop()"
+            >
+              <IconPlayerStopFilled class="size-3.5" />
+              停止
+            </Button>
+            <Button v-else ref="sendBtn" size="sm" class="ml-auto h-7 shrink-0 gap-1 px-3 font-semibold shadow-xs" :disabled="canSend" @click="onSend">
+              <IconSend class="size-3.5" />
+              发送
             </Button>
           </div>
         </div>

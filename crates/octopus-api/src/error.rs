@@ -50,6 +50,7 @@ impl From<EngineError> for ApiError {
             EngineError::RoundInProgress => {
                 Self::new(StatusCode::CONFLICT, "round_in_progress", e.to_string())
             }
+            EngineError::Cancelled => Self::new(StatusCode::CONFLICT, "cancelled", e.to_string()),
             EngineError::EmptyInput => {
                 Self::new(StatusCode::BAD_REQUEST, "empty_input", e.to_string())
             }

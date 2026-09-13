@@ -945,6 +945,29 @@ export interface AppConfig {
   turn_token_budget?: number
   /** AI 后端开关：provider = auto|rig|scripted */
   ai?: { provider: string }
+  /** 提示词覆盖表：key → 自定义文本（空 / 缺失 = 用内置默认）。目录见 GET /api/prompts */
+  prompts?: Record<string, string>
+}
+
+/** 提示词模板里的一个可用变量（占位符） */
+export interface PromptVar {
+  /** 占位符名，模板里写作双花括号包住的 name */
+  name: string
+  description: string
+}
+
+/** 一条可自定义提示词（GET /api/prompts） */
+export interface PromptDef {
+  key: string
+  /** 分组标题（前端按它折叠展示） */
+  group: string
+  label: string
+  description: string
+  variables: PromptVar[]
+  /** 内置默认文本（只读，供对照与恢复） */
+  default: string
+  /** 用户覆盖文本；null = 未覆盖（用默认） */
+  override_text: string | null
 }
 
 export interface ProviderTestResult {

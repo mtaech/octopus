@@ -16,7 +16,7 @@ import {
   setPairThreadPending,
   fetchUrl,
 } from '@/api'
-import type { EntityRef, FetchUrlResult, PairAttachment, PairFocusEntity, PairHistoryMessage, PairToolCall, PairMessageRecord, PairThreadRecord, PairUsage } from '@/api'
+import type { EntityRef, FetchUrlResult, PairAttachment, PairContextMeta, PairFocusEntity, PairHistoryMessage, PairToolCall, PairMessageRecord, PairThreadRecord, PairUsage } from '@/api'
 import { useSettingsStore } from '@/pages/list/stores/settings'
 import { PAIR_TOOLS } from './pair-tools'
 import { estimateTokens } from '@/lib/tokens'
@@ -178,6 +178,8 @@ export const usePairStore = defineStore('editorPair', () => {
     reasoningTokens?: number
     /** 本轮实际使用的输出预算 */
     maxTokens?: number
+    /** 本轮真正发给模型的上下文构成（后端口径；压缩后前端估算会偏大） */
+    context?: PairContextMeta
   } | null>(null)
 
   /** 本轮发给后端的输出预算：设置里显式配了就用，否则交给后端自适应。 */
@@ -302,6 +304,9 @@ export const usePairStore = defineStore('editorPair', () => {
         role: m.role as 'user' | 'assistant',
         content: m.content,
         reasoning: m.reasoning ?? undefined,
+        // 回放的思考块必须与当场一致：否则重载 / 切线程后，历史里带 tool_calls 的助手轮
+        // 少了 reasoning，模型看到的消息序列变了 → 整段前缀缓存作废（从那条起全部重算）。
+        reasoningForReplay: m.reasoning ?? undefined,
         model: m.model ?? undefined,
         isError: m.is_error,
         tools: Array.isArray(m.tools) ? (m.tools as PairToolTrace[]) : undefined,
@@ -447,11 +452,22 @@ export const usePairStore = defineStore('editorPair', () => {
     return text
   }
 
+  /** 本轮在途请求的中止控制器：点「停止」时 abort。连接一断，服务端的在途生成随之停止。 */
+  let inflight: AbortController | null = null
+
+  /** 停止本轮生成（客户端断开 SSE；已经流出来的内容保留在消息里）。 */
+  function stop(): void {
+    inflight?.abort()
+    inflight = null
+  }
+
   /** 发送一轮：user 消息入流 → function calling agent 循环（工具直接落稿，可撤销） */
   async function send(draft: Storybook | null, executor?: PairToolExecutor, attachments?: PairAttachment[]): Promise<boolean> {
     const t = input.value.trim()
     if (!t || sending.value) return false
     sending.value = true
+    inflight = new AbortController()
+    const signal = inflight.signal
     activeExecutor = executor ?? activeExecutor
     // 引用：本轮的显式目标（chips → 结构化 refs + 完整定义 focus）
     const refs = [...pendingRefs.value]
@@ -503,6 +519,7 @@ export const usePairStore = defineStore('editorPair', () => {
       let finalText = ''
       // 多步循环里收集最后一轮的真实用量与诊断信息（供状态行 / 空返回提示）
       let lastUsage: PairUsage | undefined
+      let lastContext: PairContextMeta | undefined
       let lastFinishReason: string | undefined
       let lastReasoningChars = 0
       let lastCounts: Record<string, number> | undefined
@@ -520,6 +537,9 @@ export const usePairStore = defineStore('editorPair', () => {
           storybook: buildSbContext(),
           tools: PAIR_TOOLS,
           focus: focus.length ? focus : undefined,
+          // 后端按线程持久化压缩检查点（前端只发全量展示历史）
+          thread_id: activeThreadId.value || undefined,
+          signal,
           max_tokens: sentMaxTokens,
           onReasoning: (text: string, replace?: boolean) => {
             roundReasoning = replace ? text : roundReasoning + text
@@ -544,6 +564,7 @@ export const usePairStore = defineStore('editorPair', () => {
           assistantMsg.value.content = finalText
         }
         lastUsage = res.usage
+        if (res.context) lastContext = res.context
         lastFinishReason = res.finishReason
         // length = 预算用尽。哪怕这一轮出了字，正文也是断在半句话上，必须让创作者看见。
         if (res.finishReason === 'length') {
@@ -692,18 +713,23 @@ export const usePairStore = defineStore('editorPair', () => {
         finishReason: lastFinishReason,
         reasoningTokens: lastUsage?.reasoning_tokens,
         maxTokens: sentMaxTokens ?? truncatedAtTokens,
+        context: lastContext,
       }
 
       await persist([assistantMsg.value])
       return true
     } catch (e) {
+      const aborted = (e as { name?: string })?.name === 'AbortError'
       const msg = (e as Error)?.message ?? String(e)
       executor?.discardTurn()
-      assistantMsg.value.content = '结对服务暂时不可用：' + msg
-      assistantMsg.value.isError = true
+      assistantMsg.value.content = aborted
+        ? '已停止本轮生成（已流出的内容保留；未批准的工具改动已丢弃）。'
+        : '结对服务暂时不可用：' + msg
+      assistantMsg.value.isError = !aborted
       await persist([assistantMsg.value])
       return false
     } finally {
+      inflight = null
       sending.value = false
     }
   }
@@ -759,7 +785,7 @@ export const usePairStore = defineStore('editorPair', () => {
     lastTurnStats,
     push, clear, openStorybook, switchThread, createThread, renameThread, deleteThread,
     pendingRefs, addRef, removeRef, clearRefs,
-    send, adopt, applySelected, discardOne, discardPending,
+    send, stop, adopt, applySelected, discardOne, discardPending,
     seedResumePrompt, resolveMaxTokens
   }
 })
