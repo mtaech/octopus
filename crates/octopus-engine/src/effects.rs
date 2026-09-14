@@ -252,25 +252,54 @@ pub fn resolve_effect(
 /// execute_skill）。同一轮里多次声明以**最后一条**为准（与判定结果覆盖同口径：
 /// 脚本顺序即优先级）。
 ///
+/// # 两个正交的声明
+///
+/// 本结构收集的是规则包声明的**两件互不相干的事**，作者陷阱正在于它们过去只有一个入口：
+///
+/// - `host.force_effect()`：**开门**（判定成功 / 未命中也照常结算效果），**不缩放**；
+/// - `host.scale_effect(f)`：**开门 且 按 f 缩放**——「声明缩放」本身在既有语义里
+///   就等于「要结算，只是缩放」，含 `scale_effect(1.0)`（既有语义，逐字保留）；
+/// - 都不声明：不开门、不缩放，走旧路径。
+///
+/// 也就是说 `scale_effect(1.0)` 与「不声明」**行为不同**（前者已开门）。想「只开门、
+/// 不缩放」时写 `force_effect()`；想「只缩放、不开门」没有表达方式，也不需要——
+/// 声明缩放本身就意味着「要结算」。
+///
 /// **没有声明时一切逐字不变**：不额外掷骰、不改语义、事件顺序原样。
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct EffectScale {
-    /// 本次结算的缩放因子；`None` = 脚本没有声明（走旧语义）。
+    /// 本次结算的缩放因子；`None` = 脚本没有声明缩放（数值逐字不动）。
     pub factor: Option<f64>,
+    /// 脚本是否**显式**声明了「打开效果门」（`host.force_effect()`）；缺省 false。
+    ///
+    /// 与 `factor` 完全正交：它只回答「判定成功 / 未命中是否照常结算效果」，
+    /// 不参与任何数值缩放。两者可同时声明。
+    pub force: bool,
 }
 
 impl EffectScale {
-    /// 脚本是否声明了缩放。
+    /// 脚本是否声明了**缩放**（只看因子，与效果门无关）。
     ///
-    /// 有声明 = 「这一次效果照常结算，数值按因子缩放」——调用方据此**覆盖**
-    /// 「判定结果决定是否结算效果」的那道门（豁免成功 / 未命中都不再等于不结算：
-    /// 声明本身就是「要结算，只是缩放」的意思），也据此决定要不要掷那一次效果骰。
-    /// 没有声明时那道门的语义逐字不变。
+    /// 单独看它不足以判断「效果要不要结算」——那道门见 `opens_effect_gate`。
     pub fn is_declared(&self) -> bool {
         self.factor.is_some()
     }
 
-    /// 吸收一批 Lua 请求里的缩放声明，返回其余请求（**顺序不变**）。
+    /// 「判定结果决定是否结算效果」的那道门是否被打开。
+    ///
+    /// 两种声明都会打开它，各自语义独立：
+    /// - `force_effect()`：**只**开门，不缩放（`force = true`）；
+    /// - `scale_effect(f)`：开门 **且** 按 `f` 缩放——「声明缩放」本身在既有语义里
+    ///   就等于「要结算，只是缩放」（含 `scale_effect(1.0)`），这里逐字保留。
+    ///
+    /// 两者都没声明时返回 false，调用方走旧路径（豁免失败才结算 / 命中才结算）；
+    /// 调用方据此决定要不要掷那一次效果骰。
+    pub fn opens_effect_gate(&self) -> bool {
+        self.force || self.factor.is_some()
+    }
+
+    /// 吸收一批 Lua 请求里的**效果声明**（`scale_effect` / `force_effect`），
+    /// 返回其余请求（**顺序不变**）。
     ///
     /// 与 `command::CheckAdjustments::absorb` 同一范式：挂载点只声明，引擎负责收集。
     pub fn absorb(&mut self, requests: Vec<LuaRequest>) -> Vec<LuaRequest> {
@@ -278,6 +307,7 @@ impl EffectScale {
         for req in requests {
             match req {
                 LuaRequest::ScaleEffect { factor } => self.factor = Some(factor),
+                LuaRequest::ForceEffect => self.force = true,
                 other => rest.push(other),
             }
         }
@@ -527,7 +557,7 @@ mod tests {
         ];
         for (factor, expected, changed) in cases {
             let mut out = build();
-            let scale = EffectScale { factor: Some(factor) };
+            let scale = EffectScale { factor: Some(factor), ..Default::default() };
             assert_eq!(scale.apply(&mut out), changed, "因子 {factor} 的改动条数");
             let got: Vec<i64> = out.deltas.iter().map(|d| d.value.as_i64().unwrap()).collect();
             assert_eq!(got, expected.to_vec(), "因子 {factor} 的取整结果");
@@ -567,7 +597,7 @@ mod tests {
             modifiers: vec![AttributeModifier { attribute: "str".into(), value: 2 }],
             rng_consumed: 1,
         };
-        let scale = EffectScale { factor: Some(0.5) };
+        let scale = EffectScale { factor: Some(0.5), ..Default::default() };
         assert_eq!(scale.apply(&mut out), 1, "只有资源 delta 会被缩放");
         assert_eq!(out.deltas[0].value, json!(-4));
         assert_eq!(out.deltas[1].value, serde_json::to_value(&status).unwrap());
@@ -580,11 +610,13 @@ mod tests {
         );
     }
 
-    /// 收集：只吸走 scale_effect，其余请求**顺序原样**；同一轮多次声明以最后一条为准。
+    /// 收集：只吸走 scale_effect / force_effect，其余请求**顺序原样**；
+    /// 同一轮多次声明以最后一条为准。
     #[test]
     fn effect_scale_absorbs_only_its_own_request_and_last_one_wins() {
         let mut scale = EffectScale::default();
         assert!(!scale.is_declared(), "没有声明时 is_declared 为假");
+        assert!(!scale.opens_effect_gate(), "没有声明时效果门关着");
         let rest = scale.absorb(vec![
             LuaRequest::TriggerEvent { event: "a".into(), payload: json!({}) },
             LuaRequest::ScaleEffect { factor: 2.0 },
@@ -600,6 +632,59 @@ mod tests {
         assert_eq!(rest.len(), 2);
         assert!(matches!(rest[0], LuaRequest::TriggerEvent { .. }));
         assert!(matches!(rest[1], LuaRequest::ModifyResource { .. }));
+
+        // force_effect 是独立的一路：只置 force，不碰 factor，也不进「其余请求」。
+        let mut forced = EffectScale::default();
+        let rest = forced.absorb(vec![
+            LuaRequest::ForceEffect,
+            LuaRequest::TriggerEvent { event: "b".into(), payload: json!({}) },
+        ]);
+        assert!(forced.force, "force_effect 置位");
+        assert_eq!(forced.factor, None, "force_effect 不设置因子");
+        assert!(!forced.is_declared(), "没有因子就不是「声明了缩放」");
+        assert!(forced.opens_effect_gate(), "但效果门已打开");
+        assert_eq!(rest.len(), 1, "force_effect 被吸走，其余顺序原样");
+        assert!(matches!(rest[0], LuaRequest::TriggerEvent { .. }));
+    }
+
+    /// 效果门与缩放**正交**：force_effect 单独声明 → 开门但一个数值都不动；
+    /// scale_effect 单独声明 → 开门且缩放（旧语义）；两者同时声明 → 开门 + 缩放。
+    #[test]
+    fn force_effect_opens_the_gate_without_scaling() {
+        let build = || EffectResolution {
+            deltas: vec![resource_delta("char-b", "hp", -7)],
+            ..Default::default()
+        };
+
+        // force_effect()：开门、不缩放 → apply 一个字节都不动。
+        let forced = EffectScale { force: true, ..Default::default() };
+        assert!(forced.opens_effect_gate(), "显式开门");
+        assert!(!forced.is_declared(), "开门 ≠ 声明缩放");
+        let mut out = build();
+        assert_eq!(forced.apply(&mut out), 0, "开门不缩放：改动条数为 0");
+        assert_eq!(out, build(), "产物逐字不变");
+
+        // scale_effect(1.0)：开门 + 因子 1（旧语义：开门，数值不动）。
+        let unit = EffectScale { factor: Some(1.0), ..Default::default() };
+        assert!(unit.opens_effect_gate(), "旧语义：scale_effect(1.0) 也开门");
+        assert!(unit.is_declared());
+        let mut out = build();
+        assert_eq!(unit.apply(&mut out), 0, "因子 1 不产生数值改动");
+        assert_eq!(out, build());
+
+        // 两者同时声明：开门 + 按 0.5 缩放。
+        let both = EffectScale { factor: Some(0.5), force: true };
+        assert!(both.opens_effect_gate());
+        let mut out = build();
+        assert_eq!(both.apply(&mut out), 1, "同声明的因子照常缩放");
+        assert_eq!(out.deltas[0].value, json!(-3), "-7 × 0.5 向零取整");
+
+        // 都不声明：门关着、数值不动（逐字旧路径）。
+        let bare = EffectScale::default();
+        assert!(!bare.opens_effect_gate() && !bare.is_declared());
+        let mut out = build();
+        assert_eq!(bare.apply(&mut out), 0);
+        assert_eq!(out, build());
     }
 
     /// 没有因子（含病态 NaN）时结算产物**逐字不变**——旧内容不受影响的硬要求。
@@ -611,7 +696,7 @@ mod tests {
         };
         for factor in [None, Some(f64::NAN), Some(f64::INFINITY)] {
             let mut out = base.clone();
-            let scale = EffectScale { factor };
+            let scale = EffectScale { factor, ..Default::default() };
             assert_eq!(scale.apply(&mut out), 0, "因子 {factor:?} 不该改动任何 delta");
             assert_eq!(out, base, "因子 {factor:?} 下产物逐字不变");
         }

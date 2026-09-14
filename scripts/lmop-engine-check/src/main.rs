@@ -15,13 +15,28 @@
 //!   CARGO_TARGET_DIR=$PWD/.scratch/lmop-engine-check-target \
 //!     cargo build --manifest-path scripts/lmop-engine-check/Cargo.toml
 //!
-//! 断言清单：
+//! 断言清单（20 条；T27 发现①/③ 新增 8 条 + 「旧实况可执行复现」1 条）：
 //!   proficiency.data_driven      改故事书 definition 的 bonus → 真实 Lua 给出的加值随之变
 //!   sunlight.by_signature        只对 attack 与 (attribute ∧ wis) 取低，其它判定零请求
-//!   encounter_table.refires      同一张表的同一行，在同一局里能触发两次以上（repeatable + clear_flag）
-//!   encounter_table.legacy_once  反证：不标 repeatable、不复位时，同一行整局只触发一次
+//!   encounter_table.refires      同一张表的同一行，在同一局里能触发两次以上（repeatable + clear_flag）；
+//!                                内嵌反证组：不标 repeatable / 不复位时同一行整局只触发一次
 //!   xp.improvised_encounter      导演即兴建的遭遇（非掷表）杀怪也发 XP；非击败事件不发
 //!   bestiary.xp_matches          开放内容里的 XP 与图鉴 statblock.xp 逐条相等
+//!   save_half.engine_scales_own_roll             同种子下因子 1.0 与 0.5 的实际 delta 关系
+//!   save_half.resolved_effects_is_engine_snapshot PostResolve 读到的就是引擎算出的那一份
+//!   pack_tactics.reads_world_facts               集群战术 8 类场景（FP-A/B/C/E、FN-A）
+//!   pack_tactics.old_impl_reproduces_misjudgments 变异：旧脚本复现 5 类误判 → 反例有牙齿
+//!   ambusher.reads_target_statuses               伏击按 host.target.statuses 判定
+//!   xp.encounter_snapshot_fallback               事件缺 template_id 时按 instance_id 回查
+//!   ambusher.check_signature                     T27 ①：attack → 给；attribute / save → 不给
+//!   ambusher.old_impl_ignores_check_signature   旧脚本原文内嵌：同一批场景 1/1/1（旧实况仍可执行）
+//!   ambusher.fail_closed_without_signature     签名缺失（无快照 / kind 缺省）→ 0；attack → 1
+//!   ambusher.target_status_data_driven           期望状态 id 只来自开放内容 fields.target_status
+//!   save_half.check_signature_gate               只对 kind == save 开缩放门（attack / attribute 零请求）
+//!   save_half.rule_comes_from_open_content       改定义 skill_id → 规则整体不生效
+//!   save_ends.reads_open_content                 改定义 dc → 结局翻转（DC 来自开放内容）
+//!   xp.event_gate                                同一 payload 换事件名 → 零 XP
+//!   xp.value_from_open_content                   改定义 xp → 发放值随之变
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
@@ -30,7 +45,8 @@ use std::sync::Mutex;
 
 use octopus_engine::conditions::evaluate_skeleton_full;
 use octopus_engine::lua_host::{
-    CheckModifier, LuaCheckContext, LuaEventContext, LuaHostContext, LuaMount, LuaRegistry, MountEnv,
+    CheckModifier, LuaCheckContext, LuaEventContext, LuaHostContext, LuaMount, LuaRegistry,
+    LuaStatusContext, MountEnv,
 };
 use octopus_engine::lua_lint::lint_storybook;
 use octopus_engine::rng::DeterministicRng;
@@ -202,8 +218,19 @@ fn run_rule_assertions(sb: &Value, a: &mut Assertions) {
     save_half_engine_scales_own_roll(sb, a);
     save_half_resolved_effects_is_engine_snapshot(sb, a);
     pack_tactics_reads_world_facts(sb, a);
+    pack_tactics_old_impl_reproduces_the_five_misjudgments(sb, a);
     ambusher_reads_target_statuses(sb, a);
     xp_encounter_snapshot_fallback(sb, a);
+    // T27 发现①/③ 新增：伏击按判定签名 + 子串一致性断言的行为级兜底
+    ambusher_check_signature(sb, a);
+    ambusher_old_impl_ignores_check_signature(sb, a);
+    ambusher_fail_closed_without_signature(sb, a);
+    ambusher_target_status_data_driven(sb, a);
+    save_half_check_signature_gate(sb, a);
+    save_half_rule_comes_from_open_content(sb, a);
+    save_ends_reads_open_content(sb, a);
+    xp_event_gate(sb, a);
+    xp_value_from_open_content(sb, a);
 }
 
 /// 验收 1：熟练加值数据驱动。
@@ -806,87 +833,249 @@ fn save_half_resolved_effects_is_engine_snapshot(sb: &Value, a: &mut Assertions)
     );
 }
 
-/// GAP-A：集群战术读运行时事实（list_encounters + get_character + location_id）。
-/// 正例 / 三个反例（同伴倒下 / 目标不在一处 / 我不在任何遭遇）。
+/// GAP-A（T26 修正轮后）：集群战术读运行时事实，实现与开放内容声明一致。
+/// 正例 + 5 类历史误判的**引擎级反例**（FP-A 同伴异地 / FP-B 同伴失能 / FP-C 无地点 /
+/// FP-E 非攻击判定 / FN-A 同伴在别的遭遇）+ 同伴倒下 / 无挂接。
 fn pack_tactics_reads_world_facts(sb: &Value, a: &mut Assertions) {
     let name = "pack_tactics.reads_world_facts";
-    let source = mount_source(sb, "dnd-pack-tactics");
+    let c = run_pack_cases(sb, &mount_source(sb, "dnd-pack-tactics"));
+    let ok = c.positive == 1
+        && c.ally_down == 0
+        && c.fp_a == 0
+        && c.fp_b == 0
+        && c.fp_c == 0
+        && c.fp_e == 0
+        && c.fn_a == 1
+        && c.no_trait == 0;
+    a.check(
+        name,
+        ok,
+        format!(
+            "同伴与目标同地点 → keep_high={}（期望 1）；同伴 HP=0 → {}；\
+             FP-A 同伴在别的地点 → {}；FP-B 同伴 stunned → {}；FP-C 双方无 location_id → {}；\
+             FP-E 属性检定 → {}；FN-A 同伴在另一场遭遇（同地点）→ {}（期望 1）；无集群战术挂接 → {}（反例均期望 0）。\
+             注：这是「与目标同 location_id + 开放内容失能名单」近似，精确 5 尺仍做不到（GAP-B）",
+            c.positive, c.ally_down, c.fp_a, c.fp_b, c.fp_c, c.fp_e, c.fn_a, c.no_trait
+        ),
+    );
+}
 
-    let wolf = |key: &str, hp: i64, place: &str| {
+/// **变异验证**：把集群战术换回 T26 修正轮之前的旧脚本，同一批反例必须复现出 5 类**错误结论**
+/// （FP-A/B/C/E → 误给优势 = 1，FN-A → 漏判 = 0）。这证明 `pack_tactics.reads_world_facts`
+/// 的反例不是恒真——旧实现真的会被它们抓住。
+fn pack_tactics_old_impl_reproduces_the_five_misjudgments(sb: &Value, a: &mut Assertions) {
+    let name = "pack_tactics.old_impl_reproduces_misjudgments";
+    let c = run_pack_cases(sb, OLD_PACK_TACTICS);
+    let fixed = run_pack_cases(sb, &mount_source(sb, "dnd-pack-tactics"));
+    let ok = c.positive == 1
+        && c.fp_a == 1
+        && c.fp_b == 1
+        && c.fp_c == 1
+        && c.fp_e == 1
+        && c.fn_a == 0
+        && fixed.fp_a == 0
+        && fixed.fp_b == 0
+        && fixed.fp_c == 0
+        && fixed.fp_e == 0
+        && fixed.fn_a == 1;
+    a.check(
+        name,
+        ok,
+        format!(
+            "同一批数据：旧脚本 FP-A 同伴异地={} / FP-B 同伴失能={} / FP-C 无地点={} / FP-E 属性检定={}（均误给 = 1）、\
+             FN-A 跨遭遇={}（漏判 = 0）；新脚本对应 {} / {} / {} / {} / {}（已修正）。旧结论被反例复现 → 反例有牙齿",
+            c.fp_a, c.fp_b, c.fp_c, c.fp_e, c.fn_a,
+            fixed.fp_a, fixed.fp_b, fixed.fp_c, fixed.fp_e, fixed.fn_a
+        ),
+    );
+}
+
+/// T26 修正轮**之前**的集群战术脚本（git HEAD 原文照抄，用于变异审计）：只查同伴 HP、
+/// 只比「狼 vs 目标」的地点，从不看同伴位置 / 判定签名，且只在我所在的那场遭遇里找同伴。
+const OLD_PACK_TACTICS: &str = r#"-- 规则包：集群战术（狼，附录 B 原文）。
+-- 数据来源：开放内容（角色模板的 dnd-pack-tactics 挂接），脚本无生物名单。
+-- T21：读运行时事实——同一场遭遇的同伴（list_encounters + get_character）。
+-- 仍受 GAP-B（没有位置 / 距离）：同伴按「同一场遭遇」近似，目标按「同一 location_id」近似。
+local ids = host.get_attachment('dnd-pack-tactics')
+if type(ids) ~= "table" or #ids == 0 then return end
+local me = host.actor
+local target = host.target
+if type(me) ~= "table" or type(target) ~= "table" then return end
+local my_key = me.id or me.instance_id
+local function alive(inst)
+  local hp = inst and inst.resources and inst.resources['res-hp']
+  return type(hp) == "number" and hp > 0
+end
+local ally_found = false
+for _, enc in ipairs(host.list_encounters()) do
+  local enemies = enc.enemies
+  if type(enemies) == "table" then
+    local mine = false
+    for _, e in ipairs(enemies) do
+      if (e.instance_id or e.id) == my_key then mine = true end
+    end
+    if mine then
+      for _, e in ipairs(enemies) do
+        local key = e.instance_id or e.id
+        if key and key ~= my_key then
+          if alive(host.get_character(key)) then ally_found = true end
+        end
+      end
+    end
+  end
+end
+if not ally_found then return end
+-- 「在目标 5 尺内」的可用近似：双方都知道地点时必须同地点（GAP-B 仍然存在）。
+local my_place = me.location_id
+local target_place = target.location_id
+if my_place and target_place and my_place ~= target_place then return end
+host.modify_check('keep_high')"#;
+
+/// 跑同一批反例（正例 / 同伴倒下 / FP-A / FP-B / FP-C / FP-E / FN-A / 无挂接），
+/// 脚本正文由调用方给（真实规则包 or 旧脚本变异）。
+struct PackCases {
+    positive: usize,
+    ally_down: usize,
+    fp_a: usize,
+    fp_b: usize,
+    fp_c: usize,
+    fp_e: usize,
+    fn_a: usize,
+    no_trait: usize,
+}
+
+fn run_pack_cases(sb: &Value, source: &str) -> PackCases {
+    let wolf = |key: &str, hp: i64, place: Option<&str>, statuses: Value| {
         json!({
             "instance_id": key, "template_id": "mon-wolf", "name": "狼", "kind": "monster",
-            "attributes": {}, "resources": { "res-hp": hp }, "statuses": [], "location_id": place
+            "attributes": {}, "resources": { "res-hp": hp }, "statuses": statuses,
+            "location_id": place
         })
     };
-    let pc = |place: &str| {
+    let pc_at = |place: Option<&str>| {
         json!({
             "instance_id": "inst-pc", "template_id": "pc-lmop-talin", "name": "塔林", "kind": "pc",
             "attributes": {}, "resources": { "res-hp": 24 }, "statuses": [], "location_id": place
         })
     };
-    let facts = |ally_hp: i64, with_encounter: bool, wolf_place: &str| {
-        let encounters = if with_encounter {
-            json!({ "enc-1": { "id": "enc-1", "name": "野外遭遇", "active": true, "enemies": [
-                { "id": "e1", "instance_id": "inst-wolf-1", "template_id": "mon-wolf", "hp": 11 },
-                { "id": "e2", "instance_id": "inst-wolf-2", "template_id": "mon-wolf", "hp": ally_hp }
-            ] } })
-        } else {
-            json!({ "enc-1": { "id": "enc-1", "name": "野外遭遇", "active": true, "enemies": [
-                { "id": "e2", "instance_id": "inst-wolf-2", "template_id": "mon-wolf", "hp": ally_hp }
-            ] } })
-        };
-        json!({
-            "characters": {
-                "inst-wolf-1": wolf("inst-wolf-1", 11, wolf_place),
-                "inst-wolf-2": wolf("inst-wolf-2", ally_hp, wolf_place)
-            },
-            "flags": {},
-            "encounters": encounters
-        })
+    let member = |key: &str, hp: i64| {
+        json!({ "id": key, "instance_id": key, "template_id": "mon-wolf", "hp": hp })
+    };
+    let facts = |chars: Vec<Value>, encounters: Value| {
+        let mut map = Map::new();
+        for c in chars {
+            map.insert(c["instance_id"].as_str().unwrap().to_string(), c);
+        }
+        json!({ "characters": map, "flags": {}, "encounters": encounters })
+    };
+    let one_encounter = |members: Value| {
+        json!({ "enc-1": { "id": "enc-1", "name": "野外遭遇", "active": true, "enemies": members } })
+    };
+    // 我（inst-wolf-1，loc-a）+ 同伴（inst-wolf-2，地点 / 状态由调用方指定），同处一场遭遇。
+    let two_at = |place: Option<&str>, statuses: Value| {
+        facts(
+            vec![
+                wolf("inst-wolf-1", 11, Some("loc-a"), json!([])),
+                wolf("inst-wolf-2", 11, place, statuses),
+            ],
+            one_encounter(json!([member("inst-wolf-1", 11), member("inst-wolf-2", 11)])),
+        )
     };
 
-    let run_pack = |facts_value: Value, actor_template: &str, target_place: &str| -> usize {
+    let run_pack = |facts_value: Value, actor: Value, target_place: Option<&str>, kind: CheckKind| -> usize {
         let host = host_with(sb, 5);
         host.set_world_facts(facts_value);
-        let actor = if actor_template == "mon-wolf" {
-            wolf("inst-wolf-1", 11, "loc-lmop-0b7")
-        } else {
-            json!({ "instance_id": "inst-wolf-1", "template_id": actor_template, "name": "旁观者", "kind": "pc",
-                    "attributes": {}, "resources": { "res-hp": 24 }, "statuses": [], "location_id": "loc-lmop-0b7" })
-        };
         let ctx = LuaHostContext {
             script_id: "lmop-check:pack".into(),
             actor_id: "inst-wolf-1".into(),
             actor,
             target_id: Some("inst-pc".into()),
-            target: Some(pc(target_place)),
+            target: Some(pc_at(target_place)),
             ..Default::default()
         };
-        modifies(&run(&host, &source, LuaMount::CheckPreRoll, &ctx, &MountEnv::default()))
+        let sig = signature("str", kind, 12);
+        let env = MountEnv { check: Some(&sig), ..Default::default() };
+        modifies(&run(&host, source, LuaMount::CheckPreRoll, &ctx, &env))
             .iter()
             .filter(|(m, _)| *m == CheckModifier::KeepHigh)
             .count()
     };
+    let wolf_actor = || wolf("inst-wolf-1", 11, Some("loc-a"), json!([]));
 
-    let positive = run_pack(facts(11, true, "loc-lmop-0b7"), "mon-wolf", "loc-lmop-0b7");
-    let ally_down = run_pack(facts(0, true, "loc-lmop-0b7"), "mon-wolf", "loc-lmop-0b7");
-    let apart = run_pack(facts(11, true, "loc-lmop-0b7"), "mon-wolf", "loc-elsewhere");
-    let no_encounter = run_pack(facts(11, false, "loc-lmop-0b7"), "mon-wolf", "loc-lmop-0b7");
-    let no_trait = run_pack(facts(11, true, "loc-lmop-0b7"), "pc-lmop-talin", "loc-lmop-0b7");
-    let ok = positive == 1 && ally_down == 0 && apart == 0 && no_encounter == 0 && no_trait == 0;
-    a.check(
-        name,
-        ok,
-        format!(
-            "同遭遇有存活同伴 → keep_high={positive}（期望 1）；同伴 HP=0 → {ally_down}；目标在别处 → {apart}；             我不在任何遭遇 → {no_encounter}；无集群战术挂接 → {no_trait}（反例均期望 0）。             注：这是「同遭遇 + 同 location_id」近似，5 尺仍做不到（GAP-B）"
+    // P0 正例：同伴与**目标**同地点、未失能 → 优势。
+    let positive = run_pack(two_at(Some("loc-a"), json!([])), wolf_actor(), Some("loc-a"), CheckKind::Attack);
+    // 同伴倒下（HP=0）→ 不算。
+    let ally_down = run_pack(
+        facts(
+            vec![
+                wolf("inst-wolf-1", 11, Some("loc-a"), json!([])),
+                wolf("inst-wolf-2", 0, Some("loc-a"), json!([])),
+            ],
+            one_encounter(json!([member("inst-wolf-1", 11), member("inst-wolf-2", 0)])),
         ),
+        wolf_actor(),
+        Some("loc-a"),
+        CheckKind::Attack,
     );
+    // FP-A：同伴在**别的地点**（旧实现从不检查同伴位置 → 误给优势）。
+    let fp_a = run_pack(two_at(Some("loc-c"), json!([])), wolf_actor(), Some("loc-a"), CheckKind::Attack);
+    // FP-B：同伴 HP>0 但带开放内容声明的失能状态（stunned）。
+    let fp_b = run_pack(
+        two_at(Some("loc-a"), json!([{ "id": "stunned", "name": "昏迷" }])),
+        wolf_actor(),
+        Some("loc-a"),
+        CheckKind::Attack,
+    );
+    // FP-C：双方都没有 location_id（旧实现整道地点闸门被跳过 → 误给优势）。
+    let fp_c = run_pack(
+        facts(
+            vec![
+                wolf("inst-wolf-1", 11, None, json!([])),
+                wolf("inst-wolf-2", 11, None, json!([])),
+            ],
+            one_encounter(json!([member("inst-wolf-1", 11), member("inst-wolf-2", 11)])),
+        ),
+        wolf("inst-wolf-1", 11, None, json!([])),
+        None,
+        CheckKind::Attack,
+    );
+    // FP-E：非攻击判定（属性检定）不给优势。
+    let fp_e = run_pack(two_at(Some("loc-a"), json!([])), wolf_actor(), Some("loc-a"), CheckKind::Attribute);
+    // FN-A：同伴在**另一场遭遇**，但同在目标的地点 → 必须算（旧实现漏判）。
+    let fn_a = run_pack(
+        facts(
+            vec![
+                wolf("inst-wolf-1", 11, Some("loc-a"), json!([])),
+                wolf("inst-wolf-2", 11, Some("loc-a"), json!([])),
+            ],
+            json!({
+                "enc-1": { "id": "enc-1", "name": "遭遇一", "active": true, "enemies": [member("inst-wolf-1", 11)] },
+                "enc-2": { "id": "enc-2", "name": "遭遇二", "active": true, "enemies": [member("inst-wolf-2", 11)] }
+            }),
+        ),
+        wolf_actor(),
+        Some("loc-a"),
+        CheckKind::Attack,
+    );
+    // 无集群战术挂接：同一切数据，actor 换成没有挂接的 PC。
+    let no_trait = run_pack(
+        two_at(Some("loc-a"), json!([])),
+        json!({ "instance_id": "inst-wolf-1", "template_id": "pc-lmop-talin", "name": "旁观者", "kind": "pc",
+                "attributes": {}, "resources": { "res-hp": 24 }, "statuses": [], "location_id": "loc-a" }),
+        Some("loc-a"),
+        CheckKind::Attack,
+    );
+
+    PackCases { positive, ally_down, fp_a, fp_b, fp_c, fp_e, fn_a, no_trait }
 }
 
 /// GAP-L：伏击直接读 host.target.statuses（不再靠 dnd-surprised 全场标记）。
 fn ambusher_reads_target_statuses(sb: &Value, a: &mut Assertions) {
     let name = "ambusher.reads_target_statuses";
     let source = mount_source(sb, "dnd-ambusher-keep-high");
+    // T26 修正轮起脚本带 kind == attack 闸门：这里显式给攻击判定签名（判定签名缺省会被早退）。
+    let sig = signature("str", CheckKind::Attack, 12);
+    let env = MountEnv { check: Some(&sig), ..Default::default() };
     let run_amb = |actor_template: &str, statuses: Value| -> usize {
         let host = host_with(sb, 5);
         let actor = json!({ "instance_id": "inst-amb", "template_id": actor_template, "name": "袭击者",
@@ -901,7 +1090,7 @@ fn ambusher_reads_target_statuses(sb: &Value, a: &mut Assertions) {
             target: Some(target),
             ..Default::default()
         };
-        modifies(&run(&host, &source, LuaMount::CheckPreRoll, &ctx, &MountEnv::default()))
+        modifies(&run(&host, &source, LuaMount::CheckPreRoll, &ctx, &env))
             .iter()
             .filter(|(m, _)| *m == CheckModifier::KeepHigh)
             .count()
@@ -916,6 +1105,464 @@ fn ambusher_reads_target_statuses(sb: &Value, a: &mut Assertions) {
         ok,
         format!(
             "target.statuses 含受突袭 → keep_high={with_status}（期望 1）；无状态 → {without}；别的状态 → {other_status}；             袭击者无伏击挂接 → {no_trait}（反例均期望 0）。期望状态 id 来自开放内容 fields.target_status"
+        ),
+    );
+}
+
+// ============================================================
+// T27 发现①/③ 的行为级兜底（T26 修正轮）
+// ============================================================
+
+/// 判定签名（掷骰后）：结果字段可用（check_result / check_total）。
+fn resolved_signature(attribute: &str, kind: CheckKind, result: bool) -> LuaCheckContext {
+    LuaCheckContext {
+        attribute: attribute.to_string(),
+        kind: Some(kind),
+        resolved: true,
+        result,
+        target: 10,
+        ..Default::default()
+    }
+}
+
+/// 缩放请求里的因子列表（只有 check_post_roll / pre_resolve 会写这条请求）。
+fn scale_factors(requests: &[LuaRequest]) -> Vec<f64> {
+    requests
+        .iter()
+        .filter_map(|r| match r {
+            LuaRequest::ScaleEffect { factor } => Some(*factor),
+            _ => None,
+        })
+        .collect()
+}
+
+/// 直接跑 dnd-save-half 脚本（不经 execute_skill）：判定签名与结果由调用方钉死，
+/// 于是「脚本对哪一类判定开门」这件事可以被单独观察。
+fn run_save_half_rule(
+    sb: &Value,
+    source: &str,
+    skill: &SkillDef,
+    kind: CheckKind,
+    result: bool,
+) -> Vec<LuaRequest> {
+    let host = host_with(sb, 3);
+    let actor = sample_actor();
+    let ctx = LuaHostContext {
+        script_id: "lmop-check:save-half-gate".into(),
+        actor_id: "inst-save".into(),
+        actor: actor.clone(),
+        target_id: Some("inst-save".into()),
+        target: Some(actor),
+        skill: serde_json::to_value(skill).ok(),
+        difficulty: Some(10),
+        ..Default::default()
+    };
+    let sig = resolved_signature("dex", kind, result);
+    let env = MountEnv { check: Some(&sig), ..Default::default() };
+    run(&host, source, LuaMount::CheckPostRoll, &ctx, &env)
+}
+
+/// 伏击的三个判定签名场景（对**给定脚本正文**跑同一批数据）：
+/// 返回 (attack, attribute, save) 各自的 keep_high 数。
+fn run_ambusher_signature_cases(sb: &Value, source: &str) -> (usize, usize, usize) {
+    let run_amb = |kind: CheckKind| -> usize {
+        let host = host_with(sb, 5);
+        let actor = json!({ "instance_id": "inst-amb", "template_id": "mon-doppelganger", "name": "袭击者",
+            "kind": "monster", "attributes": {}, "resources": { "res-hp": 22 }, "statuses": [] });
+        let target = json!({ "instance_id": "inst-pc", "template_id": "pc-lmop-talin", "name": "塔林",
+            "kind": "pc", "attributes": { "dex": 16 }, "resources": { "res-hp": 24 },
+            "statuses": [{ "id": "dnd-surprised", "name": "受突袭" }] });
+        let ctx = LuaHostContext {
+            script_id: "lmop-check:ambush-signature".into(),
+            actor_id: "inst-amb".into(),
+            actor,
+            target_id: Some("inst-pc".into()),
+            target: Some(target),
+            ..Default::default()
+        };
+        let sig = signature("str", kind, 12);
+        let env = MountEnv { check: Some(&sig), ..Default::default() };
+        modifies(&run(&host, source, LuaMount::CheckPreRoll, &ctx, &env))
+            .iter()
+            .filter(|(m, _)| *m == CheckModifier::KeepHigh)
+            .count()
+    };
+    (run_amb(CheckKind::Attack), run_amb(CheckKind::Attribute), run_amb(CheckKind::Save))
+}
+
+/// T27 发现①（第 5 轮修复）：伏击与集群战术**同口径**——只对攻击检定给优势。
+/// 交付脚本：attack → 给；attribute / save → 不给（数据卡只说「攻击检定」）。
+fn ambusher_check_signature(sb: &Value, a: &mut Assertions) {
+    let name = "ambusher.check_signature";
+    let source = mount_source(sb, "dnd-ambusher-keep-high");
+    let (attack, attribute, save) = run_ambusher_signature_cases(sb, &source);
+    let ok = attack == 1 && attribute == 0 && save == 0;
+    a.check(
+        name,
+        ok,
+        format!(
+            "数据卡只说「攻击检定」：attack → keep_high={attack}（期望 1）；attribute → {attribute}；save → {save}（反例均期望 0）。\
+             三条一起钉住两端：把 check_kind == attack 闸门去掉，attribute / save 立刻回到 1（见 ambusher.old_impl_ignores_check_signature）"
+        ),
+    );
+}
+
+/// **旧实况必须仍然「可执行地」存在**（T27 定的安全前提）：本断言内嵌 git HEAD 的旧伏击脚本
+/// **原文**（OLD_AMBUSHER），用同一批场景复现 T27 的三条原始发现——attack / attribute / save
+/// **全部**给优势。这样「伏击不看判定签名会误给优势」这件事不依赖任何会被翻转的断言而存活。
+fn ambusher_old_impl_ignores_check_signature(sb: &Value, a: &mut Assertions) {
+    let name = "ambusher.old_impl_ignores_check_signature";
+    let (attack, attribute, save) = run_ambusher_signature_cases(sb, OLD_AMBUSHER);
+    let ok = attack == 1 && attribute == 1 && save == 1;
+    a.check(
+        name,
+        ok,
+        format!(
+            "旧脚本（git HEAD 原文，无判定签名闸门）：attack → keep_high={attack} / attribute → {attribute} / save → {save}（均期望 1）\
+             = T27 原始发现① 的可执行复现；新脚本同一批场景为 1 / 0 / 0（ambusher.check_signature）"
+        ),
+    );
+}
+
+/// 显式钉住的边界：**判定签名缺失就 fail-closed**（不给优势）。
+///
+/// 为什么这不是「旧 harness 的坑」而是正确行为：真实引擎里每一次**真判定**的 check_pre_roll
+/// 都会拿到签名——`command.rs` 的 `check_signature()` 永远写 `kind: Some(kind)`（L160-167），
+/// 技能路径的 kind 在掷骰前解析、缺省 `CheckKind::Attribute`（L466-494），session 路径同样缺省
+/// Attribute 且无条件传 `Some(&signature)`（session.rs L5149-5160）；引擎既有测试
+/// `pre_roll_sees_check_signature_in_skill_path`（command.rs L1532-1559）断言签名在掷骰前可见，
+/// `pre_roll_has_no_signature_without_a_check`（L1562+）断言「没有判定就没有签名」。
+/// 所以「拿不到签名」只对应「根本没有这次判定」——那时规则必须早退。
+/// 本断言把这条从「让 round3 旧 harness 意外变红的坑」变成被明确钉住的行为。
+fn ambusher_fail_closed_without_signature(sb: &Value, a: &mut Assertions) {
+    let name = "ambusher.fail_closed_without_signature";
+    let source = mount_source(sb, "dnd-ambusher-keep-high");
+    let run_with_env = |env: &MountEnv<'_>| -> usize {
+        let host = host_with(sb, 5);
+        let actor = json!({ "instance_id": "inst-amb", "template_id": "mon-doppelganger", "name": "袭击者",
+            "kind": "monster", "attributes": {}, "resources": { "res-hp": 22 }, "statuses": [] });
+        let target = json!({ "instance_id": "inst-pc", "template_id": "pc-lmop-talin", "name": "塔林",
+            "kind": "pc", "attributes": { "dex": 16 }, "resources": { "res-hp": 24 },
+            "statuses": [{ "id": "dnd-surprised", "name": "受突袭" }] });
+        let ctx = LuaHostContext {
+            script_id: "lmop-check:ambush-fail-closed".into(),
+            actor_id: "inst-amb".into(),
+            actor,
+            target_id: Some("inst-pc".into()),
+            target: Some(target),
+            ..Default::default()
+        };
+        modifies(&run(&host, &source, LuaMount::CheckPreRoll, &ctx, env))
+            .iter()
+            .filter(|(m, _)| *m == CheckModifier::KeepHigh)
+            .count()
+    };
+    // ① 没有判定快照（= 根本没有判定）→ 不给。
+    let no_snapshot = run_with_env(&MountEnv::default());
+    // ② 有快照但 kind 缺省（脚本读到 nil）→ 同样不给。
+    let kindless = LuaCheckContext { attribute: "str".into(), kind: None, target: 12, ..Default::default() };
+    let no_kind = run_with_env(&MountEnv { check: Some(&kindless), ..Default::default() });
+    // 对照：换攻击签名 → 给（同一 harness，排除「恒 0」）。
+    let sig = signature("str", CheckKind::Attack, 12);
+    let attack = run_with_env(&MountEnv { check: Some(&sig), ..Default::default() });
+    let ok = no_snapshot == 0 && no_kind == 0 && attack == 1;
+    a.check(
+        name,
+        ok,
+        format!(
+            "目标带 dnd-surprised：没有判定快照（host.check == nil）→ keep_high={no_snapshot}（期望 0）；\
+             有快照但 kind 缺省（host.check_kind == nil）→ {no_kind}（期望 0）—— 签名缺失一律 fail-closed；\
+             同一 harness 换 attack 签名 → {attack}（期望 1，排除「恒 0」）。\
+             证据：command.rs L160-167 check_signature 恒写 kind: Some(...)，注入点 command.rs L466-494 / session.rs L5149-5160，\
+             既有测试 pre_roll_sees_check_signature_in_skill_path / pre_roll_has_no_signature_without_a_check"
+        ),
+    );
+}
+
+/// T27 发现① 之前（即本仓库 HEAD 版 story_example/lmop-storybook.json 里 dnd-ambusher-keep-high）
+/// 的伏击脚本**原文照抄**，只用于「旧实况可执行复现」，不参与任何交付路径。
+const OLD_AMBUSHER: &str = r#"-- 规则包：伏击（变形怪，附录 B 原文）：战斗开始的第一轮里，
+-- 对任何成功受其突袭的生物所发动的攻击检定具有优势。
+-- T21：host.target 与 host.actor 同级完整（含 statuses）——直接按目标状态判定（GAP-L 闭合）。
+-- 数据来源：开放内容（角色模板的 dnd-ambusher 挂接 → fields.target_status），脚本无状态名常量。
+local ids = host.get_attachment('dnd-ambusher')
+if type(ids) ~= "table" or #ids == 0 then return end
+local target = host.target
+local statuses = target and target.statuses
+if type(statuses) ~= "table" then return end
+for _, def_id in ipairs(ids) do
+  local def = host.get_definition(def_id)
+  local wanted = def and def.fields and def.fields.target_status
+  if wanted and wanted ~= "" then
+    for _, st in ipairs(statuses) do
+      if st.id == wanted or st.name == wanted then
+        host.modify_check('keep_high')
+        return
+      end
+    end
+  end
+end"#;
+
+/// T27 发现③的行为级兜底：伏击的期望状态 id 只在开放内容里——
+/// 只改定义 fields.target_status，同一份 Lua 的结论随之翻转。
+fn ambusher_target_status_data_driven(sb: &Value, a: &mut Assertions) {
+    let name = "ambusher.target_status_data_driven";
+    let source = mount_source(sb, "dnd-ambusher-keep-high");
+    let run_with = |storybook: &Value, status_id: &str| -> usize {
+        let host = host_with(storybook, 5);
+        let actor = json!({ "instance_id": "inst-amb", "template_id": "mon-doppelganger", "name": "袭击者",
+            "kind": "monster", "attributes": {}, "resources": { "res-hp": 22 }, "statuses": [] });
+        let target = json!({ "instance_id": "inst-pc", "template_id": "pc-lmop-talin", "name": "塔林",
+            "kind": "pc", "attributes": { "dex": 16 }, "resources": { "res-hp": 24 },
+            "statuses": [{ "id": status_id, "name": status_id }] });
+        let ctx = LuaHostContext {
+            script_id: "lmop-check:ambush-data".into(),
+            actor_id: "inst-amb".into(),
+            actor,
+            target_id: Some("inst-pc".into()),
+            target: Some(target),
+            ..Default::default()
+        };
+        let sig = signature("str", CheckKind::Attack, 12);
+        let env = MountEnv { check: Some(&sig), ..Default::default() };
+        modifies(&run(&host, &source, LuaMount::CheckPreRoll, &ctx, &env))
+            .iter()
+            .filter(|(m, _)| *m == CheckModifier::KeepHigh)
+            .count()
+    };
+    let base_declared = run_with(sb, "dnd-surprised");
+    let base_other = run_with(sb, "dnd-prone");
+    let mut mutated = sb.clone();
+    if let Some(defs) = mutated.get_mut("definitions").and_then(Value::as_array_mut) {
+        for def in defs.iter_mut() {
+            if def.get("kind").and_then(Value::as_str) == Some("dnd-ambusher") {
+                def["fields"]["target_status"] = Value::String("dnd-prone".into());
+            }
+        }
+    }
+    let mutated_declared = run_with(&mutated, "dnd-prone");
+    let mutated_other = run_with(&mutated, "dnd-surprised");
+    let ok =
+        base_declared == 1 && base_other == 0 && mutated_declared == 1 && mutated_other == 0;
+    a.check(
+        name,
+        ok,
+        format!(
+            "基线（定义 target_status=dnd-surprised）：带 dnd-surprised → {base_declared}（期望 1）、带 dnd-prone → {base_other}（期望 0）；\
+             只把定义改成 dnd-prone（脚本逐字不动）：带 dnd-prone → {mutated_declared}（期望 1）、带 dnd-surprised → {mutated_other}（期望 0）\
+             → 状态 id 真的来自开放内容，不是烘在 Lua 里的常量"
+        ),
+    );
+}
+
+/// T27 发现③的行为级兜底：豁免减半只对**豁免判定**开门（check_kind == save）。
+/// 同一份脚本换 Attack / Attribute 判定 → 零请求；失败分支仍按开放内容补 fail_status。
+fn save_half_check_signature_gate(sb: &Value, a: &mut Assertions) {
+    let name = "save_half.check_signature_gate";
+    let source = mount_source(sb, "dnd-save-half");
+    let Some(skill) = save_case_skill(sb) else {
+        a.check(name, false, "找不到 / 解析不了技能 sk-lmop-rubble-collapse");
+        return;
+    };
+    let save_success = run_save_half_rule(sb, &source, &skill, CheckKind::Save, true);
+    let save_fail = run_save_half_rule(sb, &source, &skill, CheckKind::Save, false);
+    let attack_success = run_save_half_rule(sb, &source, &skill, CheckKind::Attack, true);
+    let attribute_success = run_save_half_rule(sb, &source, &skill, CheckKind::Attribute, true);
+    let scale_success = scale_factors(&save_success);
+    let scale_fail = scale_factors(&save_fail);
+    let fail_status = save_fail
+        .iter()
+        .any(|r| matches!(r, LuaRequest::ApplyStatus { status, .. } if status == "dnd-prone"));
+    let ok = scale_success == vec![0.5]
+        && scale_fail.is_empty()
+        && attack_success.is_empty()
+        && attribute_success.is_empty()
+        && fail_status;
+    a.check(
+        name,
+        ok,
+        format!(
+            "同一份 dnd-save-half 脚本按判定签名分派：save+成功 → scale_effect{scale_success:?}（期望 [0.5]）；\
+             save+失败 → scale_effect{scale_fail:?}（不缩放）且补 fail_status={fail_status}；\
+             attack / attribute → 请求数 {} / {}（期望 0：脚本按 check_kind ~= 'save' 早退）",
+            attack_success.len(),
+            attribute_success.len()
+        ),
+    );
+}
+
+/// T27 发现③的行为级兜底：规则只对开放内容 dnd-save-half 声明的 skill_id 生效——
+/// 只改定义的 skill_id，同一技能上的缩放整体消失。
+fn save_half_rule_comes_from_open_content(sb: &Value, a: &mut Assertions) {
+    let name = "save_half.rule_comes_from_open_content";
+    let source = mount_source(sb, "dnd-save-half");
+    let Some(skill) = save_case_skill(sb) else {
+        a.check(name, false, "找不到 / 解析不了技能 sk-lmop-rubble-collapse");
+        return;
+    };
+    let base = scale_factors(&run_save_half_rule(sb, &source, &skill, CheckKind::Save, true));
+    let mut mutated = sb.clone();
+    if let Some(defs) = mutated.get_mut("definitions").and_then(Value::as_array_mut) {
+        for def in defs.iter_mut() {
+            if def.get("kind").and_then(Value::as_str) == Some("dnd-save-half") {
+                def["fields"]["skill_id"] = Value::String("sk-nonexistent".into());
+            }
+        }
+    }
+    let orphan =
+        scale_factors(&run_save_half_rule(&mutated, &source, &skill, CheckKind::Save, true));
+    let ok = base == vec![0.5] && orphan.is_empty();
+    a.check(
+        name,
+        ok,
+        format!(
+            "定义 savehalf-rubble.fields.skill_id = sk-lmop-rubble-collapse → 该技能上 scale_effect{base:?}（期望 [0.5]）；\
+             只把 skill_id 改成 sk-nonexistent（脚本逐字不动）→ scale_effect{orphan:?}（期望空）\
+             → 规则命中的技能真的由开放内容决定"
+        ),
+    );
+}
+
+/// T27 发现③的行为级兜底：重复豁免的 DC 只活在开放内容 dnd-save-ends 定义里——
+/// 只改 dc，同一份脚本的结局随之翻转（dc=1 必成功移除 / dc=99 必失败保留）。
+fn save_ends_reads_open_content(sb: &Value, a: &mut Assertions) {
+    let name = "save_ends.reads_open_content";
+    let source = mount_source(sb, "dnd-save-ends");
+    let run_with_dc = |storybook: &Value, dc: i64| -> bool {
+        let mut mutated = storybook.clone();
+        if let Some(defs) = mutated.get_mut("definitions").and_then(Value::as_array_mut) {
+            for def in defs.iter_mut() {
+                if def.get("kind").and_then(Value::as_str) == Some("dnd-save-ends")
+                    && def.pointer("/fields/status_id").and_then(Value::as_str)
+                        == Some("dnd-eruption-penalty")
+                {
+                    def["fields"]["dc"] = Value::String(dc.to_string());
+                }
+            }
+        }
+        let host = host_with(&mutated, 9);
+        let ctx = LuaHostContext {
+            script_id: "lmop-check:save-ends".into(),
+            actor_id: "inst-save".into(),
+            actor: sample_actor(),
+            ..Default::default()
+        };
+        let status = LuaStatusContext {
+            id: "dnd-eruption-penalty".into(),
+            name: "灰烬呛咳".into(),
+            turns_left: Some(1),
+            scenes_left: None,
+            unit: "turns",
+            remaining: 0,
+        };
+        host.run_hook_status(&source, LuaMount::StatusTick, &ctx, &MountEnv::default(), &status)
+            .expect("重复豁免脚本执行失败");
+        host.drain_requests().iter().any(|r| {
+            matches!(r, LuaRequest::RemoveStatus { status, .. } if status == "dnd-eruption-penalty")
+        })
+    };
+    let easy = run_with_dc(sb, 1);
+    let hard = run_with_dc(sb, 99);
+    let ok = easy && !hard;
+    a.check(
+        name,
+        ok,
+        format!(
+            "只改开放内容 dnd-save-ends 定义里的 dc（脚本逐字不动）：dc=1 → 本回合移除状态={easy}（期望 true）；\
+             dc=99 → 移除={hard}（期望 false：20 面骰 + con 调整值不可能够）→ DC 真的来自开放内容"
+        ),
+    );
+}
+
+/// T27 发现③的行为级兜底：XP 只在 enemy_defeated 事件发放——
+/// 同一份 payload 换事件名（scene / encounter_cleared）必须零请求。
+fn xp_event_gate(sb: &Value, a: &mut Assertions) {
+    let name = "xp.event_gate";
+    let source = mount_source(sb, "dnd-xp-award");
+    let expected = character(sb, "mon-ash-zombie")
+        .pointer("/statblock/xp")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let pay = |event: &str| -> Option<i64> {
+        let host = host_with(sb, 13);
+        let ctx = LuaHostContext {
+            script_id: "lmop-check:xp-gate".into(),
+            actor_id: "inst-pc-lmop-talin".into(),
+            actor: character(sb, "pc-lmop-talin"),
+            ..Default::default()
+        };
+        let data = json!({
+            "enemy": { "id": "e1", "name": "灰烬丧尸", "template_id": "mon-ash-zombie" },
+            "encounter": { "id": "enc-x", "name": "洞穴" }
+        });
+        let env = MountEnv {
+            event: Some(LuaEventContext { name: event, data: Some(&data) }),
+            ..Default::default()
+        };
+        xp_gain(&run(&host, &source, LuaMount::Event, &ctx, &env))
+    };
+    let hit = pay("enemy_defeated");
+    let scene = pay("scene");
+    let cleared = pay("encounter_cleared");
+    let ok = expected > 0 && hit == Some(expected) && scene.is_none() && cleared.is_none();
+    a.check(
+        name,
+        ok,
+        format!(
+            "同一份 data.enemy（mon-ash-zombie）：enemy_defeated → res-xp {hit:?}（期望 {expected}）；\
+             scene → {scene:?}；encounter_cleared → {cleared:?}（期望都不发）→ event_name 闸门真的在起作用"
+        ),
+    );
+}
+
+/// T27 发现③的行为级兜底：XP 数值只在开放内容 dnd-xp-award 定义里——
+/// 只改定义的 fields.xp，同一事件的发放随之变。
+fn xp_value_from_open_content(sb: &Value, a: &mut Assertions) {
+    let name = "xp.value_from_open_content";
+    let source = mount_source(sb, "dnd-xp-award");
+    let declared = definitions(sb, "dnd-xp-award")
+        .iter()
+        .find(|d| d.get("id").and_then(Value::as_str) == Some("xp-mon-ash-zombie"))
+        .and_then(|d| d.pointer("/fields/xp"))
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<i64>().ok());
+    let Some(declared) = declared else {
+        a.check(name, false, "故事书里找不到 xp-mon-ash-zombie 的 fields.xp");
+        return;
+    };
+    let pay = |storybook: &Value| -> Option<i64> {
+        let host = host_with(storybook, 13);
+        let ctx = LuaHostContext {
+            script_id: "lmop-check:xp-value".into(),
+            actor_id: "inst-pc-lmop-talin".into(),
+            actor: character(storybook, "pc-lmop-talin"),
+            ..Default::default()
+        };
+        let data = json!({ "enemy": { "id": "e1", "name": "灰烬丧尸", "template_id": "mon-ash-zombie" } });
+        let env = MountEnv {
+            event: Some(LuaEventContext { name: "enemy_defeated", data: Some(&data) }),
+            ..Default::default()
+        };
+        xp_gain(&run(&host, &source, LuaMount::Event, &ctx, &env))
+    };
+    let base = pay(sb);
+    let bumped = declared + 7;
+    let mut mutated = sb.clone();
+    if let Some(defs) = mutated.get_mut("definitions").and_then(Value::as_array_mut) {
+        for def in defs.iter_mut() {
+            if def.get("id").and_then(Value::as_str) == Some("xp-mon-ash-zombie") {
+                def["fields"]["xp"] = Value::String(bumped.to_string());
+            }
+        }
+    }
+    let after = pay(&mutated);
+    let ok = base == Some(declared) && after == Some(bumped) && bumped != declared;
+    a.check(
+        name,
+        ok,
+        format!(
+            "定义 xp-mon-ash-zombie.fields.xp={declared} → enemy_defeated 发 res-xp {base:?}；\
+             只把定义改成 {bumped}（脚本逐字不动）→ 发 {after:?} → XP 数值不是烘在 Lua 里的常量"
         ),
     );
 }

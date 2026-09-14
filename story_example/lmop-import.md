@@ -101,7 +101,7 @@ Lua 定义「什么时候做」**。本规则包不改引擎、不新增任何�
 | 激励用掉即消失 `dnd-consume-inspiration` | `check_post_roll` | — | `remove_status` |
 | 劣势 · 灰烬呛咳 `dnd-status-keep-low` | `check_pre_roll` | — | `has_status` + `modify_check('keep_low')` |
 | 劣势 · 日照敏感 `dnd-sunlight-sensitivity` | `check_pre_roll` | `flag_set dnd-sunlight` | `get_attachment` + **判定签名**（`check_kind` / `check_attribute`）+ `modify_check('keep_low')` |
-| 优势 · 集群战术 `dnd-pack-tactics` | `check_pre_roll` | —（脚本内自判） | `get_attachment` + `list_encounters` + `get_character` + `modify_check('keep_high')` |
+| 优势 · 集群战术 `dnd-pack-tactics` | `check_pre_roll` | —（脚本内自判） | `get_attachment` + **判定签名 `check_kind`** + `list_encounters` + `get_character`（同伴须与**目标**同 `location_id`、失能名单读开放内容 `incapacitated_statuses`）+ `get_definition` + `modify_check('keep_high')` |
 | 优势 · 伏击（第 1 轮） `dnd-ambusher-keep-high` | `check_pre_roll` | `flag_set 第1轮` | `get_attachment` + `get_definition` + **`host.target.statuses`** + `modify_check('keep_high')` |
 | 技能声明的豁免 DC `dnd-skill-dc` | `check_pre_roll` | — | `definition.check.default_dc` + `host.difficulty` + `modify_check('dc', Δ)` |
 | 熟练加值 `dnd-proficiency` | `check_pre_roll` | — | `get_attachment('dnd-proficiency')` + `get_definition(id).fields` + `check_attribute` + `modify_check('add', N)` |
@@ -127,8 +127,8 @@ Lua 定义「什么时候做」**。本规则包不改引擎、不新增任何�
 
 | 原语 | 用在哪 | 闭合 / 提高了什么 |
 |---|---|---|
-| `host.get_character(id)`（实例键 / 模板 id / 角色名 / instance_id 四种写法） | 集群战术读同伴实例（HP） | GAP-A（跨实体读取这一**能力**已闭合） |
-| `host.list_encounters()` / `host.get_encounter(id)` | 集群战术找同遭遇同伴；XP 按 `instance_id` 回查 `template_id` | GAP-A / GAP-F 佐证 |
+| `host.get_character(id)`（实例键 / 模板 id / 角色名 / instance_id 四种写法） | 集群战术读同伴实例（HP / `location_id` / `statuses`） | GAP-A（跨实体读取这一**能力**已闭合） |
+| `host.list_encounters()` / `host.get_encounter(id)` | 集群战术枚举**所有**活跃遭遇里的同伴（不限我所在那一场）；XP 按 `instance_id` 回查 `template_id` | GAP-A / GAP-F 佐证 |
 | `host.get_flag(name)` / `host.list_flags()` | 本轮规则包**未改口径**（`when` 闸门照旧），能力已可用 | — |
 | `host.target` 与 `host.actor` 同级完整（含 `statuses`） | 伏击直接读目标状态 | GAP-L |
 | `host.scale_effect(factor)`（只在 `check_post_roll` / `pre_resolve`） | 豁免成功伤害减半 | GAP-E |
@@ -194,7 +194,7 @@ turn_end + when(at_location 三猪小径 ∨ dnd-in-wilderness) + 昼夜
 | GAP | 主题 | 闭合原语 | 规则包落地 | 谁在断言 |
 |---|---|---|---|---|
 | **C** | 挂接 / 开放内容不进 Lua | `host.get_attachments()` / `get_attachment(kind)` / `get_definition(id)` / `list_definitions(kind)` | 熟练加值 / 日照敏感 / 集群战术 / 伏击 / 重复豁免 / XP 数值全部改成**运行时读开放内容**；角色模板的 `attachments` 是唯一入口 | `--check: open_content.data_driven / attachments.resolve`；引擎 `proficiency.data_driven / bestiary.xp_matches` |
-| **D** | `check_pre_roll` 没有判定签名 | 掷骰前下发 `check_attribute` / `check_kind` / `check_target` | 日照敏感按签名区分「攻击骰」与「依赖视力的感知（wis）检定」；熟练加值回到掷骰前用签名选属性 | `--check: sunlight.by_signature`；引擎 `sunlight.by_signature` |
+| **D** | `check_pre_roll` 没有判定签名 | 掷骰前下发 `check_attribute` / `check_kind` / `check_target` | 日照敏感按签名区分「攻击骰」与「依赖视力的感知（wis）检定」；熟练加值回到掷骰前用签名选属性；伏击也收敛到 `kind == attack`（T26 修正轮，闭合第四轮 T27 复查登记的同口径残留） | `--check: sunlight.by_signature / ambusher.target_status`；引擎 `sunlight.by_signature / ambusher.check_signature` |
 | **F** | 没有「敌人被击败」事件 | `event` 挂载点 + `host.event_name` / `host.event_data`（`enemy_defeated` / `encounter_cleared`） | `dnd-xp-award` 按 `data.enemy.template_id` **逐只**发 XP；与遭遇来源无关 | `--check: encounter_table.chain`；引擎 `xp.improvised_encounter` |
 | **H** | 没有清标记原语 | `host.set_flag(flag[, value])` / `host.clear_flag(flag)` | `dnd-battle-round` 每轮清 1..3 再置当前轮；`dnd-wander-reset` 在 `encounter_cleared` 时清行标记 | `--check: encounter_table.chain` |
 | **N** | 触发点一次性（`repeatable` 未实现） | `TriggerDef.repeatable`（**边沿**语义：条件由假变真） | 24 个掷表触发点全部标 `repeatable: true`，配合 H 的复位形成「结束 → 清标记 → 再触发」循环 | `--check: encounter_table.chain`；引擎 `encounter_table.refires` |
@@ -211,7 +211,7 @@ turn_end + when(at_location 三猪小径 ∨ dnd-in-wilderness) + 昼夜
 
 | GAP | 主题 | 现在的近似口径 | 仍然缺什么 |
 |---|---|---|---|
-| A | Lua 读不到其它实体 | **能力已闭合**：`get_character` / `list_encounters` / `get_encounter` / `get_flag` / `list_flags` 都已可用，集群战术已改用它们读同伴。「我方同伴」= 同一场活跃遭遇的其它敌人（HP>0 当「未失能」）；「在目标附近」= 同一 `location_id` | **规则结果仍不精确**：精确到 5 尺做不到（GAP-B），「失能」也只有 HP>0 这一种近似——所以按「近似提高」登记，不按「已闭合」报 |
+| A | Lua 读不到其它实体 | **能力已闭合**：`get_character` / `list_encounters` / `get_encounter` / `get_flag` / `list_flags` 都已可用，集群战术已改用它们读同伴。「我方同伴」= **所有**活跃遭遇里的其它敌人实例（不限我所在那一场），「在目标附近」= 与**目标**同一 `location_id`（目标缺地点时 fail-closed 不给），「未失能」= HP>0 且不带开放内容 `incapacitated_statuses` 列出的状态；只对 `kind == attack` 生效 | **规则结果仍不精确**：精确到 5 尺做不到（GAP-B）——所以按「近似提高」登记，不按「已闭合」报。T26 修正轮订正了旧的**声明与实现矛盾**（旧脚本从不检查同伴位置，却声明 `range_proxy` = 同一 `location_id`） |
 
 为什么 A 不按「已闭合」报：本条缺口当初登记的规则是**集群战术**，不是一个孤立的能力。
 跨实体读取本身确实落地了，但那条规则仍受 GAP-B 限制；**宁可少报闭合，也不夸大**。
@@ -220,7 +220,7 @@ turn_end + when(at_location 三猪小径 ∨ dnd-in-wilderness) + 昼夜
 
 | GAP | 主题 | 卡在哪个原语 / 缺什么 |
 |---|---|---|
-| B | 没有位置 / 距离 / 区域 | 引擎只有 `location_id` 这种地点归属，没有 5 尺 / 交战关系；集群战术只能用「同遭遇 + 同地点」近似 |
+| B | 没有位置 / 距离 / 区域 | 引擎只有 `location_id` 这种地点归属，没有 5 尺 / 交战关系；集群战术只能用「与目标同 `location_id` + 未失能」近似（精确距离做不到） |
 | G | 预置遭遇数量是静态整数 | `EncounterPresetEnemy.count` 没有骰式落点；「1d8+2 只蚊蝠」只能固定成骰式下界 |
 | I | 没有先攻 / 轮次 / 行动经济 | 「在战斗第一轮失去其回合」只有状态 + 标记，靠叙事层落实 |
 | J | 没有「掷骰 vs 对手被动」入口 | `CondExpr::AttributeGe` 只看 actor 自己的属性；`get_character` 能读属性，但判定上下文里拿不到「对手是谁」，也没有对抗入口 |
@@ -253,17 +253,35 @@ turn_end + when(at_location 三猪小径 ∨ dnd-in-wilderness) + 昼夜
                                   规则包 scale_effect(0.5) → delta -5 = trunc(-11×0.5)，ctx.rng 逐位相同
     save_half.resolved_effects_is_engine_snapshot  PostResolve 读到 factor=0.5 / rng_consumed=3 /
                                   delta field=resources.res-hp value=-4，与提交值逐字一致
-    pack_tactics.reads_world_facts 同遭遇有存活同伴 → keep_high；同伴 HP=0 / 目标在别处 /
-                                  我不在任何遭遇 / 无挂接 → 零请求
+    pack_tactics.reads_world_facts 同伴与目标同地点 → keep_high；同伴 HP=0 / FP-A 同伴在别的地点 /
+                                  FP-B 同伴带失能状态 / FP-C 双方无 location_id / FP-E 属性检定 /
+                                  无挂接 → 零请求；FN-A 同伴在另一场遭遇（同地点）→ keep_high
+    pack_tactics.old_impl_reproduces_misjudgments  变异：换回旧脚本，同一批反例复现出 5 类错误结论
+                                  （FP-A/B/C/E 误给 = 1、FN-A 漏判 = 0）；新脚本对应 0/0/0/0/1
+                                  → 反例不是恒真，旧实现真的会被抓住
     ambusher.reads_target_statuses target.statuses 含受突袭 → keep_high；无状态 / 别的状态 /
                                   无伏击挂接 → 零请求
     xp.encounter_snapshot_fallback 事件缺 template_id、只有 instance_id → get_encounter 回查 → res-xp +50；
                                   快照里查不到 → 不发
+    ambusher.check_signature      T27 ①（第 5 轮修复）：attack → keep_high；attribute / save → 零请求
+    ambusher.old_impl_ignores_check_signature  旧脚本原文内嵌（git HEAD）：同一批场景 1 / 1 / 1
+                                  = T27 三条原始发现的可执行复现（旧实况没有被抹掉）
+    ambusher.fail_closed_without_signature  签名缺失（无判定快照 / kind 缺省）→ keep_high = 0；
+                                  同一 harness 换 attack 签名 → 1（排除「恒 0」）
+    ambusher.target_status_data_driven  只改开放内容 target_status（dnd-surprised → dnd-prone），
+                                  同一份 Lua 的结论随之翻转
+    save_half.check_signature_gate  同一份脚本：save+成功 → scale_effect[0.5]；save+失败 → 不缩放且补 fail_status；
+                                  attack / attribute → 零请求
+    save_half.rule_comes_from_open_content  只改定义 skill_id → 该技能上的缩放整体消失
+    save_ends.reads_open_content  只改定义 dc（1 / 99）→ 本回合是否移除状态随之翻转
+    xp.event_gate                 同一 payload 换事件名（scene / encounter_cleared）→ 零 XP
+    xp.value_from_open_content    只改定义 xp（50 → 57）→ 发放值随之变
 
 ### 既有引擎 E2E 用例的口径更新（经授权）
 
 `crates/octopus-api/tests/lmop_verification.rs` 里两条用例钉的是**旧口径**，GAP-F / GAP-H / GAP-N
-闭合后按新语义改写（经协调方授权只改这一个测试文件）：
+闭合后按新语义改写（授权范围内的测试文件；T26 修正轮另有 round2 的 `r2_6` 与 round3 的
+`r3_audit4` 判据订正，见本节末尾）：
 
 | 用例 | 旧期望 | 新期望（更严，不是放宽） |
 |---|---|---|
@@ -273,18 +291,48 @@ turn_end + when(at_location 三猪小径 ∨ dnd-in-wilderness) + 昼夜
 新用例的失败条件（仍有牙齿）：少发 / 多发 / 补刀重复发 / 金额与数据卡不符 / 清空后补发 /
 行标记未复位 —— 任意一条都会 FAIL。旧缺口语义以注释形式保留在用例里（可追溯）。
 
-全套回归：`cargo test -p octopus-api --test lmop_verification` → **12 passed**（含 `a11_a13` 的
+全套回归：`cargo test -p octopus-api --test lmop_verification` → **13 passed**（含 `a11_a13` 的
 `r#mod = 8`，即 dex 3 + 数据驱动的熟练 5，证明 GAP-C 在真实 session 里生效）。
 
-**本轮（T21 / T22）复核**：`dnd-save-half` 换成 `scale_effect` 之后，这两个测试文件
-**逐字未动**——`a12` / `a12b` / `r2_6` 断言的是「豁免成功伤害落在 1..9、骰数 4、失败 3..18」，
-新口径下仍然成立（引擎掷一次 3d6 + d20 = 4 颗，成功取半 = 1..9）。实测：
-`lmop_verification` 12 passed / `lmop_verification_round2` 13 passed。
+**第三轮修正（T26 修正轮）**：`dnd-save-half` 换 `scale_effect` 时留下的**过期注释**与**机制盲断言**一并订正，
+不再停在「注释过期但断言照旧」：
 
-⚠️ 但有两处**注释口径已过期**（断言仍然有效，本轮按「本来就通过就不动」原则未改）：
-`a12` / `a12b` 里「Lua 重掷 3d6 取半」的措辞，以及 `r2_6` 负对照「`host.target` 为 nil 时减半分支静默失效」——
-新口径下成功豁免由**引擎**结算后再缩放，目标解析不到时引擎把 delta 落在不存在的实体上被 `apply_delta` 丢弃，
-delta 仍为 0。第三轮审计请据此核对。
+* `lmop_verification.rs` 的 `a12` / `a12b`：注释改成新机制（成功豁免由**引擎**结算一次、
+  按 `scale_effect(0.5)` 缩放，Lua 不再重掷）；新增 PostResolve **探针**回传 `host.resolved_effects`，
+  断言 `factor=0.5 / rng_consumed=3 / #deltas=1 / 引擎 hp delta == -本次掉血`。
+  旧断言（骰数 4、delta∈1..9）对机制无感，新判据能把「引擎缩放自己那份」与「Lua 重掷」分开：
+  变异用例 `a12_mutation_old_reroll_rule_fails_the_mechanism_probe` 把规则换回旧重掷脚本后，
+  旧断言照旧 PASS、新判据 FAIL（`factor=nil / rng=0 / deltas=0`）。
+* `lmop_verification_round2.rs` 的 `r2_6`：负对照的描述订正为「分支**发了**、引擎也**算了**，
+  只是 delta 落在不存在的实体键上被 `apply_delta` 静默丢弃（`characters.len()==1` → delta 仍为 0）」；
+  断言改为直接检查该回合 `Resolution.state_changes` 里确有一条落在不存在目标上的 hp 伤害——
+  这样才区分得出「分支被跳过」与「算了被丢弃」。变异用例
+  `r2_6_mutation_without_scale_declaration_has_no_ghost_delta` 删掉缩放声明后，
+  同一探针找不到 ghost delta（骰数 1），证明判据不是恒真。
+* 只做**判据加强**、不放宽期望：投影层面的 `delta==0`（负对照）/ `delta∈1..9`（自目标、显式目标）
+  与 `dice_count==4` 逐条保留。实测：`lmop_verification` 13 passed /
+  `lmop_verification_round2` 14 passed / `lmop_verification_round3` 14 passed。
+* 第三轮验证文件 `lmop_verification_round3.rs` 的 `r3_audit4`（集群战术近似边界）随之改为断言
+  **修正后**的边界：FP-A（同伴在别的地点）/ FP-B（同伴带失能状态）/ FP-C（双方无 `location_id`）/
+  FP-E（属性检定）从「实测给优势」翻转为**必须不给**，FN-A（同伴在另一场遭遇但同地点）翻转为**必须给**。
+  旧的「近似误差，实测」期望是修正前的实况，只在 Git 历史里可追溯。
+* **第五轮（第四轮 T27 发现① 的修复）**：`dnd-ambusher-keep-high` 与集群战术**同口径**收敛到
+  `kind == attack`（数据卡只说「攻击检定」）。两条**钉住旧实况**的用例随之订正，且旧实况没有消失：
+  · 第四轮 `lmop_verification_round4.rs` 的 `r4_ambusher_still_ignores_check_signature` 改名为
+    `r4_ambusher_check_signature_attack_only_after_r5_fix`：删掉「源码里没有 `host.check_kind`」那条
+    子串断言（T27 发现③ 批评的形态），`attribute` / `save` 由 1 翻转为 0，保留 `attack = 1`（两端都钉）。
+  · 旧脚本**原文**（git HEAD 版）以 `OLD_AMBUSHER` 内嵌进 `scripts/lmop-engine-check/src/main.rs`，
+    由引擎级断言 `ambusher.old_impl_ignores_check_signature` 在同一批场景复现 1 / 1 / 1
+    —— T27 的三条原始发现可执行地存活，不依赖任何会被翻转的断言。
+  · 第三轮 `lmop_verification_round3.rs` 的 `r3_16` 的 harness 原本没给 check 快照——那模拟的是
+    「根本没有判定」这个不可能出现在真判定里的状态（真实引擎每一次真判定的 `check_pre_roll` 都下发签名：
+    `command.rs` L160-167 / L466-494、`session.rs` L5149-5160；既有测试
+    `pre_roll_sees_check_signature_in_skill_path`）。第 5 轮经授权补上攻击签名，**四条期望值与数据驱动段一字未改**；
+    「签名缺失 → 不给优势」改为由引擎级断言 `ambusher.fail_closed_without_signature` 显式钉住。
+* **`--check` 子串型断言加固（T27 发现③）**：每条子串型一致性断言都带行为级兜底标注
+  （`--check` 打印，`--engine` 模式核对被引用的引擎断言真的在场：`consistency.behavioural_backing`）；
+  为此引擎级断言从 11 条增到 19 条（伏击签名 / 伏击旧实现复现 / 伏击状态数据驱动 / 豁免减半签名闸门 /
+  豁免减半技能来自开放内容 / 重复豁免读开放内容 / XP 事件闸门 / XP 数值来自开放内容）。
 
 ## 地点 / 地图 / 骨架
 
@@ -320,12 +368,16 @@ delta 仍为 0。第三轮审计请据此核对。
 `ConditionalModifier` / `save_ends` / `crit` / `EncounterTable` / `extends` 在整本故事书里零命中）、
 `lua_mounts` 静态预检（挂载点白名单 / 禁用 API / `host.*` 存在性 / 撤回词）、图鉴数据未被复制或改动
 （规则挂接只允许**追加**规则包自己的 kind）、掷表链路端到端形状（Lua → set_flag → repeatable 触发点 →
-预置遭遇 → `clear_flag` 复位）、开放内容引用自洽、**数据驱动**（6 条规则的 Lua 里没有标识 / 数值常量）、
+预置遭遇 → `clear_flag` 复位）、开放内容引用自洽、**数据驱动**（7 条规则的 Lua 里没有标识 / 数值常量）、
 **日照敏感按签名**、**规则挂接全部指向同 kind 的定义**、缺口清单逐条带 status、两次构建逐字节一致。
 
 加 `--engine <bin>` 时，同一支真实引擎校验器再跑：`validate_storybook` 错误 0 +
-`lint_storybook` 问题 0（警告 24 条为既有图鉴告警）+ **10 条**运行时规则断言（加值数据驱动 / 判定签名 /
+`lint_storybook` 问题 0（警告 24 条为既有图鉴告警）+ **20 条**运行时规则断言（加值数据驱动 / 判定签名 /
 同表项反复触发 / 即兴遭遇发 XP / XP 与图鉴逐条相等 / **缩放就是引擎那份骰** / **`resolved_effects` 核对** /
-**集群战术读运行时事实** / **伏击读目标状态** / **XP 遭遇快照回查**）。
+**集群战术读运行时事实** / **集群战术旧实现变异复现** / **伏击读目标状态** / **XP 遭遇快照回查** /
+**伏击只对攻击检定** / **伏击状态数据驱动** / **豁免减半签名闸门** / **豁免减半技能来自开放内容** /
+**重复豁免读开放内容** / **XP 事件闸门** / **XP 数值来自开放内容** / **伏击旧实现变异复现** / **伏击签名缺失 fail-closed**）。
+另外 `--check` 对每条**子串型一致性断言**都标了行为级兜底（引擎级断言名），
+`--engine` 模式逐条核对它们真的在场（`consistency.behavioural_backing`）——防止「注释即可满足」的弱断言。
 
 附录 B 共 **31 节 = 30 张独立数据卡 + 毒牙**（青年绿龙的别名条目）。

@@ -158,6 +158,21 @@ fn checks(session: &Session, round: u32) -> Vec<CheckResultPayload> {
         .collect()
 }
 
+/// 某一回合里所有 Resolution 事件声明的 state_changes（引擎结算产物）。
+/// 落不到的实体在 apply_delta 里被**静默丢弃**，但事件本身的记录留着——
+/// 这正是「分支算了、只是被丢弃」的可观测证据（区别于「分支被跳过」）。
+fn resolution_changes(session: &Session, round: u32) -> Vec<(String, String, Value)> {
+    rounds_events(session, round)
+        .into_iter()
+        .filter_map(|e| match e.event {
+            PlayEvent::Resolution(p) => Some(p.state_changes),
+            _ => None,
+        })
+        .flatten()
+        .map(|d| (d.entity_id, d.field, d.value))
+        .collect()
+}
+
 fn dice_count(session: &Session, round: u32) -> usize {
     rounds_events(session, round)
         .into_iter()
@@ -462,14 +477,21 @@ async fn r2_5_enemy_strike_targets_player_derived_ac() {
 // 验收 6（原未通过①）：自目标（不给 target_id）豁免减半不再静默失效
 // ============================================================
 //
-// 对照设计：
-//   · 自目标（target_id = None）→ 引擎把目标回落成施法者并把 host.target 同步为施法者
-//     → dnd-save-half 施加 floor(3d6/2) ∈ 1..9；
+// 对照设计（T24 复核后**订正 C 段的机制描述**）：
+//   · 自目标（target_id = None）→ 引擎把目标回落成施法者 → dnd-save-half 让**引擎**
+//     结算的那一份（3d6）减半 → floor(3d6/2) ∈ 1..9；
 //   · 显式 target_id = Some("pc-lmop-talin") → 同一条路径，同分布；
-//   · 负对照：target_id = Some("不存在的实体") → 目标解析不到 → host.target = nil
-//     → 减半分支静默不发 → delta = 0。这正是修复前的**失效形态**。
+//   · 负对照 target_id = Some("不存在的实体")：目标解析不到（host.target = nil），
+//     **但减半分支照样发出、引擎照样结算**（T24 实测，与旧描述相反）——
+//     只是那条 delta 的 entity_id 是不存在的键，在 apply_delta
+//     （session.rs：`let Some(c) = state.characters.get_mut(&key) else { return }`）
+//     被**静默丢弃** → 投影 delta 仍为 0。
+// 旧描述「host.target 为 nil 时减半分支静默失效」是错的：分支没有失效。
+// 为了让断言能区分「分支被跳过」与「算了但被丢弃」，这里直接读该回合 Resolution 事件里的
+// state_changes：存在一条 entity_id = 不存在目标、field = resources.res-hp、value < 0 的记录，
+// 就证明**分支发了、引擎算了**——只是落不到实体。
 #[tokio::test]
-async fn r2_6_self_target_save_half_is_not_silently_dropped() {
+async fn r2_6_save_half_target_resolution_paths() {
     let sb = lmop();
     let h = spawn_shared(CueProvider::new(vec![])).await;
     let (_sb_id, save) = publish_and_open(&h, "R2 自目标减半", sb).await;
@@ -485,7 +507,7 @@ async fn r2_6_self_target_save_half_is_not_silently_dropped() {
         assert_eq!(c.kind, Some(CheckKind::Save));
         let delta = before - pc_hp(&session.projection());
         if c.result {
-            assert_eq!(dice_count(&session, r), 4, "成功：1 颗 d20 + Lua 重掷 3d6 = 4 颗");
+            assert_eq!(dice_count(&session, r), 4, "成功：1 颗 d20 + 引擎 3d6 = 4 颗（引擎只掷一次效果骰）");
             assert!((1..=9).contains(&delta), "自目标豁免成功必须施加减半伤害，实际 {delta}");
             self_success = Some((delta, dice_count(&session, r)));
             break;
@@ -513,7 +535,8 @@ async fn r2_6_self_target_save_half_is_not_silently_dropped() {
     }
     let explicit_success = explicit_success.expect("40 次内需观察到一次显式目标豁免成功");
 
-    // --- C. 负对照：目标解析不到 → host.target = nil → 减半静默失效（delta = 0）---
+    // --- C. 负对照：目标解析不到 → **分支照样发、引擎照样算**，只是 delta 落在
+    //        不存在的实体键上被 apply_delta 静默丢弃 → 投影 delta 仍为 0。---
     let mut nil_target_zero = false;
     for _ in 0..40 {
         h.provider.push(vec![Intent::UseSkill {
@@ -524,14 +547,40 @@ async fn r2_6_self_target_save_half_is_not_silently_dropped() {
         let r = run(&session, "踩到瓦砾").await;
         let c = checks(&session, r).into_iter().next().unwrap();
         let delta = before - pc_hp(&session.projection());
+        let dice = dice_count(&session, r);
+        let changes = resolution_changes(&session, r);
         if c.result {
-            assert_eq!(delta, 0, "负对照：host.target 为 nil 时减半分支静默失效（delta 应为 0）");
+            assert_eq!(delta, 0, "负对照：伤害落不到任何实体上（投影 delta 仍为 0）");
+            // 「分支被跳过」的反证：分支若没发，优雅的旧语义是成功 = 完全不结算、只掷判定骰。
+            assert_eq!(dice, 4, "负对照：减半分支仍在——引擎仍掷 1 颗 d20 + 一次 3d6");
+            // 「算了被丢弃」的直接证据：Resolution 事件里带着那条落在不存在实体上的伤害。
+            let ghost = changes
+                .iter()
+                .find(|(entity, field, _)| entity == "r2-不存在的目标" && field == "resources.res-hp")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "减半分支必须在 Resolution.state_changes 里留下落在不存在目标上的 hp delta（否则就是「分支被跳过」），实际 {changes:?}"
+                    )
+                });
+            assert!(
+                ghost.2.as_i64().unwrap_or(0) < 0,
+                "那条被丢弃的 delta 必须是伤害（负数），实际 {ghost:?}"
+            );
+            assert!(
+                !session.projection().characters.contains_key("r2-不存在的目标"),
+                "被丢弃的实体不得留在投影里（否则就不是「静默丢弃」而是真的建了实例）"
+            );
             nil_target_zero = true;
             break;
         }
     }
-    assert!(nil_target_zero, "负对照未观察到豁免成功——无法证明「host.target 为 nil 时减半会静默失效」");
-    println!("R2-6 PASS: 自目标成功={self_success:?} 显式目标成功={explicit_success:?} 负对照=delta 0");
+    assert!(
+        nil_target_zero,
+        "负对照未观察到豁免成功——无法证明「目标解析不到时伤害算了但被丢弃」"
+    );
+    println!(
+        "R2-6 PASS: 自目标成功={self_success:?} 显式目标成功={explicit_success:?} 负对照=投影 delta 0（Resolution 里仍有落在不存在实体上的伤害）"
+    );
 }
 
 // ============================================================
@@ -1104,6 +1153,52 @@ async fn r2_mut1_a9_xp_assertions_have_teeth() {
     );
 
     println!("R2-MUT1 PASS: 基线 kill={kill_a}/post={post_a}；变异B kill={kill_b}；变异C post={post_c}");
+}
+
+/// r2_6-C 断言的**变异验证**：删掉 dnd-save-half 的缩放声明后，成功分支不再触发引擎结算，
+/// 同一支「找 ghost delta」的探针必须找不到——证明该断言确实能区分
+/// 「算了但被丢弃」与「分支被跳过」，不是恒真的。
+#[tokio::test]
+async fn r2_6_mutation_without_scale_declaration_has_no_ghost_delta() {
+    let mut sb = lmop();
+    let mounts = sb["lua_mounts"].as_array_mut().unwrap();
+    let m = mounts
+        .iter_mut()
+        .find(|m| m["id"] == "dnd-save-half")
+        .expect("规则包必须有 dnd-save-half 挂载点");
+    m["source"] = json!("-- 变异：删掉缩放声明");
+    let h = spawn_shared(CueProvider::new(vec![])).await;
+    let (_sb_id, save) = publish_and_open(&h, "R2 变异：无缩放声明", sb).await;
+    let session = session_of(&h, &save).await;
+
+    let mut observed = false;
+    for _ in 0..40 {
+        h.provider.push(vec![Intent::UseSkill {
+            skill_id: "sk-lmop-rubble-collapse".into(),
+            target_id: Some("r2-不存在的目标".into()),
+        }]);
+        let before = pc_hp(&session.projection());
+        let r = run(&session, "踩到瓦砾").await;
+        let c = checks(&session, r).into_iter().next().unwrap();
+        if !c.result {
+            continue;
+        }
+        observed = true;
+        assert_eq!(before - pc_hp(&session.projection()), 0, "变异后投影 delta 仍为 0（这一点不变）");
+        assert_eq!(dice_count(&session, r), 1, "没有缩放声明 → 成功分支完全不结算，只掷判定骰");
+        let changes = resolution_changes(&session, r);
+        assert!(
+            !changes
+                .iter()
+                .any(|(entity, field, _)| entity == "r2-不存在的目标" && field == "resources.res-hp"),
+            "变异后不应再出现 ghost delta（否则 r2_6-C 的判据是恒真的）：{changes:?}"
+        );
+        println!(
+            "R2-6 变异验证 PASS: 删掉缩放声明后 dice=1、Resolution 无 ghost delta → 判据确实区分两条路径"
+        );
+        break;
+    }
+    assert!(observed, "40 次内需观察到一次豁免成功");
 }
 
 

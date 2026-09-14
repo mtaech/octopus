@@ -575,10 +575,12 @@ pub fn execute_skill(
     // 豁免：失败（result = false）才结算效果；其余判定保持「结果交 AI 叙事」的既有语义。
     // 调用方要求命中门时（攻击类入口），一律以判定结果决定是否结算效果。
     //
-    // GAP-E：规则包**声明了缩放因子**即表示「这次效果照常结算一次、数值按因子缩放」——
-    // 声明本身就覆盖上面两道门（「豁免成功 = 完全不结算」不再是唯一出路）。
-    // 没有声明时这里逐字不变。
-    let effect_applies = scale.is_declared()
+    // GAP-E：规则包声明了效果门即表示「这次效果照常结算一次」。开门有两条正交的路：
+    // - force_effect()：只开门，不缩放；
+    // - scale_effect(f)：开门 **且** 按 f 缩放——声明本身就覆盖上面两道门
+    //   （「豁免成功 = 完全不结算」不再是唯一出路），含 scale_effect(1.0)（旧语义）。
+    // 两条都没声明时这里逐字不变。
+    let effect_applies = scale.opens_effect_gate()
         || if effect_requires_success {
             check.as_ref().map(|c| c.result).unwrap_or(true)
         } else {
@@ -1792,6 +1794,61 @@ mod tests {
         // 非数值效果与消耗两边逐字相同。
         assert_eq!(success.deltas()[2], failure.deltas()[2]);
         assert_eq!(success.deltas()[3], failure.deltas()[3]);
+    }
+
+    /// ① 效果门与缩放**正交**（T27 登记的作者脚枪）：force_effect() 单独声明 = 判定成功
+    /// 也照常结算效果，但**一个数值都不缩**；scale_effect(1.0) 单独声明 = 旧语义（开门、
+    /// 因子 1 不改变数值）；都不声明 = 逐字旧路径（豁免成功 = 效果完全不结算）。
+    #[test]
+    fn force_effect_opens_the_gate_without_scaling_in_a_save() {
+        // 旧路径基线：不声明 + 豁免成功 = 效果不结算（只剩消耗）；+ 豁免失败 = 全量结算。
+        let (untouched, untouched_rng) = run_scale_case(&save_multi_effect_skill(), &[], true);
+        let (full, full_rng) = run_scale_case(&save_multi_effect_skill(), &[], false);
+        assert_eq!(untouched_rng.len(), 1, "不声明 + 成功：只掷判定骰");
+        assert_eq!(untouched.deltas().len(), 1, "不声明 + 成功：只有消耗");
+        assert_eq!(full.deltas().len(), 4, "不声明 + 失败：全量效果 + 消耗");
+
+        // (a) force_effect() 单独声明：开门 → 与「豁免失败的全量结算」逐字相同，且没有缩放。
+        let (forced, forced_rng) = run_scale_case(
+            &save_multi_effect_skill(),
+            &[(LuaMount::CheckPostRoll, "host.force_effect()")],
+            true,
+        );
+        assert_eq!(forced_rng, full_rng, "开门不改骰序：仍是「判定骰 + 一次效果骰」");
+        assert_eq!(forced.deltas(), full.deltas(), "开门 = 全量效果，数值不缩");
+
+        // (b) scale_effect(1.0) 单独声明：旧语义（开门 + 因子 1 = 数值不动），与 force 同结果。
+        let (unit, unit_rng) = run_scale_case(
+            &save_multi_effect_skill(),
+            &[(LuaMount::CheckPostRoll, "host.scale_effect(1.0)")],
+            true,
+        );
+        assert_eq!(unit_rng, full_rng, "旧语义：scale_effect(1.0) 也一样开门");
+        assert_eq!(unit.deltas(), full.deltas(), "因子 1 → 与全量结算逐字相同");
+
+        // 两者同时声明：开门 + 按 0.5 缩放（正交叠加）。
+        let (both, both_rng) = run_scale_case(
+            &save_multi_effect_skill(),
+            &[(LuaMount::CheckPostRoll, "host.force_effect(); host.scale_effect(0.5)")],
+            true,
+        );
+        assert_eq!(both_rng, full_rng, "声明不改变骰序");
+        assert_eq!(both.deltas().len(), 4);
+        for i in [0usize, 1] {
+            let raw = full.deltas()[i].value.as_i64().unwrap();
+            assert_eq!(
+                both.deltas()[i].value.as_i64().unwrap(),
+                (raw as f64 * 0.5).trunc() as i64,
+                "第 {i} 段按 0.5 缩放"
+            );
+        }
+        assert_eq!(both.deltas()[2], full.deltas()[2], "标记不缩");
+        assert_eq!(both.deltas()[3], full.deltas()[3], "消耗不缩");
+
+        // (c) 不声明：逐字旧路径（成功 = 只消耗；失败 = 全量）。
+        let (ok, ok_rng) = run_scale_case(&save_multi_effect_skill(), &[], true);
+        assert_eq!(ok.deltas(), untouched.deltas());
+        assert_eq!(ok_rng, untouched_rng);
     }
 
     /// 硬要求：没有因子时逐字不变——挂载点事件顺序、骰序、rng_consumed 全部照旧。

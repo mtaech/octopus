@@ -5,13 +5,22 @@
 > 用户原话要求：「开发完成后自己新建一个 凡戴尔的失落矿坑 的故事书验证一下」——本报告走的是**真实 HTTP 产品路径**新建故事书（不是只读 JSON）。
 > 本报告只做记录与取证；发现的不符项**原样登记，未改动 `crates/*/src/` 与 `frontend/src/` 的任何产品代码**。
 >
-> **⚠️ 本文件含三轮验证。第 1 轮（§0–§10，T15/T12 之后的交付物）原样保留在下方，作为历史证据。**
+> **⚠️ 本文件含四轮验证。第 1 轮（§0–§10，T15/T12 之后的交付物）原样保留在下方，作为历史证据。**
 > **第 2 轮（T17/T18 引擎原语 + T19 规则包升级之后）见 §R2。** 第 2 轮由**另一名独立验证者**
 > （未参与 T17/T18/T19 实现）重新取证，**不采信任务方自述**；并专门对 T19 修改过的两处第一轮用例做了
 > **变异审计**（§R2-3）。
 > **第 3 轮（T21/T22 引擎原语 + T23 规则包改动之后）见 §R3。** 第 3 轮由**第三名独立验证者**
 > （未参与 T21/T22/T23 实现）重新取证，专门审计四件事：save-half 是否真的不重掷 / 连带修正是否保住行为 /
 > 两处过期注释的断言还有没有牙齿 / 集群战术近似的边界；并逐条复核 14 条 GAP 的第三轮现状（§R3-3 / §R3-4）。
+> **第 4 轮（T26 修掉第三轮遗留的 A/B/C 三类问题之后）见 §R4。** 第 4 轮由**第四名独立验证者**
+> （未参与 T21/T22/T23/T24/T26）专审三件事：T26 对第三轮审计用例 `r3_audit4` 的**断言翻转**是合法修复还是弱化
+> （用 git HEAD 旧脚本原文 + 逐条变异独立复现）、a12/a12b 与 r2_6 新判据的机制辨识力、以及 5 类误判与
+> 「开放内容声明 vs Lua 实现」的逐条对账；并复核 14 条 GAP 的第四轮现状（含 GAP-A 能否升为「闭合」）。
+> **第 5 轮（T28/T29 四项改动 + T29 对验证者用例的两处改动之后）见 §R5。** 第 5 轮由**第五名独立验证者**
+> （未参与 T28/T29）专审三件事：T29 对第四轮用例 `r4_ambusher_still_ignores_check_signature` 的**翻转**
+> 与对第三轮 harness `run_ambusher` 的补签名是否忠实（旧实况是否可执行存活、逐条变异）、
+> `force_effect` 与 `scale_effect` 的正交性 / `apply_delta` 丢弃可见化 / 伏击签名与 fail-closed 的独立复现、
+> 以及「16 条挂载点里只有 ambusher 缺签名」与 `--check` 行为级兜底的独立复核；并复核 14 条 GAP 的第五轮现状。
 
 ---
 
@@ -537,11 +546,15 @@ R2-MUT1 PASS: 基线 kill=50/post=0；变异B kill=0；变异C post=50
 | 清单项 **通过** | **19 / 19** | 见 §R3-2 逐条验收表 |
 | **未通过** | **0** | —— |
 | **未覆盖** | **0** | 19 条全部有可复现命令 + 原始输出；另有 3 处**覆盖边界**如实登记（§R3-6） |
-| 四件专门审计 | ①通过 ②通过（含 1 处**改善**）③**注释过期**（断言仍有牙齿，但一条机制描述已失实）④**近似边界 5 类错误结论** |
+| 四件专门审计 | ①通过 ②通过（含 1 处**改善**）③**注释过期**（断言仍有牙齿，但一条机制描述已失实）④**近似边界 5 类错误结论** ｜ **⚠️ 第四轮（§R4）：③④ 已由 T26 修掉并被独立复现**（③ 的注释/判据已订正、④ 的 5 类 → 0/0/0/0/1） |
 | 14 条 GAP 第三轮现状 | **闭合 7 / 近似提高 1 / 仍存在 6** | 独立复核（§R3-4），**数目与 T23 自述一致**，但逐条证据是本轮自己取的 |
 
 **一句话**：第三轮补的 `scale_effect` / `get_character` 等原语**是真的**——我独立复现了「同一颗效果骰被缩放」（32 个种子骰序逐位相同、半值恰为向零取整、引擎产物里 1 条 hp delta 而 Lua 无伤害请求），也独立确认了「多段效果 + modifiers 全部被缩放」这件**重掷做不到**的事。T23 的连带修正**保住了行为**（成功=半伤不倒地、失败=满伤+倒地），并且顺手修掉了一处旧实现的位置错误（附加状态从前落在**施法者**，现在落在**目标**）。
 **但有两处不能替它圆场**：a12 / a12b 的注释与 r2_6 负对照的**失效机制描述已经过期**——前者只是措辞，后者是**事实错误**（减半分支其实发了、引擎也结算了，只是 delta 落在不存在的实体上被静默丢弃）。集群战术的「近似提高」标签是**诚实**的：我实测出 5 类**错误结论**（同伴在别处、同伴失能、无地点、非攻击判定、同伴在另一场遭遇），而且开放内容自己声明的 `range_proxy`（「与目标同一 location_id」）**脚本根本没实现**——它只比了「狼 vs 目标」的地点，从没看同伴在哪。
+
+> **⚠️ 第四轮订正（T26 已修）**：本段列出的问题**全部已修**（见 §R4-1 / §R4-2 / §R4-3）：
+> a12/a12b 的注释与判据、r2_6 的失效机制描述、集群战术的 5 类错误结论与 `range_proxy` 实现，均已订正；
+> 第四轮已用旧脚本原文独立复现上述「修正前」的每一条，确认它们**当时确实为真**。
 
 ### R3-1. 环境与复现命令（第三轮）
 
@@ -671,6 +684,11 @@ R3-AUDIT3a: 基线 dice=4 delta=5
 
 ##### ③a `crates/octopus-api/tests/lmop_verification.rs` 的 a12 / a12b
 
+> **⚠️ 第四轮订正（T26 已修，见 §R4-2）**：T26 已把注释改成新机制，并加了 PostResolve 机制探针
+> （`factor / rng_consumed / #deltas / 引擎 hp delta == -本次掉血`）+ 一条变异用例。
+> 第四轮用**自己的** harness 独立复现：旧重掷脚本下松断言（dice=4 / delta∈1..9）照过、机制判据 FAIL；
+> 另外自造「缩放 + Lua 双补」反例证明 hp 对账也有牙齿。下面的「机制盲」判断描述的是**修正前**的断言。
+
 过期文本：文件头 `// 验收 12：豁免成功伤害减半（Lua 重掷同一骰式再取半）`（707 行）、
 `assert_eq!(dice, 4, "豁免成功：1 颗 d20 + Lua 重掷 3d6 取半 = 4 颗")`（730 / 774 行）。
 现在成功分支是「引擎掷 1 次 d20 + 1 次 3d6，数值减半」。
@@ -688,6 +706,12 @@ R3-AUDIT3a: 基线 dice=4 delta=5
 与 `r3_18`（多段 / 过度缩放反面）补上。
 
 ##### ③b `crates/octopus-api/tests/lmop_verification_round2.rs` 的 r2_6 负对照
+
+> **⚠️ 第四轮订正（T26 已修，见 §R4-3）**：T26 已订正机制描述，并把负对照改成直接读该回合
+> `Resolution.state_changes`，要求找到「entity_id = 不存在目标 + field = resources.res-hp + value < 0」的记录
+> ——**诊断价值已恢复**（能区分「分支被跳过」与「算了被丢弃」）。第四轮独立复现该区分：
+> 真实脚本 → ghost delta 在场、骰数 4；删掉缩放声明 → 无 ghost、骰数 1。
+> 下面「诊断价值已消失」的判断描述的是**修正前**的 r2_6。**「静默丢弃无日志」这条新观察仍然成立。**
 
 过期文本（466–470 行注释、488/516/528/533 行断言消息）：「C 负对照：`target_id = Some("不存在的实体")`
 → 目标解析不到 → `host.target = nil` → **减半分支静默不发** → delta = 0。这正是修复前的**失效形态**。」
@@ -713,7 +737,12 @@ R3-AUDIT3b PASS: 负对照 delta==0 仍成立（断言未恒真：自目标时 d
 
 #### 审计④：集群战术的近似边界 —— 在什么条件下会给出**错误结论**
 
-规则包现在的判据（`dnd-pack-tactics` 脚本原文）：
+> **⚠️ 第四轮订正（T26 已修，见 §R4-1）**：本节记录的 5 类错误结论与 `range_proxy` 声明/实现矛盾，
+> **已在 T26 修正**。以下文字是**修正前**的实况，作为第三轮的历史证据**原样保留**。
+> 第四轮已用 git HEAD 的旧脚本原文（与 HEAD 逐字一致）独立复现本节每一条（确实为真），
+> 并逐条把修复改回去，确认新断言会 FAIL。修正后的实况：FP-A/B/C/E = 0、FN-A = 1。
+
+规则包现在的判据（`dnd-pack-tactics` 脚本原文，**修正前**的版本）：
 `host.get_attachment('dnd-pack-tactics')` 非空 → 在 `host.list_encounters()` 里找**我所在的那场遭遇** →
 同遭遇里除我以外、`host.get_character(key)` 存在且 `resources['res-hp'] > 0` 的条目算「未失能的盟友」→
 若 **我** 与 **目标** 都有 `location_id` 且不同则退出 → 否则 `modify_check('keep_high')`。
@@ -736,6 +765,9 @@ R3-AUDIT4: P0=1 P1(同伴倒)=0 P2(异地)=0 |
 | **FP-E 狼做**非攻击**判定（签名 kind=attribute）** | 无（数据卡只说「攻击检定」） | **`1`** | **错**——脚本不看判定签名，也没有 `when` 闸门 |
 | **FN-A 同伴与目标同地点，但在**另一场遭遇** | 有 | **`0`** | **错**（漏判） |
 
+> **§R4-1 已订正（T26 已修）**：下面这段结论描述的是**修正前**的实况——「脚本从没实现 range_proxy」
+> 已经不再成立（实现已对齐声明）；FP-E 也已收敛到 `kind == attack`。原样保留作历史。
+
 **这决定 GAP-A 该算「近似提高」而不是「已闭合」**：跨实体读取这个**能力**确实闭合了
 （清单 15/16 + 上面的 P0），但**规则结论不精确**，而且不止是 GAP-B 的锅：
 开放内容自己声明的 `range_proxy` 写的是「与目标同一 location_id」，**脚本从没实现这一步**——
@@ -751,8 +783,8 @@ R3-AUDIT4: P0=1 P1(同伴倒)=0 P2(异地)=0 |
 
 | GAP | 主题 | 第三轮现状 | 独立证据 |
 |---|---|---|---|
-| **A** | Lua 读不到其它实体（集群战术 / 任何「对手或盟友」类规则） | **近似提高**（能力闭合，规则结论不精确） | 原语在场：`lua_host.rs` 的 `get_character / get_flag / list_flags / get_encounter / list_encounters`（`find_character_snapshot` 四形态；`active_encounters` 只列 active），会话侧由 `session.rs::refresh_lua_world_facts` 在跑脚本前注入。运行时反证：清单 15（会话级四形态/标记/遭遇/目标快照全命中）＋清单 16（伏击按目标状态）。**仍不精确的证据**：审计④ 的 FP-A/FP-B/FP-C/FP-E/FN-A。 |
-| **B** | 无位置 / 距离 / 区域概念 | **仍存在** | `distance`（词边界 grep）在 `crates/octopus-engine/src` **0 命中**；位置仍只有 `location_id` 归属。集群战术只能近似，且（审计④ FP-A）连「同伴同地点」这一步都没实现。 |
+| **A** | Lua 读不到其它实体（集群战术 / 任何「对手或盟友」类规则） | **近似提高**（能力闭合，规则结论不精确） | 原语在场：`lua_host.rs` 的 `get_character / get_flag / list_flags / get_encounter / list_encounters`（`find_character_snapshot` 四形态；`active_encounters` 只列 active），会话侧由 `session.rs::refresh_lua_world_facts` 在跑脚本前注入。运行时反证：清单 15（会话级四形态/标记/遭遇/目标快照全命中）＋清单 16（伏击按目标状态）。**仍不精确的证据**：审计④ 的 FP-A/FP-B/FP-C/FP-E/FN-A。**⚠️ 第四轮订正（§R4-1）：这 5 类已被 T26 修掉**（旧脚本复现 → 1/1/1/1/0；新脚本 → 0/0/0/0/1，见 §R4-1）。A 仍按「近似提高」登记，但残余不精确**只剩 GAP-B 的距离不可表达**（§R4-4）。 |
+| **B** | 无位置 / 距离 / 区域概念 | **仍存在** | `distance`（词边界 grep）在 `crates/octopus-engine/src` **0 命中**；位置仍只有 `location_id` 归属。集群战术只能近似，且（审计④ FP-A）连「同伴同地点」这一步都没实现。**⚠️ 第四轮订正（§R4-1）：「同伴同地点」已实现（真检查同伴 `location_id` + 缺地点 fail-closed）；B 仍然存在，只是 A 的残余不精确现在完全归因于 B。** |
 | **C** | 挂接 / 开放内容不进 Lua | **已闭合** | 原语：`get_attachments / get_attachment(kind) / get_definition(id) / list_definitions(kind)`。运行时反证：前两轮 `r2_13` 重跑（只改 definition 的 `bonus 5→9` → `r#mod 8→12`）；交付物自检 `open_content.data_driven`（7 条规则全部运行时读开放内容）。 |
 | **D** | `check_pre_roll` 拿不到判定签名 | **已闭合** | `LuaCheckContext` 含 `attribute/kind/resolved/expr`；清单 8 的探针在掷骰前读到 `kind=attribute / attribute=dex` 且无 nil 标记。 |
 | **E** | 效果骰值不暴露（豁免减半的数值等价） | **已闭合** | 原语 `host.scale_effect(factor)`（只在 `check_post_roll / pre_resolve` 注册，写错时机当场报错）＋ `PostResolve` 只读 `host.resolved_effects`。独立反证：审计①（32 种子同骰、半值恰为向零取整、引擎产物而非 Lua 补）＋清单 18（多段/modifiers 全覆盖）。 |
@@ -769,6 +801,9 @@ R3-AUDIT4: P0=1 P1(同伴倒)=0 P2(异地)=0 |
 **汇总**：闭合 **7**（C / D / E / F / H / L / N）／近似提高 **1**（A）／仍存在 **6**（B / G / I / J / K / M）。
 与 T23 自述数目一致；第二轮是「闭合 5 / 仍存在 9」，本轮新增闭合 **E / L**，并把 **A** 从「仍存在」改判为「近似提高」。
 
+> **第四轮（§R4-4）复核后这个数目不变**（闭合 7 / 近似提高 1 / 仍存在 6，规则包 `--check` 与我的独立复核一致），
+> 但 **A 的「近似提高」理由变了**：第三轮的理由含「声明与实现矛盾」，T26 修掉之后，残余不精确**只剩 GAP-B 的距离概念**。
+
 ### R3-5. 这套设计成立性的第三轮判断
 
 **第三轮被推翻的证伪（设计假设其实是对的，只是实现落后）**
@@ -776,28 +811,32 @@ R3-AUDIT4: P0=1 P1(同伴倒)=0 P2(异地)=0 |
 | 前两轮仍成立的证伪 | 第三轮 |
 |---|---|
 | 「豁免减半可以用既有原语精确表达」被证伪（GAP-E，只能重掷） | **推翻该证伪**：`scale_effect` 让引擎只掷一次、按因子缩放，且覆盖多段效果与 modifiers。这不是「期望值等价」，是**同一颗骰**（审计①）。 |
-| 「Lua 读不到其它实体」（GAP-A 能力面） | **推翻该证伪的能力面**：`get_character / get_flag / get_encounter / list_encounters` + 完整的 `host.target` 快照都到位并被规则包真的用上（清单 15/16）。**但规则结论面仍被证伪**（审计④）。 |
+| 「Lua 读不到其它实体」（GAP-A 能力面） | **推翻该证伪的能力面**：`get_character / get_flag / get_encounter / list_encounters` + 完整的 `host.target` 快照都到位并被规则包真的用上（清单 15/16）。**但规则结论面仍被证伪**（审计④）。**⚠️ 第四轮订正（§R4-1）：T26 已修掉审计④ 的 5 类；该证伪的「规则结论面」现在只剩 GAP-B 的距离不可表达。** |
 | 「`host.target` 读不到目标状态」（GAP-L） | **推翻**：伏击直接按 `host.target.statuses` 判定，期望状态 id 还来自开放内容。 |
 
 **第三轮仍成立的证伪 / 未知**
 
 - **「集群战术能得出正确结论」仍被证伪**：5 类错误结论（审计④），其中 FP-A（不看同伴 location）是**声明与实现不一致**，
   不只是「引擎没有 5 尺」；FP-E（非攻击判定也给优势）是**规则包自己写宽了**。
+  > **⚠️ 第四轮订正（§R4-1）**：这 5 类已由 T26 修掉，此条**不再成立**（残余只剩 GAP-B 的距离概念）；
+  > 但**同类误判在「伏击」上仍在**——`dnd-ambusher-keep-high` 不看判定签名，属性检定 / 豁免也给优势（§R4-6 实测 attack=1/attribute=1/save=1）。
 - **「引擎有位置概念」仍被证伪**（GAP-B，`distance` 0 命中）。
 - **「预置遭遇能表达数据卡数量」仍被证伪**（GAP-G，`count: Option<u32>`）。
 - **仍然存在的结构性缺口**：轮次经济（I）、`CondExpr` 的被动对手入口（J）、模板初始状态（K）、`encounter_active`（M）。
   这四条与第一轮登记时**一字未变**，且都不是「读不到东西」，而是**引擎刻意没有的概念**——属于边界选择，不是原语欠账。
 - **本轮新登记的未知 / 风险**（都不是验收缺陷，但值得记）：
   1. `scale_effect` 把「要不要结算」和「结算多少」绑在一个原语上，**因子 1.0 也会开门**（审计②的陷阱）。
-  2. 开放内容声明的 `range_proxy` 与脚本实现不一致（审计④ FP-A）。
-  3. 伏击 / 集群战术都**不看判定签名**，对非攻击判定也生效（审计④ FP-E；对比 `dnd-sunlight-sensitivity` 是按签名收敛的）。
-  4. r2_6 负对照的**机制描述失实**，其诊断价值已消失（审计③b）。
+  2. 开放内容声明的 `range_proxy` 与脚本实现不一致（审计④ FP-A）。**⚠️ 第四轮订正（§R4-1）：T26 已把实现对齐声明（真检查同伴位置 + 缺地点 fail-closed），这条风险已消除。**
+  3. 伏击 / 集群战术都**不看判定签名**，对非攻击判定也生效（审计④ FP-E；对比 `dnd-sunlight-sensitivity` 是按签名收敛的）。**⚠️ 第四轮订正：集群战术已收敛到 `kind == attack`；「伏击」仍未收敛（§R4-6 实测属性检定 / 豁免照样给优势）——半条仍成立。**
+  4. r2_6 负对照的**机制描述失实**，其诊断价值已消失（审计③b）。**⚠️ 第四轮订正（§R4-3）：T26 已订正描述并把负对照升级为「读 Resolution.state_changes 里的 ghost delta」，诊断价值已恢复；「静默丢弃无日志」本身仍在。**
   5. `enemy_defeated` 只在 strike 路径发 XP（边界，与第二轮相同）。
 
 **结论（第三轮）**：第一轮说「路是对的，但原语集不够」，第二轮说「边界明显变宽」，第三轮可以更明确地说：
 **「读事实」这一类缺口已经补齐**——跨实体、目标快照、效果数值三样都能读了，而且不是文档层面，是运行时实测。
 剩下的 6 条仍存在里，**4 条（I/J/K/M）是引擎没有那种概念**，**2 条（B/G）是引擎没有那种结构**；
 真正还没解决的不是「引擎能力」，而是**规则包自己的精确度**（审计④）与**几处固化的近似口径**（负对照、注释、range_proxy）。
+> **⚠️ 第四轮订正（§R4-1 / §R4-6）**：「负对照 / 注释」已由 T26 订正；`range_proxy` 的实现已对齐声明；
+> 集群战术的精确度问题已收敛到 GAP-B。**仍在的是「伏击不看判定签名」这一条**（§R4-6）。
 另需注意：本轮四条专门审计里，**两条落在「登记/注释跟不上实现」**（审计③）——这不是实现错，是**验证资产会过期**，
 下一轮若要继续用这些负对照，得先把它们的机制描述改成当前事实。
 
@@ -845,6 +884,394 @@ R3-AUDIT4: P0=1 P1(同伴倒)=0 P2(异地)=0 |
 （既有，未改动：sb-ffa1d260083048a68f1e63a2e9a219c3）
 ```
 
+---
+
+## 第四轮·独立复核（T26 对第三轮验证资产的改动之后）
+
+> 角色：**全新的独立验证者（第四轮）**（未参与 T21/T22/T23/T24/T26 的任何实现与验证）。
+> 只验证，不修产品代码；inScope：`docs/lmop-verification-report.md` · `scripts/`（只新增） · `crates/octopus-api/tests/`（**只新增**）。
+> **未修改**任何既有用例：`lmop_verification.rs` / `lmop_verification_round2.rs` / `lmop_verification_round3.rs`
+> 逐字未动；对 T26 改过的 `r3_audit4` 走「读 + 跑 + 旧脚本原文复现 + 逐条变异推理」。
+> 被测交付物：`story_example/lmop-storybook.json`，sha256 `ffc93b3e8cab551c6964aa792a2abc94625727dcc27e376f787e4a334e9cfdaa`
+> （第三轮是 `f7b15b…`，**不是同一版**）。第四轮实测：用 `scripts/lmop-rulepack.mjs` **重新生成**，
+> 产物与交付物**逐字节相同**（同 sha256）→ 交付物确实是规则包脚本的产物，脚本是唯一真源。
+> 查询口径：**不采信 T26 自述**；下面每一条都是本轮自建 harness / 自造场景跑出来的。
+
+### R4-0. 结论摘要
+
+| | 结论 | 说明 |
+|---|---|---|
+| **T26 对 `r3_audit4` 的翻转** | **合法（未弱化）** | 用旧脚本原文独立复现 T24 的 1/1/1/1/0；把 5 处修复逐条改回去，对应新断言逐条 FAIL；场景集合未缩水；断言两端都钉 |
+| a12 / a12b 新机制判据 | **合法（有牙齿）** | 旧重掷脚本：松断言照过、机制判据 FAIL；本轮自造「缩放 + Lua 双补」反例 → hp 对账也 FAIL |
+| r2_6 新判据 | **合法（真能区分）** | 真实脚本 → ghost delta 在场且 dice=4；删缩放声明 → 无 ghost 且 dice=1 |
+| 5 类误判 | **确认已修** | 旧脚本 1/1/1/1/0 → 新脚本 0/0/0/0/1（本轮自有场景，不抄 T26） |
+| 声明 vs 实现 | **不再矛盾** | `range_proxy / signature_scope / incapacitated_statuses / ally_proxy` 逐条对上；失能名单数据驱动 |
+| 14 条 GAP | **闭合 7 / 近似提高 1 / 仍存在 6**（数目不变） | **GAP-A 不能升为「闭合」**，理由见 §R4-4 |
+| 全套回归 | **全绿** | r1 13 / r2 14 / r3 14 / **r4 9（新增）** / api-lib 74 / engine 357 / ai 36 / rulepack 28 / engine-check 11 / boundary 0 命中，全部 0 失败 |
+| 本轮新发现 | 2 条（1 缺陷候选 + 1 低危）+ 2 条设计层观察 | ①**「伏击」仍不看判定签名**（与已被修的集群战术 FP-E 同类，属性检定 / 豁免照样给优势）；②代码/测试/文档把 T26 的修复记成「**T24 修正**」，归因错位 |
+
+**一句话**：T26 的三处改动**都经得起独立复现**——`r3_audit4` 的断言翻转**不是放宽**（旧脚本原文照样复现出修正前的 5 类误判，逐条变异又都能把新断言打红）；
+a12/a12b 与 r2_6 的新判据**确实能分辨机制**，不是恒真。
+**但不能替 T26 圆场的有两条**：①它只修了「集群战术」这一条规则的判定范围，**同一类误判在「伏击」上原样保留**（§R4-6 ①）；
+②这轮改动的注释/文档把修复者写成「T24」（T24 是上一轮验证者，只报告不实现），是可追溯性上的错位（§R4-6 ②）。
+
+### R4-1. T26 对 `r3_audit4` 的翻转审计（本轮最重要产出）
+
+#### (a) 改了什么
+
+`git diff` 显示改动只落在 `r3_audit4` 一处：5 条断言的值 FP-A/B/C/E `1 → 0`、FN-A `0 → 1`，
+header / 注释改写、`two` 闭包从 `&str` 改成 `Option<&str>`。**断言条数 10 → 10，场景一条没删**
+（P0 / P1 / P2 / FP-A / FP-B / FP-C / FP-D / FP-E(attr) / FP-E(attack) / FN-A 一一对应）。
+
+#### (b) 判定标准
+
+不是「测试通过」，而是两条：**①用 T24 当初的原始场景独立复现，确认规则包行为真的变了**（而不是期望值被改小改没）；
+**②把对应的修复改回去，新断言会不会 FAIL**。
+
+#### (c) 证据 1 —— 行为真的变了（旧脚本原文复现）
+
+旧脚本逐字取自 `git show HEAD:story_example/lmop-storybook.json`；本轮核对：
+嵌入 `lmop_verification_round4.rs` 的 `OLD_PACK_TACTICS` 与 HEAD **逐字节相同**（1356/1356 字节）。
+用**同一批场景**分别跑旧脚本与新脚本（本轮自建 `pack_advantage` harness，5 个体征场景 + 2 个对照）：
+
+```text
+R4-1 旧脚本（git HEAD 原文）: P0=1 FP-A=1 FP-B=1 FP-C=1 FP-E(attr)=1 FN-A=0
+R4-1 新脚本（交付物）      : P0=1 FP-A=0 FP-B=0 FP-C=0 FP-E(attr)=0 FN-A=1
+```
+
+旧脚本**精确复现** T24 的五条原始结论（FP-A/B/C/E 各 1、FN-A 为 0）；新脚本全部翻转。
+所以这次翻转是**行为变化**，不是把期望值改小 / 改没——如果只是改数字，新脚本不会给出 0/0/0/0/1。
+
+#### (d) 证据 2 —— 逐条变异，新断言逐条有牙齿
+
+每次只回退**一处**修复，其余逐字不动：
+
+```text
+R4-1 变异验证: M1(去掉同伴位置检查) FP-A=1（新断言期望 0）
+             M2(去掉失能名单判定)   FP-B=1（新断言期望 0）
+             M3(去掉缺地点 fail-closed) FP-C=1（新断言期望 0）
+             M4(去掉 kind==attack 闸门) FP-E(attr)=1（新断言期望 0）
+             M5(只看我所在遭遇)      FN-A=0（新断言期望 1）
+```
+
+5 处修复各自独立：回退哪一处，只有那一条断言会翻；本轮对每个变异都抽查了其余维度**未被带偏**
+（用例里逐条断言了代表性交叉项，例如 M1 后 `fp_b` 仍为 0、M2 后 `fp_a` 仍为 0）。
+也就是说新断言**不是恒真**，任何一处退化都会被打红。
+
+#### (e) 证据 3 —— 断言仍然钉得住两端
+
+- **「必须给」端**：`p0 == 1`、`fp_e_attack == 1`、`fn_a == 1` → 「一律不给」的实现会被抓。
+- **「必须不给」端**：`p1 / p2 / fp_a / fp_b / fp_c / fp_d / fp_e_attr == 0` → 「一律给」或任一维度退化的实现会被抓。
+
+#### (f) 结论：**合法，未弱化**——附一条过程性条件
+
+这是「实施者改验证者的审计用例」，最敏感的一类改动。它之所以安全，是因为**旧实况没有消失**：
+
+- T26 把「旧脚本复现 5 类误判」搬进了 `scripts/lmop-engine-check/src/main.rs`
+  （断言 `pack_tactics.old_impl_reproduces_misjudgments`）与 `story_example/lmop-import.md`；
+- 本轮又补了一枚 **cargo test 层**的钉子 `r4_audit4_old_script_reproduces_t24_findings`（断言旧脚本 = 1/1/1/1/0），
+  以及 §R3 各处的「修正前实况」标注（见 §R4-9）。
+
+**如果当时只改 `r3_audit4` 而不给旧实况留任何可执行记录，同一处改动就应判为「弱化（抹掉历史证据）」。**
+现在的判法是：**合法**，但这是「实施者改验证者资产」必须补上的条件，不是天然成立的。
+
+### R4-2. a12 / a12b 新机制判据的审计
+
+T26 的说法：加了一支 PostResolve 探针（`factor / rng_consumed / #deltas / hp delta 对账`），
+并用「换回旧重掷脚本 → FAIL」做变异用例。本轮**用自己的 harness 重写**了探针与场景（不调用 T26 的用例函数）：
+
+```text
+R4-2 基线（引擎缩放）    : flags={deltas:1, factor:0.5, hp:-4, missing:false, rng:3} dice=4 delta=4
+R4-2 变异A（旧重掷）     : dice=4 flags={deltas:0, factor:nil, hp:none, rng:0} 引擎hp=None Lua伤害=4
+R4-2 变异B（缩放+Lua双补）: dice=7 flags={deltas:1, factor:0.5, hp:-2, rng:3} 引擎hp=2 Lua补=4 会话可见=6
+```
+
+| 形态 | 松断言（骰数 4 / 半值 ∈ 1..9） | 机制判据 |
+|---|---|---|
+| 基线：引擎结算 + `scale_effect(0.5)` | PASS（dice=4、delta=4） | **PASS**（factor=0.5 / rng=3 / #deltas=1 / 引擎 hp delta == -掉血） |
+| **变异 A**：换回旧「Lua 重掷 3d6 取半 + `apply_effect`」 | **PASS**（dice=4、Lua 补 4） | **FAIL**（factor=nil / rng=0 / #deltas=0 / hp=none） |
+| **变异 B**（本轮自造）：既 `scale_effect(0.5)` 又让 Lua 再补一份 | PASS | **FAIL**（因子字段全对，但引擎快照 hp=-2 ≠ 会话可见掉血 6 → **hp 对账**这一半也有牙齿） |
+
+**结论：合法、有牙齿。** 变异 A 是 T26 自己给的反例，本轮独立复现成立；变异 B 是 T26 **没做**的反例，
+用来证明「hp 对账」不是装饰——只有「引擎没结算」和「Lua 又补一份」两种坏法都能被抓，判据才算完整。
+旧的两条松断言（骰数 4、1..9）逐条保留，没有放宽。
+
+**如实登记的适用边界**：`rng_consumed == 3` 钉的是「3d6」这个骰式、`#deltas == 1` 钉的是这个技能的形状，
+是**交付物专用**断言（换骰式 / 换技能要同步改）；这是可接受的，但不能当成通用判据。
+
+### R4-3. r2_6 新判据的审计
+
+T26 的说法：改成读该回合 `Resolution.state_changes`，要求找到 `entity_id = 不存在目标 + field = resources.res-hp + value < 0`。
+本轮从两侧独立确认：
+
+| 层次 | 真实脚本（交付物） | 变异（删掉 `dnd-save-half` 的缩放声明） |
+|---|---|---|
+| 引擎级（`execute_skill` 产物） | 引擎算出 1 条 `entity_id="r4-不存在的目标"` 的伤害 delta（-5），`dice=4` | 无任何 hp delta，`dice=1` |
+| 会话级（真实回合） | 投影 delta=0（落不到实体），但 `Resolution.state_changes` 里有 `("r4-不存在的目标","resources.res-hp",-5)`，`dice=4` | 无 ghost 记录，`dice=1` |
+
+代码路径旁证：`session.rs` 的 `resolve_skill` 把 `outcome.effects.deltas.clone()` 原样放进
+`Resolution.state_changes`（**不经实体过滤**），而 `apply_delta` 对未知实体直接 `return` ——
+「事件里有、投影里没有」正是「算了但被丢弃」的可观测形态，与「分支被跳过」在 dice 数与 ghost 记录上**双双可分**。
+
+**结论：合法，不是靠放宽阈值。** 旧断言 `delta == 0` 一条没少，另加了三条**更强**的断言
+（`dice == 4`、ghost delta 必须存在且为负数、不得留下幻影实例）。变异（删缩放声明）会让它 FAIL（dice=1、无 ghost）。
+
+### R4-4. 5 类误判的独立复现 + 14 条 GAP 第四轮现状
+
+#### (a) 5 类误判（本轮自造场景，不采信 T26 的 engine-check 自述）
+
+| 场景 | 规则应得 | **旧脚本（HEAD 原文）实测** | **新脚本（交付物）实测** | 判定 |
+|---|---|---|---|---|
+| FP-A 同伴在 `loc-c`、狼与目标在 `loc-a` | 无 | `1` | `0` | **已修** |
+| FP-B 同伴 HP>0 但带 `stunned`（在开放内容失能名单里） | 无 | `1` | `0` | **已修** |
+| FP-C 狼与目标都无 `location_id` | 无 | `1` | `0` | **已修** |
+| FP-E 非攻击判定（`kind=attribute`） | 无 | `1` | `0` | **已修** |
+| FN-A 同伴在**另一场遭遇**但同在 `loc-a` | 有 | `0` | `1` | **已修** |
+| P0 正例（同遭遇 + 同伴存活 + 与目标同地点） | 有 | `1` | `1` | 对（未退化） |
+| P1 同伴 HP=0 / P2 狼与目标异地 / FP-D 实例查不到 | 无 | `0 / 0 / 0` | `0 / 0 / 0` | 对 |
+
+#### (b) 14 条 GAP 第四轮现状
+
+复核方法：①规则包 `--check` 的逐条 status；②本轮自己去 `crates/*/src` 找原语 / 找结构；
+③运行时反例（本轮 r4 用例 + 前三轮用例重跑）。
+
+| GAP | 第四轮现状 | 独立证据 |
+|---|---|---|
+| A | **近似提高**（**不能升为「闭合」**，见下） | 5 类误判已修（§R4-4a）；声明与实现逐条对上（§R4-5）；但「目标 5 尺内」仍不可表达 |
+| B | **仍存在** | `distance` 在 `crates/octopus-engine/src` 词边界 grep 0 命中；只有 `location_id` 归属 |
+| C | **已闭合** | `get_attachments / get_attachment / get_definition / list_definitions`；本轮失能名单数据驱动反证（改名单 → 期望翻转） |
+| D | **已闭合** | `check_pre_roll` 下发 `kind / attribute`；集群战术新脚本正是靠它收敛（M4 变异证明有牙齿） |
+| E | **已闭合** | `scale_effect(0.5)` + PostResolve `host.resolved_effects`；本轮 §R4-2 独立复现 |
+| F | **已闭合（边界不变）** | `enemy_defeated` 逐只发 XP；边界：只在 strike 路径（与第二 / 三轮同，未构造非 strike 运行时反例） |
+| G | **仍存在** | `EncounterPresetEnemy.count: Option<u32>`，无骰式落点 |
+| H | **已闭合** | `set_flag(flag[, value]) / clear_flag` |
+| I | **仍存在** | 引擎无先攻 / 轮次 / 行动经济 |
+| J | **仍存在** | `CondExpr` 无「掷 vs 对手被动」入口（引擎侧 `Intent::Check.opponent_id` 已有） |
+| K | **仍存在** | 建实例时 `statuses: vec![]`；模板初始状态无声明入口 |
+| L | **已闭合** | `host.target` 与 `host.actor` 同级完整；**但伏击不看判定签名**（§R4-6 ①，与 L 无关，是规则包自己写宽了） |
+| M | **仍存在** | `CondExpr` 只有 `encounter_cleared` |
+| N | **已闭合** | 24 个掷表触发点 `repeatable: true` + `dnd-wander-reset` |
+
+**汇总：闭合 7 / 近似提高 1 / 仍存在 6** —— 与规则包 `--check`、与第三轮数目一致。第四轮没有新增闭合，也没有把任何一条改判回去。
+
+#### (c) GAP-A 能不能从「近似提高」升为「闭合」？——**不能**
+
+理由（三条，都是本轮实测 / 逐条读代码得到的）：
+
+1. **登记的缺口对象是「集群战术这条规则能不能得出正确结论」，不是「能不能读跨实体」。**
+   跨实体读取这个**能力**确实闭合（清单 15 是证据）；但规则的结论仍可能错：同伴与目标只要同在**一个 `location_id`**
+   就算「5 尺内」，而一个 `location_id` 覆盖整个地点，同伴可以在**任意远处**。本轮 P0 场景就是这条不可区分性的直接体现
+   ——引擎里没有任何字段能把「同在 loc-a 的 1 尺」与「同在 loc-a 的 100 尺」分开。这是 **GAP-B**，不是 A 的实现缺陷。
+2. **T24 记的那条「声明与实现矛盾」是 A 里唯一的实现缺陷，它已经闭合。** §R4-5 逐条对账：实现与开放内容的
+   `range_proxy / signature_scope / incapacitated_statuses / ally_proxy` **完全一致**。所以 A 的「近似提高」现在
+   **纯粹由 B 造成**，而不是「实现没做到声明」。
+3. **按前三轮一贯的登记口径，「闭合」= 规则结论正确。** 现在规则结论仍不精确（只是近似口径已被开放内容如实声明）。
+   把 A 改成「闭合」会**高估**；更准确的分层是：
+   **A 的「跨实体读取能力」闭合；A 的「集群战术规则」按声明的近似口径实现一致，精确性受 B 限制 → 维持「近似提高」。**
+
+> 建议（不实施，本轮不修产品代码）：如果要把口径说得更准，可把 A 拆成两条登记
+> ——「A1 跨实体读取能力（已闭合）」/「A2 集群战术的距离近似（受 B 限制）」。这会比现在一条 GAP 混装能力和结论更清楚。
+
+### R4-5. 开放内容声明 vs Lua 实现：逐条对账（不再矛盾）
+
+（读 `story_example/lmop-storybook.json` 的 `definitions[kind=dnd-pack-tactics]`.fields 与 `lua_mounts[dnd-pack-tactics]`.source 原文）
+
+| 声明（开放内容 fields） | 实现（脚本行） | 对得上？ |
+|---|---|---|
+| `range_proxy`：「与目标同一 `location_id`（目标没有 `location_id` 时不给优势，fail-closed）」 | `local target_place = target.location_id` → `if type(target_place) ~= "string" or target_place == "" then return end` → `inst.location_id == target_place` | ✅ |
+| `signature_scope`：`kind == attack`（description：「攻击检定有优势」） | `if host.check_kind ~= "attack" then return end` | ✅ |
+| `incapacitated_statuses`：`["stunned","unconscious","paralyzed","petrified","incapacitated"]` | 运行时读 `host.get_definition(def_id).fields.incapacitated_statuses` → 建表 → 按 `st.id or st.name` 判失能 | ✅（且**数据驱动**） |
+| `ally_proxy`：「所有活跃遭遇里的其它敌人实例（不限与我同场）；HP>0 且不带 `incapacitated_statuses` 才算未失能」 | `for _, enc in ipairs(host.list_encounters())`（引擎只列 active）→ 遍历 `enc.enemies` 除自己 → `able(inst)`（HP>0 且无失能状态） | ✅ |
+
+本轮四条**独立反证**（不是读代码，是跑出来的）：
+
+```text
+R4-6 失能名单数据驱动: 基线 stunned=0/prone=1 → 只改名单（["prone"]）stunned=1/prone=0
+R4-6 声明对账 PASS: 非活跃遭遇=0 / 不限同场=1 / 目标缺地点=0 / 无状态名常量
+```
+
+- 只改 `definitions.fields.incapacitated_statuses`（脚本逐字不动）→ 期望翻转 ⇒ 名单真的来自开放内容，不是 Lua 常量。
+- 脚本里**没有任何状态名字符串**（逐个状态名 grep 字面量 = 0 命中）。
+- 「所有**活跃**遭遇」：非活跃遭遇里的同伴**不算**（=0）；「不限与我同场」：我不在任何遭遇、但活跃遭遇里有同地点同伴**算**（=1）。
+- 目标缺 `location_id` → fail-closed（=0）。
+
+**结论：T24 记的「声明与实现不一致」已经消除，四条声明与实现逐条对上。** 唯一仍属「近似」的是
+声明自己承认的那件事——精确 5 尺做不到（GAP-B），以及「其它敌人实例」是 proxy 而不是真正的盟友关系（声明已如实写出）。
+
+### R4-6. 本轮新发现（不替任何人圆场）
+
+#### ① 「伏击」仍然不看判定签名（**缺陷候选**，与 T24 记的 FP-E 同类）
+
+T24 在集群战术上报的 FP-E（非攻击判定也给优势）被 T26 修了，但**同一类误判在 `dnd-ambusher-keep-high` 上原样保留**：
+数据卡写的是「对任何成功受其**突袭**的生物所发动的**攻击检定**具有优势」，
+而脚本只读 `host.target.statuses`，**没有** `host.check_kind` 闸门。本轮自造场景实测：
+
+```text
+R4-6 伏击签名: attack=1 attribute=1 save=1（数据卡只说攻击检定）
+```
+
+即：对同一个「受突袭」目标，**属性检定与豁免检定也拿到优势**。这不是 GAP，是**规则包自己写宽了**，
+和 T24 记的 FP-E 是同一条判据的同类缺陷。**本轮原样钉住现状（断言观察值 = 1），未修产品代码。**
+>
+> **⚠️ 第五轮订正**：该缺陷已由 T29 按开放内容数据卡的「攻击检定」口径收敛（`host.check_kind ~= "attack"` 早退）；
+> 旧实况（旧脚本 attack/attribute/save 全给 = 1/1/1）以 `OLD_AMBUSHER` 常量**可执行地**存活于
+> `scripts/lmop-engine-check/src/main.rs`，由引擎级断言与 §R5-1 独立跑通。本段原文保留为第四轮的历史实况。
+
+#### ② 归因错位（低 severity，但影响可追溯性）
+
+T26 把这轮修复在代码 / 测试 / 文档里统一记成「**T24 修正**」：
+`scripts/lmop-rulepack.mjs`（5 处）、`scripts/lmop-engine-check/src/main.rs`（3 处）、
+`crates/octopus-api/tests/lmop_verification_round3.rs`（7 处）、`story_example/lmop-import.md`（1 处）。
+按本任务的编号，**T24 是第三轮验证者（只报告、不实现），T26 才是实施修复的那个 agent**。
+同一批注释里还并存「T24 **之前**的旧脚本」这种把 T24 当时间点的用法，两种含义混在一起。
+建议后续统一改成「T26 修正」或「第四轮修复」——**不影响功能，但会让下一轮验证者追错责任链**。
+
+#### ③ 新增的 `--check` 一致性断言是**字符串匹配**（低 severity）
+
+T26 在 `runChecks` 里加的 4 条 GAP-A 断言是 `packSource.includes('inst.location_id == target_place')`
+一类的**源码子串**检查。它们**可以被注释 / 死代码满足**（例如脚本里加一行含该子串的注释即可通过），
+也不检查该表达式是否真的参与判定。**缓解事实**：同一条主张另有**行为级**断言兜底
+（`r3_audit4` 的场景断言、engine-check 的 `pack_tactics.reads_world_facts`、本轮 §R4-1 的变异验证），
+所以这不是真空的断言；但它本身**不是**机制判据，不应被当成「声明与实现一致」的机器保证。
+
+#### ④ 设计层观察：`range_proxy` 是自然语言，无法被机器校验
+
+`range_proxy / ally_proxy` 这些「近似口径声明」是散文；机器能查的只有 `signature_scope`（可枚举）、
+`incapacitated_statuses`（数组）、`target_status` 这类**结构化字段**。
+本轮之所以能做逐条对账，靠的是**人读 + 自造场景**，不是工具。这套设计要长期维持「声明即契约」，
+需要把可结构化的口径尽量结构化（本轮不实施）。
+
+### R4-7. 环境与复现命令 / 退出码（第四轮）
+
+```bash
+cd /home/huang/Personal/Dev/Code/octopus
+export CARGO_TARGET_DIR=$PWD/.scratch/engine-test-target
+
+# 引擎级：本轮新增的独立用例（9 条）
+cargo test -p octopus-api --test lmop_verification_round4 -- --test-threads=2 --nocapture
+#   → 9 passed; 0 failed
+
+# 全套回归
+cargo test -p octopus-api                              # lib 74 + r1 13 + r2 14 + r3 14 + r4 9，全 0 失败
+cargo test -p octopus-engine -p octopus-ai             # 357 + 36 passed，0 失败
+
+# 交付物侧自检
+node scripts/lmop-rulepack.mjs --check                 # EXIT=0，28 项断言 0 失败 + 14 条 GAP（闭合 7 / 近似 1 / 仍存在 6）
+node scripts/lmop-rulepack.mjs --out /tmp/r4-regen-storybook.json   # EXIT=0；sha256 == 交付物（逐字节相同）
+node scripts/import-bestiary.mjs --check               # EXIT=0，28/28
+./scripts/lmop-engine-check.sh                         # EXIT=0，11 条规则断言 / 0 rule_failures / lua 0 issue
+./scripts/lmop-boundary-check.sh                       # EXIT=0，禁词零命中
+```
+
+| 命令 | 退出码 | 关键结果 |
+|---|---|---|
+| `cargo test -p octopus-api --test lmop_verification_round4` | 0 | **9 passed / 0 failed** |
+| `cargo test -p octopus-api` | 0 | lib 74 / r1 13 / r2 14 / r3 14 / r4 9，全部 0 失败 |
+| `cargo test -p octopus-engine -p octopus-ai` | 0 | 357 + 36 passed / 0 failed |
+| `node scripts/lmop-rulepack.mjs --check` | 0 | 28 项断言 0 失败；14 GAP = 7 / 1 / 6 |
+| `node scripts/lmop-rulepack.mjs --out /tmp/…` | 0 | sha256 `ffc93b3e…` == 交付物 |
+| `node scripts/import-bestiary.mjs --check` | 0 | 28/28 |
+| `./scripts/lmop-engine-check.sh` | 0 | 11 规则断言全过 / 0 error / 0 lua issue |
+| `./scripts/lmop-boundary-check.sh` | 0 | 禁词零命中 |
+
+**验证基线（本轮实测时的文件指纹，便于复现）**：
+
+```text
+story_example/lmop-storybook.json              sha256 ffc93b3e8cab551c6964aa792a2abc94625727dcc27e376f787e4a334e9cfdaa
+scripts/lmop-rulepack.mjs                      sha256 7f63e4bab79f92892a5e8d05fb5313aae6f070a8e40d9a1e8db57f32dc0d720d
+crates/octopus-api/tests/lmop_verification_round4.rs  sha256 9f0704e2f1338c14faf6811bcdfba2bcf573c176ada1408eac303f71b583734c
+scripts/lmop-engine-check/src/main.rs          sha256 17cdcc0ee23feb29d8fed13ea8bb07ca0b7804c96052b015b5e66d672483a6a4
+```
+
+**并发改动提示（如实登记）**：本轮审计期间，`scripts/lmop-engine-check/src/main.rs` 在 **12:59** 被**另一次改动**重构过
+（把 pack 场景抽成 `run_pack_cases`、旧脚本抽成 `OLD_PACK_TACTICS` 常量；断言名与语义不变）。
+我第一次跑 engine-check 是在该重构之前，**已在该重构之后重跑一遍**：仍是 11 条规则断言全过 / 0 error / 0 lua issue。
+本报告引用的断言名 `pack_tactics.old_impl_reproduces_misjudgments` 与当前文件一致。
+
+### R4-8. 未通过 / 未覆盖 / 副作用（不得隐瞒）
+
+**未通过：无（0 项）。**
+
+必须声明的**覆盖边界**：
+
+1. **本轮没有跑真实 HTTP 路径（没有起服务、没有碰真实 `octopus.db`）。**
+   原因：第四轮的回归清单是 r1 / r2 / r3 / engine / api / ai / rulepack / engine-check / boundary（不含 HTTP），
+   且任务明确要求保护既有 1 本故事书 + 1 个存档。
+   **发布门的覆盖没有丢**：r3 / r4 的每条用例都走真实 `publish_and_open`（内存库 + 真实 validate / lint），
+   交付物在真实发布门上是 0 error 的；上一轮的 HTTP 证据（13/13）仍然是对应版本之前的最后一次 HTTP 级验证，
+   **T26 之后没有再跑过 HTTP**——这一条如实登记。
+2. **GAP-F 的非 strike 击杀路径**仍然只有代码复核（与第二、三轮同）。
+3. **本轮所有 `octopus.db` 操作数为 0**：所有会话用例用 `SqliteStore::open_in_memory()`；
+   `--out` 只写 `/tmp`；`import-bestiary --check` 不写文件。
+   既有的用户故事书 / 存档 / octopus 账户**未读改、未删除**（`git status` 里没有 `octopus.db`）。
+
+**副作用 / 新增数据**：
+
+- **真实 `octopus.db`：本轮新增 0 条验证数据**（无新账户 / 故事书 / 存档），因此没有需要清理的 id。
+- 新增文件只有 `crates/octopus-api/tests/lmop_verification_round4.rs` 与本节报告改动。
+
+### R4-9. 报告里「修正前实况」的标注清单（T26 已指出，本轮落实）
+
+在不删改第三轮原文的前提下，本轮在上述各处加了 **⚠️ 第四轮订正** 标注：
+
+| 位置 | 标注内容 |
+|---|---|
+| §R3-0 摘要表「四件专门审计」 | ③④ 已由 T26 修掉并被独立复现 |
+| §R3-0「一句话」 | 该段列出的全部问题「已修」；旧实况仍被复现为真 |
+| §R3-3 审计③a（a12/a12b） | 注释 / 判据已订正；「机制盲」判断描述的是修正前 |
+| §R3-3 审计③b（r2_6） | 描述已订正、诊断价值已恢复；「静默丢弃无日志」仍成立 |
+| §R3-3 审计④（集群战术） | 5 类误判与 `range_proxy` 矛盾已在 T26 修正 |
+| §R3-4 GAP-A / GAP-B 行 | 5 类已修；A 的残余不精确只剩 GAP-B |
+| §R3-4 汇总 | 数目不变，但 A 的「近似提高」理由变了 |
+| §R3-5 被推翻的证伪 / 仍成立的证伪 / 风险清单 / 结论 | 逐条标注哪一半已消除、哪一半仍成立（伏击签名不收敛） |
+
+### R4-10. 这套设计成立性的第四轮判断
+
+**第四轮被推翻的第三轮证伪 / 风险**
+
+| 第三轮仍成立的判断 | 第四轮 |
+|---|---|
+| 「集群战术能得出正确结论」仍被证伪（5 类误判） | **推翻**：5 类已修，且旧脚本原文复现证明「当时确实错」；残余不精确**只剩 GAP-B 的距离概念** |
+| 开放内容 `range_proxy` 与脚本实现不一致 | **推翻**：实现已对齐声明（真检查同伴位置 + 缺地点 fail-closed）；§R4-5 逐条对账 |
+| r2_6 负对照机制描述失实、诊断价值消失 | **推翻**：描述已订正，判据升级为「读 Resolution.state_changes 的 ghost delta」，可区分「跳过」与「丢弃」 |
+| a12 / a12b 断言「机制盲」 | **推翻**：PostResolve 探针 + hp 对账；本轮两种坏机制（旧重掷 / 缩放+Lua 双补）都被抓 |
+| `scale_effect` 的「因子 1.0 也开门」陷阱 | **仍成立**（T26 未动；这是原语语义，规则作者需要知道） |
+
+**第四轮仍然成立的证伪 / 缺口**
+
+- **「引擎有位置概念」仍被证伪**（GAP-B，`distance` 0 命中）——这也是 GAP-A 仍然只能是「近似提高」的唯一原因。
+- **GAP-G / I / J / K / M** 五条与第一轮登记时实质相同（预置数量静态、无轮次经济、无被动对手条件入口、无模板初始状态、无 `encounter_active`）。
+- **新登记（本轮）**：「规则包按判定签名收敛」**没有成为通用约定**——日照敏感做了、集群战术这轮补了，
+  **伏击没做**（§R4-6 ①）。这不是引擎能力问题，是规则包的一致性欠账；同类问题可能还有别处。
+  > **⚠️ 第五轮订正**：伏击已按 `kind == attack` 收敛（§R5-4）；但「4 条不读签名的挂载点没有结构化声明」
+  > 仍在（§R5-5），所以这条的**后半句「没有成为通用约定」在第五轮依然成立**，只是样本少了一个。
+
+**第四轮对设计成立性的判断**
+
+前三轮的判断是「路对、原语不够（R1）→ 边界变宽（R2）→ 读事实的缺口补齐（R3）」。
+第四轮在 T26 之后可以补一句：**这套设计第一次做到了「声明即契约，且声明可被独立验证」**——
+T26 的修复本质就是把实现对齐开放内容里已经写下的 `range_proxy / incapacitated_statuses`，
+修完之后我用「改开放内容 → 期望翻转」的反证确认这些字段**真的在驱动行为**，而不是装饰性文档。
+
+但**设计里没有任何机制强制维持这种一致性**：`range_proxy` 是散文、
+`--check` 的一致性断言是源码子串匹配（§R4-6 ③），
+真正把它钉住的是**行为级测试 + 变异验证**（本轮 r4 用例、r3_audit4、engine-check）。
+所以更准确的说法是：**设计成立，且这次是三处「实现落后于声明」被追平；但「实现落后于声明」这类漂移
+仍是这套设计的主要风险形态**——它不会报错，只会静默地给出错误结论（T24 的 5 类误判就是实证）。
+下一轮若要继续加固，优先级建议：①把可结构化的近似口径继续结构化（§R4-6 ④）；
+②把「判定范围 `signature_scope`」变成所有规则挂载点的通用声明并按它收敛（先补伏击）；
+③把「声明 vs 实现的语义一致性」从字符串匹配升级为行为断言。
+
+### R4-11. 本轮新增 / 改动文件
+
+| 文件 | 作用 |
+|---|---|
+| `docs/lmop-verification-report.md` | 本报告（§0–§10 / §R2 / §R3 **原样保留**，§R3 内加「⚠️ 第四轮订正」标注，追加 §R4） |
+| `crates/octopus-api/tests/lmop_verification_round4.rs` | **新增**：9 条独立用例（旧/新脚本对照、5 处单点变异、声明对账、失能名单数据驱动、a12 机制探针 + 两种反例、r2_6 引擎级 + 会话级区分、伏击签名残留） |
+
+**未改动**：`crates/*/src/` 与 `frontend/src/` 的任何产品代码；
+**未改动**任何既有测试文件（`lmop_verification.rs` / `lmop_verification_round2.rs` / `lmop_verification_round3.rs`）；
+**未改动** `story_example/lmop-storybook.json`（只读；所有变异都施加在内存副本上）。
 
 
 
@@ -855,3 +1282,468 @@ R3-AUDIT4: P0=1 P1(同伴倒)=0 P2(异地)=0 |
 
 
 
+
+
+
+---
+
+## 第五轮·独立复核（T28/T29 四项改动 + T29 对验证者用例的两处改动）
+
+> 角色：**全新的独立验证者（第五轮）**（未参与 T28/T29 的任何实现与验证，也未参与前三、四轮）。
+> 只验证，不修产品代码；inScope：`docs/lmop-verification-report.md` · `scripts/`（只新增） ·
+> `crates/octopus-api/tests/`（**只新增**）。
+> **未改动**任何产品代码与任何既有用例：对本轮被翻转的 `r4_ambusher_still_ignores_check_signature`（现名 `r4_ambusher_check_signature_attack_only_after_r5_fix`）
+> 与第三轮 harness `run_ambusher` 走「读 + 跑 + 旧实况复现 + 逐条变异推理」。
+> 被测交付物：`story_example/lmop-storybook.json`，sha256 `ce6b557f9d95c816c852a0ee08e6e4cb4b4663d21bc4ab8cd5882a12784a4f01`
+> （第四轮是 `ffc93b3e…`——T26 与 T29 之后已不是同一版）。第五轮实测：用 `scripts/lmop-rulepack.mjs` **重新生成**，
+> 产物与交付物**逐字节相同**（同 sha256）→ 交付物仍是规则包脚本的唯一产物。
+> 查询口径：**不采信 T29 自述**；下面每一条都是本轮自建 harness / 自造场景 / 自建变异跑出来的。
+
+### R5-0. 结论摘要
+
+| | 结论 | 说明 |
+|---|---|---|
+| **T29 翻转第四轮用例**（`r4_ambusher…`） | **合法（未弱化）** | 旧实况以可执行形式存活：`OLD_AMBUSHER` 与 git HEAD 原文**逐字节相同**（974 字节，sha256 `77a72f91…`），本轮独立跑出 1/1/1；翻转后的断言逐条有牙齿（3 个变异全红）；行为确实变了（有当时的失败日志为证） |
+| **T29 改第三轮 harness**（`run_ambusher` 补判定签名） | **合法（忠实）** | 真实引擎里每一次**真判定**的 `check_pre_roll` 都必然带签名（两处注入点都恒写 `kind: Some(...)`）；无签名只对应「根本没有判定」。四条期望值与数据驱动段逐字未改 |
+| **T28-A force_effect 正交性** | **成立** | 自造技能三组对照：force 单独 = 全量且不缩放；`scale_effect(1.0)` = 旧语义（开门、数值不动）；不声明 = 逐字旧路径 |
+| **T28-B apply_delta 可见化** | **成立** | 投影序列化前后逐字相同；丢弃确有 WARN；命令日志零新增事件；同形态重放只告警一次 |
+| 伏击签名 + fail-closed | **成立** | attack→给 / attribute→不给 / save→不给；无快照或 kind 缺省→不给；attack 对照排除恒 0 |
+| 「16 条挂载点里只有 ambusher 缺签名」 | **成立（限 T26 之后的口径）** | 16 条中 10 条判定类；读签名的 6 条，不读的 4 条全是「对任意判定都成立」的口径。HEAD 上 pack-tactics 也没有闸门，T26 补上后只剩 ambusher——说法准确 |
+| `--check` 行为级兜底 | **在场且能区分** | 5 个变异（源码 / 开放内容各半）全部让声明的引擎级断言变红；`consistency.behavioural_backing` 20 条引用无一悬空。**子串断言本身仍可被注释满足**（T27 发现③未被消除，靠行为级兜底救场） |
+| 14 条 GAP | **闭合 7 / 近似提高 1 / 仍存在 6**（与第四轮数目一致） | 无新增闭合、无回退；本轮无 GAP 状态变化 |
+| 全套回归 | **全绿** | engine 361 / ai 36 / api-lib 74 / r1 13 / r2 14 / r3 14 / r4 9 / **r5 9（新增）** / rulepack 28 / engine-check 20 条运行时断言 / boundary 0 命中，全部 0 失败 |
+| 本轮新发现 | 1 条低危声明漂移 + 2 条设计层观察 | ①`rule-dnd-proficiency` 声明的挂载点是 `check_post_roll`，真实挂载点是 `check_pre_roll`（`--check` 不校验这层）；②`--check` 的源码子串仍可被注释满足；③丢弃 WARN 的去重是**进程级、跨存档**的 |
+
+**一句话**：T29 的两处改动都**经得起独立复核**——它把「伏击不看判定签名」这个第四轮钉住的实况修掉了，
+同时**没有抹掉历史证据**（旧脚本原文进了引擎校验器，被断言在同一批场景复现 1/1/1）；
+第三轮 harness 补签名也不是「改测试迁就实现」，而是把「不可能出现在真判定里的状态」纠正成真实状态
+（真判定必有签名，已读代码 + 独立结构断言双重确认）。
+**但不替 T29 圆场的有三条**：①源码子串型一致性断言**仍然**是「注释即可满足」的形态（§R5-6 实证）；
+②`rule-dnd-proficiency` 的挂载点声明与实现不一致（§R5-8①，低危但属同类漂移）；
+③丢弃 WARN 一旦某形态出现过，**跨存档、跨会话**都不再提示（§R5-8③）。
+
+---
+
+### R5-1. T29 对验证者用例的两处改动 —— 审计（本轮最重要产出）
+
+#### (a) 两处改动是什么
+
+1. `crates/octopus-api/tests/lmop_verification_round4.rs`：第四轮验证者写的
+   `r4_ambusher_still_ignores_check_signature`（**如实钉住现状**：断言源码里没有 `host.check_kind`、
+   且 attribute / save 也 = 1）被**改名并翻转**为 `r4_ambusher_check_signature_attack_only_after_r5_fix`
+   （断言 attack=1、attribute=0、save=0），**去掉了源码子串断言**。
+2. `crates/octopus-api/tests/lmop_verification_round3.rs` 的 `r3_16` harness `run_ambusher`：
+   原本构造 `MountEnv` 时**不给 check 快照**（`check: None`），现补上
+   `LuaCheckContext { attribute:"str", kind: Some(CheckKind::Attack), target:12 }`。
+   `r3_16` 的四条期望值与后面的数据驱动段**一字未改**（`git diff` 只落在 `run_ambusher` 与 `r3_audit4` 两处）。
+
+#### (b) 判定标准（沿用第四轮 T27）
+
+不是「测试通过」，而是：①**旧实况是否仍然可执行地存在**（只改被翻转的断言而不留任何可执行旧实况 = 弱化）；
+②**harness 改动是否忠实**；③**翻转后的断言是否仍有牙齿**（变异）。
+
+#### (c) 证据 1 —— 旧实况仍然可执行地存在（**是**）
+
+外部核对（本轮实测）：
+
+`
+$ git show HEAD:story_example/lmop-storybook.json → lua_mounts[dnd-ambusher-keep-high].source
+  974 字节，sha256 77a72f91922d78d0ce94eeb96abdf5bbb379abe426755d73720d77e67cdd6755
+$ 从 scripts/lmop-engine-check/src/main.rs 抽 const OLD_AMBUSHER
+  974 字节，sha256 77a72f91922d78d0ce94eeb96abdf5bbb379abe426755d73720d77e67cdd6755
+  → BYTE EQUAL: true
+`
+
+本轮新增的 `lmop_verification_round5.rs` 里 `r5_ambusher_old_reality_is_executable_and_new_one_is_gated`
+**独立跑这段常量**（自己的 harness，不复用 T29 的断言函数）：
+
+`
+R5 伏击 旧脚本(HEAD 原文)=(1, 1, 1) 新脚本(交付物)=(1, 0, 0)
+`
+
+即：T27 的三条原始发现（attack / attribute / save **全部**给优势）**可执行地存活**，
+不依赖任何会被翻转的断言。引擎校验器另有 `ambusher.old_impl_ignores_check_signature` 在同一批场景复现 1/1/1
+（本轮实跑通过）。**结论：不属于「抹掉历史证据」。**
+
+**行为真的变了**（旁证）：本机留有改动当口的失败日志（`/tmp/baseline-r4.log` 13:08、`/tmp/v5.log` 13:13）：
+改动脚本之前，旧用例 `r4_ambusher_still_ignores_check_signature` **通过**（9 passed）；
+改动之后同一份旧用例 **FAILED**，打印 `attack=1 attribute=0 save=0`，并在
+`assert!(!source.contains("host.check_kind"))` 处 panic。说明翻转是**行为变化**，不是把期望值改小 / 改没。
+
+#### (d) 证据 2 —— 第三轮 harness 改动忠实（**是**）
+
+T29 的论证是「真实引擎在 `check_pre_roll` 永远下发判定签名，旧 harness 模拟的是不可能出现的状态」。
+本轮独立核验：
+
+- `command.rs`：`check_signature()` **恒写** `kind: Some(kind)`；
+  技能路径 `signature = skill_checker(...).is_some().then(|| check_signature(...))`
+  ——有判定器才有签名；没有判定器 = 根本没有这次判定。
+- `session.rs`：判定意图路径 `run_mount_chain(LuaMount::CheckPreRoll, &mount_ctx, Some(&signature), None)`
+  **无条件**下发；缺省 kind = `CheckKind::Attribute`。
+- 全仓 `check_pre_roll` 的运行时调用点只有这两处（本轮新增用例把这两条结构与计数都写成断言）。
+
+所以「无签名」只对应「**没有判定**」——那时 `modify_check('keep_high')` 本来也无判定可改。
+旧 harness 用 `check: None` + 「目标带 dnd-surprised」去期望 1，模拟的是一个真实引擎不会出现的组合
+（**有判定却拿不到签名**）。补上 attack 签名 = 让 harness 回到真实状态，**忠实**。
+`r3_16` 的四条期望值与数据驱动段逐字未改；「没有签名 → 不给优势」这一边界改由引擎级断言
+`ambusher.fail_closed_without_signature` 与第五轮新增用例显式钉住，覆盖没有丢。
+
+#### (e) 证据 3 —— 翻转后的断言仍有牙齿（**是**）
+
+新一轮独立变异（每次只改一处，跑同一个 harness）：
+
+`
+R5 变异 A（拿掉 kind == attack 闸门）      → (attack, attribute, save) = (1, 1, 1)  ← 新断言期望 0
+R5 变异 B（闸门写成恒不早退）             → (attribute, save) = (1, 1)            ← 新断言期望 0
+R5 变异 C（删掉最终 host.modify_check）   → attack = 0                            ← 新断言期望 1
+`
+
+三条都让翻转后的断言（或两端的对照）翻红：**不是恒真、也不是「怎么都算过」**。
+「必须给」端（attack=1）与「必须不给」端（attribute/save=0）都被钉住。
+
+#### (f) 结论：**两处改动都合法，未弱化**——附一条过程性条件
+
+这是「实施者改验证者资产」最敏感的一类改动。它之所以安全，是因为**旧实况没有消失**：
+旧脚本原文进了 `scripts/lmop-engine-check/src/main.rs`（`OLD_AMBUSHER`，与 HEAD 逐字节相同）并由引擎级断言复现，
+本轮又补了一枚 cargo test 层的独立钉子（`r5_ambusher_old_reality…`）。
+**如果当时只翻转 `r4_ambusher…` 而不给旧实况留任何可执行记录，同一改动就应判「弱化」。**
+另需说明的是：翻转后的用例**去掉了源码子串断言**，这与 T27 发现③的方向一致（子串断言弱于行为断言），
+不是放宽。
+
+---
+
+### R5-2. T28-A：`host.force_effect()` 与 `scale_effect` 的正交性（独立复现）
+
+自造技能 `sk-r5-gate`（**不引用 LMoP、不复用引擎单测 fixture**）：豁免判定 + 1d6 伤害 + 2d6 资源 + 置标记 + 消耗 5；
+结果由判定前挂载点钉死（force_success / force_fail），固定种子 11。
+
+`
+R5 效果门: 无声明成功=[-5]  全量=[-1, 7, true, -5]  force=[-1, 7, true, -5]
+           scale1.0=[-1, 7, true, -5]  scale0.5=[0, 3, true, -5]
+`
+
+| 对照 | 期望 | 实测 | 判定 |
+|---|---|---|---|
+| (c) 不声明 + 豁免成功 | 逐字旧路径：效果**完全不结算**，只剩消耗 | 只有 1 条 `resources.mana=-5`，1 颗骰 | **通过** |
+| (a) 只声明 `force_effect()` | 开门、**不缩放**：与「豁免失败的全量结算」逐字相同 | deltas / 骰序 / 静态修正全等于全量（[-1,7,true,-5]，4 颗骰） | **通过** |
+| (b) 只声明 `scale_effect(1.0)` | 旧语义：**也开门**，因子 1 数值不动 | 与 (a) / 全量逐字相同；且**不等于**「不声明」 | **通过** |
+| force + scale(0.5) | 开门 + 缩放 | 与只 scale(0.5) 完全相同（[0,3,true,-5]） | **通过** |
+| 只 scale(0.5) | 开门 + 缩放（非数值不缩） | hp `-1→0`、mana `7→3`（向零取整），标记 / 消耗不动 | **通过** |
+
+**旧语义逐字保留**的关键点是 (b)：`scale_effect(1.0)` 仍与「不声明」行为**不同**（前者开门）。
+本轮没有改坏第四轮及以前的规则包与用例：`r3_audit1_17` / `r3_18` / `r4_a12` 等旧用例原地重跑全绿。
+另有边界：`force_effect()` 只在 `check_post_roll` / `pre_resolve` 注册，错时机调用**当场报错**
+（不是静默丢请求），与 `scale_effect` 同口径（本轮独立实测 5 个挂载点）。
+
+---
+
+### R5-3. T28-B：`apply_delta` 丢弃可见化（独立复现）
+
+| 主张 | 本轮独立复现 | 结论 |
+|---|---|---|
+| 投影序列化前后**逐字相同** | 重放路径：`serde_json::to_value(session.projection())` 前后相等（喂入同 seq 的合成事件） | **成立** |
+| 丢弃时**确有 WARN** | 实时路径（真实回合 + 不存在的 target_id）：恰好一条 WARN，带 `domain=Character` / `entity_id` / `field=resources.res-hp` / `op` | **成立** |
+| **不得**新增落进命令日志的事件 | 重放后事件数 = 原事件数 + 输入事件数（无额外 System 事件）；日志里 grep 不到「丢弃 / 落不到」类事件 | **成立** |
+| 重放**不刷屏** | 同一批输入里同形态出现两次，同形态只告警 1 次；不同形态各告警 1 次 | **成立** |
+
+原始片段（实时路径）：
+
+`
+WARN 状态增量落不到任何角色实例，已丢弃（投影逐字不变）
+  domain=Character entity_id=verify-r5-ghost-<uuid> field=resources.res-hp op=Add
+`
+
+机理复核：`warn_dropped_character_delta` 只调 `tracing::warn!`，**不 push 任何事件**；
+去重表是 `OnceLock<Mutex<HashSet<(domain, entity, field)>>>`，上限 256。
+本条改动的**行为面为零**：除了日志，世界状态 / 事件日志 / 投影都不动。
+
+**覆盖边界（如实登记）**：去重是**进程级**的——同一形态在进程生命周期内只提示一次，
+且**跨存档共享**（A 存档丢弃过 `(Character, k, f)`，B 存档同样丢弃不再提示）；
+到 256 上限后，重复形态仍被识别，但**新形态每次都告警**。这是取舍，不是缺陷，但会削弱「复发」的可见性。
+
+---
+
+### R5-4. 伏击判定签名与 fail-closed（独立复现）
+
+| 场景 | 期望 | 实测 |
+|---|---|---|
+| `kind == attack` + 目标带 `dnd-surprised` | 给优势 | keep_high = **1** |
+| `kind == attribute`（同一目标） | 不给 | **0** |
+| `kind == save`（同一目标） | 不给 | **0** |
+| 无判定快照（`host.check == nil`） | fail-closed | **0** |
+| 有快照但 `kind == None`（`host.check_kind == nil`） | fail-closed | **0** |
+| attack 对照（同一 harness） | 给（排除恒 0） | **1** |
+
+数据驱动旁证：只把开放内容 `ambush-doppelganger.fields.target_status` 改成 `dnd-prone`（脚本逐字不动），
+期望随之翻转（prone→1、surprised→0）——引擎级 `ambusher.target_status_data_driven` 通过。
+
+---
+
+### R5-5. 「16 条挂载点里只有 ambusher 缺签名」的独立复核
+
+本轮自扫 16 条 `lua_mounts`（7 `check_pre_roll` / 3 `check_post_roll` / 1 `status_tick` / 3 `turn_end` / 2 `event`）。
+判定类共 10 条，读判定签名的 6 条：
+
+`
+读签名：dnd-ambusher-keep-high / dnd-pack-tactics / dnd-proficiency / dnd-save-half / dnd-sunlight-sensitivity / dnd-surprise
+不读签名：dnd-consume-inspiration / dnd-skill-dc / dnd-status-keep-high / dnd-status-keep-low
+`
+
+对 4 条不读签名的逐条核对「是否确有理由」：
+
+| 挂载点 | 声明口径 | 是否需要签名 |
+|---|---|---|
+| `dnd-status-keep-high` | 有 `dnd-inspired` 状态 → 任意检定优势（5e 激励可用于任意 d20） | **不需要**（对任意判定都成立） |
+| `dnd-status-keep-low` | 有 `dnd-eruption-penalty` → 任意检定劣势 | **不需要** |
+| `dnd-skill-dc` | 把技能声明的 DC 落到本次判定 | **不需要**（跟随技能自己的判定） |
+| `dnd-consume-inspiration` | 任意一次判定后消耗激励 | **不需要** |
+
+这 4 条都没有声明过 kind 范围（无 `signature_scope`），脚本也没有把某种判定排除在外——
+「不读签名」与声明一致。**HEAD 口径核对**：`git HEAD` 上 `dnd-pack-tactics` 与 `dnd-ambusher-keep-high`
+**都没有**闸门；T26 补了 pack-tactics，T29 补了 ambusher。
+所以第四轮 T27 说的「16 条里只有 ambusher 缺签名」，**限定在 T26 修正之后**成立且准确：
+当时数据卡明说「攻击检定」的两条规则里，只剩 ambusher 没按签名收敛。本轮实测当前交付物两条都已有闸门。
+**如实指出边界**：这 4 条「不需要」的依据是 `rule-dnd-*` 定义里的 coverage 文本 + 数据卡语义，
+**不是机器可校验的结构化声明**（它们连 `signature_scope` 都没有）——「设计是否要强制所有判定类挂载点声明
+`signature_scope`」是下一轮可以讨论的加固点，本轮不实施。
+
+---
+
+### R5-6. `--check` 的行为级兜底：复核（在场 + 真能区分）
+
+#### (a) 声明不悬空
+
+`node scripts/lmop-rulepack.mjs --check --engine .scratch/lmop-engine-check-target/debug/lmop-engine-check`：
+
+`
+[PASS] engine.publish_gate — validate_storybook 错误 0 / lua_lint 问题 0（警告 24）
+[PASS] consistency.behavioural_backing — 20 条被引用的引擎级断言 全部在场（声明不悬空）
+总结：50 项断言，0 项失败（含真实引擎发布门 + 20 条运行时规则断言）
+`
+
+**独立核对**：引擎校验器当前共 20 条 `rule_assertions` / 0 `rule_failures`——
+即「被引用的 20 条」与「实际存在的 20 条」是同一集合，没有悬空声明，也没有未被引用的行为断言。
+
+#### (b) 抽 5 条变异，逐条确认「真的能区分」（新增脚本 `scripts/lmop-r5-mutation-audit.mjs`）
+
+本轮**不采信** `--check` 自己的 PASS，改成「只改一处 → 用真实引擎重跑 → 看声明的断言是否变红」：
+
+`
+[基线] 交付物：6 条目标断言全部在场且通过
+[PASS] M1 拿掉伏击的 kind==attack 闸门（源码）        → ambusher.check_signature 已变红
+[PASS] M1                                                → ambusher.fail_closed_without_signature 已变红
+[PASS] M2 清空集群战术的失能名单（开放内容）          → pack_tactics.reads_world_facts 已变红
+[PASS] M3 注释掉 dnd-save-half 的 scale_effect(0.5)（源码） → save_half.engine_scales_own_roll 已变红
+[PASS] M4 只改开放内容 target_status=dnd-prone（脚本不动） → ambusher.target_status_data_driven 已变红
+[PASS] M5 去掉日照敏感的 attribute+wis 分支（源码）   → sunlight.by_signature 已变红
+`
+
+**结论：`--check` 里那 7 条子串型断言声明的「行为级兜底」是在场的、且真的能区分。**
+本轮抽的 5 条变异（3 条改源码、2 条只改开放内容）**无一只靠子串混过去**。
+
+#### (c) 但子串断言本身**仍然**可被注释满足（T27 发现③未被消除）
+
+本轮实证：把 `dnd-ambusher-keep-high` 的真实闸门**注释掉**、注释里保留同一子串，然后跑
+**不带 `--engine`** 的 `--check`：
+
+`
+[PASS] ambusher.target_status — ……只对 kind==attack 生效……
+总结：28 项断言，0 项失败            ← 纯子串模式**没能**发现闸门已死
+`
+
+同一份变异交给真实引擎：`ambusher.check_signature=false`、`ambusher.fail_closed_without_signature=false`、
+`rule_failures=2`。**即：`--check` 的基础模式对「实现已死」仍然盲；救它的是行为级兜底，不是子串断言本身。**
+这和第四轮 §R4-6③ 的判断一致，T29-B 的加固**改善了可追溯性（谁兜底、怎么区分写清楚了）并加了悬空检查**，
+但**没有**把子串断言升级成机制判据。本报告不把它记成「已闭合」。
+
+---
+
+### R5-7. 14 条 GAP 的第五轮现状（独立复核，不是照抄 T29 自述）
+
+复核方法：①规则包 `--check` 的逐条 status；②本轮自己去 `crates/*/src` 重新 grep 原语 / 结构；
+③运行时反例（本轮 r5 用例 + 前三、四轮用例重跑）。
+
+| GAP | 第五轮现状 | 独立证据（本轮实测） |
+|---|---|---|
+| A | **近似提高**（不升为「闭合」） | 跨实体读取能力闭合；集群战术按声明近似实现一致；「目标 5 尺内」仍不可表达 |
+| B | **仍存在** | `\bdistance\b` 在 `crates/octopus-engine/src` **0 命中**；只有 `location_id` 归属 |
+| C | **已闭合** | `get_attachment / get_definition / list_definitions` 在脚本里真实驱动行为（本轮 M4 反证） |
+| D | **已闭合** | `check_pre_roll` 下发签名；本轮 M1/M5 变异证明两条按签名收敛的规则都有牙齿 |
+| E | **已闭合** | `scale_effect(0.5)` + PostResolve 快照；本轮 M3 + force/scale 正交对照 |
+| F | **已闭合（边界不变）** | `enemy_defeated` 逐只发；边界仍只在 strike 路径（未构造非 strike 运行时反例） |
+| G | **仍存在** | `EncounterPresetEnemy.count: Option<u32>`，无骰式落点 |
+| H | **已闭合** | `set_flag / clear_flag` |
+| I | **仍存在** | 引擎无先攻 / 轮次 / 行动经济（`initiative\|先攻` 仅 3 处：一个 statblock 字段 + 两句注释） |
+| J | **仍存在** | `CondExpr` 变体里无「掷 vs 对手被动」入口 |
+| K | **仍存在** | `build_state` 建实例时 `statuses: vec![]`（api/src/lib.rs:520 / 591） |
+| L | **已闭合** | `host.target` 同级完整；伏击读目标状态。**第四轮登记的「不看签名」已由 T29 修掉**（§R5-4） |
+| M | **仍存在** | `CondExpr` 只有 `EncounterCleared` |
+| N | **已闭合** | 24 个掷表触发点 `repeatable: true` + `dnd-wander-reset` |
+
+**汇总：闭合 7 / 近似提高 1 / 仍存在 6** —— 与规则包 `--check`、与第四轮**数目一致**。
+第五轮**没有新增闭合**（A 的残余仍由 B 造成），也没有把任何一条改判回去。
+
+---
+
+### R5-8. 本轮新发现（不替任何人圆场）
+
+#### ① `rule-dnd-proficiency` 的挂载点声明与实现不一致（**低危，新发现**）
+
+`story_example/lmop-storybook.json` 里：
+
+| 位置 | 声明 | 真实 |
+|---|---|---|
+| `definitions[rule-dnd-proficiency].fields.mount` | `check_post_roll` | `lua_mounts[dnd-proficiency].mount = check_pre_roll` |
+| `definition.description` | 「lua_mounts:dnd-proficiency（挂载点 check_post_roll）」 | 同上 |
+| `definitions[prof-pc-lmop-talin-dex/wis].fields.note` | 「在 check_post_roll 追加（引擎只在掷骰后给判定属性）」 | 实际在 `check_pre_roll` 用签名（GAP-D 闭合后已改） |
+
+生成器源头：`scripts/lmop-rulepack.mjs` 的 `ruleMeta['dnd-proficiency'] = ['check_post_roll', …]`
+（第 1344 行），而 `buildRules` 把同一条脚本注册在 `check_pre_roll`（第 1241 行）。
+这是 GAP-D 闭合（熟练加值从掷骰后改到掷骰前）时的**文档没跟着改**。**低危**（不影响行为），
+但它正是这套设计的主要风险形态——「实现落后于声明」——的一个新样本；而且
+`--check` 的 `references.self_consistent / open_content.data_driven` **不校验**
+`rule-*` 定义的 `fields.mount` 与真实挂载点是否一致（本轮用独立脚本逐条比对 16 条，只有这 1 条不一致）。
+**只报告，不修**（inScope 不含产品代码 / 生成器）。
+
+#### ② `--check` 的源码子串仍可被注释满足（T27 发现③，**未消除**）
+
+实证见 §R5-6(c)。T29-B 的加固方向（标注 behavioural + 悬空检查）**是对的**，但子串断言本身仍是弱形态。
+建议（不实施）：把「挂载点 / 判定范围 / 开放内容字段」这类可结构化的一致性，从子串匹配升级为
+「跑引擎 → 观察行为」的断言，或至少让 `--check` 的基础模式也调用引擎校验器的行为断言。
+
+#### ③ 丢弃 WARN 的去重是进程级、跨存档（设计取舍，如实登记）
+
+`warn_dropped_character_delta` 的 `static SEEN` 不区分存档 / 会话。后果：同一 `(domain, entity_id, field)`
+形态在**任何**存档里第一次出现后，其它存档的同类丢弃都不再提示；到 256 上限后新形态每次都告警。
+「重放不刷屏」的目标达成，但「复发可见性」被削弱。本轮不改产品代码，只登记。
+
+---
+
+### R5-9. 环境与复现命令 / 退出码（第五轮）
+
+`
+cd /home/huang/Personal/Dev/Code/octopus
+export CARGO_TARGET_DIR=$PWD/.scratch/engine-test-target
+
+# 0. 旧实况与 HEAD 的逐字节核对（外部）
+git show HEAD:story_example/lmop-storybook.json   # → dnd-ambusher-keep-high.source sha256 77a72f91…（974 B）
+#   与 scripts/lmop-engine-check/src/main.rs 的 OLD_AMBUSHER 常量逐字节相同
+
+# 1. 第五轮新增的独立用例（9 条）
+cargo test -p octopus-api --test lmop_verification_round5 -- --test-threads=2 --nocapture
+
+# 2. 全套回归
+cargo test -p octopus-engine -p octopus-ai
+cargo test -p octopus-api
+
+# 3. 交付物 / 规则包 / 引擎校验
+node scripts/lmop-rulepack.mjs --check
+node scripts/lmop-rulepack.mjs --check --engine .scratch/lmop-engine-check-target/debug/lmop-engine-check
+node scripts/lmop-rulepack.mjs --out /tmp/r5-regen-storybook.json   # sha256 == 交付物
+node scripts/import-bestiary.mjs --check
+./scripts/lmop-engine-check.sh
+./scripts/lmop-boundary-check.sh
+
+# 4. 本轮新增：行为级兜底的变异审计（5 个变异）
+node scripts/lmop-r5-mutation-audit.mjs
+`
+
+| 命令 | 退出码 | 关键结果 |
+|---|---|---|
+| `cargo test -p octopus-api --test lmop_verification_round5` | 0 | **9 passed / 0 failed** |
+| `cargo test -p octopus-engine -p octopus-ai` | 0 | engine **361** / ai **36**，0 失败 |
+| `cargo test -p octopus-api` | 0 | lib 74 / r1 13 / r2 14 / r3 14 / r4 9 / **r5 9**，全 0 失败 |
+| `node scripts/lmop-rulepack.mjs --check` | 0 | 28 项断言 0 失败；14 GAP = 7 / 1 / 6 |
+| `node scripts/lmop-rulepack.mjs --check --engine …` | 0 | 50 项断言 0 失败；`consistency.behavioural_backing` 20/20 不悬空 |
+| `node scripts/lmop-rulepack.mjs --out /tmp/…` | 0 | sha256 `ce6b557f…` == 交付物 |
+| `node scripts/import-bestiary.mjs --check` | 0 | 28/28 |
+| `./scripts/lmop-engine-check.sh` | 0 | error 0 / lua 0 issue / warning 24 / **20 条运行时断言 / 0 failures** |
+| `./scripts/lmop-boundary-check.sh` | 0 | 禁词零命中 |
+| `node scripts/lmop-r5-mutation-audit.mjs` | 0 | **5/5 变异都被声明的行为级断言抓住** |
+
+**验证基线（本轮实测时的文件指纹，便于复现）**：
+
+`
+story_example/lmop-storybook.json                     sha256 ce6b557f9d95c816c852a0ee08e6e4cb4b4663d21bc4ab8cd5882a12784a4f01
+scripts/lmop-rulepack.mjs                             sha256 0d5e5b3d54a6e373bbe5674e8fc6563647f7eed8bf78f73b7502497eca312cba
+scripts/lmop-engine-check/src/main.rs                 sha256 3acd9bbf5d30eb486dc2ee6b19c9783f44ba78979e321df3c38b33b4a54bedba
+crates/octopus-api/tests/lmop_verification_round3.rs  sha256 7b439730b618b4631444cf04cf89243790235b35a853145582085f0614f27f67
+crates/octopus-api/tests/lmop_verification_round4.rs  sha256 475fa426c1475673709d294da77a34cccf7c10defaef864d506c93ba1cb83a8a
+crates/octopus-api/tests/lmop_verification_round5.rs  sha256 0fd0dd6cb41361944260f0fa097d563fb080143a40ba8142a1f53083e808b926
+git HEAD 的 dnd-ambusher-keep-high.source             sha256 77a72f91922d78d0ce94eeb96abdf5bbb379abe426755d73720d77e67cdd6755（974 B，= OLD_AMBUSHER）
+`
+
+---
+
+### R5-10. 未通过 / 未覆盖 / 副作用（不得隐瞒）
+
+**未通过：无（0 项）。**
+
+必须声明的**覆盖边界**：
+
+1. **本轮没有跑真实 HTTP 路径**（没有起服务、没有碰真实 `octopus.db`）。第五轮的回归清单
+   r1 / r2 / r3 / r4 / r5 / api-lib / engine / ai / rulepack / engine-check / boundary（不含 HTTP）；
+   与第四轮同口径。发布门的覆盖没有丢：r3 / r4 / r5 的每条会话用例都走真实 `publish_and_open`
+   （内存库 + 真实 validate / lint），交付物在真实发布门上 0 error。
+2. **GAP-F 的非 strike 击杀路径**仍只有代码复核（与第二、三、四轮同）。
+3. **`octopus.db` 操作数为 0**：所有会话用例用 `SqliteStore::open_in_memory()`；
+   `--out` 只写 `/tmp`；变异只写系统临时目录。既有用户故事书 / 存档 / octopus 账户
+   **未读改、未删除**（`git status` 里没有 `octopus.db`）。
+
+**副作用 / 新增数据**：
+
+- **真实 `octopus.db`：本轮新增 0 条验证数据**（无新账户 / 故事书 / 存档），无需清理。
+- 内存库里的临时实体键（仅存在于测试进程，未落库）：`verify-r5-ghost-<uuid>`、
+  `verify-r5-replay-a-<uuid>` / `verify-r5-replay-b-<uuid>`；HTTP harness 的内存 saves 为随机 id。
+
+---
+
+### R5-11. 这套设计成立性的第五轮判断
+
+**第五轮推翻的第四轮遗留**
+
+| 第四轮登记 | 第五轮 |
+|---|---|
+| 「伏击仍不看判定签名」（缺陷候选） | **推翻**：T29 按 `kind == attack` 收敛；旧实况仍以 `OLD_AMBUSHER` 可执行存活；本轮变异证明闸门有牙齿 |
+| 「规则包按判定签名收敛没有成为通用约定」 | **部分推翻**：数据卡明说「攻击检定」的两条（pack-tactics / ambusher）现在都收敛了；剩下 4 条不读签名的挂载点确有「对任意判定成立」的口径 |
+
+**第五轮仍然成立 / 新登记的缺口**
+
+- **GAP-B**（无位置 / 距离）仍是 GAP-A 只能「近似提高」的唯一原因。
+- **GAP-G / I / J / K / M** 五条与第一轮登记时实质相同。
+- **新登记**：`rule-dnd-proficiency` 的挂载点声明与实现不一致（§R5-8①）；
+  `--check` 的子串断言仍是「注释即可满足」的形态（§R5-6c）；
+  丢弃 WARN 的去重是进程级、跨存档（§R5-8③）。
+
+**第五轮对设计成立性的判断**
+
+前四轮的判断是「路对、原语不够（R1）→ 边界变宽（R2）→ 读事实的缺口补齐（R3）→ 声明即契约（R4）」。
+第五轮在 T28/T29 之后可以补两句：
+
+1. **这套设计第一次做到了「旧实况可执行存活」的验证纪律。** T29 修改了第四轮验证者的用例，
+   同时把旧脚本原文**逐字节**搬进引擎校验器并用断言复现旧结论——这正好满足 T27 定的安全前提。
+   这不是天然成立的，是这一轮**专门补**的。
+2. **「实现落后于声明」仍是主要风险形态，而且它对验证资产本身也适用。** 本轮实证了两条：
+   `rule-dnd-proficiency` 的 @"mount" 声明漂移（没有工具能发现，靠人逐条比对）；
+   `--check` 的源码子串能被注释满足（靠行为级兜底救场）。
+   换句话说：**声明与实现之间没有强制约束，声明与验证断言之间也没有。**
+   真正把它钉住的仍然是「真实引擎 + 行为断言 + 变异验证」这一套。
+
+**下一轮若要继续加固，优先级建议（本轮不实施）**：
+① 把判定类挂载点的「判定范围」变成**强制可结构化的 `signature_scope`**（连不读签名的那 4 条也写清楚，
+   并让 `--check` 校验它）；② 让 `--check` 的基础模式也跑引擎行为断言（消除「子串通过、行为已死」的窗口）；
+③ 给丢弃 WARN 加存档维度（或分层：首见 INFO / 复发 WARN），恢复「复发可见性」。
+
+---
+
+### R5-12. 本轮新增 / 改动文件
+
+| 文件 | 作用 |
+|---|---|
+| `docs/lmop-verification-report.md` | 本报告（§0–§10 / §R2 / §R3 / §R4 **原样保留**，在 §R4-6 / §R4-10 加「⚠️ 第五轮订正」标注，追加 §R5） |
+| `crates/octopus-api/tests/lmop_verification_round5.rs` | **新增**：9 条独立用例（旧实况复现 + harness 忠实性结构断言 + 3 个变异 + 伏击签名/fail-closed + force/scale 正交 3 组对照 + 丢弃可见化实时/重放 + 16 挂载点签名扫描） |
+| `scripts/lmop-r5-mutation-audit.mjs` | **新增**：行为级兜底的变异审计（5 个变异，真实引擎校验器逐条判定） |
+
+**未改动**：`crates/*/src/` 与 `frontend/src/` 的任何产品代码；
+**未改动**任何既有测试文件（`lmop_verification.rs` / `_round2` / `_round3` / `_round4`，只读 + 跑 + 变异推理）；
+**未改动** `story_example/lmop-storybook.json`（只读；所有变异都写在系统临时目录）。

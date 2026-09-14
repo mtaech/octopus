@@ -305,7 +305,18 @@ pub enum LuaRequest {
     /// 引擎不认识「豁免 / 减半 / 抗性 / 易伤」——只有一个因子；要不要缩放、缩放多少
     /// 由规则包 Lua 决定。只在判定之后、效果结算之前被消费（check_post_roll /
     /// pre_resolve），这两处正是效果结算的上游时机。
+    ///
+    /// **顺带开门**（既有语义，逐字保留）：这条声明本身还意味着「即使判定成功 /
+    /// 未命中，也照常结算效果」——证据是因子 1.0 与「不声明」行为并不相同。
+    /// 只想开门、不想缩放时用 [`LuaRequest::ForceEffect`]。
     ScaleEffect { factor: f64 },
+    /// 打开效果门（通用原语）：声明「即使判定成功 / 未命中，也照常结算效果一次」。
+    ///
+    /// 与 [`LuaRequest::ScaleEffect`] **正交**：它不改变任何数值（缩放是 ScaleEffect
+    /// 的事），只覆盖「判定结果决定是否结算效果」那一道门。两者可同时声明
+    ///（开门 + 缩放）。同样只在判定之后、效果结算之前被消费（check_post_roll /
+    /// pre_resolve）。
+    ForceEffect,
 }
 
 /// 归一化判定输出（#12）：脚本只能给最终值 total 与差值 margin，档位由引擎分。
@@ -1114,6 +1125,10 @@ impl LuaHost {
         // 效果缩放（通用原语）：声明「本次结算的数值型 delta 按此因子缩放」。
         // 与判定修正不同，它**只在会被消费的两个时机**注册（check_post_roll / pre_resolve）：
         // 写错时机即当场报错（调用一个不存在的函数），不会静默丢请求。
+        //
+        // 注意这条声明**顺带开门**（既有语义，逐字保留）：声明缩放同时意味着
+        // 「即使判定成功 / 未命中，也照常结算效果」。只想开门、不想缩放时用
+        // force_effect()——两者是正交的两件事。
         if matches!(mount, LuaMount::CheckPostRoll | LuaMount::PreResolve) {
             push_try!("scale_effect", |factor: f64| {
                 if !factor.is_finite() {
@@ -1124,6 +1139,10 @@ impl LuaHost {
                 }
                 Ok(LuaRequest::ScaleEffect { factor })
             });
+            // 效果门（通用原语）：显式声明「即使判定成功 / 未命中，也照常结算效果一次」。
+            // 与 scale_effect **正交**：它不缩放任何数值；两者可同时声明（开门 + 缩放）。
+            // 同样只在会被消费的两个时机注册：写错时机即当场报错，不会静默丢请求。
+            push!("force_effect", |(): ()| LuaRequest::ForceEffect);
         }
 
         // 施加即时效果：形状按 ImmediateEffect 校验，结算走同一条 resolve_effect 路径。
@@ -2251,6 +2270,39 @@ mod tests {
             assert!(err.to_string().contains("缩放因子"), "{bad} → {err}");
         }
         assert!(host.drain_requests().is_empty(), "非法因子不得留下请求");
+    }
+
+    /// 效果门与效果缩放是**两个正交的动作**，各有各的 API：
+    /// - force_effect() 只开门（「判定成功也照常结算效果」），不缩放任何数值；
+    /// - scale_effect(f) 开门 **且** 按 f 缩放（既有语义，逐字保留——这是「作者脚枪」
+    ///   的来源，现在有了只开门的显式写法）。
+    ///
+    /// 两者都只在会被消费的两个时机（check_post_roll / pre_resolve）注册：
+    /// 写错时机即当场报错，不是静默丢请求。同时声明互不吞并、顺序原样。
+    #[test]
+    fn force_effect_is_registered_only_where_it_is_consumed() {
+        let host = LuaHost::new(1).unwrap();
+        let c = ctx(json!({}));
+        for mount in [LuaMount::CheckPostRoll, LuaMount::PreResolve] {
+            host.run_hook("host.force_effect()", mount, &c).unwrap();
+            assert_eq!(
+                host.drain_requests(),
+                vec![LuaRequest::ForceEffect],
+                "{mount:?} 应收到效果门声明"
+            );
+            host.run_hook("host.force_effect(); host.scale_effect(0.5)", mount, &c).unwrap();
+            assert_eq!(
+                host.drain_requests(),
+                vec![LuaRequest::ForceEffect, LuaRequest::ScaleEffect { factor: 0.5 }],
+                "{mount:?} 两个声明互不吞并，顺序原样"
+            );
+        }
+        // 其他时机没有这个 API：调用即报错，作者立刻看到时机写错了。
+        for mount in [LuaMount::CheckPreRoll, LuaMount::PostResolve, LuaMount::Event] {
+            let err = host.run_hook("host.force_effect()", mount, &c).unwrap_err();
+            assert!(err.to_string().contains("force_effect"), "{mount:?} 应报错，实际：{err}");
+            assert!(host.drain_requests().is_empty(), "{mount:?} 不该产生请求");
+        }
     }
 
     /// resolved_effects 是 PostResolve 专属的只读事实：其他时机读它是 nil（旧脚本零影响）。

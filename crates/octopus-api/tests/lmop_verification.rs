@@ -704,12 +704,90 @@ async fn a11_a13_advantage_and_proficiency_via_lua() {
 }
 
 // ============================================================
-// 验收 12：豁免成功伤害减半（Lua 重掷同一骰式再取半）
+// 验收 12：豁免成功伤害减半——由**引擎**结算一次、按 scale_effect(0.5) 缩放
 // ============================================================
+//
+// 【机制（T24 复核后订正）】规则包 `dnd-save-half` 在 check_post_roll 只声明
+// `host.scale_effect(0.5)`：引擎照常结算一次效果、掷一次 3d6，数值型 delta 向零取整
+// 乘 0.5。**Lua 不再重掷同一骰式、也不再 apply_effect 补一份**。
+// 旧注释写的「Lua 重掷 3d6 取半」是 T23 **之前**的机制，已过期。
+//
+// 【为什么这样断言才有机制辨识力】只看「骰数 == 4」与「delta ∈ 1..9」，
+// 「引擎缩放自己那份」与「Lua 重掷再补一份」**无法区分**——T24 的 M3 变异
+// （换回旧重掷脚本）就整条逃脱。这里在 PostResolve 挂一支探针，回传引擎**实际**
+// 算出的 `host.resolved_effects`：
+//   · 新机制（引擎缩放）：factor=0.5、rng_consumed=3（引擎自己那次 3d6）、
+//     #deltas=1、引擎 hp delta == -本次掉血；
+//   · 旧机制（Lua 重掷）：成功分支引擎根本不结算 → factor=nil、rng_consumed=0、
+//     #deltas=0 → 判据 FAIL（见文件末尾的变异验证用例）。
+
+/// a12 / a12b 的机制探针：在 PostResolve 读**引擎自己算出的**效果快照
+/// （`host.resolved_effects` 的 factor / rng_consumed / deltas），写成标记回传。
+/// 每轮全覆盖写，不残留上一轮的值。
+fn lmop_with_save_probe() -> Value {
+    let mut sb = lmop();
+    sb["lua_mounts"].as_array_mut().unwrap().push(json!({
+        "id": "a12-probe-resolved-effects",
+        "mount": "post_resolve",
+        "source": "local e = host.resolved_effects\n\
+                   if e == nil then\n\
+                     host.set_flag('a12.missing', 'true')\n\
+                     host.set_flag('a12.factor', 'nil')\n\
+                     host.set_flag('a12.rng', '0')\n\
+                     host.set_flag('a12.deltas', '0')\n\
+                     host.set_flag('a12.hp', 'none')\n\
+                     return\n\
+                   end\n\
+                   host.set_flag('a12.missing', 'false')\n\
+                   host.set_flag('a12.factor', tostring(e.factor))\n\
+                   host.set_flag('a12.rng', tostring(e.rng_consumed))\n\
+                   host.set_flag('a12.deltas', tostring(#e.deltas))\n\
+                   local hp = nil\n\
+                   for _, d in ipairs(e.deltas) do\n\
+                     if d.field == 'resources.res-hp' then hp = d.value end\n\
+                   end\n\
+                   if hp ~= nil then host.set_flag('a12.hp', tostring(hp)) else host.set_flag('a12.hp', 'none') end"
+    }));
+    sb
+}
+
+/// 从投影标记里读回 a12 探针的事实。
+#[derive(Debug)]
+struct SaveProbe {
+    factor: Option<String>,
+    rng: Option<String>,
+    deltas: Option<String>,
+    hp: Option<i64>,
+    missing: bool,
+}
+
+fn save_probe(proj: &WorldProjection) -> SaveProbe {
+    let s = |k: &str| proj.flags.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    SaveProbe {
+        factor: s("a12.factor"),
+        rng: s("a12.rng"),
+        deltas: s("a12.deltas"),
+        hp: s("a12.hp").and_then(|v| v.parse::<i64>().ok()),
+        missing: proj.flags.get("a12.missing").and_then(|v| v.as_str()) == Some("true"),
+    }
+}
+
+impl SaveProbe {
+    /// 新机制的辨识判据：豁免成功时，引擎**自己**掷了一次 3d6 并按 0.5 缩放，
+    /// 且这次结算就是 HP 变化的唯一来源（引擎 hp delta == -本次掉血，Lua 没有另补一份）。
+    fn is_engine_scaled_half(&self, session_delta: i64) -> bool {
+        !self.missing
+            && self.factor.as_deref() == Some("0.5")
+            && self.rng.as_deref() == Some("3")
+            && self.deltas.as_deref() == Some("1")
+            && self.hp == Some(-session_delta)
+    }
+}
+
 #[tokio::test]
 async fn a12_save_half_via_lua() {
     let h = spawn_shared(CueProvider::new(vec![])).await;
-    let (_sb, save) = publish_and_open(&h, "A12 豁免减半", lmop()).await;
+    let (_sb, save) = publish_and_open(&h, "A12 豁免减半", lmop_with_save_probe()).await;
     let session = session_of(&h, &save).await;
 
     let mut success = None;
@@ -726,9 +804,16 @@ async fn a12_save_half_via_lua() {
         assert_eq!(c.target, 10, "技能声明的 DC 10 经 dnd-skill-dc 对齐到 10");
         let delta = before - pc_hp(&session.projection());
         let dice = dice_count(&session, r);
+        let probe = save_probe(&session.projection());
         if c.result {
-            assert_eq!(dice, 4, "豁免成功：1 颗 d20 + Lua 重掷 3d6 取半 = 4 颗");
+            assert_eq!(dice, 4, "豁免成功：1 颗 d20 + 引擎 3d6 = 4 颗（引擎只掷一次效果骰）");
             assert!((1..=9).contains(&delta), "成功伤害应为 3d6 的一半（1..9），实际 {delta}");
+            // 机制辨识：减半必须来自**引擎结算的那一份**，不是 Lua 重掷后补的一份。
+            assert!(
+                probe.is_engine_scaled_half(delta),
+                "豁免成功必须由引擎结算并按 scale_effect(0.5) 缩放：\
+                 期望 factor=0.5 / rng_consumed=3 / #deltas=1 / 引擎 hp delta == -{delta}，实际 {probe:?}"
+            );
             success = Some((delta, dice));
         } else {
             assert_eq!(dice, 4, "豁免失败：1 颗 d20 + 引擎 3d6 = 4 颗");
@@ -745,15 +830,16 @@ async fn a12_save_half_via_lua() {
 }
 
 /// A12 附加：不给 target_id（自己对自己用）时，引擎把目标回落成施法者本人，
-/// Lua 的 host.target 与结算语义一致 → dnd-save-half 正常施加「减半」伤害。
+/// 与结算语义一致 → dnd-save-half 让**引擎结算的那一份**减半。
 ///
 /// 历史可追溯：本用例原名 a12b_save_half_self_target_is_a_silent_hole，
 /// 当时钉住的是「自目标时 host.target 为 nil → apply_effect 静默不发、delta = 0」这一缺口。
-/// 引擎修复（command::execute_skill 把自目标同步进 Lua 上下文）后，改为断言**正确行为**。
+/// 引擎修复（command::execute_skill 把自目标同步进 Lua 上下文）后，改为断言**正确行为**；
+/// T24 之后进一步要求判据能分辨机制（与 a12 同一支 PostResolve 探针）。
 #[tokio::test]
 async fn a12b_save_half_self_target_applies_half_damage() {
     let h = spawn_shared(CueProvider::new(vec![])).await;
-    let (_sb, save) = publish_and_open(&h, "A12b 自目标", lmop()).await;
+    let (_sb, save) = publish_and_open(&h, "A12b 自目标", lmop_with_save_probe()).await;
     let session = session_of(&h, &save).await;
 
     let mut saw_success = false;
@@ -768,18 +854,111 @@ async fn a12b_save_half_self_target_applies_half_damage() {
         assert_eq!(c.kind, Some(CheckKind::Save), "坠落瓦砾是豁免");
         let delta = before - pc_hp(&session.projection());
         let dice = dice_count(&session, r);
+        let probe = save_probe(&session.projection());
         if c.result {
             saw_success = true;
             println!("A12b: 自目标豁免成功 delta={delta} dice={dice}（应为 3d6 的一半 1..9）");
-            assert_eq!(dice, 4, "豁免成功：1 颗 d20 + Lua 重掷 3d6 取半 = 4 颗");
+            assert_eq!(dice, 4, "豁免成功：1 颗 d20 + 引擎 3d6 = 4 颗");
+            assert!((1..=9).contains(&delta), "自目标豁免成功必须施加减半伤害，实际 {delta}");
             assert!(
-                (1..=9).contains(&delta),
-                "自目标豁免成功必须施加减半伤害（host.target 不再为 nil），实际 {delta}"
+                probe.is_engine_scaled_half(delta),
+                "自目标豁免成功同样必须来自引擎结算（factor=0.5 / rng_consumed=3 / #deltas=1），实际 {probe:?}"
             );
             break;
         }
     }
     assert!(saw_success, "40 次内需观察到一次豁免成功");
+}
+
+/// T23 **之前**的旧脚本（git HEAD 原文照抄）：Lua 自己按骰式重掷一次再取半、
+/// 用 apply_effect 补一份伤害。a12 的变异验证把它换回规则包。
+const OLD_REROLL_RULE: &str = r#"-- 旧版（T23 之前）：Lua 按 host.definition 的骰式重掷一次再取半
+if host.check_kind == 'save' and host.check_result == true then
+  local definition = host.definition
+  local effect = definition and definition.effect
+  local immediate = effect and effect.immediate
+  local first = immediate and immediate[1]
+  if first and first.kind == 'damage' and first.amount then
+    local expression = tostring(first.amount)
+    local count, sides, tail = string.match(expression, '^(%d+)d(%d+)(.*)$')
+    local total = 0
+    if count then
+      for _ = 1, tonumber(count) do
+        total = total + host.engine_rng(1, tonumber(sides))
+      end
+      total = total + (tonumber(tail) or 0)
+    else
+      total = tonumber(expression) or 0
+    end
+    local half = math.floor(total / 2)
+    if half > 0 then
+      local target = host.target and host.target.id
+      if target then
+        host.apply_effect(target, { kind = 'damage', amount = tostring(half), resource = first.resource or 'res-hp' })
+      end
+    end
+  end
+end"#;
+
+/// 把规则包里的 dnd-save-half 换回旧「Lua 重掷」脚本（探针保留）。
+fn lmop_with_old_reroll_rule() -> Value {
+    let mut sb = lmop_with_save_probe();
+    let mounts = sb["lua_mounts"].as_array_mut().unwrap();
+    let m = mounts
+        .iter_mut()
+        .find(|m| m["id"] == "dnd-save-half")
+        .expect("规则包必须有 dnd-save-half 挂载点");
+    m["source"] = json!(OLD_REROLL_RULE);
+    sb
+}
+
+/// a12 / a12b 断言的**变异验证**：把规则包换回旧的「Lua 重掷 + apply_effect」。
+/// 结果必须是：
+///   · 旧断言（dice==4 / delta∈1..9）照样 PASS —— 它们对机制无感（T24 的 M3 结论）；
+///   · 新判据（PostResolve 探针）FAIL —— 成功分支引擎根本没结算
+///     （factor=nil / rng_consumed=0 / #deltas=0）。
+/// 这就是「新断言有牙齿」的证据。
+#[tokio::test]
+async fn a12_mutation_old_reroll_rule_fails_the_mechanism_probe() {
+    let h = spawn_shared(CueProvider::new(vec![])).await;
+    let (_sb, save) = publish_and_open(&h, "A12 变异：旧重掷脚本", lmop_with_old_reroll_rule()).await;
+    let session = session_of(&h, &save).await;
+
+    let mut observed = false;
+    for _ in 0..40 {
+        h.provider.push(vec![Intent::UseSkill {
+            skill_id: "sk-lmop-rubble-collapse".into(),
+            target_id: Some("pc-lmop-talin".into()),
+        }]);
+        let before = pc_hp(&session.projection());
+        let r = run(&session, "踩到瓦砾").await;
+        let c = checks(&session, r).into_iter().next().unwrap();
+        let delta = before - pc_hp(&session.projection());
+        let dice = dice_count(&session, r);
+        if !c.result {
+            continue;
+        }
+        observed = true;
+        // 旧断言无感：机制被换成「Lua 重掷」，它们照样成立。
+        assert_eq!(dice, 4, "变异后骰数仍是 4（1 颗 d20 + Lua 重掷 3d6）");
+        assert!((1..=9).contains(&delta), "变异后半值仍落在 1..9，实际 {delta}");
+        // 新判据有牙齿：引擎在成功分支没有结算任何效果。
+        let probe = save_probe(&session.projection());
+        assert!(
+            !probe.is_engine_scaled_half(delta),
+            "换回旧重掷脚本后，机制判据必须 FAIL（否则断言没有牙齿）：{probe:?}"
+        );
+        assert_eq!(probe.factor.as_deref(), Some("nil"), "旧机制没有声明因子：{probe:?}");
+        assert_eq!(probe.rng.as_deref(), Some("0"), "旧机制引擎不掷效果骰：{probe:?}");
+        assert_eq!(probe.deltas.as_deref(), Some("0"), "旧机制引擎产物为空：{probe:?}");
+        assert_eq!(probe.hp, None, "旧机制引擎没有 hp delta：{probe:?}");
+        println!(
+            "A12 变异验证 PASS: 旧重掷脚本 dice={dice} delta={delta}（旧断言仍 PASS），但探针 factor={:?} rng={:?} deltas={:?} → 新判据 FAIL",
+            probe.factor, probe.rng, probe.deltas
+        );
+        break;
+    }
+    assert!(observed, "40 次内需观察到一次豁免成功（变异脚本的成功分支）");
 }
 
 // ============================================================

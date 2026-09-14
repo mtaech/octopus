@@ -603,18 +603,21 @@ const GAP_RESOLUTION = {
     status: 'partial',
     closed_by: 'host.get_character(id) / host.get_flag / host.list_flags / host.get_encounter / host.list_encounters'
       + '（host.target 同时升级为与 host.actor 同级完整）',
-    evidence: '读任意实体的能力**真正落地并已用上**：集群战术用 host.list_encounters 找同遭遇同伴、'
-      + 'host.get_character 读同伴 HP；伏击用 host.target.statuses；XP 用 host.get_encounter 兜底回查 template_id。'
-      + '近似口径由开放内容声明（pack-*.fields.ally_proxy / range_proxy），Lua 里没有名单常量。',
+    evidence: '读任意实体的能力**真正落地并已用上**：集群战术用 host.list_encounters 找活跃遭遇里的同伴、'
+      + 'host.get_character 读同伴实例，同伴必须与**目标**同 location_id（range_proxy）、且按开放内容 '
+      + 'incapacitated_statuses 判「未失能」；伏击用 host.target.statuses；XP 用 host.get_encounter 兜底回查 template_id。'
+      + '近似口径由开放内容声明（pack-*.fields.ally_proxy / range_proxy / incapacitated_statuses），Lua 里没有名单 / 状态名常量。',
     now: '按「近似提高」登记而不是「已闭合」：这条缺口当初登记的是**集群战术规则**，'
-      + '而「目标 5 尺内」这个事实仍受 GAP-B 限制——只能近似成「同遭遇 + 同 location_id + HP>0」，'
-      + '判定仍不精确。跨实体读取这一**能力**本身已闭合（见 closed_by / evidence），但规则结果不是精确的。',
+      + '而「目标 5 尺内」这个事实仍受 GAP-B 限制——只能近似成「同 location_id + 未失能」，判定仍不精确。'
+      + 'T26 修正轮订正了旧的**声明与实现矛盾**（旧脚本只查同伴 HP、从不检查同伴地点，却声明 range_proxy = 同一 location_id）：'
+      + '现在实现真检查同伴位置，目标缺 location_id 时 fail-closed。'
+      + '跨实体读取这一**能力**本身已闭合（见 closed_by / evidence），但规则结果不是精确的。',
   },
   'GAP-B-no-positioning': {
     status: 'open',
     now: '仍然存在：引擎没有位置 / 距离 / 区域概念（只有 location_id 这种地点归属）。'
-      + 'GAP-A 近似提高后集群战术能读同伴了，但「5 尺内」只能用「同一场遭遇 + 同一 location_id」近似，'
-      + 'HP>0 也只是「未失能」的近似——近似程度提高，判定仍不精确。'
+      + 'GAP-A 近似提高后集群战术能读同伴了，但「5 尺内」只能用「同一 location_id + 未失能」近似——'
+      + '精确距离仍做不到，判定仍不精确。'
   },
   'GAP-C-no-open-content-in-lua': {
     status: 'closed',
@@ -770,70 +773,96 @@ function srcSunlightSensitivity() {
   ].join('\n')
 }
 
-/** 集群战术（狼）：目标 5 尺内有未失能的盟友 → 攻击检定优势。
+/** 集群战术（狼）：目标 5 尺内有一个未失能的盟友 → 攻击检定优势。
  *
- *  T21 之后规则包能读运行时事实了（host.get_character / host.list_encounters），
- *  不再是「导演置位 dnd-flanked」的纯标记近似。**但仍受 GAP-B 限制**：
- *  引擎没有位置 / 距离 / 交战关系，所以：
- *    · 「我方同伴」= 与我同处一场活跃遭遇的其它敌人（遭遇的 enemies 数组即分组），
- *      HP > 0 是「未失能」能做到的最接近近似（引擎没有失能状态声明）；
- *    · 「在目标附近」= 目标与我在同一 location_id（缺任一侧时不做判断）。
- *  仍然表达不了：精确到 5 尺、以及「失能」的完整语义（麻痹 / 震慑 / 昏迷 …）。
- *  数据来源：开放内容（角色模板的 dnd-pack-tactics 挂接），脚本无生物名单。 */
+ *  T21 之后规则包能读运行时事实了（host.get_character / host.list_encounters）。
+ *  **T26 修正轮**：旧实现只查同伴 HP、从不看同伴位置，而开放内容 range_proxy 声明的
+ *  却是「与目标同一 location_id」——**声明与实现直接矛盾**。本轮把实现对齐声明，
+ *  并一并修掉同类误判（每条都有引擎级反例，见 scripts/lmop-engine-check）：
+ *    · FP-A 同伴位置：必须与**目标**同一 location_id（旧实现同伴在别的地点仍给优势）；
+ *    · FP-C 缺地点：目标没有 location_id 就无从判断距离 → 不给优势（旧实现整道地点闸门被跳过）；
+ *    · FP-E 判定范围：只对攻击检定给优势（旧实现属性检定也给）；
+ *    · FP-B 失能：HP>0 且不带开放内容声明的失能状态（旧实现 stunned 仍算「未失能」）；
+ *    · FN-A 遭遇范围：同伴取自**所有**活跃遭遇，不限我所在那一场（旧实现跨遭遇漏判）。
+ *  仍然做不到：精确到 5 尺、以及「失能」的完整语义（GAP-B 仍开放）。
+ *  近似口径由开放内容声明（pack-*.fields.range_proxy / incapacitated_statuses），
+ *  脚本里没有生物名单、也没有状态名常量。 */
 function srcPackTactics() {
   return [
     '-- 规则包：集群战术（狼，附录 B 原文）。',
-    '-- 数据来源：开放内容（角色模板的 dnd-pack-tactics 挂接），脚本无生物名单。',
-    '-- T21：读运行时事实——同一场遭遇的同伴（list_encounters + get_character）。',
-    '-- 仍受 GAP-B（没有位置 / 距离）：同伴按「同一场遭遇」近似，目标按「同一 location_id」近似。',
+    '-- 数据来源：开放内容（角色模板的 dnd-pack-tactics 挂接 + pack-*.fields），脚本无名单 / 状态名常量。',
+    '-- T26 修正轮：实现与声明对齐——同伴必须与**目标**同一 location_id；缺地点 / 非攻击判定不给优势。',
     "local ids = host.get_attachment('dnd-pack-tactics')",
     'if type(ids) ~= "table" or #ids == 0 then return end',
+    '-- 数据卡只说「对该生物发动的攻击检定」：属性检定 / 豁免一律不受影响（FP-E）。',
+    'if host.check_kind ~= "attack" then return end',
     'local me = host.actor',
     'local target = host.target',
     'if type(me) ~= "table" or type(target) ~= "table" then return end',
     'local my_key = me.id or me.instance_id',
-    'local function alive(inst)',
-    "  local hp = inst and inst.resources and inst.resources['res-hp']",
-    '  return type(hp) == "number" and hp > 0',
+    '-- 「在目标 5 尺内」的可用近似 = 同伴与目标同一 location_id（开放内容 range_proxy）。',
+    '-- 目标没有地点就无从判断距离：fail-closed，不给优势（不假装「反正很近」）——FP-C。',
+    'local target_place = target.location_id',
+    'if type(target_place) ~= "string" or target_place == "" then return end',
+    '-- 「失能」名单由开放内容给（脚本无状态名常量）——FP-B。',
+    'local incapacitated = {}',
+    'for _, def_id in ipairs(ids) do',
+    '  local def = host.get_definition(def_id)',
+    '  local list = def and def.fields and def.fields.incapacitated_statuses',
+    '  if type(list) == "table" then',
+    '    for _, st in ipairs(list) do incapacitated[st] = true end',
+    '  end',
     'end',
-    'local ally_found = false',
+    'local function able(inst)',
+    '  if type(inst) ~= "table" then return false end',
+    '  local hp = inst.resources and inst.resources["res-hp"]',
+    '  if type(hp) ~= "number" or hp <= 0 then return false end',
+    '  local statuses = inst.statuses',
+    '  if type(statuses) == "table" then',
+    '    for _, st in ipairs(statuses) do',
+    '      local id = st.id or st.name',
+    '      if id and incapacitated[id] then return false end',
+    '    end',
+    '  end',
+    '  return true',
+    'end',
+    '-- 同伴取自所有活跃遭遇（不限我所在那一场）——FN-A。',
     'for _, enc in ipairs(host.list_encounters()) do',
     '  local enemies = enc.enemies',
     '  if type(enemies) == "table" then',
-    '    local mine = false',
     '    for _, e in ipairs(enemies) do',
-    '      if (e.instance_id or e.id) == my_key then mine = true end',
-    '    end',
-    '    if mine then',
-    '      for _, e in ipairs(enemies) do',
-    '        local key = e.instance_id or e.id',
-    '        if key and key ~= my_key then',
-    '          if alive(host.get_character(key)) then ally_found = true end',
+    '      local key = e.instance_id or e.id',
+    '      if key and key ~= my_key then',
+    '        local inst = host.get_character(key)',
+    '        if able(inst) and inst.location_id == target_place then',
+    "          host.modify_check('keep_high')",
+    '          return',
     '        end',
     '      end',
     '    end',
     '  end',
-    'end',
-    'if not ally_found then return end',
-    '-- 「在目标 5 尺内」的可用近似：双方都知道地点时必须同地点（GAP-B 仍然存在）。',
-    'local my_place = me.location_id',
-    'local target_place = target.location_id',
-    'if my_place and target_place and my_place ~= target_place then return end',
-    "host.modify_check('keep_high')"
+    'end'
   ].join('\n')
 }
 
 /** 伏击：战斗第一轮里，**直接读目标的状态**（host.target.statuses，GAP-L 闭合）
  *  判断「这个目标是否受我突袭」，不再用 dnd-surprised 标记近似。
- *  期望的状态 id 来自开放内容 dnd-ambusher.fields.target_status（脚本无状态名常量）。 */
+ *  期望的状态 id 来自开放内容 dnd-ambusher.fields.target_status（脚本无状态名常量）。
+ *
+ *  **T26 修正轮**（第四轮 T27 复核实测的同类残留，与集群战术 FP-E 同口径）：
+ *  数据卡只说「对该生物发动的**攻击检定**具有优势」，而旧脚本没有判定签名闸门——
+ *  属性检定 / 豁免同样拿到 keep_high。本轮按 host.check_kind == 'attack' 收敛；
+ *  引擎级反例见 scripts/lmop-engine-check（attack → 给；attribute / save → 不给）。 */
 function srcAmbusherAdvantage() {
   return [
     '-- 规则包：伏击（变形怪，附录 B 原文）：战斗开始的第一轮里，',
     '-- 对任何成功受其突袭的生物所发动的攻击检定具有优势。',
     '-- T21：host.target 与 host.actor 同级完整（含 statuses）——直接按目标状态判定（GAP-L 闭合）。',
+    '-- T26 修正轮：数据卡只说「攻击检定」——属性检定 / 豁免一律不受影响（与集群战术 FP-E 同口径）。',
     '-- 数据来源：开放内容（角色模板的 dnd-ambusher 挂接 → fields.target_status），脚本无状态名常量。',
     "local ids = host.get_attachment('dnd-ambusher')",
     'if type(ids) ~= "table" or #ids == 0 then return end',
+    'if host.check_kind ~= "attack" then return end',
     'local target = host.target',
     'local statuses = target and target.statuses',
     'if type(statuses) ~= "table" then return end',
@@ -1377,11 +1406,16 @@ function buildOpenContent(draft, tables) {
       description: '至少一个未失能的盟友在目标 5 尺内时，攻击检定有优势',
       fields: {
         creature_id: id,
-        ally_proxy: '同一场活跃遭遇里的其它敌人（HP>0 视为未失能）',
-        range_proxy: '与目标同一 location_id',
+        signature_scope: 'kind == attack',
+        ally_proxy: '所有活跃遭遇里的其它敌人实例（不限与我同场）；HP>0 且不带 incapacitated_statuses 里的状态才算「未失能」',
+        range_proxy: '与目标同一 location_id（目标没有 location_id 时不给优势，fail-closed）',
+        incapacitated_statuses: ['stunned', 'unconscious', 'paralyzed', 'petrified', 'incapacitated'],
         note:
-          'GAP-A 已闭合：规则用 host.list_encounters + host.get_character 读同遭遇同伴，不再靠 dnd-flanked 标记；'
-          + '但精确「目标 5 尺内」仍做不到（GAP-B：引擎无位置 / 距离），HP>0 只是「未失能」的近似。'
+          'T26 修正轮：同伴位置按 range_proxy **真检查**（旧实现从不看同伴地点，声明与实现矛盾）；'
+          + '判定范围收敛到 kind == attack；目标缺 location_id 时 fail-closed。'
+          + '「失能」按本定义列出的 id 读同伴 statuses。'
+          + '攻击者自身与目标的距离不参与判断（能发动攻击即隐含在攻击范围内）。'
+          + '精确「目标 5 尺内」仍做不到（GAP-B：引擎无位置 / 距离）——按近似口径登记，不假装精确。'
           + '「哪只生物有集群战术」由本定义驱动（Lua 读模板挂接，不烘名单）。'
       }
     })
@@ -1396,9 +1430,13 @@ function buildOpenContent(draft, tables) {
       fields: {
         creature_id: id,
         target_status: 'dnd-surprised',
+        signature_scope: 'kind == attack',
         note:
           '附录 B 原文：战斗开始的第一轮里，该生物对任何成功受其突袭的生物所发动的攻击检定具有优势。'
           + 'GAP-L 已闭合：Lua 直接读 host.target.statuses 里有没有 target_status 这个状态，不用全场标记近似。'
+          + 'T26 修正轮：T27 复核实测的同类残留（同集群战术 FP-E）——旧脚本没有判定签名闸门，'
+          + '属性检定 / 豁免也拿到优势；现在按 host.check_kind == "attack" 收敛，'
+          + '引擎级反例见 scripts/lmop-engine-check 的 ambusher.check_signature。'
           + '「哪只生物有伏击」由本定义驱动（Lua 读模板挂接，不烘名单）。'
       }
     })
@@ -1807,9 +1845,15 @@ function checkLuaSources(book) {
 function runChecks(build) {
   const { book, rules, tables } = build
   const results = []
-  const ok = (name, detail) => results.push({ pass: true, name, detail })
-  const fail = (name, detail) => results.push({ pass: false, name, detail })
-  const expect = (cond, name, detail) => (cond ? ok(name, detail) : fail(name, detail))
+  // T27 发现③：子串型一致性断言可被注释 / 死代码满足（有行为级断言兜底，故低危）。
+  // 每条子串断言都带 meta：
+  //   confidence: 'high' = 有引擎级**行为**断言兜底（behavioural 列出的断言名；
+  //                        --engine 模式会逐条校验它们真的存在，防悬空声明）
+  //               'low'  = 没有行为级兜底，只能靠源码子串，理由写在 note
+  //   note: 行为级断言怎么区分「真生效」与「被注释 / 死代码满足」；低置信时说明为什么区分不了
+  const ok = (name, detail, meta) => results.push({ pass: true, name, detail, ...(meta || {}) })
+  const fail = (name, detail, meta) => results.push({ pass: false, name, detail, ...(meta || {}) })
+  const expect = (cond, name, detail, meta) => (cond ? ok(name, detail, meta) : fail(name, detail, meta))
 
   // 1. 规则包覆盖（八条能力）
   const ruleIds = new Set(rules.map(r => r.id))
@@ -1874,7 +1918,12 @@ function runChecks(build) {
     'lua_mounts.lint',
     luaProblems.length === 0
       ? (book.lua_mounts || []).length + ' 条脚本；挂载点名 / source / host API / 禁用 API 全部通过'
-      : luaProblems.slice(0, 6).join(' ; ')
+      : luaProblems.slice(0, 6).join(' ; '),
+    {
+      confidence: 'high',
+      behavioural: [],
+      note: '这条是静态 lint（挂载点白名单 / 禁用 API / host API 存在性 / 撤回词），全部是**反向**检查：标识写进注释只会造成假 FAIL，不会假 PASS，因此不属于「可被注释满足」的那一类。同一批脚本仍由真实引擎的 lint_storybook（--engine 的 engine.publish_gate）与运行时规则断言各跑一遍，故不需要行为级兜底。'
+    }
   )
 
   // 5. 图鉴数据不复制：T8 条目的数值逐字未改
@@ -1969,7 +2018,11 @@ function runChecks(build) {
       ? tables.length + ' 张表 / ' + tables.reduce((n, t) => n + t.rolls.length, 0)
         + ' 行：Lua 掷骰 → set_flag → repeatable 触发点（flag_set + encounter 预置）'
         + ' → 回合末边沿建遭遇 → 遭遇结束 clear_flag 复位 → 可反复出；XP 走 enemy_defeated 逐只发'
-      : tableProblems.slice(0, 6).join(' ; ')
+      : tableProblems.slice(0, 6).join(' ; '),
+    {
+      behavioural: ['encounter_table.refires', 'xp.improvised_encounter', 'xp.event_gate', 'xp.encounter_snapshot_fallback'],
+      note: '子串只证明源码里有这些调用；引擎级断言跑**同一份 Lua 原文**：引擎 RNG / 查表被注释掉 → 掷表不再出遭遇（refires 挂）；clear_flag 被注释掉 → 同一行整局只触发一次（refires 的 legacy 对照组挂）；event_name 闸门被注释掉 → 任意事件都发 XP（event_gate 挂）。'
+    }
   )
 
   // 7. 开放内容引用自洽（status / skill / resource / kind / flag）
@@ -2093,7 +2146,17 @@ function runChecks(build) {
     'open_content.data_driven',
     dataDrivenProblems.length === 0
       ? dataDriven.length + ' 条规则全部运行时读开放内容（挂接 / 定义），Lua 里没有标识与数值常量'
-      : dataDrivenProblems.slice(0, 6).join(' ; ')
+      : dataDrivenProblems.slice(0, 6).join(' ; '),
+    {
+      behavioural: [
+        'proficiency.data_driven', 'sunlight.by_signature',
+        'pack_tactics.reads_world_facts', 'pack_tactics.old_impl_reproduces_misjudgments',
+        'ambusher.reads_target_statuses', 'ambusher.target_status_data_driven',
+        'save_ends.reads_open_content', 'xp.improvised_encounter', 'xp.value_from_open_content',
+        'bestiary.xp_matches', 'save_half.engine_scales_own_roll', 'save_half.rule_comes_from_open_content'
+      ],
+      note: 'reads 是正向子串（写进注释即可满足），所以 7 条规则每条都配「只改开放内容数据 → 行为随之变」的引擎级断言：熟练加值改 bonus / 伏击改 target_status / 重复豁免改 dc / XP 改定义值 / 豁免减半改 skill_id。forbids 是**反向**子串：注释或死代码只会造成假 FAIL，不会假 PASS，故不需要行为级兜底。'
+    }
   )
 
   // 9. 日照敏感按判定签名（GAP-D 闭合的验收 2）
@@ -2111,7 +2174,11 @@ function runChecks(build) {
     'sunlight.by_signature',
     sunProblems.length === 0
       ? '日照敏感按判定签名区分：attack ∨ (attribute ∧ wis)，其它判定不受影响；定义里带 signature_scope'
-      : sunProblems.slice(0, 6).join(' ; ')
+      : sunProblems.slice(0, 6).join(' ; '),
+    {
+      behavioural: ['sunlight.by_signature'],
+      note: '引擎级断言用**同一份 Lua 原文**跑四种判定签名：attack → keep_low、attribute+wis → keep_low、attribute+str / save+con → 零请求；把签名分支注释掉，后两种会立刻变成给劣势（能真正区分）。'
+    }
   )
 
   // 9b. GAP-E：豁免减半 = 声明引擎缩放，Lua 不再重掷效果骰
@@ -2133,7 +2200,11 @@ function runChecks(build) {
     'save_half.scale_effect',
     halfProblems.length === 0
       ? 'dnd-save-half 只声明 scale_effect(0.5)（Lua 无效果骰重掷）；失败附加状态走开放内容 fields.fail_status，技能 effect 不含状态'
-      : halfProblems.slice(0, 6).join(' ; ')
+      : halfProblems.slice(0, 6).join(' ; '),
+    {
+      behavioural: ['save_half.engine_scales_own_roll', 'save_half.resolved_effects_is_engine_snapshot', 'save_half.check_signature_gate', 'save_half.rule_comes_from_open_content'],
+      note: 'scale_effect(0.5) 子串 → 引擎比对同种子下 1.0 与 0.5 的实际 delta（把声明注释掉，delta 会等于全量）；check_kind 闸门 → check_signature_gate 用 Attack 判定跑同一脚本，期望零缩放请求；list_definitions → rule_comes_from_open_content 把定义里的 skill_id 改成不存在的技能，期望规则整体不生效。'
+    }
   )
 
   // 9c. GAP-L：伏击读 host.target.statuses（不再靠 dnd-surprised 标记）
@@ -2142,33 +2213,63 @@ function runChecks(build) {
   if (!ambSource.includes('host.target')) ambProblems.push('没有读 host.target')
   if (!ambSource.includes('statuses')) ambProblems.push('没有读目标的 statuses')
   if (ambSource.includes('dnd-surprised')) ambProblems.push('仍把受突袭状态名烘进 Lua（应读开放内容 fields.target_status）')
+  // T26 修正轮（T27 实测的同类残留）：数据卡只说「攻击检定」——必须按判定签名收敛。
+  if (!ambSource.includes('host.check_kind')) {
+    ambProblems.push('没有读判定签名（check_kind）——属性检定 / 豁免也会给优势（与集群战术 FP-E 同类）')
+  }
+  if (!/check_kind ~= "attack"/.test(ambSource)) {
+    ambProblems.push('没有把范围收敛到攻击检定（与集群战术 FP-E 同口径）')
+  }
   const ambDefs = book.definitions.filter(d => d.kind === 'dnd-ambusher')
   if (!ambDefs.length || !ambDefs.every(d => d.fields && d.fields.target_status)) ambProblems.push('伏击定义缺少 target_status')
+  if (!ambDefs.every(d => d.fields && d.fields.signature_scope === 'kind == attack')) {
+    ambProblems.push('伏击定义没有声明判定范围 signature_scope')
+  }
   const ambMount = book.lua_mounts.find(m => m.id === 'dnd-ambusher-keep-high')
   if (JSON.stringify((ambMount && ambMount.when) || {}).includes('dnd-surprised')) ambProblems.push('when 闸门仍要求 dnd-surprised 标记')
   expect(
     ambProblems.length === 0,
     'ambusher.target_status',
     ambProblems.length === 0
-      ? '伏击读 host.target.statuses，期望状态 id 由开放内容 fields.target_status 给出；闸门只留战斗第一轮'
-      : ambProblems.slice(0, 6).join(' ; ')
+      ? '伏击读 host.target.statuses，期望状态 id 由开放内容 fields.target_status 给出；只对 kind==attack 生效；闸门只留战斗第一轮'
+      : ambProblems.slice(0, 6).join(' ; '),
+    {
+      behavioural: ['ambusher.reads_target_statuses', 'ambusher.check_signature', 'ambusher.old_impl_ignores_check_signature', 'ambusher.fail_closed_without_signature', 'ambusher.target_status_data_driven'],
+      note: 'statuses 子串 → 引擎跑同一脚本，带受突袭状态给 keep_high、别的状态零请求；check_kind 子串 → check_signature 实测 attack 给、attribute / save 不给，旧脚本原文（old_impl_ignores_check_signature）在同一批场景复现 1/1/1 = 反例不是恒真，签名缺失（fail_closed_without_signature）一律不给；fields.target_status 的「无状态名常量」→ target_status_data_driven 只改开放内容里的状态 id，行为随之变。'
+    }
   )
 
-  // 9d. GAP-A：集群战术读运行时事实（近似程度提高，不假装精确）
+  // 9d. GAP-A（T26 修正轮后）：集群战术读运行时事实，且**实现与开放内容声明一致**
   const packSource = srcOf('dnd-pack-tactics')
   const packProblems = []
   if (!packSource.includes('host.list_encounters')) packProblems.push('没有读活跃遭遇')
   if (!packSource.includes('host.get_character')) packProblems.push('没有读同伴实例')
   if (!packSource.includes('location_id')) packProblems.push('没有用 location_id 做「目标附近」的近似')
+  // FP-A：必须拿**目标**的地点与同伴比对（旧实现只比 actor 与 target，从不看同伴）
+  if (!packSource.includes('inst.location_id == target_place')) packProblems.push('没有真检查同伴位置（FP-A：声明 range_proxy 却不查同伴地点）')
+  // FP-C：目标缺 location_id 时必须 fail-closed，不能跳过地点闸门
+  if (!packSource.includes('type(target_place) ~= "string"')) packProblems.push('目标缺 location_id 时没有 fail-closed（FP-C：地点闸门被跳过）')
+  // FP-E：只对攻击检定
+  if (!packSource.includes('host.check_kind') || !packSource.includes('~= "attack"')) packProblems.push('没有把范围收敛到攻击检定（FP-E）')
+  // FP-B：失能名单必须来自开放内容
+  if (!packSource.includes('incapacitated_statuses')) packProblems.push('没有从开放内容读失能名单（FP-B：HP>0 当成未失能）')
   if (packSource.includes('dnd-flanked')) packProblems.push('仍靠 dnd-flanked 标记')
   const packDefs = book.definitions.filter(d => d.kind === 'dnd-pack-tactics')
   if (!packDefs.length || !packDefs.every(d => d.fields && d.fields.range_proxy)) packProblems.push('集群战术定义缺少 range_proxy（近似口径必须写明）')
+  if (!packDefs.every(d => d.fields && Array.isArray(d.fields.incapacitated_statuses) && d.fields.incapacitated_statuses.length)) {
+    packProblems.push('集群战术定义缺少 incapacitated_statuses（失能名单是开放内容，不是 Lua 常量）')
+  }
+  if (!packDefs.every(d => d.fields && d.fields.signature_scope === 'kind == attack')) packProblems.push('集群战术定义没有声明判定范围 signature_scope')
   expect(
     packProblems.length === 0,
     'pack_tactics.world_facts',
     packProblems.length === 0
-      ? '集群战术用 host.list_encounters + host.get_character 读同遭遇同伴（HP>0），目标按同一 location_id 近似；5 尺仍做不到（GAP-B）'
-      : packProblems.slice(0, 6).join(' ; ')
+      ? '集群战术：读所有活跃遭遇的同伴实例（get_character），同伴必须与**目标**同 location_id、HP>0 且不带 incapacitated_statuses；只对 kind==attack 生效；缺地点 fail-closed。5 尺仍做不到（GAP-B，近似口径写进 pack-*.fields）'
+      : packProblems.slice(0, 6).join(' ; '),
+    {
+      behavioural: ['pack_tactics.reads_world_facts', 'pack_tactics.old_impl_reproduces_misjudgments'],
+      note: '引擎级断言跑同一份 Lua 原文的 8 类场景（正例 / 同伴倒 / FP-A 异地 / FP-B 失能 / FP-C 无地点 / FP-E 属性检定 / FN-A 跨遭遇 / 无挂接）；old_impl 变异把源码换回旧脚本，五类误判全部复现 = 反例不是恒真。'
+    }
   )
 
   // 10. 规则挂接自洽（开放内容 → Lua 的入口必须真的指得到定义）
@@ -2225,9 +2326,30 @@ function checkMode(engineBin) {
   const results = runChecks(build)
   let failed = 0
   let engineChecks = 0
+  let lowConfidence = 0
+  const behaviouralRefs = new Set()
   for (const r of results) {
-    console.log('[' + (r.pass ? 'PASS' : 'FAIL') + '] ' + r.name + ' — ' + r.detail)
+    const tag = r.confidence === 'low' ? '[低置信]' : ''
+    console.log('[' + (r.pass ? 'PASS' : 'FAIL') + ']' + tag + ' ' + r.name + ' — ' + r.detail)
     if (!r.pass) failed++
+    if (r.confidence === 'low') lowConfidence++
+    for (const b of r.behavioural || []) behaviouralRefs.add(b)
+  }
+
+  // T27 发现③：逐条列出子串断言的行为级兜底 / 低置信理由（不删任何断言）。
+  const annotated = results.filter(r => r.confidence || (r.behavioural || []).length)
+  if (annotated.length) {
+    console.log('')
+    console.log('—— 子串型一致性断言的行为级兜底（T27 发现③）——')
+    for (const r of annotated) {
+      if (r.confidence === 'low') {
+        console.log('· [低置信] ' + r.name + '：' + (r.note || '（未写理由）'))
+      } else {
+        console.log('· [行为级兜底] ' + r.name + '：' + (r.note || ''))
+        if ((r.behavioural || []).length) console.log('    引擎级断言：' + (r.behavioural || []).join(' / '))
+      }
+    }
+    console.log('（' + annotated.length + ' 条子串型断言已逐条标注；低置信 ' + lowConfidence + ' 条）')
   }
 
   // 确定性：同输入两次构建逐字节一致
@@ -2264,6 +2386,15 @@ function checkMode(engineBin) {
         }
       }
       if (parsed.rule_failures) failed += parsed.rule_failures
+      // T27 发现③：子串断言声明的「行为级兜底」必须真的在引擎断言清单里（防悬空声明）。
+      const engineNames = new Set((parsed.rule_assertions || []).map(i => i.name))
+      const dangling = [...behaviouralRefs].filter(n => !engineNames.has(n))
+      console.log(
+        '[' + (dangling.length === 0 ? 'PASS' : 'FAIL') + '] consistency.behavioural_backing — '
+        + behaviouralRefs.size + ' 条被引用的引擎级断言'
+        + (dangling.length ? '，悬空引用：' + dangling.join(',') : ' 全部在场（声明不悬空）')
+      )
+      if (dangling.length) failed++
     } catch (err) {
       console.log('[FAIL] engine.publish_gate — 调引擎校验器失败：' + (err && err.message ? err.message : String(err)))
       failed++
@@ -2295,7 +2426,9 @@ function checkMode(engineBin) {
     }
   }
   console.log('')
-  const totalChecks = results.length + 1 + (engineBin ? 1 + engineChecks : 0)
+  // engine 模式下额外算两项：发布门 + 行为级兜底的对账（consistency.behavioural_backing）
+  const totalChecks = results.length + 1 + (engineBin ? 2 + engineChecks : 0)
+  if (lowConfidence) console.log('注意：' + lowConfidence + ' 条子串型断言标为低置信（理由见上），未删任何断言。')
   console.log(
     '总结：' + totalChecks + ' 项断言，' + failed + ' 项失败'
     + (engineBin ? '（含真实引擎发布门 + ' + engineChecks + ' 条运行时规则断言）' : '')

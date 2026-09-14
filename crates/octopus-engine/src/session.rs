@@ -4914,9 +4914,10 @@ impl Session {
                 // 判定修正只在判定挂载点（check_pre_roll / check_post_roll）被消费；
                 // 其他时机抛出这类请求没有判定可改，忽略。
                 LuaRequest::ModifyCheck { .. } => {}
-                // 效果缩放在技能结算路径（command::execute_skill）被消费；
-                // 判定意图（Intent::Check）没有效果可缩放，这里忽略。
+                // 效果缩放 / 效果门都在技能结算路径（command::execute_skill）被消费；
+                // 判定意图（Intent::Check）没有效果可结算，这里忽略。
                 LuaRequest::ScaleEffect { .. } => {}
+                LuaRequest::ForceEffect => {}
             }
         }
         if !changes.is_empty() {
@@ -5612,6 +5613,53 @@ fn apply_event(state: &mut WorldState, event: &PlayEvent) {
     }
 }
 
+/// 落不到任何角色实例的 Character 域 delta：**只告警，不改行为**。
+///
+/// 这是本设计自报的主要风险形态——「不报错，只静默给出错误结论」。这类 delta
+/// （最常见的来源：AI 把 entity_id 写成了不存在的键）以前被直接丢弃、不留任何痕迹，
+/// 只能靠事后比对 `Resolution.state_changes` 才能发现。这里补一条 WARN，带上
+/// 域 / 实体键 / 字段，让「丢弃」在日志里可见。
+///
+/// **不落事件**：给丢弃补一条 System 事件会让命令日志多出内容，重放路径随之产生
+/// 新事件、重放一致性被破坏。所以这里只有日志，投影结果逐字不变。
+///
+/// **去重（重放不刷屏）**：实时（`emit`）与重放（`replay`）走的是同一条 `apply_delta`，
+/// 同一批 delta 会被原样再跑一遍。按 `(域, 实体键, 字段)` 去重后，同一种丢弃在
+/// **进程生命周期内只告警一次**，重放不会把它再刷一遍。表有上限，防止病态输入
+/// 把它撑大；到上限后重复形态仍被识别，新形态则每次都告警。
+fn warn_dropped_character_delta(d: &StateDelta) {
+    /// 去重表上限：只记「形态」，不记次数，正常内容远到不了这里。
+    const CAP: usize = 256;
+    static SEEN: std::sync::OnceLock<Mutex<std::collections::HashSet<(String, String, String)>>> =
+        std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    let shape = (format!("{:?}", d.domain), d.entity_id.clone(), d.field.clone());
+    let first_time = match seen.lock() {
+        Ok(mut set) => {
+            if set.contains(&shape) {
+                false
+            } else {
+                if set.len() < CAP {
+                    set.insert(shape);
+                }
+                true
+            }
+        }
+        // 锁中毒不该让投影路径 panic：退化为每次都告警。
+        Err(_) => true,
+    };
+    if !first_time {
+        return;
+    }
+    tracing::warn!(
+        domain = ?d.domain,
+        entity_id = %d.entity_id,
+        field = %d.field,
+        op = ?d.op,
+        "状态增量落不到任何角色实例，已丢弃（投影逐字不变）"
+    );
+}
+
 fn apply_delta(state: &mut WorldState, d: &StateDelta) {
     match d.domain {
         DeltaDomain::Flag => match d.op {
@@ -5701,6 +5749,8 @@ fn apply_delta(state: &mut WorldState, d: &StateDelta) {
                 return;
             }
             let Some(c) = state.characters.get_mut(&key) else {
+                // 丢弃可见化（只写日志，不落事件、不改状态）：见 warn_dropped_character_delta。
+                warn_dropped_character_delta(d);
                 return;
             };
             if d.field == "present" {
@@ -10455,6 +10505,96 @@ mod tests {
             },
         );
         assert!(!st.characters.contains_key("不存在的键"));
+    }
+
+    /// 极简 tracing 订阅者：只收集 WARN 及以上事件（含域 / 键 / 字段等结构化字段）。
+    ///
+    /// 刻意不引入 tracing-subscriber（那是 api 层的依赖）：这里只需要「收到一条事件」，
+    /// 用 tracing 自带的 `Subscriber` trait 即可，engine 的依赖零变化。
+    struct WarnCapture {
+        lines: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl tracing::Subscriber for WarnCapture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::WARN)
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Fields(String);
+            impl tracing::field::Visit for Fields {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0.push_str(&format!("{value:?}"));
+                    } else {
+                        self.0.push_str(&format!(" {}={value:?}", field.name()));
+                    }
+                }
+            }
+            let mut fields = Fields(String::new());
+            event.record(&mut fields);
+            if let Ok(mut lines) = self.lines.lock() {
+                lines.push(format!("{} {}", event.metadata().level(), fields.0));
+            }
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// T26/T27 登记：落不到角色的 Character delta 以前是**静默丢弃**。
+    ///
+    /// 这里钉住三件事：
+    /// ① 行为零变化——投影逐字相同（可见性修复不改变任何状态结果）；
+    /// ② 可见性——丢弃时确实有一条带 域 / 实体键 / 字段 的 WARN；
+    /// ③ 去重——同一条丢弃（实时之后的重放会原样再跑一遍）不再重复刷日志。
+    #[test]
+    fn dropped_character_delta_keeps_projection_verbatim_but_warns_once() {
+        let mut st = state_with_pc();
+        let before = serde_json::to_value(&st).unwrap();
+        let delta = StateDelta {
+            domain: DeltaDomain::Character,
+            entity_id: "t27-missing-entity-warn".into(),
+            field: "resources.hp".into(),
+            op: DeltaOp::Add,
+            value: json!(-7),
+        };
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = WarnCapture { lines: lines.clone() };
+        tracing::subscriber::with_default(subscriber, || {
+            apply_delta(&mut st, &delta);
+            // 重放是纯投影，会把同一批 delta 再跑一遍：去重后不该再刷一条。
+            apply_delta(&mut st, &delta);
+        });
+        assert_eq!(
+            serde_json::to_value(&st).unwrap(),
+            before,
+            "丢弃路径的行为不变：世界状态逐字相同"
+        );
+        let lines = lines.lock().unwrap().clone();
+        assert_eq!(lines.len(), 1, "同一条丢弃只告警一次（重放不刷屏）：{lines:?}");
+        let line = &lines[0];
+        assert!(line.starts_with("WARN"), "必须是 WARN 级：{line}");
+        assert!(line.contains("Character"), "带域：{line}");
+        assert!(line.contains("t27-missing-entity-warn"), "带实体键：{line}");
+        assert!(line.contains("resources.hp"), "带字段：{line}");
     }
 
     /// 验收 2：遭遇按 template_id + count 克隆实例（键 enc-{enc}:{tpl}#n），

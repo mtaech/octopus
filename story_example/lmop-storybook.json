@@ -5021,7 +5021,8 @@
       "fields": {
         "creature_id": "mon-doppelganger",
         "target_status": "dnd-surprised",
-        "note": "附录 B 原文：战斗开始的第一轮里，该生物对任何成功受其突袭的生物所发动的攻击检定具有优势。GAP-L 已闭合：Lua 直接读 host.target.statuses 里有没有 target_status 这个状态，不用全场标记近似。「哪只生物有伏击」由本定义驱动（Lua 读模板挂接，不烘名单）。"
+        "signature_scope": "kind == attack",
+        "note": "附录 B 原文：战斗开始的第一轮里，该生物对任何成功受其突袭的生物所发动的攻击检定具有优势。GAP-L 已闭合：Lua 直接读 host.target.statuses 里有没有 target_status 这个状态，不用全场标记近似。T26 修正轮：T27 复核实测的同类残留（同集群战术 FP-E）——旧脚本没有判定签名闸门，属性检定 / 豁免也拿到优势；现在按 host.check_kind == \"attack\" 收敛，引擎级反例见 scripts/lmop-engine-check 的 ambusher.check_signature。「哪只生物有伏击」由本定义驱动（Lua 读模板挂接，不烘名单）。"
       }
     },
     {
@@ -5430,9 +5431,17 @@
       "description": "至少一个未失能的盟友在目标 5 尺内时，攻击检定有优势",
       "fields": {
         "creature_id": "mon-wolf",
-        "ally_proxy": "同一场活跃遭遇里的其它敌人（HP>0 视为未失能）",
-        "range_proxy": "与目标同一 location_id",
-        "note": "GAP-A 已闭合：规则用 host.list_encounters + host.get_character 读同遭遇同伴，不再靠 dnd-flanked 标记；但精确「目标 5 尺内」仍做不到（GAP-B：引擎无位置 / 距离），HP>0 只是「未失能」的近似。「哪只生物有集群战术」由本定义驱动（Lua 读模板挂接，不烘名单）。"
+        "signature_scope": "kind == attack",
+        "ally_proxy": "所有活跃遭遇里的其它敌人实例（不限与我同场）；HP>0 且不带 incapacitated_statuses 里的状态才算「未失能」",
+        "range_proxy": "与目标同一 location_id（目标没有 location_id 时不给优势，fail-closed）",
+        "incapacitated_statuses": [
+          "stunned",
+          "unconscious",
+          "paralyzed",
+          "petrified",
+          "incapacitated"
+        ],
+        "note": "T26 修正轮：同伴位置按 range_proxy **真检查**（旧实现从不看同伴地点，声明与实现矛盾）；判定范围收敛到 kind == attack；目标缺 location_id 时 fail-closed。「失能」按本定义列出的 id 读同伴 statuses。攻击者自身与目标的距离不参与判断（能发动攻击即隐含在攻击范围内）。精确「目标 5 尺内」仍做不到（GAP-B：引擎无位置 / 距离）——按近似口径登记，不假装精确。「哪只生物有集群战术」由本定义驱动（Lua 读模板挂接，不烘名单）。"
       }
     },
     {
@@ -6436,12 +6445,12 @@
     {
       "id": "dnd-pack-tactics",
       "mount": "check_pre_roll",
-      "source": "-- 规则包：集群战术（狼，附录 B 原文）。\n-- 数据来源：开放内容（角色模板的 dnd-pack-tactics 挂接），脚本无生物名单。\n-- T21：读运行时事实——同一场遭遇的同伴（list_encounters + get_character）。\n-- 仍受 GAP-B（没有位置 / 距离）：同伴按「同一场遭遇」近似，目标按「同一 location_id」近似。\nlocal ids = host.get_attachment('dnd-pack-tactics')\nif type(ids) ~= \"table\" or #ids == 0 then return end\nlocal me = host.actor\nlocal target = host.target\nif type(me) ~= \"table\" or type(target) ~= \"table\" then return end\nlocal my_key = me.id or me.instance_id\nlocal function alive(inst)\n  local hp = inst and inst.resources and inst.resources['res-hp']\n  return type(hp) == \"number\" and hp > 0\nend\nlocal ally_found = false\nfor _, enc in ipairs(host.list_encounters()) do\n  local enemies = enc.enemies\n  if type(enemies) == \"table\" then\n    local mine = false\n    for _, e in ipairs(enemies) do\n      if (e.instance_id or e.id) == my_key then mine = true end\n    end\n    if mine then\n      for _, e in ipairs(enemies) do\n        local key = e.instance_id or e.id\n        if key and key ~= my_key then\n          if alive(host.get_character(key)) then ally_found = true end\n        end\n      end\n    end\n  end\nend\nif not ally_found then return end\n-- 「在目标 5 尺内」的可用近似：双方都知道地点时必须同地点（GAP-B 仍然存在）。\nlocal my_place = me.location_id\nlocal target_place = target.location_id\nif my_place and target_place and my_place ~= target_place then return end\nhost.modify_check('keep_high')"
+      "source": "-- 规则包：集群战术（狼，附录 B 原文）。\n-- 数据来源：开放内容（角色模板的 dnd-pack-tactics 挂接 + pack-*.fields），脚本无名单 / 状态名常量。\n-- T26 修正轮：实现与声明对齐——同伴必须与**目标**同一 location_id；缺地点 / 非攻击判定不给优势。\nlocal ids = host.get_attachment('dnd-pack-tactics')\nif type(ids) ~= \"table\" or #ids == 0 then return end\n-- 数据卡只说「对该生物发动的攻击检定」：属性检定 / 豁免一律不受影响（FP-E）。\nif host.check_kind ~= \"attack\" then return end\nlocal me = host.actor\nlocal target = host.target\nif type(me) ~= \"table\" or type(target) ~= \"table\" then return end\nlocal my_key = me.id or me.instance_id\n-- 「在目标 5 尺内」的可用近似 = 同伴与目标同一 location_id（开放内容 range_proxy）。\n-- 目标没有地点就无从判断距离：fail-closed，不给优势（不假装「反正很近」）——FP-C。\nlocal target_place = target.location_id\nif type(target_place) ~= \"string\" or target_place == \"\" then return end\n-- 「失能」名单由开放内容给（脚本无状态名常量）——FP-B。\nlocal incapacitated = {}\nfor _, def_id in ipairs(ids) do\n  local def = host.get_definition(def_id)\n  local list = def and def.fields and def.fields.incapacitated_statuses\n  if type(list) == \"table\" then\n    for _, st in ipairs(list) do incapacitated[st] = true end\n  end\nend\nlocal function able(inst)\n  if type(inst) ~= \"table\" then return false end\n  local hp = inst.resources and inst.resources[\"res-hp\"]\n  if type(hp) ~= \"number\" or hp <= 0 then return false end\n  local statuses = inst.statuses\n  if type(statuses) == \"table\" then\n    for _, st in ipairs(statuses) do\n      local id = st.id or st.name\n      if id and incapacitated[id] then return false end\n    end\n  end\n  return true\nend\n-- 同伴取自所有活跃遭遇（不限我所在那一场）——FN-A。\nfor _, enc in ipairs(host.list_encounters()) do\n  local enemies = enc.enemies\n  if type(enemies) == \"table\" then\n    for _, e in ipairs(enemies) do\n      local key = e.instance_id or e.id\n      if key and key ~= my_key then\n        local inst = host.get_character(key)\n        if able(inst) and inst.location_id == target_place then\n          host.modify_check('keep_high')\n          return\n        end\n      end\n    end\n  end\nend"
     },
     {
       "id": "dnd-ambusher-keep-high",
       "mount": "check_pre_roll",
-      "source": "-- 规则包：伏击（变形怪，附录 B 原文）：战斗开始的第一轮里，\n-- 对任何成功受其突袭的生物所发动的攻击检定具有优势。\n-- T21：host.target 与 host.actor 同级完整（含 statuses）——直接按目标状态判定（GAP-L 闭合）。\n-- 数据来源：开放内容（角色模板的 dnd-ambusher 挂接 → fields.target_status），脚本无状态名常量。\nlocal ids = host.get_attachment('dnd-ambusher')\nif type(ids) ~= \"table\" or #ids == 0 then return end\nlocal target = host.target\nlocal statuses = target and target.statuses\nif type(statuses) ~= \"table\" then return end\nfor _, def_id in ipairs(ids) do\n  local def = host.get_definition(def_id)\n  local wanted = def and def.fields and def.fields.target_status\n  if wanted and wanted ~= \"\" then\n    for _, st in ipairs(statuses) do\n      if st.id == wanted or st.name == wanted then\n        host.modify_check('keep_high')\n        return\n      end\n    end\n  end\nend",
+      "source": "-- 规则包：伏击（变形怪，附录 B 原文）：战斗开始的第一轮里，\n-- 对任何成功受其突袭的生物所发动的攻击检定具有优势。\n-- T21：host.target 与 host.actor 同级完整（含 statuses）——直接按目标状态判定（GAP-L 闭合）。\n-- T26 修正轮：数据卡只说「攻击检定」——属性检定 / 豁免一律不受影响（与集群战术 FP-E 同口径）。\n-- 数据来源：开放内容（角色模板的 dnd-ambusher 挂接 → fields.target_status），脚本无状态名常量。\nlocal ids = host.get_attachment('dnd-ambusher')\nif type(ids) ~= \"table\" or #ids == 0 then return end\nif host.check_kind ~= \"attack\" then return end\nlocal target = host.target\nlocal statuses = target and target.statuses\nif type(statuses) ~= \"table\" then return end\nfor _, def_id in ipairs(ids) do\n  local def = host.get_definition(def_id)\n  local wanted = def and def.fields and def.fields.target_status\n  if wanted and wanted ~= \"\" then\n    for _, st in ipairs(statuses) do\n      if st.id == wanted or st.name == wanted then\n        host.modify_check('keep_high')\n        return\n      end\n    end\n  end\nend",
       "when": {
         "op": "flag_set",
         "flag": "dnd-battle-round-1"

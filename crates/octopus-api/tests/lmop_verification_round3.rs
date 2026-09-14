@@ -905,7 +905,19 @@ fn run_ambusher(sb: &Value, actor_template: &str, statuses: Value) -> usize {
         ..Default::default()
     };
     let gate = |_: &CondExpr| true;
-    let env = MountEnv { gate: Some(&gate), ..Default::default() };
+    // 第 5 轮（第四轮 T27 发现① 的修复）：伏击脚本按数据卡收敛到 kind == attack，所以这里必须补上
+    // **真实引擎在每一次真判定的 check_pre_roll 都会下发**的判定签名——旧 harness 不给 check 快照，
+    // 模拟的是「根本没有判定」这个不可能出现在真判定里的状态（证据：command.rs 的
+    // pre_roll_sees_check_signature_in_skill_path / session.rs 的签名注入点）。
+    // 四条期望值与后面的数据驱动段一字未改；「没有签名 → 不给优势」改由引擎级断言
+    // ambusher.fail_closed_without_signature 显式钉住。
+    let sig = LuaCheckContext {
+        attribute: "str".into(),
+        kind: Some(CheckKind::Attack),
+        target: 12,
+        ..Default::default()
+    };
+    let env = MountEnv { gate: Some(&gate), check: Some(&sig), ..Default::default() };
     host.run_hook_with(&source, LuaMount::CheckPreRoll, &ctx, &env).expect("伏击脚本执行失败");
     keep_high_count(&host.drain_requests())
 }
@@ -1265,7 +1277,8 @@ async fn r3_audit3b_r26_negative_control_mechanism() {
 }
 
 // ============================================================
-// 审计④：集群战术近似的边界（GAP-A 是「近似提高」还是「闭合」）
+// 审计④（T26 修正轮后）：集群战术的边界——实现必须与开放内容声明一致
+//   （同伴位置真检查 / 失能名单来自开放内容 / 缺地点 fail-closed / 只对攻击检定 / 跨遭遇同伴算数）
 // ============================================================
 fn run_pack(
     sb: &Value,
@@ -1331,25 +1344,25 @@ fn r3_audit4_pack_tactics_approximation_boundaries() {
         json!({ "enc-1": { "id": "enc-1", "name": "野外遭遇", "active": true, "enemies": members } })
     };
     let member = |key: &str, hp: i64| json!({ "id": key, "instance_id": key, "template_id": "mon-wolf", "hp": hp });
-    let two = |hp2: i64, place2: &str, st2: Value| {
+    let two = |hp2: i64, place2: Option<&str>, st2: Value| {
         facts_with(
             vec![
                 wolf_char("inst-wolf-1", 11, Some("loc-a"), json!([])),
-                wolf_char("inst-wolf-2", hp2, Some(place2), st2),
+                wolf_char("inst-wolf-2", hp2, place2, st2),
             ],
             enc(json!([member("inst-wolf-1", 11), member("inst-wolf-2", hp2)])),
         )
     };
 
-    // P0 正例 / P1 同伴倒下 / P2 狼与目标异地
-    let p0 = run_pack(&sb, two(11, "loc-a", json!([])), "inst-wolf-1", Some("loc-a"), Some("loc-a"), Some(CheckKind::Attack));
-    let p1 = run_pack(&sb, two(0, "loc-a", json!([])), "inst-wolf-1", Some("loc-a"), Some("loc-a"), Some(CheckKind::Attack));
-    let p2 = run_pack(&sb, two(11, "loc-a", json!([])), "inst-wolf-1", Some("loc-a"), Some("loc-b"), Some(CheckKind::Attack));
-    // 边界 FP-A：同伴在**另一个地点**（脚本从不检查同伴位置）
-    let fp_a = run_pack(&sb, two(11, "loc-c", json!([])), "inst-wolf-1", Some("loc-a"), Some("loc-a"), Some(CheckKind::Attack));
-    // 边界 FP-B：同伴 HP>0 但带失能状态（「未失能」被近似成 HP>0）
-    let fp_b = run_pack(&sb, two(11, "loc-a", json!([{ "id": "stunned", "name": "昏迷" }])), "inst-wolf-1", Some("loc-a"), Some("loc-a"), Some(CheckKind::Attack));
-    // 边界 FN-A：同伴在**另一场遭遇**里（同地点）→ 漏判
+    // P0 正例 / P1 同伴倒下 / P2 同伴与目标异地
+    let p0 = run_pack(&sb, two(11, Some("loc-a"), json!([])), "inst-wolf-1", Some("loc-a"), Some("loc-a"), Some(CheckKind::Attack));
+    let p1 = run_pack(&sb, two(0, Some("loc-a"), json!([])), "inst-wolf-1", Some("loc-a"), Some("loc-a"), Some(CheckKind::Attack));
+    let p2 = run_pack(&sb, two(11, Some("loc-a"), json!([])), "inst-wolf-1", Some("loc-a"), Some("loc-b"), Some(CheckKind::Attack));
+    // T26 修正轮①（FP-A）：同伴在**另一个地点** → 必须不给（声明 range_proxy = 与目标同一 location_id）
+    let fp_a = run_pack(&sb, two(11, Some("loc-c"), json!([])), "inst-wolf-1", Some("loc-a"), Some("loc-a"), Some(CheckKind::Attack));
+    // T26 修正轮②（FP-B）：同伴 HP>0 但带开放内容声明的失能状态 → 不算「未失能」
+    let fp_b = run_pack(&sb, two(11, Some("loc-a"), json!([{ "id": "stunned", "name": "昏迷" }])), "inst-wolf-1", Some("loc-a"), Some("loc-a"), Some(CheckKind::Attack));
+    // T26 修正轮③（FN-A）：同伴在**另一场遭遇**但同在目标的地点 → 必须算
     let fn_a = run_pack(
         &sb,
         facts_with(
@@ -1367,7 +1380,7 @@ fn r3_audit4_pack_tactics_approximation_boundaries() {
         Some("loc-a"),
         Some(CheckKind::Attack),
     );
-    // 边界 FP-C：狼与目标都没有 location_id → 地点闸门被跳过
+    // T26 修正轮④（FP-C）：双方都没有 location_id → fail-closed，不给
     let fp_c = run_pack(
         &sb,
         facts_with(
@@ -1394,22 +1407,22 @@ fn r3_audit4_pack_tactics_approximation_boundaries() {
         Some("loc-a"),
         Some(CheckKind::Attack),
     );
-    // 边界 FP-E：非攻击判定（属性检定）照样给优势
-    let fp_e_attr = run_pack(&sb, two(11, "loc-a", json!([])), "inst-wolf-1", Some("loc-a"), Some("loc-a"), Some(CheckKind::Attribute));
-    let fp_e_attack = run_pack(&sb, two(11, "loc-a", json!([])), "inst-wolf-1", Some("loc-a"), Some("loc-a"), Some(CheckKind::Attack));
+    // T26 修正轮⑤（FP-E）：非攻击判定（属性检定）不给优势
+    let fp_e_attr = run_pack(&sb, two(11, Some("loc-a"), json!([])), "inst-wolf-1", Some("loc-a"), Some("loc-a"), Some(CheckKind::Attribute));
+    let fp_e_attack = run_pack(&sb, two(11, Some("loc-a"), json!([])), "inst-wolf-1", Some("loc-a"), Some("loc-a"), Some(CheckKind::Attack));
 
     assert_eq!(p0, 1, "P0 正例必须给优势");
     assert_eq!(p1, 0, "P1 同伴倒下 → 不给");
-    assert_eq!(p2, 0, "P2 目标不在一处 → 不给");
-    assert_eq!(fp_a, 1, "FP-A：同伴在别的地点仍给优势（近似误差，实测）");
-    assert_eq!(fp_b, 1, "FP-B：同伴带失能状态但 HP>0 仍给优势（近似误差，实测）");
-    assert_eq!(fn_a, 0, "FN-A：同伴在另一场遭遇 → 漏判（近似误差，实测）");
-    assert_eq!(fp_c, 1, "FP-C：双方都无 location_id → 地点闸门被跳过（近似误差，实测）");
+    assert_eq!(p2, 0, "P2 同伴与目标异地 → 不给");
+    assert_eq!(fp_a, 0, "FP-A 已修正：同伴在别的地点 → 不给（range_proxy 真检查同伴位置）");
+    assert_eq!(fp_b, 0, "FP-B 已修正：同伴带失能状态（stunned）→ 不算「未失能」");
+    assert_eq!(fn_a, 1, "FN-A 已修正：同伴在另一场遭遇但同地点 → 给优势");
+    assert_eq!(fp_c, 0, "FP-C 已修正：双方都无 location_id → fail-closed，不给");
     assert_eq!(fp_d, 0, "FP-D：遭遇条目查不到实例 → 不给");
-    assert_eq!(fp_e_attr, 1, "FP-E：非攻击判定也给优势（脚本不看判定签名）");
-    assert_eq!(fp_e_attack, 1);
+    assert_eq!(fp_e_attr, 0, "FP-E 已修正：属性检定不给优势（只对 kind == attack）");
+    assert_eq!(fp_e_attack, 1, "攻击检定仍给优势");
     println!(
-        "R3-AUDIT4: P0={p0} P1(同伴倒)={p1} P2(异地)={p2} | FP-A(同伴在别处)={fp_a} FP-B(同伴失能)={fp_b} FP-C(无地点)={fp_c} FP-E(属性检定)={fp_e_attr} | FN-A(同伴在别的遭遇)={fn_a} FP-D(无实例)={fp_d}"
+        "R3-AUDIT4（T26 修正轮后）: P0={p0} P1(同伴倒)={p1} P2(异地)={p2} | FP-A(同伴在别处)={fp_a} FP-B(同伴失能)={fp_b} FP-C(无地点)={fp_c} FP-E(属性检定)={fp_e_attr} | FN-A(同伴在别的遭遇)={fn_a} FP-D(无实例)={fp_d}"
     );
 }
 
