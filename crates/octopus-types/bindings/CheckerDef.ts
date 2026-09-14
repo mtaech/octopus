@@ -35,6 +35,15 @@ kind?: CheckKind | null,
  */
 passive_base?: bigint | null, 
 /**
+ * 判定属性维度 key（判定 C1）：技能未声明时用它，再缺省回落 'str'。
+ * 必须命中故事书 attribute_dimensions 的 key，否则校验报 Error（不静默 0 分）。
+ */
+attribute?: string | null, 
+/**
+ * 对抗判定时对手所用的属性维度 key（判定 C1）；缺省同 attribute。
+ */
+opposed_attribute?: string | null, 
+/**
  * 兼容别名：故事书常写 type: "d20" / type: "d100" 表示骰子家族；
  * 未显式给 dice 时据此推导（d20 → 1d20）。非骰式类型名（如 attribute）忽略。
  */

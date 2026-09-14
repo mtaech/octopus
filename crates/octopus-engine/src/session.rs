@@ -9,15 +9,16 @@ use std::sync::{
 };
 
 use octopus_types::{
-    ActorRef, CheckKind, CheckResultPayload, CheckerDef, CondExpr, ConfirmDecision, DeltaDomain, DeltaOp,
+    ActorRef, CheckKind, CheckMode, CheckResultPayload, CheckerDef, CondExpr, ConfirmDecision, DeltaDomain, DeltaOp,
     DialoguePayload,
     EmotePayload, EventEnvelope, FocusEntity, HistoryPage, Intent, NarrativeOverride, NarratePayload, PendingPayload, PhasePayload,
     normalize_event_name,
     relationship_endpoint,
     PhaseStage, PlayEvent, RejectionCode, ResolutionPayload, ResolutionStatus, RoundChannel,
-    EncounterView, EnemyView, QuestView, RoundEndPayload, RoundInput, RoundStartPayload, ScenePayload, Seq,
-    SkillDef, StateDelta, StateUpdatePayload, StatusUnit,
-    EffectTrigger, StatusDef, StatusInstance, SystemLevel, SystemPayload,
+    CharacterInstance, EncounterView, EnemyAttack, EnemyView, QuestView, RoundEndPayload, RoundInput,
+    RoundStartPayload, ScenePayload, Seq,
+    EnemySpec, SkillDef, StateDelta, StateUpdatePayload, StatusUnit,
+    EffectDef, EffectTrigger, ImmediateEffect, SkillCheck, StatusDef, StatusInstance, SystemLevel, SystemPayload,
     AiCallPayload, AiCallStatus, AiCallUsage, ReasoningPayload,
     WorldProjection,
 };
@@ -26,11 +27,19 @@ use tokio::sync::oneshot;
 use tokio::time::{timeout, Duration};
 
 use crate::{
-    command::{execute_item_skill, execute_skill, CommandContext},
-    conditions::{eval_cond, evaluate_skeleton, goal_delta, trigger_delta, EvalContext},
-    effects::{build_status_instance, resolve_immediate, status_delta},
+    command::{execute_item_skill, execute_skill, CommandContext, CommandOutcome},
+    derived::compute_derived,
+    conditions::{
+        chapter_locations, eval_cond, evaluate_skeleton_full, goal_delta, goal_id_of,
+        scene_encounter_goal_id, trigger_encounter_preset, trigger_progress_delta,
+        ChapterLocations, EvalContext, TriggerEncounterPlan,
+    },
+    effects::{build_status_instance, resolve_effect, resolve_immediate, status_delta},
     error::EngineError,
-    lua_host::{LuaHost, LuaHostContext, LuaMount, LuaRegistry, LuaRequest, SandboxLimits},
+    lua_host::{
+        LuaCheckContext, LuaHost, LuaHostContext, LuaMount, LuaRegistry, LuaRequest, LuaStatusContext,
+        MountEnv, SandboxLimits,
+    },
     modifiers::AttrModifier,
     ports::{
         AiSlot, EventSink, LoreView, MemoryHit, MemoryRetriever, ModelRef, NarrativeView, PersonaView,
@@ -87,6 +96,9 @@ fn compact_value(v: &Value) -> String {
 
 /// 单回合最多注入多少个人物的人格档案（防止上下文被设定撑爆）。
 const PERSONA_LIMIT: usize = 6;
+
+/// 一条 EnemySpec 最多展开多少只（图鉴 M2）：护栏，防止模型写 count: 100000 撑爆实例表。
+const MAX_ENCOUNTER_UNITS: u32 = 20;
 
 /// 单回合最多注入多少条「相关往事」（#05 §3.4 的 K=5）。
 const MEMORY_TOP_K: usize = 5;
@@ -232,10 +244,65 @@ impl SessionRules {
         self.skills.get(id)
     }
 
+    /// 故事书 derived[] 的 (key, formula) 声明，顺序即求值顺序（后者可引用前者）。
+    ///
+    /// 空 key / 空公式的条目直接丢弃：它们是发布门该拦的坏声明，运行期不猜。
+    pub fn derived_defs(&self) -> Vec<(String, String)> {
+        self.storybook
+            .get("derived")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|d| {
+                        let key = d.get("key").and_then(Value::as_str)?.trim().to_string();
+                        let formula = d.get("formula").and_then(Value::as_str)?.trim().to_string();
+                        (!key.is_empty() && !formula.is_empty()).then_some((key, formula))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// 图鉴模板（图鉴 M2）：storybook.characters[] 里 kind = "monster" 的条目。
+    ///
+    /// 命中不了（id 不存在 / 那条不是怪物）返回 None——调用方回落到「临时敌人」路径，
+    /// 旧故事书与 AI 现编的敌人行为逐字不变。
+    pub fn monster_template(&self, id: &str) -> Option<Value> {
+        self.storybook
+            .get("characters")
+            .and_then(Value::as_array)?
+            .iter()
+            .find(|c| {
+                c.get("id").and_then(Value::as_str) == Some(id)
+                    && c.get("kind").and_then(Value::as_str) == Some("monster")
+            })
+            .cloned()
+    }
+
     pub fn global_checker(&self) -> Option<CheckerDef> {
         self.storybook
             .pointer("/world/check")
             .and_then(|v| serde_json::from_value::<CheckerDef>(v.clone()).ok())
+    }
+
+    /// 故事书人物声明的属性值（判定 C3：对抗的静态被动值用）。
+    ///
+    /// 先按 id 命中，再按 name；返回（显示名，属性值）。查不到返回 None——调用方按
+    /// 「无修正」处理，绝不猜一个值出来。
+    pub fn character_attribute(&self, id: &str, attribute: &str) -> Option<(String, f64)> {
+        let chars = self.storybook.get("characters").and_then(Value::as_array)?;
+        let hit = chars
+            .iter()
+            .find(|c| c.get("id").and_then(Value::as_str) == Some(id))
+            .or_else(|| {
+                chars
+                    .iter()
+                    .find(|c| c.get("name").and_then(Value::as_str) == Some(id))
+            })?;
+        let raw = hit.get("attributes").and_then(|a| a.get(attribute))?;
+        let value = raw.as_f64().or_else(|| raw.as_i64().map(|i| i as f64))?;
+        let name = hit.get("name").and_then(Value::as_str).unwrap_or(id).to_string();
+        Some((name, value))
     }
 
     pub fn skeleton(&self) -> Option<&Value> {
@@ -428,6 +495,10 @@ impl SessionRules {
             else {
                 continue;
             };
+            // 图鉴 M2 §4.6：怪物没有对话示例，不参与扮演，也不该占人格预算。
+            if c.get("kind").and_then(Value::as_str) == Some("monster") {
+                continue;
+            }
             let s = |k: &str| c.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
             let p = PersonaView {
                 id: id.clone(),
@@ -507,6 +578,19 @@ pub struct SnapshotBase {
     pub scene_start_round: u32,
 }
 
+/// 挂载点 `when` 条件求值的只读世界快照（owned 版本，供 EvalContext 借用）。
+struct MountWorld {
+    flags: std::collections::BTreeMap<String, Value>,
+    goals: serde_json::Map<String, Value>,
+    triggers: serde_json::Map<String, Value>,
+    actor_location: Option<String>,
+    actor_attributes: Option<serde_json::Map<String, Value>>,
+    relationships: Vec<Value>,
+    /// 当前场景与遭遇快照（地图 P5）：encounter_cleared 作为挂载点 when 的判据。
+    scene_id: Option<String>,
+    encounters: Vec<Value>,
+}
+
 pub struct Session {
     pub save_id: String,
     state: Mutex<WorldState>,
@@ -567,6 +651,8 @@ impl Session {
         // Lua 宿主与引擎共享同一 RNG 序列（#12 ④：engine_rng 走确定性序列）。
         let lua = LuaHost::with_rng(rng.clone(), SandboxLimits::default())
             .expect("初始化 Lua 沙箱宿主失败");
+        // 规则集挂载点：随故事书声明装载；故事书随存档冻结，因此规则集也随存档冻结。
+        let lua_registry = LuaRegistry::from_storybook(&storybook);
         let base_state = state.clone();
         Self {
             save_id,
@@ -577,7 +663,7 @@ impl Session {
             rng_recorded: AtomicUsize::new(initial_position),
             rules: SessionRules::from_storybook(storybook),
             lua,
-            lua_registry: Mutex::new(LuaRegistry::new()),
+            lua_registry: Mutex::new(lua_registry),
             sink,
             ai,
             seq: AtomicU64::new(0),
@@ -832,17 +918,19 @@ impl Session {
                 let Some(goals) = scene.get("goals").and_then(Value::as_array) else {
                     continue;
                 };
+                // 任务的地点（地图 P5 §6.2）：继承**所属场景**，投影时推导、不落库。
+                let location_id = scene
+                    .get("location_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
                 for (idx, goal) in goals.iter().enumerate() {
                     let text = goal.get("text").and_then(Value::as_str).unwrap_or("").trim();
                     if text.is_empty() {
                         continue;
                     }
-                    let id = goal
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string)
-                        .unwrap_or_else(|| format!("{scene_id}#goal[{idx}]"));
+                    let id = goal_id_of(scene_id, idx, goal);
                     let done = progress.get(&id).and_then(Value::as_bool).unwrap_or(false);
                     out.push(QuestView {
                         id,
@@ -851,6 +939,7 @@ impl Session {
                         source: "skeleton".into(),
                         hidden: goal.get("hidden").and_then(Value::as_bool).unwrap_or(false),
                         primary: goal.get("primary").and_then(Value::as_bool).unwrap_or(false),
+                        location_id: location_id.clone(),
                     });
                 }
             }
@@ -1310,12 +1399,16 @@ impl Session {
             self.with_eval_context("narrative", |eval| self.rules.narrative(eval, &overrides))
         };
         let live = self.projection();
+        // 当前地点名（位置链路 P2，设计 §6.6）：只进回合用户提示词，绝不进系统 preamble
+        // ——AGENTS.md 上下文缓存不变量：系统层必须逐回合稳定。
+        let location = self.current_location(&scene_id);
         let ctx = TurnContext {
             save_id: self.save_id.clone(),
             round,
             scene_id,
             scene_title,
             scene_description,
+            location,
             controlled,
             player_text: input.text.clone(),
             channel: input.channel,
@@ -1504,7 +1597,7 @@ impl Session {
     /// 受控角色视角的 flags / 目标 / 触发点 / 属性 / 位置 / 关系 + Lua 宿主。
     /// `script_id` 区分调用来源（turn_end / narrative），供 Lua 上下文标识。
     fn with_eval_context<R>(&self, script_id: &str, f: impl FnOnce(&EvalContext<'_>) -> R) -> R {
-        let (flags, goals, triggers, actor_attrs, actor_loc) = {
+        let (flags, goals, triggers, actor_attrs, actor_loc, scene_id, encounters) = {
             let st = self.state.lock().expect("state poisoned");
             let actor_id = st.controlled.first().cloned().unwrap_or_default();
             let actor = st.characters.get(&actor_id);
@@ -1514,6 +1607,8 @@ impl Session {
                 st.progress.triggers.clone(),
                 actor.map(|c| c.attributes.clone()),
                 actor.and_then(|c| c.location_id.clone()),
+                st.scene_id.clone(),
+                st.encounters.values().cloned().collect::<Vec<Value>>(),
             )
         };
         let relationships = self.rules.relationships();
@@ -1540,6 +1635,8 @@ impl Session {
             actor_location: actor_loc.as_deref(),
             actor_attributes: actor_attrs.as_ref(),
             relationships: &relationships,
+            scene_id: Some(scene_id.as_str()),
+            encounters: &encounters,
             lua: Some((&self.lua, &lua_ctx)),
         };
 
@@ -1547,27 +1644,35 @@ impl Session {
     }
 
     /// 回合末对全部 goal / trigger 求值，把新进展落成权威 StateUpdate 事件。
+    ///
+    /// 触发点进度写的是**完整变化集**（`trigger_progress`）：一次性触发与历史一样落
+    /// `true`，可重复触发落 `{fired, active}`——后者带上了「上一次条件值」，边沿检测
+    /// 才能在重放（同一条日志 → 同一份进度）下得出同一个结论。
     fn evaluate_turn_end(&self) {
         let skeleton = self.rules.skeleton().cloned().unwrap_or(Value::Null);
-        match self.with_eval_context("turn_end", |ctx| evaluate_skeleton(&skeleton, ctx)) {
-            Ok((new_goals, new_triggers)) => {
-                if new_goals.is_empty() && new_triggers.is_empty() {
+        match self.with_eval_context("turn_end", |ctx| evaluate_skeleton_full(&skeleton, ctx)) {
+            Ok(out) => {
+                if out.goals.is_empty() && out.trigger_progress.is_empty() {
                     return;
                 }
                 let mut changes = Vec::new();
-                for id in &new_goals {
+                for id in &out.goals {
                     changes.push(goal_delta(id));
                 }
-                for id in &new_triggers {
-                    changes.push(trigger_delta(id));
+                for (id, value) in &out.trigger_progress {
+                    changes.push(trigger_progress_delta(id, value.clone()));
                 }
                 self.emit_simple(PlayEvent::StateUpdate(StateUpdatePayload { changes }));
+                // 触发点预置遭遇（地图 P5 §6.3）：标记 fired 之后自动建遭遇，
+                // 走 Intent::Encounter 的同一条创建路径（含图鉴实例克隆与地点继承）。
+                // 可重复触发在每次边沿都会重新走这条路（遭遇可再次出现）。
+                self.spawn_trigger_encounters(&out.triggers);
                 let mut parts = Vec::new();
-                if !new_goals.is_empty() {
-                    parts.push(format!("目标达成：{}", new_goals.join("、")));
+                if !out.goals.is_empty() {
+                    parts.push(format!("目标达成：{}", out.goals.join("、")));
                 }
-                if !new_triggers.is_empty() {
-                    parts.push(format!("剧情触发：{}", new_triggers.join("、")));
+                if !out.triggers.is_empty() {
+                    parts.push(format!("剧情触发：{}", out.triggers.join("、")));
                 }
                 self.emit_simple(PlayEvent::System(SystemPayload {
                     level: SystemLevel::Info,
@@ -1585,10 +1690,247 @@ impl Session {
         }
     }
 
-    /// 切换到骨架里的目标场景：把在场名单重置为该场景声明（present_char_ids + 受控角色），
-    /// 并以 Scene 事件记录场景元信息。此前只发了一条 Resolution，场景实际没有变化。
+    /// 建一场遭遇：导演即兴（Intent::Encounter）与触发点预置遭遇（地图 P5 §6.3）
+    /// **同一条创建路径**——图鉴实例克隆、地点继承、叙事锚快照都在这里。
+    ///
+    /// location_override：预置显式声明的地点；None = 继承当前场景的 location_id。
+    fn create_encounter(
+        &self,
+        name: String,
+        enemies: Vec<EnemySpec>,
+        note: Option<String>,
+        location_override: Option<String>,
+    ) {
+        // 3a：只建结构与 HP；先攻与回合限制见后续。
+        // 图鉴 M2 §4.1：带 template_id 的敌人按模板**克隆实例**（同一模板的多场
+        // 遭遇天然隔离：实例键带遭遇 id）；命中不了模板就保持临时敌人（现状）。
+        let id = format!("enc-{}", uuid::Uuid::new_v4().simple());
+        let scene_id = self.state.lock().expect("state poisoned").scene_id.clone();
+        // 遭遇地点（地图 P2）：预置地点优先，缺省继承当前场景声明的地点；
+        // 怪物实例也按它归位。
+        let location_id = location_override
+            .or_else(|| self.scene_def(&scene_id).and_then(|s| s.location_id));
+        // 叙事锚（地图 P5 §6.4）：**创建时快照**，绝不查询时推导——运行时事件必须可重放，
+        // 「此刻的场景」在重放时会得到错误答案。
+        let goal_id = self
+            .rules
+            .skeleton()
+            .and_then(|skeleton| scene_encounter_goal_id(skeleton, &scene_id));
+        let mut list: Vec<EnemyView> = Vec::new();
+        let mut template_ids: Vec<String> = Vec::new();
+        let mut changes: Vec<StateDelta> = Vec::new();
+        for spec in enemies {
+            let Some(template) = spec
+                .template_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .and_then(|t| self.rules.monster_template(t))
+            else {
+                // 临时敌人（AI 现编 / 旧日志 / 模板失配）：行为与改动前逐字一致。
+                let hp = spec.hp.filter(|h| *h > 0).unwrap_or(10);
+                let ac = spec.ac.filter(|a| *a > 0).unwrap_or(12);
+                list.push(EnemyView {
+                    id: format!("e{}", list.len() + 1),
+                    name: spec.name,
+                    hp,
+                    max: hp,
+                    ac,
+                    ..Default::default()
+                });
+                continue;
+            };
+            let template_id = template
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let name = if spec.name.trim().is_empty() {
+                template
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&template_id)
+                    .to_string()
+            } else {
+                spec.name.clone()
+            };
+            let attributes = template
+                .get("attributes")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let mut resources = template
+                .get("resources")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            // 快照满值：spec.hp 显式给值时才覆盖模板的生命值。
+            let vital = vital_resource_key(&resources).unwrap_or_else(|| "hp".to_string());
+            let hp = spec
+                .hp
+                .filter(|h| *h > 0)
+                .or_else(|| resources.get(&vital).and_then(Value::as_i64))
+                .unwrap_or(10);
+            resources.insert(vital.clone(), Value::from(hp));
+            // AC（图鉴 M2 §4.4）：派生值 derived.ac（LMoP 是 10 + dex_mod + 挂接护甲）。
+            let probe = CharacterInstance {
+                instance_id: String::new(),
+                template_id: template_id.clone(),
+                name: name.clone(),
+                kind: "monster".into(),
+                attributes: attributes.clone(),
+                resources: resources.clone(),
+                inventory: Default::default(),
+                location_id: location_id.clone(),
+                present: true,
+                statuses: vec![],
+            };
+            let ac = self
+                .derived_ac(&probe)
+                .or_else(|| spec.ac.filter(|a| *a > 0))
+                .unwrap_or(12);
+            let attacks = self.enemy_attacks(&template, spec.skill_id.as_deref());
+            // 涉及的图鉴条目（§6.4）：去重、按创建顺序；临时敌人不计入。
+            if !template_ids.contains(&template_id) {
+                template_ids.push(template_id.clone());
+            }
+            // 护栏：单条 spec 最多展开 MAX_ENCOUNTER_UNITS 只。
+            let count = spec.count.unwrap_or(1).clamp(1, MAX_ENCOUNTER_UNITS);
+            for n in 1..=count {
+                let key = format!("enc-{id}:{template_id}#{n}");
+                let instance = CharacterInstance {
+                    instance_id: key.clone(),
+                    template_id: template_id.clone(),
+                    name: name.clone(),
+                    kind: "monster".into(),
+                    attributes: attributes.clone(),
+                    resources: resources.clone(),
+                    inventory: Default::default(),
+                    location_id: location_id.clone(),
+                    present: true,
+                    statuses: vec![],
+                };
+                changes.push(StateDelta {
+                    domain: DeltaDomain::Character,
+                    entity_id: key.clone(),
+                    field: "instance".into(),
+                    op: DeltaOp::Add,
+                    value: serde_json::to_value(&instance).unwrap_or(Value::Null),
+                });
+                list.push(EnemyView {
+                    id: format!("e{}", list.len() + 1),
+                    name: name.clone(),
+                    hp,
+                    max: hp,
+                    ac,
+                    instance_id: Some(key),
+                    template_id: Some(template_id.clone()),
+                    scene_id: Some(scene_id.clone()),
+                    location_id: location_id.clone(),
+                    attacks: attacks.clone(),
+                });
+            }
+        }
+        let view = EncounterView {
+            id: id.clone(),
+            name,
+            enemies: list,
+            note,
+            active: true,
+            scene_id: Some(scene_id),
+            location_id,
+            goal_id,
+            template_ids,
+        };
+        changes.push(StateDelta {
+            domain: DeltaDomain::Encounter,
+            entity_id: id,
+            field: "encounter".into(),
+            op: DeltaOp::Add,
+            value: serde_json::to_value(view).unwrap_or(Value::Null),
+        });
+        self.emit(
+            PlayEvent::StateUpdate(StateUpdatePayload { changes }),
+            Some(story_actor()),
+            None,
+        );
+    }
+
+    /// 触发点被标记 fired 之后自动建遭遇（地图 P5 §6.3）。
+    ///
+    /// 预置遭遇的创建路径与 Intent::Encounter **完全同一条**（见 create_encounter）；
+    /// 引擎在这里只读触发点的 condition 结果与 encounter 预置。
+    ///
+    /// 掷表遭遇不在这里：表是内容 / 规则集语义，由 Lua 掷骰（engine_rng）→ set_flag →
+    /// 触发点 condition: flag_set + encounter 预置表达，引擎不认识「遭遇表」这个东西
+    /// （docs/rules-via-lua.md §6）。
+    fn spawn_trigger_encounters(&self, trigger_ids: &[String]) {
+        if trigger_ids.is_empty() {
+            return;
+        }
+        let skeleton = self.rules.skeleton().cloned().unwrap_or(Value::Null);
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for trigger_id in trigger_ids {
+            // 同一 id 写进多个场景时只建一场（求值侧按 id 去重不了）。
+            if !seen.insert(trigger_id.as_str()) {
+                continue;
+            }
+            let Some(plan) = trigger_encounter_preset(&skeleton, trigger_id) else {
+                continue;
+            };
+            let TriggerEncounterPlan { preset, title } = plan;
+            if preset.enemies.is_empty() {
+                continue;
+            }
+            let name = preset
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or(title)
+                .unwrap_or_else(|| "遭遇".to_string());
+            let location_override = preset
+                .location_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let enemies: Vec<EnemySpec> = preset
+                .enemies
+                .iter()
+                .map(|e| EnemySpec {
+                    // 空名 = 用图鉴条目的名字（与 AI 只给 template_id 时同一口径）。
+                    name: String::new(),
+                    hp: None,
+                    ac: None,
+                    template_id: Some(e.template_id.trim().to_string()),
+                    count: e.count,
+                    skill_id: None,
+                })
+                .collect();
+            self.create_encounter(name, enemies, preset.note, location_override);
+        }
+    }
+
+    /// 章节的空间范围（地图 P5 §6.2 / §6.7）：其 scenes 的 location_id **并集**。
+    ///
+    /// **推导，不存冗余字段**——存一份就一定会与场景定义不同步；地图按它高亮「本章范围」。
+    pub fn chapter_locations(&self) -> Vec<ChapterLocations> {
+        self.rules
+            .skeleton()
+            .map(chapter_locations)
+            .unwrap_or_default()
+    }
+
+    /// 切换到骨架里的目标场景：按**三层在场优先级**重算在场名单
+    /// （① 作者点名 present_char_ids > ② 实例 location_id == 场景 location_id >
+    /// ③ 两者都未声明则全员在场；受控角色恒在场），并以 Scene 事件记录场景元信息。
+    ///
+    /// 判据与开档共用 `scene_presence`：这里修掉了旧行为的不一致——旧代码把
+    /// 「未声明 present_char_ids」直接当成空名单，一切场就把所有人清空（开档却是全员在场）。
     fn switch_scene(&self, scene_id: &str) {
-        let Some((title, description, present_ids)) = self.scene_def(scene_id) else {
+        let Some(def) = self.scene_def(scene_id) else {
             return;
         };
         let (present, deltas) = {
@@ -1596,8 +1938,15 @@ impl Session {
             let mut present = Vec::new();
             let mut deltas = Vec::new();
             for (key, c) in &st.characters {
-                let on =
-                    present_ids.contains(&c.template_id) || st.controlled.contains(key) || st.controlled.contains(&c.instance_id);
+                let controlled =
+                    st.controlled.contains(key) || st.controlled.contains(&c.instance_id);
+                let on = scene_presence(
+                    def.present_char_ids.as_ref(),
+                    def.location_id.as_deref(),
+                    &c.template_id,
+                    c.location_id.as_deref(),
+                    controlled,
+                );
                 if on {
                     present.push(key.clone());
                 }
@@ -1618,17 +1967,17 @@ impl Session {
         }
         self.emit_simple(PlayEvent::Scene(ScenePayload {
             scene_id: scene_id.to_string(),
-            title,
-            description,
+            title: def.title,
+            description: def.description,
             present,
         }));
     }
 
-    /// 从骨架取场景定义：(标题, 描述, 在场模板 id 集合)。
-    fn scene_def(
-        &self,
-        scene_id: &str,
-    ) -> Option<(String, Option<String>, std::collections::HashSet<String>)> {
+    /// 从骨架取一个场景定义（标题 / 描述 / 在场名单 / 地点）——切场判据与提示词共用。
+    ///
+    /// present_char_ids 与 location_id 都保留 Option：**未声明**（None）与
+    /// **显式空名单**（Some(空集)）在 scene_presence 里语义不同，不可合并。
+    fn scene_def(&self, scene_id: &str) -> Option<SceneDef> {
         let chapters = self.rules.skeleton()?.as_array()?;
         for chapter in chapters {
             let Some(scenes) = chapter.get("scenes").and_then(Value::as_array) else {
@@ -1647,15 +1996,43 @@ impl Session {
                     .get("description")
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                let present_ids = scene
-                    .get("present_char_ids")
-                    .and_then(Value::as_array)
-                    .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
-                    .unwrap_or_default();
-                return Some((title, description, present_ids));
+                let present_char_ids =
+                    scene.get("present_char_ids").and_then(Value::as_array).map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect::<std::collections::HashSet<String>>()
+                    });
+                let location_id = scene
+                    .get("location_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                return Some(SceneDef { title, description, present_char_ids, location_id });
             }
         }
         None
+    }
+
+    /// 当前场景所在地点的**显示名**（骨架 scenes[].location_id → world.locations[].name）：
+    /// 只喂回合提示词的 TurnContext.location（用户消息），不进系统 preamble。
+    /// 场景没声明地点、或场景不在骨架里 → None；地点表里查不到该 id 时回落 id 本身
+    /// （宁肯告诉模型一个未登记的地点，也不要让它以为自己在虚空里）。
+    fn current_location(&self, scene_id: &str) -> Option<String> {
+        let location_id = self.scene_def(scene_id)?.location_id?;
+        let st = self.state.lock().ok()?;
+        let named = st.locations.iter().find_map(|l| {
+            if l.get("id").and_then(Value::as_str) != Some(location_id.as_str()) {
+                return None;
+            }
+            l.get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        });
+        Some(named.unwrap_or(location_id))
     }
 
     /// 合法判定属性 key：属性维度 + world.check.attributes（去重、稳定排序）。
@@ -1860,60 +2237,21 @@ impl Session {
         best.map(|(_, c)| c).unwrap_or_default()
     }
 
-    /// 有效属性值（基础 + 挂接/装备修正），与 command 管线同口径。
-    fn effective_attribute(&self, key: &str, attribute: &str) -> f64 {
-        let (raw, template) = {
-            let st = self.state.lock().expect("state poisoned");
-            let c = st
-                .characters
-                .get(key)
-                .or_else(|| st.characters.values().find(|c| c.template_id == key));
-            match c {
-                Some(c) => (
-                    c.attributes.get(attribute).and_then(Value::as_f64).unwrap_or(0.0),
-                    c.template_id.clone(),
-                ),
-                None => (0.0, String::new()),
-            }
-        };
-        self.rules
-            .attribute_bonuses()
-            .get(&template)
-            .and_then(|m| m.get(attribute))
-            .map(|b| b.apply(raw))
-            .unwrap_or(raw)
-    }
-
     /// 结算一次对遭遇内敌人的攻击：**命中与伤害全由引擎算**，AI 只叙事。
+    ///
+    /// 判定与效果走 `command::execute_skill`（与 use_skill / use_item 同一内核，判定 C2）：
+    /// - 判定器：技能内联 → 引用全局 world.check → 合成徒手 1d20（修 D3，不再静默换骰）
+    /// - Lua 判定器与 Lua 挂载点走同一份实现（修 D2）
+    /// - 属性修正来源 = 挂接定义 + 已装备物品（修 D5，与技能同口径）
+    /// - 难度：目标 AC → world.check.default_dc → 12（修 D6）
+    /// - 命中判据用内核的 resolved.result（尊重 mode），不再丢弃档位
     async fn strike_enemy(&self, enemy_id: String, choice: AttackChoice, actor: Option<ActorRef>) {
         let actor = actor
             .or_else(|| self.controlled_actor())
             .unwrap_or(ActorRef { id: String::new(), name: "未知角色".into() });
 
-        // 1) 找遭遇与敌人（enemy_id 认 id，也认名字，方便「我砍头狼」）
-        let found = {
-            let st = self.state.lock().expect("state poisoned");
-            let mut hit: Option<(String, Value, usize)> = None;
-            for (enc_id, enc) in st.encounters.iter() {
-                if !enc.get("active").and_then(Value::as_bool).unwrap_or(true) {
-                    continue;
-                }
-                let Some(list) = enc.get("enemies").and_then(Value::as_array) else { continue };
-                for (i, e) in list.iter().enumerate() {
-                    let eid = e.get("id").and_then(Value::as_str).unwrap_or("");
-                    let name = e.get("name").and_then(Value::as_str).unwrap_or("");
-                    if eid == enemy_id || (!enemy_id.is_empty() && name == enemy_id) {
-                        hit = Some((enc_id.clone(), enc.clone(), i));
-                        break;
-                    }
-                }
-                if hit.is_some() {
-                    break;
-                }
-            }
-            hit
-        };
-        let Some((enc_id, enc, idx)) = found else {
+        // 1) 找遭遇与敌人（enemy_id 认条目 id、名字，也认背后的实例键）
+        let Some((enc_id, enc, idx)) = self.find_encounter_enemy(&enemy_id) else {
             self.reject(
                 format!("当前遭遇里没有这个敌人：{enemy_id}"),
                 RejectionCode::TargetInvalid,
@@ -1925,79 +2263,167 @@ impl Session {
             .and_then(Value::as_str)
             .unwrap_or("敌人")
             .to_string();
-        let hp_before = enc
-            .pointer(&format!("/enemies/{idx}/hp"))
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
-        // 难度 = 该敌人的防御值（没有就用 12）
-        let difficulty = enc
-            .pointer(&format!("/enemies/{idx}/ac"))
-            .and_then(Value::as_i64)
-            .filter(|a| *a > 0)
-            .unwrap_or(12);
+        let enemy_json = enc.pointer(&format!("/enemies/{idx}")).cloned().unwrap_or(Value::Null);
+        let global_checker = self.rules.global_checker();
 
-        // 2) 命中判定：技能自带 checker 优先，否则默认 1d20 vs 12
-        let skill = choice.skill_id.as_deref().and_then(|id| self.rules.skill(id).cloned());
-        let skill_name = skill
+        // 2) 守方（图鉴 M2 §4.1/§4.3）：有 instance_id 的图鉴怪 → 真实例（权威 HP + 派生 AC）；
+        //    没有的临时敌人 → 条目自身是权威，键沿用调用方给的 id（旧路径逐字不变）。
+        let instance = self.enemy_instance(&enc, idx);
+        let instance_backed = instance.is_some();
+        let (defender_key, defender_json, vital, hp_before, derived_ac) = match instance {
+            Some((key, c)) => {
+                let vital = vital_resource_key(&c.resources).unwrap_or_else(|| "hp".to_string());
+                let entry_hp = enc
+                    .pointer(&format!("/enemies/{idx}/hp"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let hp = c.resources.get(&vital).and_then(resource_num).unwrap_or(entry_hp);
+                let ac = self.derived_ac(&c);
+                (
+                    key,
+                    serde_json::to_value(&c).unwrap_or(Value::Null),
+                    vital,
+                    hp,
+                    ac,
+                )
+            }
+            None => (
+                enemy_id.clone(),
+                enemy_json.clone(),
+                "hp".to_string(),
+                enc.pointer(&format!("/enemies/{idx}/hp"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
+                None,
+            ),
+        };
+        // 难度（修 D6 + 图鉴 M2 §4.4）：实例派生 ac → 条目 ac → world.check.default_dc → 12。
+        let difficulty = derived_ac
+            .or_else(|| {
+                enc.pointer(&format!("/enemies/{idx}/ac"))
+                    .and_then(Value::as_i64)
+                    .filter(|a| *a > 0)
+            })
+            .or_else(|| global_checker.as_ref().and_then(|c| c.default_dc))
+            .unwrap_or(12)
+            .max(0);
+
+        // 3) 组装本次攻击的技能：AI 指明 / 文本命中的技能优先，缺省合成徒手攻击。
+        let declared = choice.skill_id.as_deref().and_then(|id| self.rules.skill(id)).cloned();
+        let skill_name = declared
             .as_ref()
             .map(|s| s.name.clone())
             .or_else(|| choice.label.clone())
             .unwrap_or_else(|| "徒手攻击".into());
-        let checker = match skill.as_ref().and_then(|s| s.check.as_ref()) {
-            Some(octopus_types::SkillCheck::Def(c)) => c.clone(),
-            _ => CheckerDef { dice: Some("1d20".into()), ..Default::default() },
+        let damage_expr = {
+            let declared_expr = attack_damage_expr(declared.as_ref());
+            if declared_expr.is_empty() {
+                choice.damage.clone().unwrap_or_else(|| "1d6".to_string())
+            } else {
+                declared_expr
+            }
         };
-        let attribute = "str".to_string();
-        let value = self.effective_attribute(&actor.id, &attribute);
-        let profile = self
-            .rules
-            .profiles()
-            .get(&attribute)
-            .copied()
-            .unwrap_or_default();
-        let resolved = {
-            let mut rng = self.rng.lock().expect("rng poisoned");
-            crate::resolve::resolve_declarative_check(&checker, &attribute, value, difficulty, profile, &mut rng)
+        // 只有「生命资源不叫 hp」的图鉴怪才显式指定资源：临时敌人传 None，
+        // 合成的技能与改动前逐字一致（effects 缺省回落 hp）。
+        let damage_resource = (instance_backed && vital != "hp").then(|| vital.as_str());
+        let skill = attack_skill(
+            declared.as_ref(),
+            global_checker.as_ref(),
+            &skill_name,
+            &damage_expr,
+            damage_resource,
+        );
+
+        // 3b) 攻方实例与场景：任意 id 形态（实例键 / 模板 id / 名字 / instance_id）都能定位。
+        let (actor_key, actor_json, scene_id) = {
+            let st = self.state.lock().expect("state poisoned");
+            let scene = st.scene_id.clone();
+            let hit = if actor.id.is_empty() {
+                None
+            } else {
+                Self::find_character(&st.characters, &actor.id)
+            };
+            match hit {
+                Some((key, c)) => (key.clone(), serde_json::to_value(c).unwrap_or(Value::Null), scene),
+                None => (actor.id.clone(), Value::Null, scene),
+            }
         };
-        let Ok(mut check) = resolved else {
-            self.reject("攻击判定失败".into(), RejectionCode::RuleViolation);
-            return;
-        };
-        // 武器自带的命中加值（物品 modifiers 里 target=attack 的 add 之和）
-        if choice.bonus != 0 {
-            crate::resolve::apply_check_bonus(
-                &mut check,
-                choice.bonus,
-                checker.mode.unwrap_or(octopus_types::CheckMode::Gte),
-                crate::resolve::degree_thresholds(&checker),
+
+        // 冷却门（#01）：攻击技能同样受 cooldown 约束，与 use_skill 同口径。
+        if let Some(remaining) = self.cooldown_block(&actor_key, &skill) {
+            self.reject(
+                format!("「{skill_name}」还在冷却中（剩余 {remaining} 回合）"),
+                RejectionCode::CooldownActive,
             );
+            return;
         }
 
-        // 3) 伤害：技能声明的伤害骰优先，否则 1d6；最低 1 点
-        let damage_expr = skill
-            .as_ref()
-            .and_then(|s| s.effect.as_ref())
-            .and_then(|e| e.immediate.as_ref())
-            .and_then(|list| {
-                list.iter().find_map(|f| match f {
-                    octopus_types::ImmediateEffect::Damage { amount, .. } => Some(amount.clone()),
-                    _ => None,
-                })
-            })
-            .or_else(|| choice.damage.clone())
-            .unwrap_or_else(|| "1d6".to_string());
-        let harm = if check.total >= difficulty {
-            let dmg = {
-                let mut rng = self.rng.lock().expect("rng poisoned");
-                crate::resolve::roll_dice(&damage_expr, &mut rng).map(|r| r.total).unwrap_or(1)
-            };
-            dmg.max(1)
-        } else {
-            0
+        // 4) 交给内核结算（对称内核：与 enemy_strike 同一份实现）。
+        let lua_ctx = LuaHostContext {
+            script_id: format!("strike:{}", skill.id),
+            actor_id: actor_key.clone(),
+            actor: actor_json.clone(),
+            target_id: Some(defender_key.clone()),
+            target: Some(defender_json.clone()),
+            skill: serde_json::to_value(&skill).ok(),
+            scene_id,
+            round: self.round.load(Ordering::SeqCst),
+            difficulty: Some(difficulty),
+            relationships: vec![],
+            present: vec![],
+            controlled: String::new(),
         };
+        let settled = self.resolve_attack(AttackSetup {
+            attacker_key: &actor_key,
+            attacker_json: &actor_json,
+            target_id: Some(defender_key.as_str()),
+            target_json: Some(&defender_json),
+            skill: &skill,
+            difficulty,
+            attribute: None,
+            extra_bonus: choice.bonus,
+            global_checker: global_checker.clone(),
+            lua_ctx,
+        });
+        let outcome = match settled {
+            Ok(o) => o,
+            Err(e) => {
+                self.emit_simple(PlayEvent::System(SystemPayload {
+                    level: SystemLevel::Error,
+                    code: Some("lua_error".into()),
+                    text: e.to_string(),
+                }));
+                return;
+            }
+        };
+        if let Some(code) = outcome.rejection {
+            self.reject(format!("攻击「{skill_name}」被驳回"), code);
+            return;
+        }
+
+        // 5) 命中与伤害：命中判据取内核的 resolved.result（尊重 mode，不再丢弃档位）。
+        let hit = outcome.check.as_ref().map(|c| c.result).unwrap_or(true);
+        let (die, total, r#mod) = match outcome.check.as_ref() {
+            Some(c) => (c.rolls.first().copied().unwrap_or(0), c.total, c.r#mod),
+            None => (0, 0, 0),
+        };
+        let hp_field = format!("resources.{vital}");
+        let harm = outcome
+            .effects
+            .deltas
+            .iter()
+            .filter(|d| {
+                d.domain == DeltaDomain::Character
+                    && d.entity_id == defender_key
+                    && d.field == hp_field
+            })
+            .map(|d| -d.value.as_i64().unwrap_or(0))
+            .sum::<i64>()
+            .max(0);
+        let harm = if hit { harm.max(1) } else { 0 };
         let hp_after = (hp_before - harm).max(0);
 
-        // 4) 写回敌人 HP（遭遇局部更新）
+        // 6) 写回敌人 HP（遭遇条目 = 实例的投影）；非敌人 HP 的效果 delta（消耗等）原样进事件。
         let mut list = enc
             .get("enemies")
             .and_then(Value::as_array)
@@ -2010,20 +2436,41 @@ impl Session {
             .iter()
             .all(|e| e.get("hp").and_then(Value::as_i64).unwrap_or(0) <= 0);
 
-        let mut changes = vec![StateDelta {
+        let mut state_changes: Vec<StateDelta> = outcome
+            .effects
+            .deltas
+            .iter()
+            .filter(|d| {
+                !(d.domain == DeltaDomain::Character
+                    && d.entity_id == defender_key
+                    && d.field == hp_field)
+            })
+            .cloned()
+            .collect();
+        if instance_backed {
+            // 图鉴怪物的 HP 落在**实例**上（图鉴 M2）：扣血压成一条钳制后的 Set，
+            // 与遭遇条目的投影一致，也不会把生命值打成负数。临时敌人没有实例，
+            // 旧路径原样剔除（只有遭遇条目被改写）。
+            state_changes.push(StateDelta {
+                domain: DeltaDomain::Character,
+                entity_id: defender_key.clone(),
+                field: hp_field,
+                op: DeltaOp::Set,
+                value: Value::from(hp_after),
+            });
+        }
+        state_changes.push(StateDelta {
             domain: DeltaDomain::Encounter,
             entity_id: enc_id,
             field: "encounter".into(),
             op: DeltaOp::Set,
             value: serde_json::json!({ "enemies": list }),
-        }];
-        let die = check.rolls.first().copied().unwrap_or(0);
-        let verdict = format!(
-            "命中判定 {total}（骰 {die} + 修正 {m}）",
-            total = check.total,
-            die = die,
-            m = check.r#mod,
-        );
+        });
+        let verdict = if outcome.check.as_ref().is_some_and(|c| c.rolls.is_empty()) {
+            format!("命中判定 {total}")
+        } else {
+            format!("命中判定 {total}（骰 {die} + 修正 {m}）", m = r#mod)
+        };
         let narrative = if harm > 0 {
             format!(
                 "{actor} 用{skill_name}命中{enemy_name}：{verdict} ≥ {difficulty}，造成 {harm} 点伤害（{before} → {after}）",
@@ -2041,14 +2488,29 @@ impl Session {
                 difficulty = difficulty,
             )
         };
-        if all_down {
-            changes.push(StateDelta {
-                domain: DeltaDomain::Encounter,
-                entity_id: String::new(),
-                field: "encounter".into(),
-                op: DeltaOp::Set,
-                value: Value::Null,
-            });
+        // 攻击判定的可观测（判定 C5）：与 use_skill / Intent::Check 同一条 CheckResult
+        // 事件——玩家在 UI 看得到骰面 / 修正 / 总值 / 难度，前端 CheckCard 直接复用。
+        // 发射顺序与技能判定一致：先 CheckResult，后 Resolution（叙事文案逐字不变）。
+        if let Some(check) = &outcome.check {
+            self.emit(
+                PlayEvent::CheckResult(CheckResultPayload {
+                    intent_id: None,
+                    actor: actor.clone(),
+                    attribute: check.attribute.clone(),
+                    expr: check.expr.clone(),
+                    rolls: if check.rolls.is_empty() { None } else { Some(check.rolls.clone()) },
+                    r#mod: check.r#mod,
+                    total: check.total,
+                    target: check.target,
+                    margin: check.margin,
+                    result: check.result,
+                    level: check.level,
+                    opponent: None,
+                    kind: Some(check.kind),
+                }),
+                Some(actor.clone()),
+                None,
+            );
         }
         self.emit(
             PlayEvent::Resolution(ResolutionPayload {
@@ -2058,10 +2520,7 @@ impl Session {
                 narrative: Some(narrative),
                 outcome: Some("strike".into()),
                 triggered_events: None,
-                state_changes: changes
-                    .into_iter()
-                    .filter(|c| !c.entity_id.is_empty())
-                    .collect(),
+                state_changes,
             }),
             Some(actor),
             None,
@@ -2073,7 +2532,393 @@ impl Session {
                 text: "遭遇结束：敌人已全部被击倒。".into(),
             }));
         }
+        // Lua 判定器 / 挂载点的写请求（消耗 / 状态 / 事件）真正落到世界状态。
+        self.apply_lua_requests(&outcome.requests, &actor_key);
     }
+
+    /// 结算一次「遭遇里的敌人攻击某个角色」（图鉴 M2 §4.2 / §4.3）。
+    ///
+    /// 与 `strike_enemy` 是**同一个内核的两个方向**——两者都经 `resolve_attack` 调用
+    /// `command::execute_skill`，不是第 4 个平行实现：
+    /// - 命中：怪物自身属性 + 它自己的攻击技能（缺省 = 图鉴条目的第一个攻击技能）；
+    /// - 难度：目标（玩家）的**派生 AC**（derived.ac），缺失回落 default_dc → 12；
+    /// - 伤害：落到目标实例的 `resources.hp`（走效果 delta，与 use_skill 同一条路径）。
+    async fn enemy_strike(
+        &self,
+        enemy_id: String,
+        target_id: Option<String>,
+        skill_id: Option<String>,
+    ) {
+        // 1) 攻方：遭遇条目 → 背后的怪物实例；临时敌人走条目适配器（属性为空）。
+        let Some((_enc_id, enc, idx)) = self.find_encounter_enemy(&enemy_id) else {
+            self.reject(
+                format!("当前遭遇里没有这个敌人：{enemy_id}"),
+                RejectionCode::TargetInvalid,
+            );
+            return;
+        };
+        let enemy_name = enc
+            .pointer(&format!("/enemies/{idx}/name"))
+            .and_then(Value::as_str)
+            .unwrap_or("敌人")
+            .to_string();
+        let enemy_json = enc.pointer(&format!("/enemies/{idx}")).cloned().unwrap_or(Value::Null);
+        let (attacker_key, attacker_json, attacker_template) = match self.enemy_instance(&enc, idx) {
+            Some((key, c)) => {
+                let template = c.template_id.clone();
+                (key, serde_json::to_value(&c).unwrap_or(Value::Null), template)
+            }
+            None => (enemy_id.clone(), enemy_json.clone(), String::new()),
+        };
+        let attacker_ref = ActorRef {
+            id: if attacker_template.is_empty() { enemy_id.clone() } else { attacker_template },
+            name: enemy_name.clone(),
+        };
+
+        // 2) 守方：显式 target_id（任意 id 形态）→ 受控角色。
+        let (target_key, target_instance) = {
+            let st = self.state.lock().expect("state poisoned");
+            let wanted = target_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| st.controlled.first().cloned());
+            match wanted.as_deref().and_then(|id| Self::find_character(&st.characters, id)) {
+                Some((key, c)) => (key.clone(), c.clone()),
+                None => {
+                    drop(st);
+                    self.reject(
+                        format!("找不到要攻击的角色：{}", target_id.unwrap_or_default()),
+                        RejectionCode::ActorNotFound,
+                    );
+                    return;
+                }
+            }
+        };
+        let target_json = serde_json::to_value(&target_instance).unwrap_or(Value::Null);
+        let target_ref = ActorRef {
+            id: target_instance.template_id.clone(),
+            name: target_instance.name.clone(),
+        };
+
+        // 3) 技能：显式 skill_id → 数据卡第一条攻击（EnemySpec.skill_id 覆盖时它就是唯一一条）
+        //    → 合成徒手攻击；判定器 / 属性沿用技能声明，与 use_skill 同口径。
+        let global_checker = self.rules.global_checker();
+        let default_skill_id = enc
+            .pointer(&format!("/enemies/{idx}/attacks/0/skill_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let declared = skill_id
+            .as_deref()
+            .or(default_skill_id.as_deref())
+            .and_then(|id| self.rules.skill(id))
+            .cloned();
+        let skill_name = declared
+            .as_ref()
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| "徒手攻击".into());
+        let damage_expr = {
+            let declared_expr = attack_damage_expr(declared.as_ref());
+            if declared_expr.is_empty() { "1d6".to_string() } else { declared_expr }
+        };
+        // 伤害落到目标的**生命资源**（图鉴 M2）：目标叫 res-hp 就打到 res-hp，
+        // 缺省 hp 与既有的临时敌人路径一致。
+        let vital = vital_resource_key(&target_instance.resources).unwrap_or_else(|| "hp".to_string());
+        let skill = attack_skill(
+            declared.as_ref(),
+            global_checker.as_ref(),
+            &skill_name,
+            &damage_expr,
+            Some(&vital),
+        );
+        let hp_before = target_instance
+            .resources
+            .get(&vital)
+            .and_then(resource_num)
+            .unwrap_or(0);
+        // 难度（图鉴 M2 §4.4）：目标的派生 AC，缺失 → world.check.default_dc → 12。
+        let difficulty = self
+            .derived_ac(&target_instance)
+            .or_else(|| global_checker.as_ref().and_then(|c| c.default_dc))
+            .unwrap_or(12)
+            .max(0);
+
+        // 4) 同一内核：Lua 挂载点 → 判定（含 Lua 判定器）→ 命中门 → 效果。
+        let scene_id = self.state.lock().expect("state poisoned").scene_id.clone();
+        let lua_ctx = LuaHostContext {
+            script_id: format!("enemy_strike:{}", skill.id),
+            actor_id: attacker_key.clone(),
+            actor: attacker_json.clone(),
+            target_id: Some(target_key.clone()),
+            target: Some(target_json.clone()),
+            skill: serde_json::to_value(&skill).ok(),
+            scene_id,
+            round: self.round.load(Ordering::SeqCst),
+            difficulty: Some(difficulty),
+            relationships: vec![],
+            present: vec![],
+            controlled: String::new(),
+        };
+        // 冷却门（#01）：敌人的攻击技能同样受 cooldown 约束（怪物能力也该被量化）。
+        if let Some(remaining) = self.cooldown_block(&attacker_key, &skill) {
+            self.reject(
+                format!("「{skill_name}」还在冷却中（剩余 {remaining} 回合）"),
+                RejectionCode::CooldownActive,
+            );
+            return;
+        }
+        let settled = self.resolve_attack(AttackSetup {
+            attacker_key: &attacker_key,
+            attacker_json: &attacker_json,
+            target_id: Some(target_key.as_str()),
+            target_json: Some(&target_json),
+            skill: &skill,
+            difficulty,
+            attribute: None,
+            extra_bonus: 0,
+            global_checker: global_checker.clone(),
+            lua_ctx,
+        });
+        let outcome = match settled {
+            Ok(o) => o,
+            Err(e) => {
+                self.emit_simple(PlayEvent::System(SystemPayload {
+                    level: SystemLevel::Error,
+                    code: Some("lua_error".into()),
+                    text: e.to_string(),
+                }));
+                return;
+            }
+        };
+        if let Some(code) = outcome.rejection {
+            self.reject(format!("攻击「{skill_name}」被驳回"), code);
+            return;
+        }
+
+        // 5) 命中与伤害：伤害落到目标实例的 resources.hp（效果 delta 原样进事件）。
+        let hit = outcome.check.as_ref().map(|c| c.result).unwrap_or(true);
+        let (die, total, r#mod) = match outcome.check.as_ref() {
+            Some(c) => (c.rolls.first().copied().unwrap_or(0), c.total, c.r#mod),
+            None => (0, 0, 0),
+        };
+        let hp_field = format!("resources.{vital}");
+        let harm = outcome
+            .effects
+            .deltas
+            .iter()
+            .filter(|d| {
+                d.domain == DeltaDomain::Character && d.entity_id == target_key && d.field == hp_field
+            })
+            .map(|d| -d.value.as_i64().unwrap_or(0))
+            .sum::<i64>()
+            .max(0);
+        let harm = if hit { harm.max(1) } else { 0 };
+        let hp_after = hp_before - harm;
+        let verdict = if outcome.check.as_ref().is_some_and(|c| c.rolls.is_empty()) {
+            format!("命中判定 {total}")
+        } else {
+            format!("命中判定 {total}（骰 {die} + 修正 {m}）", m = r#mod)
+        };
+        let narrative = if harm > 0 {
+            format!(
+                "{attacker} 的{skill_name}命中{target}：{verdict} ≥ {difficulty}，造成 {harm} 点伤害（{before} → {after}）",
+                attacker = enemy_name,
+                target = target_ref.name,
+                verdict = verdict,
+                difficulty = difficulty,
+                before = hp_before,
+                after = hp_after,
+            )
+        } else {
+            format!(
+                "{attacker} 的{skill_name}未命中{target}：{verdict} < {difficulty}",
+                attacker = enemy_name,
+                target = target_ref.name,
+                verdict = verdict,
+                difficulty = difficulty,
+            )
+        };
+        // 怪物攻击同样发 CheckResult（判定 C5）：攻守双方共用一条可观测路径，
+        // 玩家在防御时也看得到敌人的骰面；署名是攻方（敌人）实例。
+        if let Some(check) = &outcome.check {
+            self.emit(
+                PlayEvent::CheckResult(CheckResultPayload {
+                    intent_id: None,
+                    actor: attacker_ref.clone(),
+                    attribute: check.attribute.clone(),
+                    expr: check.expr.clone(),
+                    rolls: if check.rolls.is_empty() { None } else { Some(check.rolls.clone()) },
+                    r#mod: check.r#mod,
+                    total: check.total,
+                    target: check.target,
+                    margin: check.margin,
+                    result: check.result,
+                    level: check.level,
+                    opponent: None,
+                    kind: Some(check.kind),
+                }),
+                Some(attacker_ref.clone()),
+                None,
+            );
+        }
+        self.emit(
+            PlayEvent::Resolution(ResolutionPayload {
+                intent_id: None,
+                status: ResolutionStatus::Ok,
+                rejection_code: None,
+                narrative: Some(narrative),
+                outcome: Some("enemy_strike".into()),
+                triggered_events: None,
+                // 与 use_skill 同一条路径：效果 delta 原样落状态（damage → resources.hp）。
+                state_changes: outcome.effects.deltas.clone(),
+            }),
+            Some(attacker_ref),
+            None,
+        );
+        // Lua 判定器 / 挂载点的写请求（消耗 / 状态 / 事件）真正落到世界状态。
+        self.apply_lua_requests(&outcome.requests, &attacker_key);
+    }
+
+    /// 遭遇里的敌人：按条目 id / 名字 / 背后的实例键定位（图鉴 M2 起实例键也能寻址）。
+    fn find_encounter_enemy(&self, enemy_id: &str) -> Option<(String, Value, usize)> {
+        let st = self.state.lock().expect("state poisoned");
+        for (enc_id, enc) in st.encounters.iter() {
+            if !enc.get("active").and_then(Value::as_bool).unwrap_or(true) {
+                continue;
+            }
+            let Some(list) = enc.get("enemies").and_then(Value::as_array) else { continue };
+            for (i, e) in list.iter().enumerate() {
+                let eid = e.get("id").and_then(Value::as_str).unwrap_or("");
+                let name = e.get("name").and_then(Value::as_str).unwrap_or("");
+                let inst = e.get("instance_id").and_then(Value::as_str).unwrap_or("");
+                if eid == enemy_id
+                    || (!enemy_id.is_empty() && name == enemy_id)
+                    || (!inst.is_empty() && inst == enemy_id)
+                {
+                    return Some((enc_id.clone(), enc.clone(), i));
+                }
+            }
+        }
+        None
+    }
+
+    /// 敌人条目背后的图鉴怪物实例（图鉴 M2）；临时敌人（无 instance_id / 实例已不在）返回 None。
+    fn enemy_instance(&self, enc: &Value, idx: usize) -> Option<(String, CharacterInstance)> {
+        let key = enc
+            .pointer(&format!("/enemies/{idx}/instance_id"))
+            .and_then(Value::as_str)
+            .filter(|k| !k.is_empty())?
+            .to_string();
+        let st = self.state.lock().expect("state poisoned");
+        st.characters.get(&key).map(|c| (key.clone(), c.clone()))
+    }
+
+    /// 一次攻击的对称结算（图鉴 M2 §4.3）：攻守双方都是角色实例。
+    ///
+    /// **不是新写的第四个实现**——它就是 `command::execute_skill` 的一次调用：
+    /// 判定器（内联 / 全局 / 合成 1d20）、Lua 挂载点、属性修正、消耗扣减、效果结算
+    /// 全部沿用 use_skill / use_item 的同一条路径；玩家的 strike 与怪物的 enemy_strike
+    /// 只是「谁是攻方、谁是守方」这一件事不同。
+    fn resolve_attack(&self, setup: AttackSetup<'_>) -> Result<CommandOutcome, EngineError> {
+        // 冷却起点用的两个字段先复制出来：闭包会借用 setup 的其余字段。
+        let attacker_key = setup.attacker_key;
+        let skill = setup.skill;
+        // 注册表锁只在结算期间持有：Lua 写请求（trigger_event 等）在锁释放后才落状态，
+        // 否则事件回到 dispatch_lua_event 再取同一把锁即死锁。
+        let outcome = self.with_mount_gate(&setup.lua_ctx, |gate| {
+            let registry = self.lua_registry.lock().expect("lua registry poisoned");
+            let mut ctx = CommandContext {
+                actor_id: setup.attacker_key,
+                actor: setup.attacker_json,
+                target_id: setup.target_id,
+                target: setup.target_json,
+                difficulty: setup.difficulty,
+                attribute: setup.attribute.clone(),
+                global_checker: setup.global_checker.as_ref(),
+                rng: &self.rng,
+                lua: Some((&self.lua, &setup.lua_ctx)),
+                registry: Some(&*registry),
+                status_defs: Some(self.rules.status_defs()),
+                profiles: Some(self.rules.profiles()),
+                attribute_bonuses: Some(self.rules.attribute_bonuses()),
+                extra_bonus: setup.extra_bonus,
+                effect_requires_success: true,
+                mount_gate: gate,
+            };
+            execute_skill(setup.skill, &mut ctx)
+        })?;
+        // 攻击也是一种「使用技能」：结算成功（非驳回）即记冷却起点（#01），两种入口同口径。
+        if outcome.rejection.is_none() {
+            self.record_cooldown(attacker_key, skill);
+        }
+        Ok(outcome)
+    }
+
+    /// 按故事书 derived[] 顺序求值派生值（图鉴 M2 §4.4）：变量 = 实例属性（并入挂接定义 /
+    /// 已装备物品的修正）+ 之前已算出的派生值。
+    ///
+    /// **纯计算，绝不写进 CharacterInstance**：属性被状态或装备改动后 AC 自动跟随，
+    /// 没有陈旧值、没有新的不变量。与前端 computeDerived 同语法同口径。
+    fn derived_values(
+        &self,
+        inst: &CharacterInstance,
+    ) -> std::collections::HashMap<String, f64> {
+        let attrs: std::collections::HashMap<String, f64> = inst
+            .attributes
+            .iter()
+            .filter_map(|(k, v)| {
+                v.as_f64()
+                    .or_else(|| v.as_i64().map(|i| i as f64))
+                    .map(|n| (k.clone(), n))
+            })
+            .collect();
+        let empty = std::collections::HashMap::new();
+        let modifiers = self
+            .rules
+            .attribute_bonuses()
+            .get(&inst.template_id)
+            .unwrap_or(&empty);
+        compute_derived(&attrs, &self.rules.derived_defs(), modifiers)
+    }
+
+    /// 实例的派生 AC（图鉴 M2 §4.4）：故事书 derived[] 里 key = "ac" 的值。
+    /// 缺失 / 求值失败 / 非正数 → None（调用方回落 default_dc → 12）。
+    fn derived_ac(&self, inst: &CharacterInstance) -> Option<i64> {
+        let v = *self.derived_values(inst).get("ac")?;
+        (v.is_finite() && v > 0.0).then(|| v.round() as i64)
+    }
+
+    /// 图鉴条目的可用攻击（图鉴 M2 §4.6）：技能名 + 伤害骰。
+    ///
+    /// EnemySpec.skill_id 覆盖时它就是唯一一条（也是缺省的攻击技能）。只保留攻击类技能
+    /// （check.kind = attack）；一个都没有时退回全部，别把数据卡清空。
+    fn enemy_attacks(&self, template: &Value, override_skill: Option<&str>) -> Vec<EnemyAttack> {
+        let ids: Vec<String> = match override_skill.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(id) => vec![id.to_string()],
+            None => template
+                .get("skills")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                .unwrap_or_default(),
+        };
+        let all: Vec<EnemyAttack> = ids
+            .iter()
+            .filter_map(|id| self.rules.skill(id))
+            .map(|skill| EnemyAttack {
+                skill_id: skill.id.clone(),
+                name: skill.name.clone(),
+                damage: attack_damage_expr(Some(skill)),
+            })
+            .collect();
+        let attacks: Vec<EnemyAttack> = all
+            .iter()
+            .filter(|a| is_attack_skill(self.rules.skill(&a.skill_id)))
+            .cloned()
+            .collect();
+        if attacks.is_empty() { all } else { attacks }
+    }
+
 
     /// 最近由「故事/导演」裁定的叙事事实（供提示词，确保 AI 不推翻既定前提）。
     fn canon_lines(&self, limit: usize) -> Vec<String> {
@@ -2159,7 +3004,8 @@ impl Session {
         let mut out: Vec<ActorRef> = st
             .characters
             .values()
-            .filter(|c| c.kind != "pc" && c.present)
+            // 图鉴 M2 §4.6：怪物不参与对话扮演（它们出现在【当前遭遇】块里）。
+            .filter(|c| c.kind != "pc" && c.kind != "monster" && c.present)
             .map(|c| ActorRef { id: c.template_id.clone(), name: c.name.clone() })
             .collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -2706,8 +3552,8 @@ impl Session {
             Intent::Emote { content, emotion, .. } => {
                 self.emit(PlayEvent::Emote(EmotePayload { content, emotion, gesture: None }), actor, None);
             }
-            Intent::Check { attribute, difficulty, .. } => {
-                return self.run_check(attribute, difficulty, actor).await;
+            Intent::Check { attribute, difficulty, opponent_id, .. } => {
+                return self.run_check(attribute, difficulty, opponent_id, actor).await;
             }
             Intent::Quest { text, hidden, primary } => {
                 let id = format!("quest-{}", uuid::Uuid::new_v4().simple());
@@ -2787,32 +3633,14 @@ impl Session {
                 let choice = AttackChoice { skill_id, ..Default::default() };
                 self.strike_enemy(enemy_id, choice, actor).await;
             }
+            Intent::EnemyStrike { enemy_id, target_id, skill_id } => {
+                // 图鉴 M2 §4.2：敌人打角色——与 strike 同一个内核的另一个方向。
+                self.enemy_strike(enemy_id, target_id, skill_id).await;
+            }
             Intent::Encounter { name, enemies, note } => {
-                // 3a：只建结构与 HP；先攻与回合限制见后续。
-                let id = format!("enc-{}", uuid::Uuid::new_v4().simple());
-                let list: Vec<EnemyView> = enemies
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, e)| {
-                        let hp = e.hp.filter(|h| *h > 0).unwrap_or(10);
-                        let ac = e.ac.filter(|a| *a > 0).unwrap_or(12);
-                        EnemyView { id: format!("e{}", i + 1), name: e.name, hp, max: hp, ac }
-                    })
-                    .collect();
-                let view = EncounterView { id: id.clone(), name, enemies: list, note, active: true };
-                self.emit(
-                    PlayEvent::StateUpdate(StateUpdatePayload {
-                        changes: vec![StateDelta {
-                            domain: DeltaDomain::Encounter,
-                            entity_id: id,
-                            field: "encounter".into(),
-                            op: DeltaOp::Add,
-                            value: serde_json::to_value(view).unwrap_or(Value::Null),
-                        }],
-                    }),
-                    Some(story_actor()),
-                    None,
-                );
+                // 导演即兴遭遇：与触发点预置遭遇（地图 P5 §6.3）共用同一条创建路径
+                // （见 create_encounter：图鉴实例克隆 / 地点继承 / 叙事锚快照）。
+                self.create_encounter(name, enemies, note, None);
             }
             Intent::Status { character_id, status_id, remove } => {
                 let (op, value) = if remove {
@@ -2829,6 +3657,14 @@ impl Session {
                     let unit = if def.unit == StatusUnit::Scenes { "scenes" } else { "turns" };
                     let inst =
                         crate::effects::build_status_instance(&status_id, def.duration, unit, defs);
+                    // 叠加策略（#12 ③）：显式施加状态与技能效果走同一套 add / max 合并，
+                    // 否则「声明了 stack 却只有技能路径生效」会变成第二处声明与实现不一致。
+                    let existing = {
+                        let st = self.state.lock().expect("state poisoned");
+                        Self::find_character(&st.characters, &character_id)
+                            .and_then(|(_, c)| c.statuses.iter().find(|s| s.id == status_id).cloned())
+                    };
+                    let inst = crate::effects::merge_status(existing.as_ref(), inst, def.stack);
                     (DeltaOp::Set, serde_json::to_value(inst).unwrap_or(Value::Null))
                 };
                 self.emit(
@@ -2870,15 +3706,40 @@ impl Session {
                     text: format!("玩家干预：{content}"),
                 }));
             }
-            Intent::Move { destination_id } => {
-                let controlled = self
-                    .state
-                    .lock()
-                    .expect("state poisoned")
-                    .controlled
-                    .first()
-                    .cloned();
-                if let Some(c) = controlled {
+            Intent::Move { destination_id, character_id } => {
+                // 目标角色：显式 character_id（图鉴 M2 补丁）→ 意图归属的角色（角色 AI 的
+                // move 就是**本人**移动，NPC / 怪物都算）→ 受控角色——未指名时旧的
+                // 「只动受控角色」行为逐字不变。设计 §4.2「Move 泛化」：位置不再只有
+                // 玩家一个人写得动。
+                let explicit = character_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let (target, missing) = {
+                    let st = self.state.lock().expect("state poisoned");
+                    match explicit {
+                        // 显式指名却找不到 → 驳回，绝不静默改判给受控角色。
+                        Some(id) => match character_key_in(&st, id) {
+                            Some(key) => (Some(key), None),
+                            None => (None, Some(id.to_string())),
+                        },
+                        None => (
+                            actor
+                                .as_ref()
+                                .and_then(|a| character_key_in(&st, &a.id))
+                                .or_else(|| st.controlled.first().cloned()),
+                            None,
+                        ),
+                    }
+                };
+                if let Some(id) = missing {
+                    self.reject(
+                        format!("找不到要移动的角色：{id}"),
+                        RejectionCode::ActorNotFound,
+                    );
+                    return None;
+                }
+                if let Some(c) = target {
                     self.emit_simple(PlayEvent::StateUpdate(StateUpdatePayload {
                         changes: vec![StateDelta {
                             domain: DeltaDomain::Character,
@@ -3003,6 +3864,47 @@ impl Session {
         }));
     }
 
+    /// 冷却剩余回合（#01）：技能声明了 \`cooldown.turns\` 且仍在冷却期内 → 返回剩余回合数。
+    ///
+    /// 未声明冷却 / 冷却 <= 0 / 从未用过 → None（可以使用）。记账读 \`WorldState.cooldowns\`
+    /// （随命令日志重放），所以重启后冷却不会凭空消失。
+    fn cooldown_block(&self, actor_key: &str, skill: &SkillDef) -> Option<i64> {
+        let turns = skill.cooldown.map(|c| c.turns).unwrap_or(0);
+        if turns <= 0 || skill.id.is_empty() || actor_key.is_empty() {
+            return None;
+        }
+        let last = {
+            let st = self.state.lock().expect("state poisoned");
+            st.cooldowns
+                .get(actor_key)
+                .and_then(|m| m.get(&skill.id))
+                .copied()?
+        };
+        let now = self.round.load(Ordering::SeqCst);
+        let elapsed = now.saturating_sub(last) as i64;
+        (elapsed < turns).then(|| turns - elapsed)
+    }
+
+    /// 记一次技能使用起点（#01）：只有声明了冷却的技能才写，避免给无冷却技能刷无用状态。
+    ///
+    /// 走 Character 域的 \`cooldown.<skill_id>\` delta（\`apply_delta\` 是唯一变更路径），
+    /// 因此与其它状态一样可重放、可审计；不产生叙事、也不改其它世界状态。
+    fn record_cooldown(&self, actor_key: &str, skill: &SkillDef) {
+        let turns = skill.cooldown.map(|c| c.turns).unwrap_or(0);
+        if turns <= 0 || skill.id.is_empty() || actor_key.is_empty() {
+            return;
+        }
+        self.emit_simple(PlayEvent::StateUpdate(StateUpdatePayload {
+            changes: vec![StateDelta {
+                domain: DeltaDomain::Character,
+                entity_id: actor_key.to_string(),
+                field: format!("cooldown.{}", skill.id),
+                op: DeltaOp::Set,
+                value: Value::from(self.round.load(Ordering::SeqCst)),
+            }],
+        }));
+    }
+
     /// 走 command 管线结算一次技能/物品使用，并把结果落成权威事件。
     fn resolve_skill(
         &self,
@@ -3011,34 +3913,68 @@ impl Session {
         target_id: Option<&str>,
         actor: Option<ActorRef>,
     ) {
-        let (actor_id, actor_json, scene_id) = {
+        // 结算主体（修 D7）：调用方指定（意图 / 参数）优先，其次受控角色；两者都按
+        // 任意 id 形态（实例键 / 模板 id / 名字 / instance_id）解析，不再恒取 controlled。
+        let (actor_key, actor_json, actor_ref, scene_id) = {
             let st = self.state.lock().expect("state poisoned");
-            let id = st.controlled.first().cloned().unwrap_or_default();
-            let json = st
-                .characters
-                .get(&id)
-                .map(|c| serde_json::to_value(c).unwrap_or(Value::Null))
-                .unwrap_or(Value::Null);
-            (id, json, st.scene_id.clone())
+            let scene = st.scene_id.clone();
+            let found = match actor.as_ref().filter(|a| !a.id.is_empty()) {
+                Some(a) => Self::find_character(&st.characters, &a.id),
+                None => None,
+            }
+            .or_else(|| {
+                st.controlled
+                    .first()
+                    .and_then(|c| Self::find_character(&st.characters, c))
+            });
+            match found {
+                Some((key, c)) => (
+                    key.clone(),
+                    serde_json::to_value(c).unwrap_or(Value::Null),
+                    ActorRef { id: c.template_id.clone(), name: c.name.clone() },
+                    scene,
+                ),
+                None => (
+                    String::new(),
+                    Value::Null,
+                    ActorRef { id: String::new(), name: String::new() },
+                    scene,
+                ),
+            }
         };
-        if actor_id.is_empty() {
-            self.reject("没有受控角色".into(), RejectionCode::ActorNotFound);
+        if actor_key.is_empty() {
+            self.reject("找不到可结算的角色".into(), RejectionCode::ActorNotFound);
             return;
         }
-        let target_json = target_id.and_then(|t| {
-            self.state
-                .lock()
-                .ok()
-                .and_then(|st| st.characters.get(t).and_then(|c| serde_json::to_value(c).ok()))
-        });
+        // 冷却门（#01）：声明了 cooldown.turns 的技能在冷却期内一律驳回。
+        // 提示词一直在告诉 AI「技能有冷却」，引擎就必须真的检查——否则那是幻觉规则的源头。
+        if let Some(remaining) = self.cooldown_block(&actor_key, skill) {
+            self.reject(
+                format!("「{}」还在冷却中（剩余 {remaining} 回合）", skill.name),
+                RejectionCode::CooldownActive,
+            );
+            return;
+        }
+        // 目标（修 D8）：模板 id / 角色名 / 实例键 / instance_id 都要能命中；
+        // 解析不到时保留原始串（可能是非角色实体），行为与旧版一致。
+        let (target_key, target_json) = match target_id {
+            Some(t) => {
+                let st = self.state.lock().expect("state poisoned");
+                match Self::find_character(&st.characters, t) {
+                    Some((key, c)) => (Some(key.clone()), serde_json::to_value(c).ok()),
+                    None => (Some(t.to_string()), None),
+                }
+            }
+            None => (None, None),
+        };
         let global_checker = self.rules.global_checker();
-        let difficulty = 12;
-        // 技能未声明判定属性，v1 以力量为默认维度。
+        // 难度（修 D6）：world.check.default_dc → 12（不再硬编码 12）。
+        let difficulty = global_checker.as_ref().and_then(|c| c.default_dc).unwrap_or(12);
         let lua_ctx = LuaHostContext {
             script_id: format!("skill:{}", skill.id),
-            actor_id: actor_id.clone(),
+            actor_id: actor_key.clone(),
             actor: actor_json.clone(),
-            target_id: target_id.map(str::to_string),
+            target_id: target_key.clone(),
             target: target_json.clone(),
             skill: serde_json::to_value(skill).ok(),
             scene_id,
@@ -3048,27 +3984,35 @@ impl Session {
             present: vec![],
             controlled: String::new(),
         };
-        let registry = self.lua_registry.lock().expect("lua registry poisoned");
-        let mut ctx = CommandContext {
-            actor_id: &actor_id,
-            actor: &actor_json,
-            target_id,
-            target: target_json.as_ref(),
-            difficulty,
-            attribute: Some("str".to_string()),
-            global_checker: global_checker.as_ref(),
-            rng: &self.rng,
-            lua: Some((&self.lua, &lua_ctx)),
-            registry: Some(&*registry),
-            status_defs: Some(self.rules.status_defs()),
-            profiles: Some(self.rules.profiles()),
-            attribute_bonuses: Some(self.rules.attribute_bonuses()),
-        };
-        let result = match item_id {
-            Some(id) => execute_item_skill(id, skill, &mut ctx),
-            None => execute_skill(skill, &mut ctx),
-        };
-        let outcome = match result {
+        // 注册表锁只在结算期间持有：Lua 写请求（trigger_event 等）在锁释放后才落状态，
+        // 否则事件回到 dispatch_lua_event 再取同一把锁即死锁。
+        let settled = self.with_mount_gate(&lua_ctx, |gate| {
+            let registry = self.lua_registry.lock().expect("lua registry poisoned");
+            let mut ctx = CommandContext {
+                actor_id: &actor_key,
+                actor: &actor_json,
+                target_id: target_key.as_deref(),
+                target: target_json.as_ref(),
+                difficulty,
+                // 判定属性交给内核按优先级解析（修 D1）：技能声明 → 判定器 → 全局 → 'str'。
+                attribute: None,
+                global_checker: global_checker.as_ref(),
+                rng: &self.rng,
+                lua: Some((&self.lua, &lua_ctx)),
+                registry: Some(&*registry),
+                status_defs: Some(self.rules.status_defs()),
+                profiles: Some(self.rules.profiles()),
+                attribute_bonuses: Some(self.rules.attribute_bonuses()),
+                extra_bonus: 0,
+                effect_requires_success: false,
+                mount_gate: gate,
+            };
+            match item_id {
+                Some(id) => execute_item_skill(id, skill, &mut ctx),
+                None => execute_skill(skill, &mut ctx),
+            }
+        });
+        let outcome = match settled {
             Ok(o) => o,
             Err(e) => {
                 self.emit_simple(PlayEvent::System(SystemPayload {
@@ -3085,14 +4029,8 @@ impl Session {
         }
         // RNG 消耗不再在此单独落条：emit 统一在发事件前把新增消耗补成 rng_consume
         // 事件（#06 ②），技能 / 判定 / 状态 tick / Lua 等所有路径一视同仁、不漏不重。
-        let actor_ref = actor.clone().unwrap_or_else(|| ActorRef {
-            id: actor_id.clone(),
-            name: actor_json
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or(&actor_id)
-                .to_string(),
-        });
+        // 结算主体与 CheckResult / Resolution 的署名一致（修 D7：不再「算在受控角色头上、
+        // 叙事却署名别人」）。
         if let Some(check) = &outcome.check {
             self.emit(
                 PlayEvent::CheckResult(CheckResultPayload {
@@ -3110,7 +4048,7 @@ impl Session {
                     opponent: None,
                     kind: Some(check.kind),
                 }),
-                Some(actor_ref),
+                Some(actor_ref.clone()),
                 None,
             );
         }
@@ -3124,84 +4062,325 @@ impl Session {
                 triggered_events: None,
                 state_changes: outcome.effects.deltas.clone(),
             }),
-            actor,
+            Some(actor_ref),
             None,
         );
+        // 结算成功才记冷却起点（#01）：驳回（含冷却未好）不算「用过」。
+        self.record_cooldown(&actor_key, skill);
         // Lua 钩子的写请求（消耗 / 施加与移除状态 / 触发事件）真正落到世界状态。
-        self.apply_lua_requests(&outcome.requests, &actor_id);
+        self.apply_lua_requests(&outcome.requests, &actor_key);
     }
 
-    /// 回合开始 tick：turns 单位的持续状态减 1，归零移除（#12 ④）。
+    /// 回合边界 tick：turns 单位的持续状态减 1，归零移除（#12 ④）。
+    ///
+    /// 同时是 Lua 时机（「规则集走 Lua」⑤ 时机原语）：结算**前**逐 (角色, 状态) 派发
+    /// `status_tick`，结算**后**派发一次 `turn_end`。
+    /// 边界放在结算后，规则包在此新加的状态才不会被同一次 tick 立刻递减掉。
     fn tick_statuses_turn(&self) {
         self.tick_statuses(true);
+        self.tick_natural_recovery(crate::recovery::TickKind::Turn);
+        self.dispatch_tick_boundary(LuaMount::TurnEnd);
     }
 
-    /// 场景切换 tick：scenes 单位的持续状态减 1。
+    /// 场景切换 tick：scenes 单位的持续状态减 1；Lua 时机为 `status_tick` + `scene_end`。
     fn tick_statuses_scene(&self) {
         self.tick_statuses(false);
+        self.tick_natural_recovery(crate::recovery::TickKind::Scene);
+        self.dispatch_tick_boundary(LuaMount::SceneEnd);
+    }
+
+    /// 边界 tick 的自然恢复（#12 ④）：\`natural_recovery.trigger = per_turn / per_scene\`
+    /// 在对应边界给**每个角色实例**补量，上限取资源声明的 \`default_max\`。
+    ///
+    /// 未声明这两类触发的故事书在这里什么都不做、也不发事件——与旧行为逐字一致。
+    /// 先在锁内快照 (实例键, 资源)，锁外结算：\`emit\` 要再取同一把锁。
+    fn tick_natural_recovery(&self, tick: crate::recovery::TickKind) {
+        let world_resources = self
+            .rules
+            .storybook
+            .get("world")
+            .and_then(|w| w.get("resources"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let actors: Vec<(String, Value)> = {
+            let st = self.state.lock().expect("state poisoned");
+            st.characters
+                .iter()
+                .map(|(k, c)| (k.clone(), Value::Object(c.resources.clone())))
+                .collect()
+        };
+        let mut changes: Vec<StateDelta> = Vec::new();
+        for (actor_id, resources) in actors {
+            changes.extend(crate::recovery::tick_deltas(
+                &actor_id,
+                &world_resources,
+                &resources,
+                tick,
+            ));
+        }
+        if !changes.is_empty() {
+            self.emit_simple(PlayEvent::StateUpdate(StateUpdatePayload { changes }));
+        }
+    }
+
+    /// 边界时机（`turn_end` / `scene_end`）：每个边界派发一次，actor = 受控角色。
+    ///
+    /// 引擎只提供时机与事实；要不要在此做事、做什么，全由规则包的 Lua 决定
+    ///（引擎不认识任何规则集语义，也不会替规则包结算任何东西）。
+    fn dispatch_tick_boundary(&self, mount: LuaMount) {
+        if !self.has_mount(mount) {
+            return;
+        }
+        let controlled = self
+            .state
+            .lock()
+            .map(|st| st.controlled.first().cloned().unwrap_or_default())
+            .unwrap_or_default();
+        let ctx = self.tick_lua_context(format!("{}:{}", mount.as_str(), controlled), &controlled);
+        match self.run_mount_chain(mount, &ctx, None, None) {
+            Ok(requests) => self.apply_lua_requests(&requests, &controlled),
+            Err(e) => {
+                self.emit_simple(PlayEvent::System(SystemPayload {
+                    level: SystemLevel::Error,
+                    code: Some(format!("{}_lua_error", mount.as_str())),
+                    text: format!("{} 挂载点脚本执行失败：{e}", mount.as_str()),
+                }));
+            }
+        }
+    }
+
+    /// 单个 (角色, 状态) 的结算时机：把状态实例快照交给 `status_tick` 脚本。
+    ///
+    /// 引擎只派发「谁、哪个状态、还剩多久」；脚本要不要在此结束这个状态、
+    /// 用什么方式决定，都是规则包自己的事。
+    fn dispatch_status_tick(&self, char_key: &str, status: &StatusInstance, left: i32, turn: bool) {
+        let ctx = self.tick_lua_context(format!("status_tick:{char_key}:{}", status.id), char_key);
+        let snapshot = LuaStatusContext {
+            id: status.id.clone(),
+            name: status.name.clone(),
+            turns_left: status.turns_left,
+            scenes_left: status.scenes_left,
+            unit: if turn { "turns" } else { "scenes" },
+            remaining: left - 1,
+        };
+        match self.run_mount_chain(LuaMount::StatusTick, &ctx, None, Some(&snapshot)) {
+            Ok(requests) => self.apply_lua_requests(&requests, char_key),
+            Err(e) => {
+                self.emit_simple(PlayEvent::System(SystemPayload {
+                    level: SystemLevel::Error,
+                    code: Some("status_tick_lua_error".into()),
+                    text: format!("status_tick 挂载点脚本执行失败：{e}"),
+                }));
+            }
+        }
+    }
+
+    /// 状态 tick / 边界时机的 Lua 上下文：actor = 被结算的角色实例（含其状态与资源）。
+    fn tick_lua_context(&self, script_id: String, char_key: &str) -> LuaHostContext {
+        let (scene_id, actor) = {
+            let st = self.state.lock().expect("state poisoned");
+            (
+                st.scene_id.clone(),
+                st.characters
+                    .get(char_key)
+                    .map(|c| serde_json::to_value(c).unwrap_or(Value::Null))
+                    .unwrap_or(Value::Null),
+            )
+        };
+        LuaHostContext {
+            script_id,
+            actor_id: char_key.to_string(),
+            actor,
+            scene_id,
+            round: self.round.load(Ordering::SeqCst),
+            relationships: self.rules.relationships(),
+            ..Default::default()
+        }
+    }
+
+    /// 某角色身上某状态在本 tick 单位下的剩余量；
+    /// 状态已被脚本移除（或不再按这个单位计时）时返回 None。
+    fn status_left(&self, char_key: &str, status_id: &str, turn: bool) -> Option<i32> {
+        let st = self.state.lock().expect("state poisoned");
+        let c = st.characters.get(char_key)?;
+        c.statuses
+            .iter()
+            .find(|s| s.id == status_id)
+            .and_then(|s| if turn { s.turns_left } else { s.scenes_left })
+    }
+
+    /// 某挂载点是否注册了脚本（没有 → 整条路径零额外开销、零行为变化）。
+    fn has_mount(&self, mount: LuaMount) -> bool {
+        self.lua_registry
+            .lock()
+            .map(|registry| registry.for_mount(mount).next().is_some())
+            .unwrap_or(false)
     }
 
     fn tick_statuses(&self, turn: bool) {
         let status_defs = self.rules.status_defs();
-        let mut changes: Vec<StateDelta> = Vec::new();
-        {
+        // 先快照本次要结算的 (角色, 状态) 列表，再逐个结算：派发 Lua 时不能持有状态锁
+        //（脚本的写请求要落状态，持锁即死锁）。快照不改变结算顺序，也不改变骰序。
+        let pending: Vec<(String, StatusInstance)> = {
             let st = self.state.lock().expect("state poisoned");
-            for (char_id, c) in st.characters.iter() {
-                for status in &c.statuses {
-                    let left = if turn { status.turns_left } else { status.scenes_left };
-                    let Some(left) = left else {
-                        continue;
+            st.characters
+                .iter()
+                .flat_map(|(char_id, c)| {
+                    c.statuses
+                        .iter()
+                        .filter(|s| if turn { s.turns_left.is_some() } else { s.scenes_left.is_some() })
+                        .map(|s| (char_id.clone(), s.clone()))
+                })
+                .collect()
+        };
+        // 没有 status_tick 脚本 → 与旧行为逐字一致：不构造上下文、不派发、不多掷一颗骰。
+        let has_tick_scripts = self.has_mount(LuaMount::StatusTick);
+        let mut changes: Vec<StateDelta> = Vec::new();
+        for (char_id, status) in pending {
+            let Some(mut left) = (if turn { status.turns_left } else { status.scenes_left }) else {
+                continue;
+            };
+            if has_tick_scripts {
+                self.dispatch_status_tick(&char_id, &status, left, turn);
+                // 脚本可能已移除该状态：以最新状态为准，既不重复结算，
+                // 也不让引擎的递减 delta 把它写回来。
+                match self.status_left(&char_id, &status.id, turn) {
+                    Some(current) => left = current,
+                    None => continue,
+                }
+            }
+            // 先结算状态自身的持续效果（#12 ③）：每经过一个 duration 单位结算一次。
+            if let Some(def) = status_defs.get(&status.id) {
+                if let Some(effects) = def.effect.as_ref().filter(|e| !e.is_empty()) {
+                    let resolved = {
+                        let mut rng = self.rng.lock().expect("rng poisoned");
+                        resolve_immediate(effects, &char_id, &mut rng)
                     };
-                    // 先结算状态自身的持续效果（#12 ③）：每经过一个 duration 单位结算一次。
-                    if let Some(def) = status_defs.get(&status.id) {
-                        if let Some(effects) = def.effect.as_ref().filter(|e| !e.is_empty()) {
-                            let resolved = {
-                                let mut rng = self.rng.lock().expect("rng poisoned");
-                                resolve_immediate(effects, char_id, &mut rng)
-                            };
-                            match resolved {
-                                Ok(mut deltas) => changes.append(&mut deltas),
-                                Err(e) => {
-                                    self.emit_simple(PlayEvent::System(SystemPayload {
-                                        level: SystemLevel::Error,
-                                        code: Some("status_effect_error".into()),
-                                        text: e.to_string(),
-                                    }));
-                                }
-                            }
+                    match resolved {
+                        Ok(mut deltas) => changes.append(&mut deltas),
+                        Err(e) => {
+                            self.emit_simple(PlayEvent::System(SystemPayload {
+                                level: SystemLevel::Error,
+                                code: Some("status_effect_error".into()),
+                                text: e.to_string(),
+                            }));
                         }
-                    }
-                    if left <= 1 {
-                        changes.push(StateDelta {
-                            domain: DeltaDomain::Character,
-                            entity_id: char_id.clone(),
-                            field: "status".into(),
-                            op: DeltaOp::Remove,
-                            value: Value::String(status.id.clone()),
-                        });
-                    } else {
-                        let mut next = status.clone();
-                        if turn {
-                            next.turns_left = Some(left - 1);
-                        } else {
-                            next.scenes_left = Some(left - 1);
-                        }
-                        changes.push(StateDelta {
-                            domain: DeltaDomain::Character,
-                            entity_id: char_id.clone(),
-                            field: "status".into(),
-                            op: DeltaOp::Set,
-                            value: serde_json::to_value(next).unwrap_or(Value::Null),
-                        });
                     }
                 }
+            }
+            if left <= 1 {
+                changes.push(StateDelta {
+                    domain: DeltaDomain::Character,
+                    entity_id: char_id,
+                    field: "status".into(),
+                    op: DeltaOp::Remove,
+                    value: Value::String(status.id.clone()),
+                });
+            } else {
+                let mut next = status.clone();
+                if turn {
+                    next.turns_left = Some(left - 1);
+                } else {
+                    next.scenes_left = Some(left - 1);
+                }
+                changes.push(StateDelta {
+                    domain: DeltaDomain::Character,
+                    entity_id: char_id,
+                    field: "status".into(),
+                    op: DeltaOp::Set,
+                    value: serde_json::to_value(next).unwrap_or(Value::Null),
+                });
             }
         }
         if !changes.is_empty() {
             self.emit_simple(PlayEvent::StateUpdate(StateUpdatePayload { changes }));
         }
-        // 状态 tick 也可能掷骰（每 tick 效果）：即使没有状态变更也要补记消耗（#06 ②）。
+        // 状态 tick 也可能掷骰（每 tick 效果 / 脚本次骰）：即使没有状态变更也要补记消耗（#06 ②）。
         self.flush_rng_consumption();
+    }
+
+    /// 挂载点 `when` 条件求值的只读世界快照。
+    fn mount_world(&self, actor_key: &str) -> MountWorld {
+        let (flags, goals, triggers, actor_location, actor_attributes, scene_id, encounters) = {
+            let st = self.state.lock().expect("state poisoned");
+            let hit = if actor_key.is_empty() {
+                None
+            } else {
+                Self::find_character(&st.characters, actor_key)
+            };
+            (
+                st.flags.clone(),
+                st.progress.goals.clone(),
+                st.progress.triggers.clone(),
+                hit.and_then(|(_, c)| c.location_id.clone()),
+                hit.map(|(_, c)| c.attributes.clone()),
+                st.scene_id.clone(),
+                st.encounters.values().cloned().collect::<Vec<Value>>(),
+            )
+        };
+        MountWorld {
+            flags,
+            goals,
+            triggers,
+            actor_location,
+            actor_attributes,
+            relationships: self.rules.relationships(),
+            scene_id: Some(scene_id),
+            encounters,
+        }
+    }
+
+    /// 用当前世界快照构造挂载点 `when` 闸门，并在闸门存活期内执行回调。
+    ///
+    /// 引擎侧只做「条件成立才跑」这一件事；条件本身是作者的声明（复用 CondExpr）。
+    fn with_mount_gate<R>(
+        &self,
+        lua_ctx: &LuaHostContext,
+        f: impl FnOnce(Option<&dyn Fn(&CondExpr) -> bool>) -> R,
+    ) -> R {
+        let world = self.mount_world(&lua_ctx.actor_id);
+        let eval = EvalContext {
+            flags: &world.flags,
+            goals: &world.goals,
+            triggers: &world.triggers,
+            actor_location: world.actor_location.as_deref(),
+            actor_attributes: world.actor_attributes.as_ref(),
+            relationships: &world.relationships,
+            scene_id: world.scene_id.as_deref(),
+            encounters: &world.encounters,
+            lua: Some((&self.lua, lua_ctx)),
+        };
+        // 条件求值出错按「不成立」处理：坏条件不该中断整轮结算（与骨架求值同口径）。
+        let gate = |cond: &CondExpr| eval_cond(cond, &eval).unwrap_or(false);
+        f(Some(&gate))
+    }
+
+    /// 跑一个判定挂载点链并取回写请求（不经 command 的入口——Intent::Check——用）。
+    ///
+    /// 注册表锁只在链执行期间持有：链里的 trigger_event 请求会在锁释放后才派发，
+    /// 否则事件回到 dispatch_lua_event 再取同一把锁即死锁。
+    fn run_mount_chain(
+        &self,
+        mount: LuaMount,
+        lua_ctx: &LuaHostContext,
+        check: Option<&LuaCheckContext>,
+        status: Option<&LuaStatusContext>,
+    ) -> Result<Vec<LuaRequest>, EngineError> {
+        // 没有该挂载点的脚本 → 连世界快照都不构造（旧故事书零额外开销、零行为变化）。
+        if !self.has_mount(mount) {
+            return Ok(Vec::new());
+        }
+        self.with_mount_gate(lua_ctx, |gate| {
+            let registry = self.lua_registry.lock().expect("lua registry poisoned");
+            let env = MountEnv { gate, check };
+            match registry.run_chain_status(&self.lua, mount, lua_ctx, &env, status) {
+                Ok(_) => Ok(self.lua.drain_requests()),
+                Err(e) => {
+                    let _ = self.lua.drain_requests();
+                    Err(e)
+                }
+            }
+        })
     }
 
     /// 注册 Lua 挂载点脚本（供 API / 测试接线）。
@@ -3242,7 +4421,7 @@ impl Session {
             return;
         }
 
-        let (flags, goals, prog_triggers, actor_id, actor_attrs, actor_loc) = {
+        let (flags, goals, prog_triggers, actor_id, actor_attrs, actor_loc, scene_id, encounters) = {
             let st = self.state.lock().expect("state poisoned");
             let actor_id = st.controlled.first().cloned().unwrap_or_default();
             let actor = st.characters.get(&actor_id);
@@ -3253,6 +4432,8 @@ impl Session {
                 actor_id,
                 actor.map(|c| c.attributes.clone()),
                 actor.and_then(|c| c.location_id.clone()),
+                st.scene_id.clone(),
+                st.encounters.values().cloned().collect::<Vec<Value>>(),
             )
         };
         let relationships = self.rules.relationships();
@@ -3274,6 +4455,8 @@ impl Session {
             actor_location: actor_loc.as_deref(),
             actor_attributes: actor_attrs.as_ref(),
             relationships: &relationships,
+            scene_id: Some(scene_id.as_str()),
+            encounters: &encounters,
             lua: Some((&self.lua, &lua_ctx)),
         };
 
@@ -3330,19 +4513,13 @@ impl Session {
             round: self.round.load(Ordering::SeqCst),
             ..Default::default()
         };
-        let outcome = {
-            let registry = self.lua_registry.lock().expect("lua registry poisoned");
-            registry.run_chain(&self.lua, LuaMount::Event, &lua_ctx)
-        };
-        match outcome {
+        // 走统一入口：注册表锁只在链执行期间持有（写请求在锁释放后落状态），
+        // 且 `when` 条件与世界快照一并生效。
+        match self.run_mount_chain(LuaMount::Event, &lua_ctx, None, None) {
             // Lua 事件脚本的写请求同样落状态（此前被直接丢弃）。
-            Ok(_) => {
-                let requests = self.lua.drain_requests();
-                self.apply_lua_requests(&requests, &controlled);
-            }
+            Ok(requests) => self.apply_lua_requests(&requests, &controlled),
             Err(e) => {
                 // fail-fast：报错即不落该链的任何请求（与命令侧一致）。
-                let _ = self.lua.drain_requests();
                 self.emit_simple(PlayEvent::System(SystemPayload {
                     level: SystemLevel::Error,
                     code: Some("event_lua_error".into()),
@@ -3398,6 +4575,76 @@ impl Session {
                 LuaRequest::TriggerEvent { event, .. } => events.push(event.clone()),
                 // query_world 交由引擎解释，v1 暂为 no-op。
                 LuaRequest::QueryWorld { .. } => {}
+                // 施加即时效果：与声明式 ImmediateEffect 走同一条 resolve_effect 路径
+                //（骰子数量在这里消耗引擎 RNG，随后的 emit 会补记 rng_consume）。
+                LuaRequest::ApplyEffect { target, effect } => {
+                    let entity = self.resolve_lua_target(target, default_actor);
+                    if entity.is_empty() {
+                        continue;
+                    }
+                    let immediate = match serde_json::from_value::<ImmediateEffect>(effect.clone())
+                    {
+                        Ok(e) => e,
+                        Err(e) => {
+                            self.emit_simple(PlayEvent::System(SystemPayload {
+                                level: SystemLevel::Warn,
+                                code: Some("lua_effect_invalid".into()),
+                                text: format!("apply_effect 形状非法，已忽略：{e}"),
+                            }));
+                            continue;
+                        }
+                    };
+                    let def = EffectDef {
+                        immediate: Some(vec![immediate]),
+                        ..Default::default()
+                    };
+                    // 叠加策略基座：目标当前的同名状态（#12 ③）；读不到即空表。
+                    let current_statuses: Vec<StatusInstance> = {
+                        let st = self.state.lock().expect("state poisoned");
+                        st.characters
+                            .get(&entity)
+                            .map(|c| c.statuses.clone())
+                            .unwrap_or_default()
+                    };
+                    let resolved = {
+                        let mut rng = self.rng.lock().expect("rng poisoned");
+                        resolve_effect(
+                            &def,
+                            &entity,
+                            &entity,
+                            &mut rng,
+                            self.rules.status_defs(),
+                            &current_statuses,
+                        )
+                    };
+                    match resolved {
+                        Ok(out) => changes.extend(out.deltas),
+                        Err(e) => {
+                            self.emit_simple(PlayEvent::System(SystemPayload {
+                                level: SystemLevel::Warn,
+                                code: Some("lua_effect_error".into()),
+                                text: format!("apply_effect 结算失败，已忽略：{e}"),
+                            }));
+                        }
+                    }
+                }
+                // 加减资源：可正可负、可指定任意目标（不受「当前 actor 消耗」限制）。
+                LuaRequest::ModifyResource { target, resource, amount } => {
+                    let entity = self.resolve_lua_target(target, default_actor);
+                    if entity.is_empty() || *amount == 0 {
+                        continue;
+                    }
+                    changes.push(StateDelta {
+                        domain: DeltaDomain::Character,
+                        entity_id: entity,
+                        field: format!("resources.{resource}"),
+                        op: DeltaOp::Add,
+                        value: Value::from(*amount),
+                    });
+                }
+                // 判定修正只在判定挂载点（check_pre_roll / check_post_roll）被消费；
+                // 其他时机抛出这类请求没有判定可改，忽略。
+                LuaRequest::ModifyCheck { .. } => {}
             }
         }
         if !changes.is_empty() {
@@ -3406,11 +4653,123 @@ impl Session {
         for event in events {
             self.dispatch_event(&event);
         }
+        // 效果可能掷骰：没有状态变更时也要把消耗记进日志（与状态 tick 同口径）。
+        self.flush_rng_consumption();
+    }
+
+    /// Lua 请求的实体寻址：任意 id 形态（实例键 / 模板 id / 名字 / instance_id）→ 存档键；
+    /// 解析不到时保留原串（可能是敌人 / 非角色实体），与既有 ApplyStatus 的行为一致。
+    fn resolve_lua_target(&self, target: &str, default_actor: &str) -> String {
+        let raw = if target.trim().is_empty() { default_actor } else { target.trim() };
+        if raw.is_empty() {
+            return String::new();
+        }
+        let st = self.state.lock().expect("state poisoned");
+        Self::find_character(&st.characters, raw)
+            .map(|(key, _)| key.clone())
+            .unwrap_or_else(|| raw.to_string())
+    }
+
+    /// 对抗判定的对手值（判定 C3）：返回（对手署名，对手 total）。
+    ///
+    /// 对手的两种形态——LMoP 的三种组合由「主动方 kind × 对手形态」组合出来：
+    /// - **角色实例**（模板 id / 名字 / 实例键 / 实例 id 都能命中）→ 对手也掷一次骰：
+    ///   同一骰式、`opposed_attribute`（缺省 = 主动方属性）、它自己的属性值 + 修正来源。
+    ///   主动方 kind = passive 时即「被动 vs 掷」。
+    /// - **静态被动值**（命中不了实例）→ 不掷骰：`passive_base`（缺省 10）+ 属性修正
+    ///   （属性值取故事书 characters[] 里同名条目声明的值；查不到按 0 修正）。即「掷 vs 被动」。
+    ///
+    /// 引擎不认识「被动察觉」这类规则词——它只知道这一侧掷不掷骰。
+    fn opponent_total(
+        &self,
+        opponent_id: &str,
+        attribute: &str,
+        checker: Option<&CheckerDef>,
+        difficulty: i64,
+    ) -> Result<(ActorRef, i64), EngineError> {
+        // 对手属性：判定器声明的 opposed_attribute；缺省与主动方同属性。
+        let opposed_attribute = checker
+            .and_then(|c| c.opposed_attribute.clone())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| attribute.to_string());
+        let mut opponent_checker = checker.cloned().unwrap_or_else(|| CheckerDef {
+            dice: Some("1d20".into()),
+            ..Default::default()
+        });
+        let instance = {
+            let st = self.state.lock().expect("state poisoned");
+            Self::find_character(&st.characters, opponent_id).map(|(_, c)| c.clone())
+        };
+        let Some(instance) = instance else {
+            // 静态被动值：没有骰子，只有基数 + 属性修正。
+            let base = opponent_checker.passive_base.unwrap_or(10);
+            let declared = self.rules.character_attribute(opponent_id, &opposed_attribute);
+            let name = declared
+                .as_ref()
+                .map(|(n, _)| n.clone())
+                .unwrap_or_else(|| opponent_id.to_string());
+            let bonus = declared
+                .map(|(_, v)| {
+                    let profile = self
+                        .rules
+                        .profiles()
+                        .get(&opposed_attribute)
+                        .copied()
+                        .unwrap_or_default();
+                    crate::resolve::modifier_for(&opponent_checker, &opposed_attribute, v, profile)
+                })
+                .unwrap_or(0);
+            return Ok((ActorRef { id: opponent_id.to_string(), name }, base + bonus));
+        };
+        let sign = ActorRef { id: instance.template_id.clone(), name: instance.name.clone() };
+        let base = instance
+            .attributes
+            .get(&opposed_attribute)
+            .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64)))
+            .unwrap_or(crate::resolve::DEFAULT_BASELINE);
+        let value = self
+            .rules
+            .attribute_bonuses()
+            .get(&instance.template_id)
+            .and_then(|m| m.get(&opposed_attribute))
+            .map(|m| m.apply(base))
+            .unwrap_or(base);
+        let profile = self
+            .rules
+            .profiles()
+            .get(&opposed_attribute)
+            .copied()
+            .unwrap_or_default();
+        // 对手侧固定掷骰（它的被动形态走上面那条静态被动值）；主动方的 lua 判定器上下文
+        // 属于主动方，不套到对手头上——否则脚本会以对手的身份读到主动方的上下文。
+        opponent_checker.kind = Some(CheckKind::Attribute);
+        opponent_checker.mode = Some(CheckMode::Gte);
+        opponent_checker.lua = None;
+        let resolved = crate::command::run_check(
+            &opponent_checker,
+            &opposed_attribute,
+            value,
+            difficulty,
+            profile,
+            &self.rng,
+            None,
+            crate::command::RollPolicy::Single,
+        )?;
+        Ok((sign, resolved.total))
     }
 
     /// 结算一次判定。成功结算时返回结果摘要，供回合内续轮回喂模型（#04 ⑦）；
     /// 取消 / 出错没有可续写的信息，返回 None。
-    async fn run_check(&self, attribute: String, difficulty: Option<i64>, actor: Option<ActorRef>) -> Option<String> {
+    ///
+    /// `opponent_id`（判定 C3）：给了对手就是**对抗判定**——双方各得一次值比大小，
+    /// 不再与静态难度比。对手是什么见 [`Session::opponent_total`]。
+    async fn run_check(
+        &self,
+        attribute: String,
+        difficulty: Option<i64>,
+        opponent_id: Option<String>,
+        actor: Option<ActorRef>,
+    ) -> Option<String> {
         // 判定归属：意图指定 → 受控角色（是玩家在掷骰）。
         // 绝不回落到种子/测试角色；真找不到人时用中性占位。
         let actor = actor
@@ -3435,6 +4794,17 @@ impl Session {
                 return None;
             }
         }
+        // 判定 C3：对抗判定必须有对手。mode = opposed 却没收对手 → 显式驳回，
+        // 不再静默降级成 gte（给作者一个错误，而不是一个看起来正常的错误结果）。
+        let declared_mode = declared.as_ref().and_then(|c| c.mode).unwrap_or(CheckMode::Gte);
+        let opponent_id = opponent_id.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        if declared_mode == CheckMode::Opposed && opponent_id.is_none() {
+            self.reject(
+                "判定模式为对抗（opposed），但意图没有给出对手 opponent_id".to_string(),
+                RejectionCode::RuleViolation,
+            );
+            return None;
+        }
         if !self.auto_confirm.load(Ordering::SeqCst) {
             self.phase(PhaseStage::WaitingConfirm, None);
             let action_id = uuid::Uuid::new_v4().to_string();
@@ -3445,8 +4815,12 @@ impl Session {
                     action_id: action_id.clone(),
                     intent_id: None,
                     actor: actor.clone(),
-                    description: format!("用{attribute}进行一次判定"),
-                    impact: Some("会消耗一次行动机会".into()),
+                    // 对抗判定把对手一并写进确认描述；非对抗的文案逐字不变。
+                    description: match opponent_id.as_deref() {
+                        Some(id) => format!("用{attribute}进行一次对抗判定（对手：{id}）"),
+                        None => format!("用{attribute}进行一次判定"),
+                    },
+                    impact: Some("判定会立即结算，成败写入世界状态".into()),
                     timeout_ms: self.confirmation_timeout_ms,
                 }),
                 Some(actor.clone()),
@@ -3479,10 +4853,52 @@ impl Session {
         }
 
         // 难度：意图给的优先 → 故事书 default_dc → 12。
-        let target = difficulty
+        let mut target = difficulty
             .or_else(|| declared.as_ref().and_then(|c| c.default_dc))
             .unwrap_or(12);
-        let resolved = match &declared {
+        // 判定归属的存档键：挂载点写请求（状态 / 资源 / 即时效果）默认落到它头上。
+        let actor_key = {
+            let st = self.state.lock().expect("state poisoned");
+            Self::find_character(&st.characters, &actor.id)
+                .map(|(k, _)| k.clone())
+                .unwrap_or_else(|| actor.id.clone())
+        };
+        // 判定挂载点上下文：判定前后都要用（前改骰数/难度，后改 total/margin/档位）。
+        let mut mount_ctx = LuaHostContext {
+            script_id: format!("check:{attribute}"),
+            actor_id: actor.id.clone(),
+            actor: self.actor_json_of(&actor),
+            scene_id: self.state.lock().map(|st| st.scene_id.clone()).unwrap_or_default(),
+            round: self.round.load(Ordering::SeqCst),
+            difficulty: Some(target),
+            ..Default::default()
+        };
+        // 判定种类在掷骰前就确定（缺省 = 属性检定）：check_pre_roll 的签名要用它。
+        let signature_kind = declared
+            .as_ref()
+            .and_then(|c| c.kind)
+            .unwrap_or(CheckKind::Attribute);
+        // 签名（属性 / 种类 / 难度）在掷骰前已经确定，一并交给钩子——
+        // 「优势 / 劣势只有掷骰前有意义」由此才表达得出来。
+        let signature = crate::command::check_signature(&attribute, signature_kind, target);
+        let mut adjustments = crate::command::CheckAdjustments::default();
+        let mut lua_requests: Vec<LuaRequest> = Vec::new();
+        // check_pre_roll：收集 → **掷骰前**生效（取高/取低、改难度、加值）。
+        match self.run_mount_chain(LuaMount::CheckPreRoll, &mount_ctx, Some(&signature), None) {
+            Ok(reqs) => lua_requests.extend(adjustments.absorb(reqs)),
+            Err(e) => {
+                self.emit_simple(PlayEvent::System(SystemPayload {
+                    level: SystemLevel::Error,
+                    code: Some("check_lua_error".into()),
+                    text: e.to_string(),
+                }));
+                return None;
+            }
+        }
+        target += adjustments.dc;
+        mount_ctx.difficulty = Some(target);
+        let policy = adjustments.roll_policy();
+        let mut resolved = match &declared {
             Some(checker) => {
                 let value = self.actor_attribute_value(&actor, &attribute);
                 let profile = self
@@ -3495,8 +4911,8 @@ impl Session {
                     script_id: format!("check:{attribute}"),
                     actor_id: actor.id.clone(),
                     actor: self.actor_json_of(&actor),
-                    scene_id: self.state.lock().map(|st| st.scene_id.clone()).unwrap_or_default(),
-                    round: self.round.load(Ordering::SeqCst),
+                    scene_id: mount_ctx.scene_id.clone(),
+                    round: mount_ctx.round,
                     difficulty: Some(target),
                     ..Default::default()
                 };
@@ -3518,6 +4934,7 @@ impl Session {
                     profile,
                     &self.rng,
                     lua,
+                    policy,
                 ) {
                     Ok(r) => r,
                     Err(e) => {
@@ -3531,10 +4948,17 @@ impl Session {
                 }
             }
             None => {
-                // 缺省路径与历史逐字一致：1d20，无修正，默认成功度阈值。
-                let roll = {
+                // 缺省路径与历史逐字一致（单次时只掷一颗 1d20，无修正，默认阈值）；
+                // 取高/取低的通用策略下掷两次取优（RNG 消耗 = 2）。
+                let rolls = {
                     let mut rng = self.rng.lock().expect("rng poisoned");
-                    rng.range_inclusive(1, 20)
+                    let times = if policy == crate::command::RollPolicy::Single { 1 } else { 2 };
+                    (0..times).map(|_| rng.range_inclusive(1, 20)).collect::<Vec<i64>>()
+                };
+                let roll = match policy {
+                    crate::command::RollPolicy::KeepHigh => rolls.iter().copied().max().unwrap_or(0),
+                    crate::command::RollPolicy::KeepLow => rolls.iter().copied().min().unwrap_or(0),
+                    crate::command::RollPolicy::Single => rolls.first().copied().unwrap_or(0),
                 };
                 let margin = roll - target;
                 ResolvedCheck {
@@ -3553,6 +4977,63 @@ impl Session {
             }
         };
 
+        // 判定 C3：有对手就是对抗——对手也得过一次值（角色实例掷一次 / 静态被动值算一次），
+        // 它的 total 成为本判定的 target（不是静态难度）。RNG 顺序：主动方先掷，对手后掷。
+        let mut opponent: Option<(ActorRef, i64)> = None;
+        if let Some(oid) = opponent_id.as_deref() {
+            match self.opponent_total(oid, &attribute, declared.as_ref(), target) {
+                Ok(o) => opponent = Some(o),
+                Err(e) => {
+                    self.emit_simple(PlayEvent::System(SystemPayload {
+                        level: SystemLevel::Error,
+                        code: Some("check_error".into()),
+                        text: e.to_string(),
+                    }));
+                    return None;
+                }
+            }
+        }
+        let mode = if opponent.is_some() {
+            CheckMode::Opposed
+        } else {
+            declared_mode
+        };
+        let thresholds: &[i64] = match declared.as_ref() {
+            Some(checker) => crate::resolve::degree_thresholds(checker),
+            None => &DEFAULT_DEGREE_THRESHOLDS,
+        };
+        if let Some((_, opponent_total)) = &opponent {
+            crate::resolve::apply_opposed_target(&mut resolved, *opponent_total, thresholds);
+        }
+        // 判定前挂载点的结果覆盖（判定 C4）：与技能路径同口径，在快照之前兑现——
+        // 后置挂载点读到的是覆盖之后的判定（骰面 / 总值 / 难度都不变）。
+        if let Some(success) = adjustments.force {
+            crate::resolve::apply_forced_result(&mut resolved, success);
+        }
+
+        // check_post_roll：收集 → **掷骰后**生效（改 total / margin / 成功度分档 / 覆盖结果）。
+        let mut post = crate::command::CheckAdjustments::default();
+        let check_snapshot = crate::command::check_context(&resolved);
+        match self.run_mount_chain(LuaMount::CheckPostRoll, &mount_ctx, Some(&check_snapshot), None) {
+            Ok(reqs) => lua_requests.extend(post.absorb(reqs)),
+            Err(e) => {
+                self.emit_simple(PlayEvent::System(SystemPayload {
+                    level: SystemLevel::Error,
+                    code: Some("check_lua_error".into()),
+                    text: e.to_string(),
+                }));
+                return None;
+            }
+        }
+        crate::command::apply_post_roll_adjustments(
+            &mut resolved,
+            adjustments.add + post.add,
+            post.dc,
+            mode,
+            thresholds,
+            post.force,
+        );
+
         self.emit(
             PlayEvent::CheckResult(CheckResultPayload {
                 intent_id: None,
@@ -3566,7 +5047,8 @@ impl Session {
                 margin: resolved.margin,
                 result: resolved.result,
                 level: resolved.level,
-                opponent: None,
+                // 判定 C3：对手署名落 payload（前端 CheckCard 早已能渲染）。
+                opponent: opponent.as_ref().map(|(o, _)| o.clone()),
                 kind: Some(resolved.kind),
             }),
             Some(actor.clone()),
@@ -3587,6 +5069,8 @@ impl Session {
             Some(actor),
             None,
         );
+        // 挂载点的写请求（状态 / 资源 / 即时效果 / 事件）在判定事件之后落状态。
+        self.apply_lua_requests(&lua_requests, &actor_key);
         // #04 ⑦：把判定结果摘要回喂模型，让它据此续写（失败时改换策略、成功时顺势推进）。
         let dice = if resolved.rolls.is_empty() {
             resolved.expr.clone().unwrap_or_else(|| "无骰".to_string())
@@ -3599,10 +5083,17 @@ impl Session {
             octopus_types::SuccessLevel::Barely => "险胜",
             octopus_types::SuccessLevel::Fail => "失败",
         };
-        Some(format!(
-            "判定「{}」：{level}（骰 {dice}，修正 {}，总值 {}，难度 {}）",
-            resolved.attribute, resolved.r#mod, resolved.total, resolved.target
-        ))
+        // 非对抗的摘要逐字不变（旧行为）；对抗把「难度」换成对手署名 + 对手总值。
+        Some(match &opponent {
+            Some((o, _)) => format!(
+                "判定「{}」：{level}（骰 {dice}，修正 {}，总值 {}，对抗 {} {}）",
+                resolved.attribute, resolved.r#mod, resolved.total, o.name, resolved.target
+            ),
+            None => format!(
+                "判定「{}」：{level}（骰 {dice}，修正 {}，总值 {}，难度 {}）",
+                resolved.attribute, resolved.r#mod, resolved.total, resolved.target
+            ),
+        })
     }
 }
 
@@ -3614,6 +5105,111 @@ struct AttackChoice {
     bonus: i64,
     /// 叙事里用的名字（武器名优先于「徒手攻击」）
     label: Option<String>,
+}
+
+/// 一次攻击结算的输入（图鉴 M2 §4.3 对称内核）：攻守双方都是角色实例。
+///
+/// 临时敌人（无图鉴实例）由 `strike_enemy` 传条目 JSON + 条目 id：属性为空、
+/// 生命值取条目，Lua 与效果看到的 target 与改动前逐字一致。
+struct AttackSetup<'a> {
+    attacker_key: &'a str,
+    attacker_json: &'a Value,
+    target_id: Option<&'a str>,
+    target_json: Option<&'a Value>,
+    skill: &'a SkillDef,
+    difficulty: i64,
+    /// 判定属性（None = 交给内核按「技能 → 判定器 → 全局 → str」解析）。
+    attribute: Option<String>,
+    /// 调用方追加的固定判定修正（武器命中加值）。
+    extra_bonus: i64,
+    global_checker: Option<CheckerDef>,
+    lua_ctx: LuaHostContext,
+}
+
+/// 合成徒手攻击的技能 id（技能未声明时用它，供 rng / 事件记账定位）。
+const STRIKE_SKILL_ID: &str = "__strike__";
+
+/// 为一次攻击组装「判定 + 伤害」的技能声明（判定 C2：攻击就是一次 execute_skill）。
+///
+/// - 判定器：技能内联声明原样沿用；`check: "world"` 取全局 world.check 的骰式 / 修正 / 阈值
+///   （修 D3：不再静默换成裸 1d20）；两者都缺省时合成 1d20（与历史徒手默认一致）。
+/// - 属性：沿用技能声明，交给内核按「技能 → 判定器 → 全局 → 'str'」解析（修 D1）。
+/// - 消耗 / lua 钩子：原样保留，攻击与技能同口径。
+/// - 效果：收敛为本次攻击的伤害骰（历史 strike 的结算范围），静态修正原样保留。
+/// - `damage_resource`：伤害落到哪个资源（图鉴 M2）。None = 历史默认 `hp`；
+///   图鉴怪物的生命资源可能叫别的（LMoP 是 `res-hp`），传它才能真的扣到血。
+fn attack_skill(
+    declared: Option<&SkillDef>,
+    global: Option<&CheckerDef>,
+    name: &str,
+    damage_expr: &str,
+    damage_resource: Option<&str>,
+) -> SkillDef {
+    let mut skill = declared.cloned().unwrap_or_default();
+    if skill.id.is_empty() {
+        skill.id = STRIKE_SKILL_ID.to_string();
+    }
+    if skill.name.is_empty() {
+        skill.name = name.to_string();
+    }
+    let mut checker = match skill.check.as_ref() {
+        Some(SkillCheck::Def(def)) => Some(def.clone()),
+        Some(SkillCheck::Ref(_)) => global.cloned(),
+        None => None,
+    }
+    .unwrap_or_else(|| CheckerDef { dice: Some("1d20".into()), ..Default::default() });
+    // 本入口就是一次攻击判定：种类固定，避免继承其它判定种类的掷骰方语义。
+    checker.kind = Some(CheckKind::Attack);
+    skill.check = Some(SkillCheck::Def(checker));
+    let modifiers = skill.effect.as_ref().and_then(|e| e.modifiers.clone());
+    skill.effect = Some(EffectDef {
+        immediate: Some(vec![ImmediateEffect::Damage {
+            amount: damage_expr.to_string(),
+            resource: damage_resource.map(str::to_string),
+        }]),
+        modifiers,
+        ..Default::default()
+    });
+    skill
+}
+
+/// 实例的生命资源键（图鉴 M2）。
+///
+/// 约定 `hp` 优先；否则取 id 以 `-hp` / `_hp` 结尾的那一个（LMoP 导入的图鉴用 `res-hp`）。
+/// 只用于读取 / 投影，**绝不写进实例**——与派生值同一条纪律：不制造第二份真相。
+fn vital_resource_key(resources: &serde_json::Map<String, Value>) -> Option<String> {
+    if resources.contains_key("hp") {
+        return Some("hp".to_string());
+    }
+    let mut keys: Vec<&String> = resources.keys().collect();
+    keys.sort();
+    keys.iter()
+        .find(|k| k.ends_with("-hp") || k.ends_with("_hp"))
+        .map(|k| (*k).clone())
+}
+
+/// 读资源的数值：命中 delta 的 Add 会把整数写成浮点（27 → 27.0），读取必须两种都认。
+fn resource_num(v: &Value) -> Option<i64> {
+    v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))
+}
+
+/// 技能声明的伤害骰（effect.immediate 里第一条 damage）；未声明时为空串。
+fn attack_damage_expr(skill: Option<&SkillDef>) -> String {
+    skill
+        .and_then(|s| s.effect.as_ref())
+        .and_then(|e| e.immediate.as_ref())
+        .and_then(|list| {
+            list.iter().find_map(|f| match f {
+                ImmediateEffect::Damage { amount, .. } => Some(amount.clone()),
+                _ => None,
+            })
+        })
+        .unwrap_or_default()
+}
+
+/// 是否攻击类技能（check.kind = attack）：图鉴数据卡的「可用攻击」只列这些。
+fn is_attack_skill(skill: Option<&SkillDef>) -> bool {
+    matches!(skill.and_then(|s| s.check.as_ref()), Some(SkillCheck::Def(c)) if c.kind == Some(CheckKind::Attack))
 }
 
 /// 「故事本身」的保留身份：导演通道的事件都归它，永不指向真实角色。
@@ -3634,6 +5230,54 @@ fn character_key_in(st: &WorldState, id: &str) -> Option<String> {
         .map(|(key, _)| key.clone())
 }
 
+/// 在场判据：位置驱动 + 显式覆盖（docs/map-and-presence-design.md §4.1 三层优先级）。
+///
+/// ① 作者点名（场景 present_char_ids 命中该模板 id）→ 在场；
+/// ② 位置匹配（角色实例 location_id == 场景 location_id）→ 在场；
+/// ③ 场景**既未声明** present_char_ids、**也未声明** location_id → 全员在场
+///    （沿用开档的既有回落，避免无名单的旧故事书一切场就空场）；
+/// 受控角色（玩家）恒在场。
+///
+/// named 必须是 Option：None = 场景没写这个字段（未声明），
+/// Some(空集) = 作者显式声明「这一幕没人」。两者语义不同，不可合并——
+/// 合并正是旧代码「缺省名单即清场」这个不一致的根源。
+///
+/// 开档（octopus-api 的 is_initially_present）与切场（Session::switch_scene）
+/// 共用这一个函数，两处判据永远同源。
+pub fn scene_presence(
+    named: Option<&std::collections::HashSet<String>>,
+    scene_location_id: Option<&str>,
+    template_id: &str,
+    character_location_id: Option<&str>,
+    controlled: bool,
+) -> bool {
+    if controlled {
+        return true;
+    }
+    if named.is_some_and(|list| list.contains(template_id)) {
+        return true;
+    }
+    // 空串视为「未声明」：校验层会报错，运行期不因一个空值把全场清空。
+    let scene_location_id = scene_location_id.filter(|s| !s.is_empty());
+    let character_location_id = character_location_id.filter(|s| !s.is_empty());
+    if let (Some(scene), Some(character)) = (scene_location_id, character_location_id) {
+        if scene == character {
+            return true;
+        }
+    }
+    named.is_none() && scene_location_id.is_none()
+}
+
+/// 骨架里的一个场景定义：切场在场判据与「当前地点」提示词共用同一份解析。
+struct SceneDef {
+    title: String,
+    description: Option<String>,
+    /// 作者点名的在场名单；None = 场景**未声明**该字段（≠ 显式空名单）。
+    present_char_ids: Option<std::collections::HashSet<String>>,
+    /// 场景所在地点 id；None = **未声明**（空串同样视为未声明）。
+    location_id: Option<String>,
+}
+
 /// 关系边是否触及给定的一组实体 id（端点兼容 from/to 与旧 from_id/to_id）。
 fn edge_touches(edge: &Value, ids: &[String]) -> bool {
     ["from", "to"].iter().any(|canonical| {
@@ -3647,6 +5291,8 @@ fn edge_touches(edge: &Value, ids: &[String]) -> bool {
 fn present_actors(st: &WorldState) -> Vec<ActorRef> {
     st.characters
         .iter()
+        // 图鉴 M2 §4.6：怪物不进「在场角色」名单——它们出现在【当前遭遇】数据卡里。
+        .filter(|(_, c)| c.kind != "monster")
         .filter(|(key, c)| {
             c.present || st.controlled.contains(key) || st.controlled.contains(&c.instance_id)
         })
@@ -3738,6 +5384,16 @@ fn apply_delta(state: &mut WorldState, d: &StateDelta) {
             }
         },
         DeltaDomain::Character => {
+            // 图鉴 M2：field="instance" + op=Add 插入**完整实例**（怪物克隆）。
+            // 必须先于「解析已有实例键」那条路：刚插入的实例此刻还不存在，
+            // 而 entity_id 就是新实例键本身。实时（emit）与重放（replay）都只经由
+            // apply_delta 这一条唯一变更路径，所以二者必然一致。
+            if d.field == "instance" && d.op == DeltaOp::Add {
+                if let Ok(inst) = serde_json::from_value::<CharacterInstance>(d.value.clone()) {
+                    state.upsert_instance(&d.entity_id, inst);
+                }
+                return;
+            }
             // entity_id 应为存档内的实例键；历史日志里存的是模板 id，这里统一解析，
             // 保证老存档回放后 controlled / 属性 / 资源 仍指向同一个角色。
             let key = if state.characters.contains_key(&d.entity_id) {
@@ -3752,6 +5408,24 @@ fn apply_delta(state: &mut WorldState, d: &StateDelta) {
             };
             if d.field == "controlled" {
                 state.controlled = vec![key];
+                return;
+            }
+            // 技能冷却（#01）：与角色实例字段无关，单独处理以免与下面的可变借用冲突。
+            if let Some(skill_id) = d.field.strip_prefix("cooldown.") {
+                match d.op {
+                    DeltaOp::Remove => {
+                        state.cooldowns.entry(key).or_default().remove(skill_id);
+                    }
+                    _ => {
+                        if let Some(round) = d.value.as_u64() {
+                            state
+                                .cooldowns
+                                .entry(key)
+                                .or_default()
+                                .insert(skill_id.to_string(), round as u32);
+                        }
+                    }
+                }
                 return;
             }
             let Some(c) = state.characters.get_mut(&key) else {
@@ -3810,13 +5484,48 @@ fn apply_map_value(map: &mut serde_json::Map<String, Value>, key: &str, d: &Stat
             map.remove(key);
         }
         DeltaOp::Add => {
-            let cur = map.get(key).and_then(Value::as_f64).unwrap_or(0.0);
-            let add = d.value.as_f64().unwrap_or(0.0);
-            map.insert(key.to_string(), Value::from(cur + add));
+            let cur = map.get(key).cloned().unwrap_or_else(|| Value::from(0));
+            map.insert(key.to_string(), add_numbers(&cur, &d.value));
         }
         DeltaOp::Set => {
             map.insert(key.to_string(), d.value.clone());
         }
+    }
+}
+
+/// 数值相加：**两个操作数都是整数值时结果保持 JSON 整数**，只有真的带小数才落浮点。
+///
+/// 数据形状必须一致：资源 / 属性是整数口径的字段，一旦被加成 21.0，下游
+/// Value::as_i64() 就会返回 None，按整数读的地方（伤害扣血、阈值比较、协议归一化）
+/// 会静默拿不到值。这里只按数值本身判定，不引入任何规则集语义。
+fn add_numbers(cur: &Value, add: &Value) -> Value {
+    if let (Some(a), Some(b)) = (integral_number(cur), integral_number(add)) {
+        if let Some(sum) = a.checked_add(b) {
+            return Value::from(sum);
+        }
+    }
+    let a = cur.as_f64().unwrap_or(0.0);
+    let b = add.as_f64().unwrap_or(0.0);
+    Value::from(a + b)
+}
+
+/// 把 JSON 数值读成整数：整数原样；浮点仅在**小数部分为 0** 且落在 i64 范围内时按整数处理；
+/// 其余（真的带小数 / 非数值 / 越界）返回 None，交给浮点路径。
+fn integral_number(v: &Value) -> Option<i64> {
+    if v.is_boolean() || v.is_string() {
+        return None;
+    }
+    if let Some(i) = v.as_i64() {
+        return Some(i);
+    }
+    if let Some(u) = v.as_u64() {
+        return i64::try_from(u).ok();
+    }
+    let f = v.as_f64()?;
+    if f.is_finite() && f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
+        Some(f as i64)
+    } else {
+        None
     }
 }
 
@@ -3870,6 +5579,7 @@ mod tests {
         );
         WorldState {
             encounters: Default::default(),
+            cooldowns: Default::default(),
             seq: 0,
             scene_id: "sc-1".into(),
             scene_title: "场景".into(),
@@ -3956,6 +5666,202 @@ mod tests {
         let proj = session.projection();
         assert_eq!(proj.characters["char-a"]["resources"]["mana"].as_f64(), Some(15.0));
         assert!(proj.characters["char-a"]["resources"]["hp"].as_f64().unwrap() < 30.0);
+    }
+
+    // ---------- 缺陷 1（回归）：资源 Add 后的数据形状 ----------
+
+    fn hp_delta(op: DeltaOp, value: Value) -> StateDelta {
+        StateDelta {
+            domain: DeltaDomain::Character,
+            entity_id: "char-a".into(),
+            field: "resources.hp".into(),
+            op,
+            value,
+        }
+    }
+
+    /// 缺陷 1：整数 + 整数必须仍是 **JSON 整数**。修复前走 as_f64 相加，
+    /// 结果落成 21.0，Value::as_i64() 返回 None，按整数读的下游静默拿不到值。
+    #[test]
+    fn resource_add_keeps_json_integer_for_integer_operands() {
+        let mut map = json!({ "hp": 30 }).as_object().unwrap().clone();
+        apply_map_value(&mut map, "hp", &hp_delta(DeltaOp::Add, json!(-9)));
+        assert!(map["hp"].is_i64(), "整数 + 整数必须是 JSON 整数，实际 {:?}", map["hp"]);
+        assert_eq!(map["hp"].as_i64(), Some(21));
+        // 继续扣血（负数）仍保持整数，含跨零。
+        apply_map_value(&mut map, "hp", &hp_delta(DeltaOp::Add, json!(-25)));
+        assert!(map["hp"].is_i64(), "跨零后仍是整数，实际 {:?}", map["hp"]);
+        assert_eq!(map["hp"].as_i64(), Some(-4));
+    }
+
+    /// 缺陷 1：只有真的带小数才落浮点；整数值的浮点（历史遗留 21.0）按整数回正。
+    #[test]
+    fn resource_add_floats_only_on_real_fractions() {
+        let mut map = json!({ "hp": 10 }).as_object().unwrap().clone();
+        apply_map_value(&mut map, "hp", &hp_delta(DeltaOp::Add, json!(2.5)));
+        assert!(map["hp"].is_f64(), "真的带小数才落浮点");
+        assert_eq!(map["hp"].as_f64(), Some(12.5));
+        apply_map_value(&mut map, "hp", &hp_delta(DeltaOp::Add, json!(1)));
+        assert!(map["hp"].is_f64(), "一旦是小数，再加整数仍是小数");
+        assert_eq!(map["hp"].as_f64(), Some(13.5));
+        // 修复前写下的 21.0：整数值浮点按整数处理，形状自动回正。
+        let mut legacy = json!({ "hp": 21.0 }).as_object().unwrap().clone();
+        apply_map_value(&mut legacy, "hp", &hp_delta(DeltaOp::Add, json!(-1)));
+        assert!(legacy["hp"].is_i64(), "整数值浮点按整数回正，实际 {:?}", legacy["hp"]);
+        assert_eq!(legacy["hp"].as_i64(), Some(20));
+    }
+
+    /// 缺陷 1：Set 分支不动——原样落值（含 7.0，不擅自改形状）。
+    #[test]
+    fn resource_set_keeps_value_verbatim() {
+        let mut map = json!({ "hp": 30 }).as_object().unwrap().clone();
+        apply_map_value(&mut map, "hp", &hp_delta(DeltaOp::Set, json!(7.0)));
+        assert!(map["hp"].is_f64(), "Set 原样落值");
+        assert_eq!(map["hp"].as_f64(), Some(7.0));
+    }
+
+    /// 缺陷 1 端到端：伤害结算经 DeltaOp::Add 落到投影后，资源仍是 JSON 整数。
+    #[test]
+    fn damage_keeps_projected_resource_as_json_integer() {
+        let sb = json!({
+            "skills": [{
+                "id": "sk-hit", "name": "打击",
+                "check": { "dice": "1d20" },
+                "effect": { "immediate": [{ "kind": "damage", "amount": "5", "resource": "hp" }] }
+            }],
+            "world": { "check": { "dice": "1d20" } }
+        });
+        let (session, _sink) = session_with(sb);
+        let skill = session.rules.skill("sk-hit").cloned().unwrap();
+        session.resolve_skill(None, &skill, Some("char-a"), None);
+        let hp = &session.projection().characters["char-a"]["resources"]["hp"];
+        println!("缺陷1 证据：resources.hp = {hp}（is_i64 = {}）", hp.is_i64());
+        assert!(hp.is_i64(), "受伤后投影里的生命资源必须仍是 JSON 整数，实际 {hp}");
+        assert_eq!(hp.as_i64(), Some(25), "30 - 5（常量伤害）");
+    }
+
+    // ---------- 缺陷 2（回归）：use_skill 自目标回落 Lua 的 host.target ----------
+
+    /// 缺陷 2：不给 target_id（自目标）时，Lua 的 host.target 必须与结算语义一致——
+    /// 指向施法者本人，而不是 nil。修复前规则包读 host.target 拿到 nil，
+    /// 会「看着跑了其实没结算」。
+    #[test]
+    fn use_skill_self_target_exposes_actor_as_lua_target() {
+        let sb = json!({
+            "skills": [{
+                "id": "sk-self", "name": "自目标",
+                "check": { "dice": "1d20" }
+            }],
+            "world": { "check": { "dice": "1d20" } },
+            "lua_mounts": [{
+                "id": "probe", "mount": "check_post_roll",
+                "source": "local t = host.target\nif t and t.id then host.apply_effect(t.id, { kind = 'set_flag', flag = 'lua-saw-' .. t.id }) end"
+            }]
+        });
+        let (session, _sink) = session_with(sb);
+        let skill = session.rules.skill("sk-self").cloned().unwrap();
+        session.resolve_skill(None, &skill, None, None);
+        let flags = session.state.lock().unwrap().flags.clone();
+        println!("缺陷2 证据：规则包在自目标下读到 host.target.id → flags = {flags:?}");
+        assert_eq!(
+            flags.get("lua-saw-char-a"),
+            Some(&json!(true)),
+            "自目标时 host.target.id 必须是施法者本人（实际 flags={flags:?}）"
+        );
+    }
+
+    /// 缺陷 2 的真实后果：豁免成功时规则包补的「减半」必须真的落到目标。
+    /// 自目标（不给 target_id）+ 判定成功时，host.target 不再是 nil，apply_effect 不再静默不发。
+    #[test]
+    fn self_target_save_half_effect_is_not_silently_skipped() {
+        let sb = json!({
+            "skills": [{
+                "id": "sk-trap", "name": "陷阱",
+                "check": { "dice": "1d20", "kind": "save" }
+            }],
+            "world": { "check": { "dice": "1d20", "default_dc": 0 } },
+            "lua_mounts": [{
+                "id": "half", "mount": "check_post_roll",
+                "source": "if host.check_kind == 'save' and host.check_result == true then\n  local t = host.target\n  if t and t.id then host.apply_effect(t.id, { kind = 'damage', amount = '3', resource = 'hp' }) end\nend"
+            }]
+        });
+        let (session, _sink) = session_with(sb);
+        let skill = session.rules.skill("sk-trap").cloned().unwrap();
+        session.resolve_skill(None, &skill, None, None);
+        let hp = session.projection().characters["char-a"]["resources"]["hp"]
+            .as_i64()
+            .expect("资源仍是整数");
+        println!("缺陷2 证据：自目标豁免成功后 resources.hp = {hp}（修复前静默保持 30）");
+        assert_eq!(hp, 27, "豁免成功（DC 0 必成功）→ 规则包补的 3 点伤害必须真的结算；修复前静默为 30");
+    }
+
+    // ---------- 缺陷 3（回归）：check_pre_roll 判定签名 + check_post_roll expr ----------
+
+    /// 缺陷 3（GAP-D）：check_pre_roll 读得到判定**签名**（attribute + kind + target），
+    /// 结果字段仍是 nil；check_post_roll 读得到骰式 expr。
+    /// 「取高/取低只有掷骰前有意义」+「只对某一类检定生效」由此才表达得出来。
+    #[tokio::test]
+    async fn check_pre_roll_sees_signature_and_post_roll_sees_expr() {
+        let sb = || {
+            json!({
+                "world": { "check": { "dice": "1d20", "kind": "attribute" } },
+                "lua_mounts": [
+                    {
+                        "id": "gate",
+                        "mount": "check_pre_roll",
+                        "source": "local c = host.check\nif c and c.attribute == 'str' and c.kind == 'attribute' and c.target == 10 and c.total == nil and c.result == nil then host.modify_check('keep_high') end"
+                    },
+                    {
+                        "id": "expr",
+                        "mount": "check_post_roll",
+                        "source": "if host.check_expr == '1d20' and host.check.expr == '1d20' then host.modify_check('add', 5) end"
+                    }
+                ]
+            })
+        };
+        // 命中签名（str）→ 取高：掷两次，与独立探针同序列。
+        let mut probe = DeterministicRng::new(42);
+        let d1 = probe.range_inclusive(1, 20);
+        let d2 = probe.range_inclusive(1, 20);
+        let (session, sink) = session_with(sb());
+        session
+            .handle_intent(
+                Intent::Check {
+                    attribute: "str".into(),
+                    difficulty: Some(10),
+                    actor_id: None,
+                    opponent_id: None,
+                },
+                None,
+            )
+            .await;
+        let events = sink.0.lock().unwrap().clone();
+        let check = check_result_of(&events).expect("check result");
+        println!(
+            "缺陷3 证据：pre_roll 签名驱动取高 → rolls={:?}；post_roll 读 expr → r#mod={}",
+            check.rolls, check.r#mod
+        );
+        assert_eq!(check.rolls, Some(vec![d1.max(d2)]), "签名命中 → 取高生效");
+        assert_eq!(check.r#mod, 4 + 5, "post_roll 读到 expr 后加值");
+        assert_eq!(rng_logged(&events), probe.consumed);
+
+        // 签名不命中（dex）→ 取高不生效：只掷一次（证明签名真的可读、可判别）。
+        let (session2, sink2) = session_with(sb());
+        session2
+            .handle_intent(
+                Intent::Check {
+                    attribute: "dex".into(),
+                    difficulty: Some(10),
+                    actor_id: None,
+                    opponent_id: None,
+                },
+                None,
+            )
+            .await;
+        let events2 = sink2.0.lock().unwrap().clone();
+        let check2 = check_result_of(&events2).expect("check result 2");
+        assert_eq!(rng_logged(&events2).len(), 1, "签名不命中 → 不取高，只掷一次");
+        assert_eq!(check2.rolls.as_ref().map(Vec::len), Some(1));
     }
 
     /// #06 ① 回归（修复前应失败）：进程重启后从日志重放必须恢复 RNG 位置，
@@ -4232,6 +6138,338 @@ mod tests {
         assert!(session.projection().characters["char-a"]["statuses"].as_array().unwrap().is_empty());
     }
 
+    /// 一次状态 tick 期间写进 resources.mark_* 的标记，按事件顺序取出（时机顺序的可观测证据）。
+    fn mark_order(sink: &CaptureSink) -> Vec<String> {
+        let events = sink.0.lock().unwrap().clone();
+        let mut out = Vec::new();
+        for e in &events {
+            if let PlayEvent::StateUpdate(p) = &e.event {
+                for d in &p.changes {
+                    if let Some(name) = d.field.strip_prefix("resources.mark_") {
+                        out.push(name.to_string());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// 状态结算的时钟粒度（L4 时机原语）：turn_end / scene_end 每个边界各派发一次，
+    /// status_tick 每个 (角色, 状态) 各派发一次，且携带的正是被结算的那个状态实例。
+    #[test]
+    fn status_tick_mounts_fire_per_boundary_and_per_status() {
+        let sb = json!({
+            "statuses": [
+                { "id": "hold", "name": "定身", "duration": 3, "unit": "turns" },
+                { "id": "veil", "name": "帷幕", "duration": 3, "unit": "scenes" }
+            ],
+            "lua_mounts": [
+                { "id": "b-turn", "mount": "turn_end",
+                  "source": "host.modify_resource(host.actor.id, 'mark_' .. host.mount, 1)" },
+                { "id": "b-scene", "mount": "scene_end",
+                  "source": "host.modify_resource(host.actor.id, 'mark_' .. host.mount, 1)" },
+                { "id": "s-tick", "mount": "status_tick",
+                  "source": "host.modify_resource(host.actor.id, 'mark_' .. host.mount .. '_' .. host.status_id .. '_' .. host.status_unit .. '_' .. host.status_remaining, 1)" }
+            ]
+        });
+        let (session, sink) = session_with(sb);
+        session.emit_simple(PlayEvent::StateUpdate(StateUpdatePayload {
+            changes: vec![
+                StateDelta {
+                    domain: DeltaDomain::Character,
+                    entity_id: "char-a".into(),
+                    field: "status".into(),
+                    op: DeltaOp::Set,
+                    value: json!({ "id": "hold", "name": "定身", "turns_left": 3 }),
+                },
+                StateDelta {
+                    domain: DeltaDomain::Character,
+                    entity_id: "char-a".into(),
+                    field: "status".into(),
+                    op: DeltaOp::Set,
+                    value: json!({ "id": "veil", "name": "帷幕", "scenes_left": 3 }),
+                },
+            ],
+        }));
+
+        session.tick_statuses_turn();
+        session.tick_statuses_scene();
+
+        assert_eq!(
+            mark_order(&sink),
+            vec![
+                // 逐状态时机在结算前；回合边界时机在结算后（新加的状态不会被同一次 tick 递减）。
+                "status_tick_hold_turns_2".to_string(),
+                "turn_end".to_string(),
+                // 回合边界只结算 turns 单位的状态；上下文带 id / 单位 / 结算后剩余。
+                "status_tick_veil_scenes_2".to_string(),
+                "scene_end".to_string(),
+            ],
+            "逐状态时机与边界时机的派发顺序、上下文"
+        );
+        // 时机没有打乱引擎自己的结算：两个状态各递减一次。
+        let chars = session.projection().characters.clone();
+        let statuses = chars["char-a"]["statuses"].as_array().unwrap();
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(statuses[0]["id"], json!("hold"));
+        assert_eq!(statuses[0]["turns_left"], json!(2));
+        assert_eq!(statuses[1]["id"], json!("veil"));
+        assert_eq!(statuses[1]["scenes_left"], json!(2));
+    }
+
+    /// 边界时机在状态结算**之后**：规则包在 turn_end 新加的状态不会被同一次 tick 立刻递减。
+    #[test]
+    fn turn_end_runs_after_status_settlement() {
+        let sb = json!({
+            "statuses": [
+                { "id": "burn", "name": "灼烧", "duration": 2, "unit": "turns" },
+                { "id": "ward", "name": "守护", "duration": 1, "unit": "turns" }
+            ],
+            "lua_mounts": [{ "id": "ward-on", "mount": "turn_end",
+                "source": "host.apply_status(host.actor.id, 'ward', 1, 'turns')" }]
+        });
+        let (session, _sink) = session_with(sb);
+        session.emit_simple(PlayEvent::StateUpdate(StateUpdatePayload {
+            changes: vec![StateDelta {
+                domain: DeltaDomain::Character,
+                entity_id: "char-a".into(),
+                field: "status".into(),
+                op: DeltaOp::Set,
+                value: json!({ "id": "burn", "name": "灼烧", "turns_left": 2 }),
+            }],
+        }));
+        session.tick_statuses_turn();
+        let statuses = session.projection().characters["char-a"]["statuses"].clone();
+        let by_id = |id: &str| {
+            statuses
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["id"] == json!(id))
+                .cloned()
+                .unwrap_or(Value::Null)
+        };
+        assert_eq!(by_id("burn")["turns_left"], json!(1), "已有状态照常递减");
+        assert_eq!(by_id("ward")["turns_left"], json!(1), "边界新加的状态保留完整时长");
+    }
+
+    /// L4 范式：规则包在 status_tick 里掷骰决定是否结束状态（引擎不认识「豁免」）。
+    ///
+    /// 骰子取自引擎的确定性序列，因此与同种子的探针逐位相同；
+    /// 掷骰成功 → 状态被移除且不会被引擎的递减写回；失败 → 状态照常递减。
+    #[test]
+    fn status_tick_script_can_end_status_and_consumes_engine_rng() {
+        // 探针：与存档同一段 RNG 序列（seed 42 / position 0），先取出脚本将掷的那一颗骰。
+        let mut probe = DeterministicRng::new(42);
+        let roll = probe.range_inclusive(1, 20);
+        assert_eq!(probe.consumed.len(), 1);
+
+        let storybook = |source: String| {
+            json!({
+                "statuses": [{ "id": "grasp", "name": "缠绕", "duration": 3, "unit": "turns" }],
+                "lua_mounts": [{ "id": "grasp-rule", "mount": "status_tick", "source": source }]
+            })
+        };
+        let source = |threshold: i64| {
+            format!(
+                "if host.status_id == 'grasp' then \
+                   local r = host.engine_rng(1, 20) \
+                   if r >= {threshold} then host.remove_status(host.actor.id, host.status_id) end \
+                 end"
+            )
+        };
+        let apply_grasp = |session: &Arc<Session>| {
+            session.emit_simple(PlayEvent::StateUpdate(StateUpdatePayload {
+                changes: vec![StateDelta {
+                    domain: DeltaDomain::Character,
+                    entity_id: "char-a".into(),
+                    field: "status".into(),
+                    op: DeltaOp::Set,
+                    value: json!({ "id": "grasp", "name": "缠绕", "turns_left": 3 }),
+                }],
+            }));
+        };
+        let rng_events = |sink: &CaptureSink| -> Vec<u64> {
+            let events = sink.0.lock().unwrap().clone();
+            events
+                .iter()
+                .find_map(|e| match &e.event {
+                    PlayEvent::System(p) if p.code.as_deref() == Some("rng_consume") => {
+                        serde_json::from_str::<Vec<u64>>(&p.text).ok()
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default()
+        };
+
+        // 成功分支：阈值取探针值 → 脚本掷出的同一颗骰必然达成 → 状态移除。
+        let (session, sink) = session_with(storybook(source(roll)));
+        apply_grasp(&session);
+        session.tick_statuses_turn();
+        let statuses = session.projection().characters["char-a"]["statuses"].clone();
+        assert_eq!(statuses, json!([]), "脚本掷骰成功 → 状态被移除");
+        assert_eq!(
+            session.rng.lock().unwrap().consumed,
+            probe.consumed,
+            "脚本的骰子必须走引擎确定性序列（与探针同序列）"
+        );
+        assert_eq!(rng_events(&sink), probe.consumed, "掷骰消耗必须进命令日志");
+        // 引擎不得在脚本移除之后再把状态递减写回。
+        let ops: Vec<DeltaOp> = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match &e.event {
+                PlayEvent::StateUpdate(p) => Some(p.changes.clone()),
+                _ => None,
+            })
+            .flatten()
+            .filter(|d| d.field == "status")
+            .map(|d| d.op)
+            .collect();
+        assert_eq!(ops, vec![DeltaOp::Set, DeltaOp::Remove], "移除后不得再写回 Set");
+
+        // 失败分支：阈值取探针值 + 1 → 同一颗骰不达成 → 状态照常递减。
+        let (session2, sink2) = session_with(storybook(source(roll + 1)));
+        apply_grasp(&session2);
+        session2.tick_statuses_turn();
+        let statuses = session2.projection().characters["char-a"]["statuses"].clone();
+        assert_eq!(statuses[0]["turns_left"], json!(2), "掷骰未达成 → 引擎照常递减");
+        assert_eq!(session2.rng.lock().unwrap().consumed, probe.consumed);
+        assert_eq!(rng_events(&sink2), probe.consumed);
+    }
+
+    /// 向后兼容：无 lua_mounts、或有挂载点但没有 status_tick 脚本时，
+    /// 状态 tick 的事件与骰序逐字相同（脚本不参与 = 旧行为）。
+    #[test]
+    fn status_tick_without_status_tick_scripts_is_unchanged() {
+        let statuses = json!([{
+            "id": "burn", "name": "灼烧", "duration": 2, "unit": "turns",
+            "effect": [{ "kind": "damage", "amount": "2d6", "resource": "hp" }]
+        }]);
+        let run = |lua_mounts: Option<Value>| -> (Vec<String>, usize, Value) {
+            let mut sb = json!({ "statuses": statuses.clone() });
+            if let Some(m) = lua_mounts {
+                sb["lua_mounts"] = m;
+            }
+            let (session, sink) = session_with(sb);
+            session.emit_simple(PlayEvent::StateUpdate(StateUpdatePayload {
+                changes: vec![StateDelta {
+                    domain: DeltaDomain::Character,
+                    entity_id: "char-a".into(),
+                    field: "status".into(),
+                    op: DeltaOp::Set,
+                    value: json!({ "id": "burn", "name": "灼烧", "turns_left": 2 }),
+                }],
+            }));
+            // 只看 tick 自己产生的事件，排除测试自己落的施加 delta。
+            sink.0.lock().unwrap().clear();
+            session.tick_statuses_turn();
+            let events = sink.0.lock().unwrap().clone();
+            let summary: Vec<String> = events
+                .iter()
+                .map(|e| match &e.event {
+                    PlayEvent::System(p) => format!("system:{}:{}", p.code.clone().unwrap_or_default(), p.text),
+                    PlayEvent::StateUpdate(p) => format!("state:{:?}", p.changes),
+                    other => format!("other:{other:?}"),
+                })
+                .collect();
+            let draws = session.rng.lock().unwrap().consumed.len();
+            (summary, draws, session.projection().characters["char-a"]["resources"].clone())
+        };
+
+        let (plain, plain_draws, _) = run(None);
+        // 有挂载点、但没有 status_tick 脚本：同样零影响。
+        let (with_other_mount, other_draws, _) = run(Some(json!([
+            { "id": "unrelated", "mount": "check_pre_roll", "source": "host.modify_check('add', 6)" },
+            { "id": "turn-marker", "mount": "event", "source": "host.trigger_event('noop')" }
+        ])));
+        assert_eq!(plain, with_other_mount, "无 status_tick 脚本 → 事件逐字不变");
+        assert_eq!(plain_draws, 2, "2d6 消耗两颗骰，Lua 不得多掷");
+        assert_eq!(plain_draws, other_draws);
+        assert!(
+            !plain
+                .iter()
+                .any(|s| s.starts_with("system:") && !s.starts_with("system:rng_consume")),
+            "旧路径不得新增 System 事件（rng_consume 除外）：{plain:?}"
+        );
+        assert!(plain.iter().any(|s| s.starts_with("state:")), "仍要有状态结算：{plain:?}");
+    }
+
+    /// 沙箱照旧：status_tick 脚本超指令预算即被拦，且不阻断引擎自己的结算。
+    #[test]
+    fn status_tick_script_is_still_sandboxed() {
+        let sb = json!({
+            "statuses": [{ "id": "hold", "name": "定身", "duration": 2, "unit": "turns" }],
+            "lua_mounts": [{ "id": "runaway", "mount": "status_tick", "source": "while true do end" }]
+        });
+        let (session, sink) = session_with(sb);
+        session.emit_simple(PlayEvent::StateUpdate(StateUpdatePayload {
+            changes: vec![StateDelta {
+                domain: DeltaDomain::Character,
+                entity_id: "char-a".into(),
+                field: "status".into(),
+                op: DeltaOp::Set,
+                value: json!({ "id": "hold", "name": "定身", "turns_left": 2 }),
+            }],
+        }));
+        session.tick_statuses_turn();
+        let events = sink.0.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|e| matches!(&e.event,
+                PlayEvent::System(p) if p.code.as_deref() == Some("status_tick_lua_error")
+                    && p.text.contains("instruction budget"))),
+            "超预算脚本必须被沙箱拦下"
+        );
+        let statuses = session.projection().characters["char-a"]["statuses"].clone();
+        assert_eq!(statuses[0]["turns_left"], json!(1), "脚本失败不影响引擎自己的结算");
+    }
+
+    /// 端到端：一个完整回合（run_round）的边界就把 status_tick 交给规则包，
+    /// 规则包掷骰成功即结束状态——引擎全程不认识「何时结束」这个规则。
+    #[tokio::test]
+    async fn round_boundary_dispatches_status_tick_end_to_end() {
+        let mut probe = DeterministicRng::new(42);
+        let roll = probe.range_inclusive(1, 20);
+        let sb = json!({
+            "statuses": [{ "id": "grasp", "name": "缠绕", "duration": 5, "unit": "turns" }],
+            "lua_mounts": [{
+                "id": "grasp-rule", "mount": "status_tick",
+                "source": format!(
+                    "if host.status_id == 'grasp' then \
+                       local r = host.engine_rng(1, 20) \
+                       if r >= {roll} then host.remove_status(host.actor.id, host.status_id) end \
+                     end"
+                )
+            }]
+        });
+        let (session, _sink) = session_with(sb);
+        session.emit_simple(PlayEvent::StateUpdate(StateUpdatePayload {
+            changes: vec![StateDelta {
+                domain: DeltaDomain::Character,
+                entity_id: "char-a".into(),
+                field: "status".into(),
+                op: DeltaOp::Set,
+                value: json!({ "id": "grasp", "name": "缠绕", "turns_left": 5 }),
+            }],
+        }));
+        session
+            .run_round(
+                RoundInput { channel: RoundChannel::Meta, text: "/帮助".into(), refs: vec![] },
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            session.projection().characters["char-a"]["statuses"],
+            json!([]),
+            "回合边界派发 status_tick → 规则包掷骰成功 → 状态结束"
+        );
+        assert_eq!(session.rng.lock().unwrap().consumed, probe.consumed, "骰子走引擎序列");
+    }
+
     #[test]
     fn lua_apply_status_request_updates_state() {
         let sb = json!({
@@ -4464,6 +6702,164 @@ mod tests {
         )));
     }
 
+    /// 在场三层优先级（设计 §4.1）：① 作者点名 > ② 位置匹配 > ③ 两者都未声明则全员在场；
+    /// 受控角色恒在场。同时钉住旧代码的不一致——「缺省名单」曾被当成空集而清场。
+    #[test]
+    fn switch_scene_presence_three_layers() {
+        let sb = json!({
+            "skeleton": [{
+                "id": "ch-1",
+                "scenes": [
+                    { "id": "sc-none", "title": "无声明" },
+                    { "id": "sc-tavern", "title": "酒馆", "location_id": "loc-tavern" },
+                    { "id": "sc-mixed", "title": "混合", "location_id": "loc-tavern",
+                      "present_char_ids": ["char-elsewhere"] },
+                    { "id": "sc-empty", "title": "空场", "present_char_ids": [] }
+                ]
+            }]
+        });
+        let mut st = state_with_pc();
+        let npc = |id: &str, location_id: Option<&str>, present: bool| CharacterInstance {
+            instance_id: format!("inst-{id}"),
+            template_id: id.into(),
+            name: id.into(),
+            kind: "npc".into(),
+            attributes: Default::default(),
+            resources: Default::default(),
+            inventory: Default::default(),
+            location_id: location_id.map(str::to_string),
+            present,
+            statuses: vec![],
+        };
+        st.characters.insert("char-tavern".into(), npc("char-tavern", Some("loc-tavern"), false));
+        st.characters.insert("char-elsewhere".into(), npc("char-elsewhere", Some("loc-mine"), false));
+        st.characters.insert("char-nomad".into(), npc("char-nomad", None, false));
+        let (session, _sink) = session_with_state(sb, st);
+
+        // ③ 两个字段都未声明 → 全员在场（旧代码把缺省名单当空集，一切场就清空所有人）
+        session.switch_scene("sc-none");
+        let on = |id: &str| session.projection().characters[id]["present"].as_bool().unwrap();
+        assert!(on("char-tavern") && on("char-elsewhere") && on("char-nomad"), "未声明的场景不再清场");
+        assert!(on("char-a"), "受控角色恒在场");
+
+        // ② 只声明地点 → 位置匹配决定在场（清空 present_char_ids 后位置接管）
+        session.switch_scene("sc-tavern");
+        assert!(on("char-tavern"), "常驻该地点 → 在场");
+        assert!(!on("char-elsewhere"), "常驻别处 → 不在场");
+        assert!(!on("char-nomad"), "没有常驻地 → 不在场");
+        assert!(on("char-a"), "受控角色恒在场");
+
+        // ① 作者点名优先于 ②：被点名的人即使常驻别处也在场；位置匹配对其他人照旧生效
+        session.switch_scene("sc-mixed");
+        assert!(on("char-elsewhere"), "点名覆盖位置");
+        assert!(on("char-tavern"), "位置匹配照旧生效");
+        assert!(!on("char-nomad"));
+
+        // 显式空名单 ≠ 未声明：作者说这一幕没人
+        session.switch_scene("sc-empty");
+        assert!(!on("char-tavern") && !on("char-elsewhere") && !on("char-nomad"));
+        assert!(on("char-a"), "受控角色恒在场");
+    }
+
+    /// 回归（设计 §8 验收 1）：旧故事书（每个场景都写了 present_char_ids、人物没有常驻地）
+    /// 连续切场时，在场名单与改动前的判据 `present_ids.contains || controlled` 逐字一致。
+    #[test]
+    fn legacy_storybook_rosters_unchanged_across_scene_switches() {
+        let scenes = json!([
+            { "id": "sc-1", "title": "甲", "location_id": "loc-a", "present_char_ids": ["char-b"] },
+            { "id": "sc-2", "title": "乙", "location_id": "loc-b", "present_char_ids": ["char-c"] },
+            { "id": "sc-3", "title": "丙", "present_char_ids": ["char-b", "char-c"] }
+        ]);
+        let sb = json!({ "skeleton": [{ "id": "ch-1", "scenes": scenes.clone() }] });
+        let mut st = state_with_pc();
+        let npc = |id: &str, location_id: Option<&str>, present: bool| CharacterInstance {
+            instance_id: format!("inst-{id}"),
+            template_id: id.into(),
+            name: id.into(),
+            kind: "npc".into(),
+            attributes: Default::default(),
+            resources: Default::default(),
+            inventory: Default::default(),
+            location_id: location_id.map(str::to_string),
+            present,
+            statuses: vec![],
+        };
+        // 旧档开档时按 sc-1 的名单判定：char-b 在场、char-c 不在场（人物没有 location_id）
+        st.characters.insert("char-b".into(), npc("char-b", None, true));
+        st.characters.insert("char-c".into(), npc("char-c", None, false));
+        let (session, _sink) = session_with_state(sb, st);
+        for target in ["sc-2", "sc-3", "sc-1", "sc-2"] {
+            session.switch_scene(target);
+            let proj = session.projection();
+            let named: Vec<&str> = scenes
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["id"] == json!(target))
+                .unwrap()["present_char_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            let got: Vec<(String, bool)> = proj
+                .characters
+                .iter()
+                .map(|(k, c)| (k.clone(), c["present"].as_bool().unwrap()))
+                .collect();
+            let expected: Vec<(String, bool)> = proj
+                .characters
+                .iter()
+                .map(|(k, c)| {
+                    let template = c["template_id"].as_str().unwrap();
+                    (k.clone(), named.contains(&template) || proj.controlled.contains(k))
+                })
+                .collect();
+            assert_eq!(got, expected, "切到 {target} 后在场名单与改动前判据不一致");
+        }
+    }
+
+    /// Intent::Move 泛化（设计 §4.2）：意图归属的角色移动（NPC 也能被搬），
+    /// 未归属时缺省受控角色——旧的「只动受控角色」行为逐字不变。
+    #[tokio::test]
+    async fn move_intent_moves_named_actor_and_defaults_to_controlled() {
+        let mut st = state_with_pc();
+        let npc = |id: &str, location_id: Option<&str>, present: bool| CharacterInstance {
+            instance_id: format!("inst-{id}"),
+            template_id: id.into(),
+            name: id.into(),
+            kind: "npc".into(),
+            attributes: Default::default(),
+            resources: Default::default(),
+            inventory: Default::default(),
+            location_id: location_id.map(str::to_string),
+            present,
+            statuses: vec![],
+        };
+        st.characters.insert("char-isa".into(), npc("char-isa", None, true));
+        let (session, _sink) = session_with_state(json!({}), st);
+
+        // 指定角色：NPC / 怪物也能被搬
+        session
+            .handle_intent(
+                Intent::Move { destination_id: "loc-tavern".into(), character_id: None },
+                Some(ActorRef { id: "char-isa".into(), name: "伊莎".into() }),
+            )
+            .await;
+        let proj = session.projection();
+        assert_eq!(proj.characters["char-isa"]["location_id"], json!("loc-tavern"));
+        assert!(proj.characters["char-a"].get("location_id").is_none(), "未指定时不该动别人");
+
+        // 未指定 → 受控角色（旧调用行为不变）
+        session
+            .handle_intent(
+                Intent::Move { destination_id: "loc-mine".into(), character_id: None },
+                None,
+            )
+            .await;
+        assert_eq!(session.projection().characters["char-a"]["location_id"], json!("loc-mine"));
+    }
+
     struct CapturingAi(StdMutex<Vec<TurnContext>>);
 
     #[async_trait::async_trait]
@@ -4541,6 +6937,63 @@ mod tests {
             ctx.scenes.iter().any(|s| s.id == "sc-1" && s.title == "场景"),
             "要给出可 advance_scene 的合法场景清单"
         );
+    }
+
+    /// 当前地点进回合提示词（设计 §6.6）：TurnContext.location 取「场景 location_id → 地点名」，
+    /// 切场后跟着变；未声明地点的场景不注入（老故事书提示词逐字不变）。
+    #[tokio::test]
+    async fn turn_context_carries_current_location_name() {
+        let sb = json!({
+            "skeleton": [{ "id": "ch-1", "scenes": [
+                { "id": "sc-1", "title": "碎星酒馆的夜晚", "location_id": "loc-tavern" },
+                { "id": "sc-2", "title": "矿坑口", "location_id": "loc-mine" },
+                { "id": "sc-3", "title": "无名之地" }
+            ] }],
+            "world": { "locations": [
+                { "id": "loc-tavern", "name": "碎星酒馆" },
+                { "id": "loc-mine", "name": "废矿坑" }
+            ] }
+        });
+        let mut st = state_with_pc();
+        st.scene_id = "sc-1".into();
+        st.scene_title = "碎星酒馆的夜晚".into();
+        st.locations = json!([
+            { "id": "loc-tavern", "name": "碎星酒馆" },
+            { "id": "loc-mine", "name": "废矿坑" }
+        ])
+        .as_array()
+        .cloned()
+        .unwrap();
+        let sink = Arc::new(CaptureSink(StdMutex::new(vec![])));
+        let ai = Arc::new(CapturingAi(StdMutex::new(vec![])));
+        let session = Arc::new(Session::new(
+            "s".into(),
+            st,
+            sink as Arc<dyn EventSink>,
+            ai_slot(ai.clone() as Arc<dyn AiProvider>),
+            true,
+            sb,
+        ));
+        let input = |text: &str| RoundInput { channel: RoundChannel::Character, text: text.into(), refs: vec![] };
+
+        session.run_round(input("看看四周"), None, vec![]).await.unwrap();
+        assert_eq!(
+            ai.0.lock().unwrap()[0].location.as_deref(),
+            Some("碎星酒馆"),
+            "初始场景的地点名要进回合上下文"
+        );
+
+        session.switch_scene("sc-2");
+        session.run_round(input("继续走"), None, vec![]).await.unwrap();
+        assert_eq!(
+            ai.0.lock().unwrap()[1].location.as_deref(),
+            Some("废矿坑"),
+            "切场后地点名跟着变"
+        );
+
+        session.switch_scene("sc-3");
+        session.run_round(input("四下张望"), None, vec![]).await.unwrap();
+        assert_eq!(ai.0.lock().unwrap()[2].location, None, "未声明地点的场景不注入地点");
     }
 
     #[tokio::test]
@@ -5393,7 +7846,7 @@ mod tests {
         let (session, sink) = session_with(sb);
         session
             .handle_intent(
-                Intent::Check { attribute: "str".into(), difficulty: Some(10), actor_id: None },
+                Intent::Check { attribute: "str".into(), difficulty: Some(10), actor_id: None, opponent_id: None },
                 None,
             )
             .await;
@@ -5416,7 +7869,7 @@ mod tests {
         let (session2, sink2) = session_with(json!({ "world": {} }));
         session2
             .handle_intent(
-                Intent::Check { attribute: "str".into(), difficulty: Some(12), actor_id: None },
+                Intent::Check { attribute: "str".into(), difficulty: Some(12), actor_id: None, opponent_id: None },
                 None,
             )
             .await;
@@ -5431,6 +7884,611 @@ mod tests {
         assert_eq!(check2.expr.as_deref(), Some("1d20"));
         assert_eq!(check2.r#mod, 0, "无 world.check 时不应用属性修正");
         assert_eq!(check2.rolls.as_ref().unwrap().len(), 1);
+    }
+
+    // ---------- 判定 C3：对抗判定（双方各得一次值比大小） ----------
+
+    /// 一个在场的怪物实例（对手的「角色实例」形态）+ 一个只在故事书里声明属性的
+    /// 人物条目（对手的「静态被动值」形态）。
+    fn opponent_state() -> WorldState {
+        let mut st = state_with_pc();
+        st.characters.insert(
+            "char-goblin".to_string(),
+            CharacterInstance {
+                instance_id: "inst-char-goblin".into(),
+                template_id: "char-goblin".into(),
+                name: "地精斥候".into(),
+                kind: "monster".into(),
+                attributes: json!({ "insight": 14, "stealth": 18 })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                resources: json!({ "hp": 7 }).as_object().unwrap().clone(),
+                inventory: Default::default(),
+                location_id: None,
+                present: true,
+                statuses: vec![],
+            },
+        );
+        st
+    }
+
+    fn last_check(sink: &Arc<CaptureSink>) -> CheckResultPayload {
+        sink.0
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|e| match &e.event {
+                PlayEvent::CheckResult(p) => Some(p.clone()),
+                _ => None,
+            })
+            .expect("应有判定结果事件")
+    }
+
+    /// 判定 C3 验收 1 / 2 / 3 / 5：**掷 vs 掷**——对手是角色实例时双方各掷一次；
+    /// target = 对手 total（不是静态难度），对手走 opposed_attribute，署名落 payload。
+    #[tokio::test]
+    async fn opposed_check_rolls_both_sides_against_a_character_opponent() {
+        let sb = json!({
+            "world": { "check": {
+                "dice": "1d20",
+                "mode": "opposed",
+                "attribute": "dex",
+                "opposed_attribute": "insight",
+                "attribute_modifier": { "dex": 1, "insight": 7 }
+            } }
+        });
+        let (session, sink) = session_with_state(sb, opponent_state());
+        session
+            .handle_intent(
+                Intent::Check {
+                    attribute: "dex".into(),
+                    // 对抗不看这个难度（写 5 就是为了证明「不是与静态数值比」）。
+                    difficulty: Some(5),
+                    actor_id: None,
+                    opponent_id: Some("char-goblin".into()),
+                },
+                None,
+            )
+            .await;
+        let check = last_check(&sink);
+        let consumed = session.rng.lock().unwrap().consumed.clone();
+        assert_eq!(consumed.len(), 2, "双方各掷一次：RNG 消耗 = 2");
+        let own_roll = 1 + (consumed[0] % 20) as i64;
+        let opponent_roll = 1 + (consumed[1] % 20) as i64;
+        assert_eq!(check.rolls, Some(vec![own_roll]));
+        assert_eq!(check.total, own_roll + 1, "主动方用主动属性 dex 的修正");
+        assert_eq!(
+            check.target,
+            opponent_roll + 7,
+            "target = 对手 total（对手走 opposed_attribute = insight）"
+        );
+        assert_eq!(check.margin, check.total - check.target);
+        assert_eq!(check.result, check.total >= check.target);
+        assert_eq!(
+            check.opponent,
+            Some(ActorRef { id: "char-goblin".into(), name: "地精斥候".into() })
+        );
+    }
+
+    /// 判定 C3 验收 1 / 3 / 5：**掷 vs 被动**——对手命中不了角色实例时用静态被动值
+    /// （passive_base + 属性修正），对手不掷骰。LMoP「隐匿 vs 被动察觉」正是这一形态。
+    #[tokio::test]
+    async fn opposed_check_uses_static_passive_value_for_a_non_instance_opponent() {
+        let sb = json!({
+            "attribute_dimensions": [
+                { "key": "perception", "baseline": 10, "modifier_step": 2 }
+            ],
+            "characters": [
+                { "id": "goblin-passive", "name": "地精（被动）", "kind": "monster",
+                  "attributes": { "perception": 16 } }
+            ],
+            "world": { "check": {
+                "dice": "1d20",
+                "mode": "opposed",
+                "attribute": "dex",
+                "opposed_attribute": "perception",
+                "passive_base": 10
+            } }
+        });
+        let (session, sink) = session_with_state(sb, state_with_pc());
+        session
+            .handle_intent(
+                Intent::Check {
+                    attribute: "dex".into(),
+                    difficulty: None,
+                    actor_id: None,
+                    opponent_id: Some("goblin-passive".into()),
+                },
+                None,
+            )
+            .await;
+        let check = last_check(&sink);
+        let consumed = session.rng.lock().unwrap().consumed.clone();
+        assert_eq!(consumed.len(), 1, "静态被动值不掷骰：只有主动方消耗 RNG");
+        // passive_base 10 + floor((16 - 10) / 2) = 13
+        assert_eq!(check.target, 13, "静态被动值 = passive_base + 属性修正");
+        assert_eq!(check.total, 1 + (consumed[0] % 20) as i64);
+        assert_eq!(check.margin, check.total - 13);
+        assert_eq!(
+            check.opponent,
+            Some(ActorRef { id: "goblin-passive".into(), name: "地精（被动）".into() })
+        );
+    }
+
+    /// 判定 C3 验收 1（第三种组合）：**被动 vs 掷**——主动方 kind = passive 不掷骰，
+    /// 对手是角色实例，掷一次。
+    #[tokio::test]
+    async fn opposed_passive_side_is_compared_with_a_rolling_opponent() {
+        let sb = json!({
+            "world": { "check": {
+                "dice": "1d20",
+                "mode": "opposed",
+                "kind": "passive",
+                "passive_base": 10,
+                "attribute": "insight",
+                "opposed_attribute": "stealth",
+                "attribute_modifier": { "insight": 4, "stealth": 2 }
+            } }
+        });
+        let (session, sink) = session_with_state(sb, opponent_state());
+        session
+            .handle_intent(
+                Intent::Check {
+                    attribute: "insight".into(),
+                    difficulty: None,
+                    actor_id: None,
+                    opponent_id: Some("char-goblin".into()),
+                },
+                None,
+            )
+            .await;
+        let check = last_check(&sink);
+        let consumed = session.rng.lock().unwrap().consumed.clone();
+        assert_eq!(consumed.len(), 1, "被动一侧不掷骰，只有对手掷一次");
+        assert_eq!(check.rolls, None, "被动判定没有骰面");
+        assert_eq!(check.total, 10 + 4, "被动值 = passive_base + 修正");
+        assert_eq!(check.target, 1 + (consumed[0] % 20) as i64 + 2);
+        assert_eq!(
+            check.opponent,
+            Some(ActorRef { id: "char-goblin".into(), name: "地精斥候".into() })
+        );
+    }
+
+    /// 判定 C3 验收 4：mode = opposed 却没有对手 → 显式驳回（不再静默降级成 gte）。
+    #[tokio::test]
+    async fn opposed_without_opponent_is_rejected() {
+        let sb = json!({ "world": { "check": { "dice": "1d20", "mode": "opposed" } } });
+        let (session, sink) = session_with_state(sb, state_with_pc());
+        session
+            .handle_intent(
+                Intent::Check {
+                    attribute: "str".into(),
+                    difficulty: Some(12),
+                    actor_id: None,
+                    opponent_id: None,
+                },
+                None,
+            )
+            .await;
+        let events = sink.0.lock().unwrap().clone();
+        assert!(
+            !events.iter().any(|e| matches!(&e.event, PlayEvent::CheckResult(_))),
+            "没有对手就不该有判定结果"
+        );
+        let rejected = events
+            .iter()
+            .find_map(|e| match &e.event {
+                PlayEvent::Resolution(p) if p.status == ResolutionStatus::Rejected => Some(p),
+                _ => None,
+            })
+            .expect("应显式驳回");
+        assert_eq!(rejected.rejection_code.as_deref(), Some("rule_violation"));
+        assert!(session.rng.lock().unwrap().consumed.is_empty(), "驳回不掷骰");
+    }
+
+    /// 判定 C3 验收 5：判定器没声明 opposed_attribute 时，对手用主动方同一属性。
+    #[tokio::test]
+    async fn opponent_attribute_falls_back_to_the_active_attribute() {
+        let sb = json!({ "world": { "check": {
+            "dice": "1d20",
+            "mode": "opposed",
+            "attribute": "dex",
+            "attribute_modifier": { "dex": 1, "insight": 7 }
+        } } });
+        let (session, sink) = session_with_state(sb, opponent_state());
+        session
+            .handle_intent(
+                Intent::Check {
+                    attribute: "dex".into(),
+                    difficulty: None,
+                    actor_id: None,
+                    opponent_id: Some("char-goblin".into()),
+                },
+                None,
+            )
+            .await;
+        let check = last_check(&sink);
+        let consumed = session.rng.lock().unwrap().consumed.clone();
+        assert_eq!(consumed.len(), 2);
+        let opponent_roll = 1 + (consumed[1] % 20) as i64;
+        assert_eq!(
+            check.target,
+            opponent_roll + 1,
+            "缺省取主动方属性 dex（修正 1），不是 opposed_attribute 缺省成 insight 的 7"
+        );
+    }
+
+    /// 判定 C3 验收 6：非 opposed 的判定逐字不变——单次掷骰、opponent 为空、摘要格式不变。
+    #[tokio::test]
+    async fn non_opposed_check_stays_byte_for_byte_the_same() {
+        let sb = json!({ "world": { "check": {
+            "dice": "1d20",
+            "attribute_modifier": { "str": 7 },
+            "degree_thresholds": [100, -100, -100]
+        } } });
+        let (session, sink) = session_with_state(sb, state_with_pc());
+        let out = session
+            .handle_intent(
+                Intent::Check {
+                    attribute: "str".into(),
+                    difficulty: Some(10),
+                    actor_id: None,
+                    opponent_id: None,
+                },
+                None,
+            )
+            .await;
+        let check = last_check(&sink);
+        let consumed = session.rng.lock().unwrap().consumed.clone();
+        assert_eq!(consumed.len(), 1, "非对抗只掷一次");
+        let roll = 1 + (consumed[0] % 20) as i64;
+        assert_eq!(check.opponent, None);
+        assert_eq!(check.target, 10);
+        assert_eq!(check.total, roll + 7);
+        assert_eq!(
+            out,
+            Some(format!(
+                "判定「str」：成功（骰 {roll}，修正 7，总值 {}，难度 10）",
+                roll + 7
+            ))
+        );
+    }
+
+    /// 判定 C3 验收 3：对手寻址与 actor / target 同一口径——模板 id / 角色名 / 实例键
+    /// / instance_id 都能命中同一个角色实例（命中不了才走静态被动值）。
+    #[tokio::test]
+    async fn opponent_id_accepts_template_id_name_and_instance_key() {
+        let sb = json!({ "world": { "check": {
+            "dice": "1d20", "mode": "opposed", "attribute": "dex"
+        } } });
+        for id in ["char-goblin", "地精斥候", "inst-char-goblin"] {
+            let (session, sink) = session_with_state(sb.clone(), opponent_state());
+            session
+                .handle_intent(
+                    Intent::Check {
+                        attribute: "dex".into(),
+                        difficulty: None,
+                        actor_id: None,
+                        opponent_id: Some(id.into()),
+                    },
+                    None,
+                )
+                .await;
+            let check = last_check(&sink);
+            assert_eq!(
+                check.opponent,
+                Some(ActorRef { id: "char-goblin".into(), name: "地精斥候".into() }),
+                "对手 id `{id}` 必须命中角色实例"
+            );
+            // 命中实例 = 对手掷骰，所以 RNG 消耗是 2（主动方一次 + 对手一次）。
+            assert_eq!(session.rng.lock().unwrap().consumed.len(), 2, "对手 `{id}` 应掷骰");
+        }
+    }
+
+    // ---------- 判定 C2：攻击与技能共用一个内核 ----------
+
+    /// 造一个含单只敌人的遭遇；ac 由调用方给（0 = 未声明防御值）。
+    fn state_with_encounter(ac: i64) -> WorldState {
+        let mut st = state_with_pc();
+        st.encounters.insert(
+            "enc-1".to_string(),
+            json!({
+                "id": "enc-1", "name": "洞穴", "active": true,
+                "enemies": [{ "id": "e1", "name": "灰狼", "hp": 20, "max": 20, "ac": ac }]
+            }),
+        );
+        st
+    }
+
+    /// 再加一个角色：验 actor / target 的任意 id 寻址。
+    fn state_with_ally() -> WorldState {
+        let mut st = state_with_pc();
+        st.characters.insert(
+            "char-b".to_string(),
+            CharacterInstance {
+                instance_id: "inst-char-b".into(),
+                template_id: "char-b".into(),
+                name: "卢克".into(),
+                kind: "npc".into(),
+                attributes: json!({ "str": 50 }).as_object().unwrap().clone(),
+                resources: json!({ "hp": 12 }).as_object().unwrap().clone(),
+                inventory: Default::default(),
+                location_id: None,
+                present: true,
+                statuses: vec![],
+            },
+        );
+        st
+    }
+
+    fn strike_narrative(sink: &Arc<CaptureSink>) -> String {
+        sink.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match &e.event {
+                PlayEvent::Resolution(p) if p.outcome.as_deref() == Some("strike") => {
+                    p.narrative.clone()
+                }
+                _ => None,
+            })
+            .next_back()
+            .unwrap_or_default()
+    }
+
+    fn enemy_hp(session: &Arc<Session>, enc: &str, idx: usize) -> i64 {
+        let st = session.state.lock().unwrap();
+        st.encounters[enc]["enemies"][idx]["hp"].as_i64().unwrap_or(-1)
+    }
+
+    /// 验收 1：带 Lua 判定器的攻击技能真正执行 Lua。
+    ///
+    /// 旧实现绕过 resolve_checker 直接调 resolve_declarative_check：Lua 判定器不掷骰，
+    /// total = 0 + mod → 除极端情况外恒未命中。
+    #[tokio::test]
+    async fn strike_runs_lua_checker_and_deals_damage() {
+        let sb = json!({
+            "skills": [{
+                "id": "sk-sneak", "name": "背刺",
+                "check": { "lua": "return { total = 100, margin = 100 }" },
+                "effect": { "immediate": [{ "kind": "damage", "amount": "3", "resource": "hp" }] }
+            }]
+        });
+        let (session, sink) = session_with_state(sb, state_with_encounter(15));
+        session
+            .strike_enemy(
+                "e1".into(),
+                AttackChoice { skill_id: Some("sk-sneak".into()), ..Default::default() },
+                None,
+            )
+            .await;
+        let narrative = strike_narrative(&sink);
+        assert!(narrative.contains("造成 3 点伤害"), "Lua 判定器必须被真正执行：{narrative}");
+        assert_eq!(enemy_hp(&session, "enc-1", 0), 17);
+    }
+
+    /// 验收 2：`check: \"world\"`（Ref）读 world.check 的骰式 / 修正 / 阈值，不再静默换裸 1d20。
+    #[tokio::test]
+    async fn strike_ref_checker_reads_global_check() {
+        let sb = json!({
+            "world": { "check": {
+                "dice": "1d20",
+                "attribute_modifier": { "str": 100 },
+                "degree_thresholds": [1000, 1000, 1000]
+            } },
+            "skills": [{
+                "id": "sk-atk", "name": "挥砍", "check": "world",
+                "effect": { "immediate": [{ "kind": "damage", "amount": "1", "resource": "hp" }] }
+            }]
+        });
+        let (session, sink) = session_with_state(sb, state_with_encounter(15));
+        session
+            .strike_enemy(
+                "e1".into(),
+                AttackChoice { skill_id: Some("sk-atk".into()), ..Default::default() },
+                None,
+            )
+            .await;
+        let narrative = strike_narrative(&sink);
+        assert!(narrative.contains("修正 100"), "Ref 必须用 world.check 的修正：{narrative}");
+        assert!(!narrative.contains("骰 0"), "Ref 必须真的掷 1d20：{narrative}");
+        assert_eq!(enemy_hp(&session, "enc-1", 0), 19);
+    }
+
+    /// 验收 3：攻击参与 attribute_bonuses（挂接定义 / 已装备物品），与 use_skill 同口径。
+    #[tokio::test]
+    async fn strike_and_use_skill_share_attribute_bonuses() {
+        let sb = json!({
+            "attribute_dimensions": [{ "key": "str", "baseline": 10, "modifier_step": 2, "min": 1, "max": 200 }],
+            "definitions": [{ "id": "def-mighty", "modifiers": [{ "target": "str", "value": 4 }] }],
+            "items": [{ "id": "it-gloves", "name": "力手套", "modifiers": [{ "target": "str", "value": 6 }] }],
+            "characters": [{
+                "id": "char-a", "kind": "pc",
+                "attachments": { "trait": ["def-mighty"] },
+                "equipped": ["it-gloves"]
+            }],
+            "skills": [{
+                "id": "sk-atk", "name": "挥砍", "attribute": "str",
+                "check": { "dice": "1d20" },
+                "effect": { "immediate": [{ "kind": "damage", "amount": "1", "resource": "hp" }] }
+            }]
+        });
+        let (session, sink) = session_with_state(sb, state_with_encounter(15));
+        let skill = session.rules.skill("sk-atk").cloned().unwrap();
+        // 技能路径：修正 = floor((70 基础 + 4 挂接 + 6 已装备 - 10) / 2) = 35
+        session.resolve_skill(None, &skill, None, None);
+        let skill_mod = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match &e.event {
+                PlayEvent::CheckResult(p) => Some(p.r#mod),
+                _ => None,
+            })
+            .next_back();
+        assert_eq!(skill_mod, Some(35), "技能路径的修正含挂接定义与已装备物品的加值");
+        session
+            .strike_enemy(
+                "e1".into(),
+                AttackChoice { skill_id: Some("sk-atk".into()), ..Default::default() },
+                None,
+            )
+            .await;
+        let narrative = strike_narrative(&sink);
+        assert!(narrative.contains("修正 35"), "攻击必须与技能同口径：{narrative}");
+    }
+
+    /// 验收 4：难度来源统一 —— 目标 AC → world.check.default_dc → 12。
+    #[tokio::test]
+    async fn strike_difficulty_uses_ac_then_default_dc_then_twelve() {
+        // 技能自带固定修正：命中无悬念，难度差异只体现在叙事里。
+        let attack = json!({
+            "id": "sk-atk", "name": "挥砍",
+            "check": { "dice": "1d20", "attribute_modifier": { "str": 100 } },
+            "effect": { "immediate": [{ "kind": "damage", "amount": "1", "resource": "hp" }] }
+        });
+        let with_dc = json!({
+            "world": { "check": { "dice": "1d20", "default_dc": 20 } },
+            "skills": [attack.clone()]
+        });
+        let choice = || AttackChoice { skill_id: Some("sk-atk".into()), ..Default::default() };
+        // ① 敌人 AC 优先
+        let (s1, k1) = session_with_state(with_dc.clone(), state_with_encounter(15));
+        s1.strike_enemy("e1".into(), choice(), None).await;
+        assert!(strike_narrative(&k1).contains("≥ 15"), "{}", strike_narrative(&k1));
+        // ② AC 缺省（0）→ default_dc
+        let (s2, k2) = session_with_state(with_dc, state_with_encounter(0));
+        s2.strike_enemy("e1".into(), choice(), None).await;
+        assert!(strike_narrative(&k2).contains("≥ 20"), "{}", strike_narrative(&k2));
+        // ③ 两处都缺省 → 12
+        let sb = json!({ "skills": [attack] });
+        let (s3, k3) = session_with_state(sb, state_with_encounter(0));
+        s3.strike_enemy("e1".into(), choice(), None).await;
+        assert!(strike_narrative(&k3).contains("≥ 12"), "{}", strike_narrative(&k3));
+    }
+
+    /// 验收 4（技能路径）：resolve_skill 读 default_dc，不再硬编码 12。
+    #[test]
+    fn resolve_skill_difficulty_follows_default_dc() {
+        let sb = json!({
+            "world": { "check": { "dice": "1d20", "default_dc": 7 } },
+            "skills": [{ "id": "sk-hit", "name": "敲击", "check": { "dice": "1d20" }, "effect": {} }]
+        });
+        let (session, sink) = session_with_state(sb, state_with_encounter(0));
+        let skill = session.rules.skill("sk-hit").cloned().unwrap();
+        session.resolve_skill(None, &skill, None, None);
+        let target = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|e| match &e.event {
+                PlayEvent::CheckResult(p) => Some(p.target),
+                _ => None,
+            })
+            .expect("check result");
+        assert_eq!(target, 7, "难度取自 world.check.default_dc");
+
+        // 无 world.check.default_dc → 回落 12
+        let (session2, sink2) = session_with_state(json!({}), state_with_encounter(0));
+        let skill2 = {
+            let mut s = skill.clone();
+            s.id = "sk-hit".into();
+            s
+        };
+        session2.resolve_skill(None, &skill2, None, None);
+        let target2 = sink2
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|e| match &e.event {
+                PlayEvent::CheckResult(p) => Some(p.target),
+                _ => None,
+            })
+            .expect("check result");
+        assert_eq!(target2, 12, "无声明时回落 12");
+    }
+
+    /// 验收 5：resolve_skill 用传入的 actor（修 D7），target 经 find_character 解析（修 D8）。
+    #[test]
+    fn resolve_skill_uses_passed_actor_and_resolves_target_by_any_id() {
+        let sb = json!({
+            "skills": [{
+                "id": "sk-hit", "name": "敲击",
+                "check": { "dice": "1d20" },
+                "effect": { "immediate": [{ "kind": "damage", "amount": "4", "resource": "hp" }] }
+            }]
+        });
+        let (session, sink) = session_with_state(sb, state_with_ally());
+        let skill = session.rules.skill("sk-hit").cloned().unwrap();
+        let actor = || ActorRef { id: "char-b".into(), name: "卢克".into() };
+        // 模板 id / 角色名 / instance_id 三种寻址都要命中。
+        for target in ["卢克", "char-b", "inst-char-b"] {
+            session.resolve_skill(None, &skill, Some(target), Some(actor()));
+        }
+        let events = sink.0.lock().unwrap().clone();
+        let checks: Vec<&CheckResultPayload> = events
+            .iter()
+            .filter_map(|e| match &e.event {
+                PlayEvent::CheckResult(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(checks.len(), 3);
+        assert!(
+            checks.iter().all(|c| c.actor.id == "char-b"),
+            "结算主体取传入的 actor，而不是恒取受控角色"
+        );
+        let ok: Vec<&ResolutionPayload> = events
+            .iter()
+            .filter_map(|e| match &e.event {
+                PlayEvent::Resolution(p) if p.status == ResolutionStatus::Ok => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ok.len(), 3);
+        assert!(
+            ok.iter().all(|r| r
+                .state_changes
+                .iter()
+                .any(|d| d.entity_id == "char-b" && d.field == "resources.hp")),
+            "target 必须解析到实例键：{:?}",
+            ok.iter().map(|r| r.state_changes.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            session.projection().characters["char-b"]["resources"]["hp"].as_f64(),
+            Some(0.0),
+            "三次 4 点伤害打在卢克身上"
+        );
+    }
+
+    /// 验收 7：判定骰序逐位不变 —— 徒手攻击 = 先 1d20 后 1d6（命令日志重放依赖该序列）。
+    #[tokio::test]
+    async fn strike_consumes_hit_die_then_damage_die_in_order() {
+        let (session, sink) = session_with_state(json!({ "world": {} }), state_with_encounter(1));
+        session
+            .strike_enemy("e1".into(), AttackChoice::default(), None)
+            .await;
+        let consumed: Vec<u64> = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|e| match &e.event {
+                PlayEvent::System(p) if p.code.as_deref() == Some("rng_consume") => {
+                    serde_json::from_str(&p.text).ok()
+                }
+                _ => None,
+            })
+            .expect("rng_consume");
+        let mut reference = DeterministicRng::new(42);
+        let _ = reference.range_inclusive(1, 20);
+        let dmg = reference.range_inclusive(1, 6);
+        assert_eq!(consumed, reference.consumed, "骰序必须是 1d20 → 1d6");
+        assert_eq!(enemy_hp(&session, "enc-1", 0), 20 - dmg, "伤害取自第二次掷骰");
     }
 
     /// 主线 AI 输出重复 intent_id：只结算一次；缺省 id 保持旧行为（都结算）。
@@ -6062,7 +9120,7 @@ mod tests {
         let (session, sink) = session_with(sb());
         session
             .handle_intent(
-                Intent::Check { attribute: "dexterity".into(), difficulty: None, actor_id: None },
+                Intent::Check { attribute: "dexterity".into(), difficulty: None, actor_id: None, opponent_id: None },
                 None,
             )
             .await;
@@ -6085,7 +9143,7 @@ mod tests {
         let (session2, sink2) = session_with(sb());
         session2
             .handle_intent(
-                Intent::Check { attribute: "agi".into(), difficulty: None, actor_id: None },
+                Intent::Check { attribute: "agi".into(), difficulty: None, actor_id: None, opponent_id: None },
                 None,
             )
             .await;
@@ -6150,7 +9208,7 @@ mod tests {
         let (session, sink) = session_with(sb());
         session
             .handle_intent(
-                Intent::Check { attribute: "str".into(), difficulty: Some(30), actor_id: None },
+                Intent::Check { attribute: "str".into(), difficulty: Some(30), actor_id: None, opponent_id: None },
                 None,
             )
             .await;
@@ -6168,7 +9226,7 @@ mod tests {
         let (session2, sink2) = session_with(sb());
         session2
             .handle_intent(
-                Intent::Check { attribute: "str".into(), difficulty: Some(-100), actor_id: None },
+                Intent::Check { attribute: "str".into(), difficulty: Some(-100), actor_id: None, opponent_id: None },
                 None,
             )
             .await;
@@ -6183,5 +9241,1480 @@ mod tests {
         assert!(!check2.result, "lte 模式 total>target 必失败");
     }
 
+    // ---------- 规则集挂载点：入口 · 判定路径收敛 · 原语落地 ----------
+
+    fn rng_logged(events: &[EventEnvelope]) -> Vec<u64> {
+        events
+            .iter()
+            .filter_map(|e| match &e.event {
+                PlayEvent::System(p) if p.code.as_deref() == Some("rng_consume") => {
+                    serde_json::from_str::<Vec<u64>>(&p.text).ok()
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    fn check_result_of(events: &[EventEnvelope]) -> Option<CheckResultPayload> {
+        events.iter().find_map(|e| match &e.event {
+            PlayEvent::CheckResult(p) => Some(p.clone()),
+            _ => None,
+        })
+    }
+
+    /// 验收 1 / 5 / 7：storybook.lua_mounts 装载生效；Intent::Check 触发挂载点；
+    /// 取高 = 掷两次（RNG 消耗 = 2）且确定性可重放。
+    #[tokio::test]
+    async fn storybook_lua_mounts_drive_intent_check() {
+        let sb = || {
+            json!({
+                "world": { "check": { "dice": "1d20" } },
+                "lua_mounts": [
+                    { "id": "gate", "mount": "check_pre_roll", "source": "host.modify_check('keep_high')" },
+                    { "id": "prof", "mount": "check_post_roll", "source": "host.modify_check('add', 6)" }
+                ]
+            })
+        };
+        // 会话种子 42（state_with_pc）：独立探针取同序列前两颗 d20。
+        let mut probe = DeterministicRng::new(42);
+        let d1 = probe.range_inclusive(1, 20);
+        let d2 = probe.range_inclusive(1, 20);
+
+        let (session, sink) = session_with(sb());
+        session
+            .handle_intent(
+                Intent::Check { attribute: "str".into(), difficulty: Some(10), actor_id: None, opponent_id: None },
+                None,
+            )
+            .await;
+        let events = sink.0.lock().unwrap().clone();
+        let check = check_result_of(&events).expect("check result");
+        assert_eq!(check.rolls, Some(vec![d1.max(d2)]), "取高 = 两次取大");
+        assert_eq!(check.r#mod, 4 + 6, "属性修正 +4，挂载点后置加值 +6");
+        assert_eq!(check.total, d1.max(d2) + 4 + 6);
+        assert_eq!(check.margin, check.total - 10);
+        assert_eq!(rng_logged(&events), probe.consumed, "两次掷骰的消耗都进了日志");
+
+        // 同种子重放：骰面与消耗逐字一致。
+        let (session2, sink2) = session_with(sb());
+        session2
+            .handle_intent(
+                Intent::Check { attribute: "str".into(), difficulty: Some(10), actor_id: None, opponent_id: None },
+                None,
+            )
+            .await;
+        let events2 = sink2.0.lock().unwrap().clone();
+        let check2 = check_result_of(&events2).expect("check result 2");
+        assert_eq!(check2.rolls, check.rolls);
+        assert_eq!(check2.total, check.total);
+        assert_eq!(check2.r#mod, check.r#mod);
+        assert_eq!(check2.margin, check.margin);
+        assert_eq!(check2.level, check.level);
+        assert_eq!(rng_logged(&events2), rng_logged(&events));
+    }
+
+    /// 挂载点 when 条件：世界快照里 flag 未置位 → 不执行；置位 → 执行。
+    #[tokio::test]
+    async fn lua_mount_when_condition_gates_execution() {
+        let sb = json!({
+            "world": { "check": { "dice": "1d20" } },
+            "lua_mounts": [{
+                "id": "gated", "mount": "check_pre_roll",
+                "source": "host.modify_check('keep_high')",
+                "when": { "op": "flag_set", "flag": "focused" }
+            }]
+        });
+        let (session, sink) = session_with(sb.clone());
+        session
+            .handle_intent(
+                Intent::Check { attribute: "str".into(), difficulty: Some(10), actor_id: None, opponent_id: None },
+                None,
+            )
+            .await;
+        let events = sink.0.lock().unwrap().clone();
+        assert_eq!(rng_logged(&events).len(), 1, "条件不成立 → 只有裸判定掷一颗");
+
+        let mut state = state_with_pc();
+        state.flags.insert("focused".to_string(), json!(true));
+        let mut probe = DeterministicRng::new(42);
+        let d1 = probe.range_inclusive(1, 20);
+        let d2 = probe.range_inclusive(1, 20);
+        let (session2, sink2) = session_with_state(sb, state);
+        session2
+            .handle_intent(
+                Intent::Check { attribute: "str".into(), difficulty: Some(10), actor_id: None, opponent_id: None },
+                None,
+            )
+            .await;
+        let events2 = sink2.0.lock().unwrap().clone();
+        assert_eq!(rng_logged(&events2).len(), 2, "条件成立 → 取高掷两次");
+        assert_eq!(check_result_of(&events2).expect("check").rolls, Some(vec![d1.max(d2)]));
+    }
+
+    /// 验收 5：Intent::Strike 也触发挂载点（攻击不再绕过规则集）。
+    #[tokio::test]
+    async fn strike_runs_storybook_lua_mounts() {
+        let sb = json!({
+            "lua_mounts": [{
+                "id": "prof", "mount": "check_pre_roll",
+                "source": "host.modify_check('add', 50)"
+            }],
+            "skills": [{
+                "id": "sk-atk", "name": "挥砍",
+                "check": { "dice": "1d20" },
+                "effect": { "immediate": [{ "kind": "damage", "amount": "1", "resource": "hp" }] }
+            }]
+        });
+        let (session, sink) = session_with_state(sb, state_with_encounter(15));
+        session
+            .strike_enemy(
+                "e1".into(),
+                AttackChoice { skill_id: Some("sk-atk".into()), ..Default::default() },
+                None,
+            )
+            .await;
+        let narrative = strike_narrative(&sink);
+        assert!(narrative.contains("修正 54"), "攻击必须跑规则集挂载点：{narrative}");
+        assert_eq!(enemy_hp(&session, "enc-1", 0), 19);
+    }
+
+    // ---------- 判定 C5：攻击判定也在 UI 可见 ----------
+
+    /// 判定 C5 验收 1：strike 也发 CheckResultPayload——骰面 / 修正 / 总值 / 难度齐备，
+    /// 前端 CheckCard 直接复用；事件顺序与技能判定一致（判定卡在叙事之前）。
+    #[tokio::test]
+    async fn strike_emits_check_result_for_the_ui() {
+        let sb = json!({
+            "skills": [{
+                "id": "sk-atk", "name": "挥砍",
+                "check": { "dice": "1d20", "attribute_modifier": { "str": 0 } },
+                "effect": { "immediate": [{ "kind": "damage", "amount": "1", "resource": "hp" }] }
+            }]
+        });
+        let (session, sink) = session_with_state(sb, state_with_encounter(15));
+        session
+            .strike_enemy(
+                "e1".into(),
+                AttackChoice { skill_id: Some("sk-atk".into()), ..Default::default() },
+                None,
+            )
+            .await;
+        let events = sink.0.lock().unwrap().clone();
+        let check = check_result_of(&events).expect("strike 必须发 CheckResult（UI 看得到骰面）");
+        assert_eq!(check.actor, ActorRef { id: "char-a".into(), name: "米拉".into() });
+        assert_eq!(check.expr.as_deref(), Some("1d20"));
+        assert_eq!(check.rolls.as_ref().map(Vec::len), Some(1), "骰面必须外露");
+        assert_eq!(check.target, 15, "难度 = 目标 AC");
+        assert_eq!(check.total, check.rolls.as_ref().unwrap()[0] + check.r#mod);
+        assert_eq!(check.margin, check.total - check.target);
+        assert_eq!(check.result, check.total >= check.target);
+        assert_eq!(check.level, level_for_margin(check.margin, &DEFAULT_DEGREE_THRESHOLDS));
+        assert_eq!(check.kind, Some(CheckKind::Attack));
+        let seq: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match &e.event {
+                PlayEvent::CheckResult(_) => Some("check"),
+                PlayEvent::Resolution(p) if p.outcome.as_deref() == Some("strike") => {
+                    Some("resolution")
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(seq, vec!["check", "resolution"], "先判定卡、后叙事");
+    }
+
+    /// 判定 C4 验收 2：check_post_roll 钩子读得到完整判定细节
+    /// （rolls / total / target / margin / level / result / attribute / kind）。
+    ///
+    /// 脚本把这七项逐个对账：全对才加 100——任何一项读不到就加不上，测试即失败。
+    #[tokio::test]
+    async fn post_roll_mount_reads_full_check_details() {
+        let sb = json!({
+            "world": { "check": { "dice": "1d20", "attribute_modifier": { "str": 0 } } },
+            "lua_mounts": [{
+                "id": "probe", "mount": "check_post_roll",
+                "source": "local c = host.check\nif c ~= nil and c.rolls ~= nil and #c.rolls == 1\n   and c.attribute == 'str' and c.kind == 'attribute'\n   and c.total == c.rolls[1] and c.target == 12\n   and c.margin == c.total - c.target\n   and c.result == (c.margin >= 0)\n   and c.level == (c.margin >= 10 and 'great' or (c.margin >= 0 and 'success' or (c.margin >= -10 and 'barely' or 'fail')))\n   and host.check_total == c.total and host.check_target == c.target\n   and host.check_margin == c.margin and host.check_attribute == 'str'\n   and host.check_kind == 'attribute' and host.check_result == c.result\n   and host.check_level == c.level\nthen host.modify_check('add', 100) end"
+            }]
+        });
+        let (session, sink) = session_with(sb);
+        session
+            .handle_intent(
+                Intent::Check { attribute: "str".into(), difficulty: Some(12), actor_id: None, opponent_id: None },
+                None,
+            )
+            .await;
+        let events = sink.0.lock().unwrap().clone();
+        let check = check_result_of(&events).expect("check result");
+        assert_eq!(check.r#mod, 100, "脚本读到完整判定细节并据此加值");
+        assert_eq!(check.target, 12);
+        assert_eq!(check.total, check.rolls.as_ref().unwrap()[0] + 100);
+    }
+
+    /// 判定 C4 验收 3：ModifyCheck 覆盖判定结果——强制失败把大成功压到最低档，
+    /// 强制成功把必失败抬到中档；骰面 / 总值 / 差值都不动。
+    #[tokio::test]
+    async fn modify_check_force_fail_and_success_change_levels() {
+        let sb = |force: &str| {
+            json!({
+                "world": { "check": { "dice": "1d20", "attribute_modifier": { "str": 100 } } },
+                "lua_mounts": [{ "id": "override", "mount": "check_post_roll",
+                    "source": format!("host.modify_check('{force}')") }]
+            })
+        };
+        // 强制失败：总值 ≥ 112、差值 ≥ 100（本来必是大成功）→ 改判失败，档位落到 Fail。
+        let (session, sink) = session_with(sb("force_fail"));
+        session
+            .handle_intent(
+                Intent::Check { attribute: "str".into(), difficulty: Some(12), actor_id: None, opponent_id: None },
+                None,
+            )
+            .await;
+        let forced = check_result_of(&sink.0.lock().unwrap().clone()).expect("check result");
+        assert!(!forced.result, "强制失败必须改判");
+        assert_eq!(forced.level, SuccessLevel::Fail, "档位随之落到最低档");
+        assert_eq!(forced.rolls.as_ref().map(Vec::len), Some(1), "骰面不动");
+        assert_eq!(forced.total, forced.rolls.as_ref().unwrap()[0] + 100, "总值不动");
+        assert!(forced.margin >= 100, "差值不动（覆盖结果不是重写骰子）");
+
+        // 强制成功：负修正构造必失败 → 改判成功，档位至少中档。
+        let sb2 = json!({
+            "world": { "check": { "dice": "1d20", "attribute_modifier": { "str": -100 } } },
+            "lua_mounts": [{ "id": "override", "mount": "check_post_roll",
+                "source": "host.modify_check('force_success')" }]
+        });
+        let (session2, sink2) = session_with(sb2);
+        session2
+            .handle_intent(
+                Intent::Check { attribute: "str".into(), difficulty: Some(12), actor_id: None, opponent_id: None },
+                None,
+            )
+            .await;
+        let forced2 = check_result_of(&sink2.0.lock().unwrap().clone()).expect("check result 2");
+        assert!(forced2.result, "强制成功必须改判");
+        assert_eq!(forced2.level, SuccessLevel::Success, "最低档抬到中档");
+        assert!(forced2.margin < -10, "差值仍是骰子算出来的负值");
+
+        // 回归：不声明 override 的故事书，同样的修正下结果 / 档位与改动前一致。
+        let sb3 = json!({ "world": { "check": { "dice": "1d20", "attribute_modifier": { "str": 100 } } } });
+        let (session3, sink3) = session_with(sb3);
+        session3
+            .handle_intent(
+                Intent::Check { attribute: "str".into(), difficulty: Some(12), actor_id: None, opponent_id: None },
+                None,
+            )
+            .await;
+        let plain = check_result_of(&sink3.0.lock().unwrap().clone()).expect("check result 3");
+        assert!(plain.result);
+        assert_eq!(plain.level, SuccessLevel::Great);
+    }
+
+    /// 验收 3 / 4：apply_effect / modify_resource 写请求真正落状态（可指定目标、可正可负）。
+    #[test]
+    fn lua_requests_apply_effects_and_target_resources() {
+        let (session, sink) = session_with(json!({}));
+        session.apply_lua_requests(
+            &[
+                LuaRequest::ApplyEffect {
+                    target: "char-a".into(),
+                    effect: json!({ "kind": "heal", "amount": "5" }),
+                },
+                // 名字寻址：与既有 ApplyStatus 同口径（任意 id 形态）。
+                LuaRequest::ModifyResource {
+                    target: "米拉".into(),
+                    resource: "mana".into(),
+                    amount: -3,
+                },
+                LuaRequest::ModifyResource {
+                    target: "char-a".into(),
+                    resource: "mana".into(),
+                    amount: 7,
+                },
+                // 非判定时机抛出的判定修正无处可用，忽略（不崩）。
+                LuaRequest::ModifyCheck { mode: crate::lua_host::CheckModifier::Add, amount: 3 },
+            ],
+            "char-a",
+        );
+        let proj = session.projection();
+        assert_eq!(proj.characters["char-a"]["resources"]["hp"].as_f64(), Some(35.0));
+        assert_eq!(proj.characters["char-a"]["resources"]["mana"].as_f64(), Some(24.0));
+        assert!(sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(&e.event, PlayEvent::StateUpdate(_))));
+    }
+
+    /// apply_effect 的数量支持骰式：走既有 resolve_effect 路径，骰子消耗记进日志。
+    #[test]
+    fn lua_apply_effect_with_dice_uses_engine_rng() {
+        let (session, sink) = session_with(json!({}));
+        session.apply_lua_requests(
+            &[LuaRequest::ApplyEffect {
+                target: "char-a".into(),
+                effect: json!({ "kind": "damage", "amount": "3d6", "resource": "hp" }),
+            }],
+            "char-a",
+        );
+        let events = sink.0.lock().unwrap().clone();
+        assert_eq!(rng_logged(&events).len(), 3, "3d6 消耗三颗骰且写进日志");
+        let hp = session.projection().characters["char-a"]["resources"]["hp"]
+            .as_f64()
+            .unwrap();
+        assert!((12.0..=27.0).contains(&hp), "hp = 30 - 3d6：{hp}");
+    }
+
+    /// 非法效果形状只 warn，不 panic 也不中断其余请求。
+    #[test]
+    fn lua_apply_effect_invalid_shape_is_ignored_with_warning() {
+        let (session, sink) = session_with(json!({}));
+        session.apply_lua_requests(
+            &[
+                LuaRequest::ApplyEffect {
+                    target: "char-a".into(),
+                    effect: json!({ "kind": "bogus" }),
+                },
+                LuaRequest::ModifyResource {
+                    target: "char-a".into(),
+                    resource: "mana".into(),
+                    amount: 1,
+                },
+            ],
+            "char-a",
+        );
+        let events = sink.0.lock().unwrap().clone();
+        assert!(events.iter().any(|e| matches!(
+            &e.event,
+            PlayEvent::System(p) if p.code.as_deref() == Some("lua_effect_invalid")
+        )));
+        assert_eq!(
+            session.projection().characters["char-a"]["resources"]["mana"].as_f64(),
+            Some(21.0)
+        );
+    }
+
+    /// 注册表锁不得跨 apply_lua_requests 持有：挂载点触发的事件会回到 dispatch_lua_event
+    /// 再取同一把锁，持锁即死锁（用超时线程把它变成失败而不是挂起）。
+    #[test]
+    fn skill_event_request_does_not_deadlock_registry_lock() {
+        let sb = json!({
+            "skills": [{ "id": "sk-shout", "name": "呐喊", "lua": "host.trigger_event('scene')" }]
+        });
+        let (session, _sink) = session_with(sb);
+        session.register_lua_hook(
+            "evt",
+            LuaMount::Event,
+            "host.modify_resource('char-a', 'mana', 1)",
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let skill = session.rules.skill("sk-shout").cloned().unwrap();
+            session.resolve_skill(None, &skill, None, None);
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok(),
+            "注册表锁被跨 apply_lua_requests 持有 → 事件回派死锁"
+        );
+    }
+
+    // ============================================================
+    // 图鉴 M2：怪物实例 / 克隆 / 对称攻击内核 / 派生 AC / 门控
+    // ============================================================
+
+    /// 一份最小图鉴故事书（LMoP 的形状）：
+    /// - 派生 AC = 10 + dex_mod，挂接定义 monster-armor 再给 ac +3（地精 dex 14 → 15）；
+    /// - 生命资源叫 res-hp（不是 hp），攻击资源也写 res-hp；
+    /// - 图鉴条目带 background（若不做 kind 门控，它会漏进人格档案）。
+    fn bestiary_storybook() -> Value {
+        serde_json::json!({
+            "attribute_dimensions": [
+                { "key": "str", "baseline": 10, "modifier_step": 2, "min": 1, "max": 30 },
+                { "key": "dex", "baseline": 10, "modifier_step": 2, "min": 1, "max": 30 }
+            ],
+            "derived": [
+                { "key": "dex_mod", "formula": "floor((dex - 10) / 2)" },
+                { "key": "ac", "formula": "10 + dex_mod" }
+            ],
+            "definitions": [
+                { "id": "armor-goblin", "modifiers": [ { "target": "ac", "value": 3, "op": "add" } ] }
+            ],
+            "characters": [{
+                "id": "mon-goblin", "name": "地精", "kind": "monster",
+                "background": "地精是小个子、心肠黑、自私的类人生物。",
+                "attributes": { "str": 8, "dex": 14 },
+                "resources": { "res-hp": 7 },
+                "skills": ["sk-scimitar", "sk-bow"],
+                "attachments": { "monster-armor": ["armor-goblin"] }
+            }],
+            "skills": [
+                { "id": "sk-scimitar", "name": "弯刀", "attribute": "str",
+                  "check": { "dice": "1d20", "kind": "attack" },
+                  "effect": { "immediate": [
+                      { "kind": "damage", "amount": "1d6+2", "resource": "res-hp" }
+                  ] } },
+                { "id": "sk-bow", "name": "短弓", "attribute": "dex",
+                  "check": { "dice": "1d20", "kind": "attack" },
+                  "effect": { "immediate": [
+                      { "kind": "damage", "amount": "1d6+2", "resource": "res-hp" }
+                  ] } },
+                { "id": "sk-hit", "name": "劈砍", "attribute": "str",
+                  "check": { "lua": "return { total = 100, margin = 100 }" },
+                  "effect": { "immediate": [
+                      { "kind": "damage", "amount": "3", "resource": "hp" }
+                  ] } }
+            ],
+            "skeleton": [{ "scenes": [
+                { "id": "sc-1", "title": "洞穴", "location_id": "loc-cave" }
+            ] }],
+            "world": { "locations": [ { "id": "loc-cave", "name": "洞穴" } ] }
+        })
+    }
+
+    fn goblin_spec(count: u32) -> octopus_types::EnemySpec {
+        octopus_types::EnemySpec {
+            name: "地精".into(),
+            hp: None,
+            ac: None,
+            template_id: Some("mon-goblin".into()),
+            count: Some(count),
+            skill_id: None,
+        }
+    }
+
+    fn temp_spec(name: &str, hp: i64, ac: i64) -> octopus_types::EnemySpec {
+        octopus_types::EnemySpec {
+            name: name.into(),
+            hp: Some(hp),
+            ac: Some(ac),
+            template_id: None,
+            count: None,
+            skill_id: None,
+        }
+    }
+
+    /// 结算一次遭遇创建，返回新遭遇的键。
+    async fn create_encounter(
+        session: &Arc<Session>,
+        enemies: Vec<octopus_types::EnemySpec>,
+    ) -> String {
+        let before: std::collections::BTreeSet<String> =
+            session.state.lock().unwrap().encounters.keys().cloned().collect();
+        session
+            .handle_intent(Intent::Encounter { name: "遭遇".into(), enemies, note: None }, None)
+            .await;
+        let st = session.state.lock().unwrap();
+        st.encounters
+            .keys()
+            .find(|k| !before.contains(*k))
+            .cloned()
+            .expect("遭遇已创建")
+    }
+
+    fn instance_of(session: &Arc<Session>, key: &str) -> CharacterInstance {
+        session
+            .state
+            .lock()
+            .unwrap()
+            .characters
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| panic!("实例不存在：{key}"))
+    }
+
+    fn res_hp_of(session: &Arc<Session>, key: &str) -> i64 {
+        instance_of(session, key).resources["res-hp"].as_i64().unwrap_or(-1)
+    }
+
+    fn enemy_views(session: &Arc<Session>, enc: &str) -> Vec<EnemyView> {
+        let st = session.state.lock().unwrap();
+        serde_json::from_value(st.encounters[enc]["enemies"].clone()).expect("敌人条目")
+    }
+
+    fn persisted_of(session: &Arc<Session>) -> Vec<PersistedEvent> {
+        session
+            .event_log
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .map(|envelope| PersistedEvent { request_id: None, envelope })
+            .collect()
+    }
+
+    /// 验收 1：DeltaDomain::Character 的 field="instance" + op=Add 能插入完整实例。
+    #[test]
+    fn character_instance_delta_inserts_full_instance() {
+        let mut st = state_with_pc();
+        let inst = CharacterInstance {
+            instance_id: "enc-x:mon-goblin#1".into(),
+            template_id: "mon-goblin".into(),
+            name: "地精".into(),
+            kind: "monster".into(),
+            attributes: serde_json::json!({ "dex": 14 }).as_object().unwrap().clone(),
+            resources: serde_json::json!({ "res-hp": 7 }).as_object().unwrap().clone(),
+            inventory: Default::default(),
+            location_id: Some("loc-cave".into()),
+            present: true,
+            statuses: vec![],
+        };
+        apply_delta(
+            &mut st,
+            &StateDelta {
+                domain: DeltaDomain::Character,
+                entity_id: "enc-x:mon-goblin#1".into(),
+                field: "instance".into(),
+                op: DeltaOp::Add,
+                value: serde_json::to_value(&inst).unwrap(),
+            },
+        );
+        let got = st.characters.get("enc-x:mon-goblin#1").expect("实例已插入");
+        assert_eq!(got.name, "地精");
+        assert_eq!(got.kind, "monster");
+        assert_eq!(got.resources["res-hp"].as_i64(), Some(7));
+        assert_eq!(got.location_id.as_deref(), Some("loc-cave"));
+        // 非 instance / 非 Add 的 delta 不走插入路径（旧日志行为不变）。
+        apply_delta(
+            &mut st,
+            &StateDelta {
+                domain: DeltaDomain::Character,
+                entity_id: "不存在的键".into(),
+                field: "resources.hp".into(),
+                op: DeltaOp::Set,
+                value: serde_json::json!(5),
+            },
+        );
+        assert!(!st.characters.contains_key("不存在的键"));
+    }
+
+    /// 验收 2：遭遇按 template_id + count 克隆实例（键 enc-{enc}:{tpl}#n），
+    /// attributes / resources 来自模板快照，present / location_id 按遭遇地点。
+    #[tokio::test]
+    async fn encounter_clones_bestiary_instances() {
+        let (session, _sink) = session_with_state(bestiary_storybook(), state_with_pc());
+        let enc = create_encounter(&session, vec![goblin_spec(2)]).await;
+        let views = enemy_views(&session, &enc);
+        assert_eq!(views.len(), 2, "count = 2 → 两只实例");
+        assert_eq!(views[0].id, "e1");
+        assert_eq!(views[1].id, "e2");
+        for (i, view) in views.iter().enumerate() {
+            let key = view.instance_id.clone().expect("实例键");
+            assert_eq!(key, format!("enc-{enc}:mon-goblin#{}", i + 1));
+            assert_eq!(view.template_id.as_deref(), Some("mon-goblin"));
+            assert_eq!(view.hp, 7, "模板快照满值");
+            assert_eq!(view.max, 7);
+            assert_eq!(view.ac, 15, "10 + dex_mod(2) + 挂接护甲(3)");
+            assert_eq!(view.scene_id.as_deref(), Some("sc-1"));
+            assert_eq!(view.location_id.as_deref(), Some("loc-cave"));
+            let inst = instance_of(&session, &key);
+            assert_eq!(inst.kind, "monster");
+            assert_eq!(inst.attributes["dex"].as_i64(), Some(14));
+            assert_eq!(inst.resources["res-hp"].as_i64(), Some(7));
+            assert!(inst.present, "遭遇里的怪物在场");
+            assert_eq!(inst.location_id.as_deref(), Some("loc-cave"));
+        }
+        // 数据卡摘要：技能名 + 伤害骰。
+        assert_eq!(views[0].attacks.len(), 2);
+        assert_eq!(views[0].attacks[0].skill_id, "sk-scimitar");
+        assert_eq!(views[0].attacks[0].name, "弯刀");
+        assert_eq!(views[0].attacks[0].damage, "1d6+2");
+    }
+
+    /// 验收 3 + 9：玩家 strike 模板怪 → 难度取派生 AC，伤害扣实例的 res-hp，
+    /// 遭遇条目是实例的**投影**；重放后实例与 HP 一致。
+    #[tokio::test]
+    async fn strike_bestiary_monster_hits_derived_ac_and_instance_hp() {
+        let (session, sink) = session_with_state(bestiary_storybook(), state_with_pc());
+        let enc = create_encounter(&session, vec![goblin_spec(2)]).await;
+        let key = enemy_views(&session, &enc)[0].instance_id.clone().unwrap();
+
+        session
+            .strike_enemy(
+                "e1".into(),
+                AttackChoice { skill_id: Some("sk-hit".into()), ..Default::default() },
+                None,
+            )
+            .await;
+        let narrative = strike_narrative(&sink);
+        assert!(narrative.contains("≥ 15"), "难度必须是派生 AC 15：{narrative}");
+        assert!(narrative.contains("造成 3 点伤害（7 → 4）"), "{narrative}");
+        // 伤害落到**实例**的 res-hp（技能声明的是 hp，图鉴怪的生命资源叫 res-hp）。
+        assert_eq!(res_hp_of(&session, &key), 4);
+        // 遭遇条目同步为投影。
+        assert_eq!(enemy_hp(&session, &enc, 0), 4);
+        assert_eq!(enemy_hp(&session, &enc, 1), 7, "第二只不受影响");
+        // 连续第二次：实例 HP 是权威，钳制到 0 且与投影保持同步。
+        session
+            .strike_enemy(
+                "e1".into(),
+                AttackChoice { skill_id: Some("sk-hit".into()), ..Default::default() },
+                None,
+            )
+            .await;
+        assert_eq!(res_hp_of(&session, &key), 1);
+        assert_eq!(enemy_hp(&session, &enc, 0), 1);
+
+        // 重放（验收 9 的实例部分）：实时与重放必须得到同一世界状态。
+        let persisted = persisted_of(&session);
+        let (restarted, _sink2) = session_with_state(bestiary_storybook(), state_with_pc());
+        restarted.replay(&persisted);
+        assert_eq!(res_hp_of(&restarted, &key), 1, "重放后实例 HP 一致");
+        assert_eq!(
+            serde_json::to_value(session.projection()).unwrap(),
+            serde_json::to_value(restarted.projection()).unwrap(),
+            "重放后投影逐字一致"
+        );
+        assert_eq!(session.current_seq(), restarted.current_seq());
+    }
+
+    /// 验收 5：同模板两场遭遇的实例互相隔离（各自独立 HP）。
+    #[tokio::test]
+    async fn bestiary_instances_are_isolated_between_encounters() {
+        let (session, _sink) = session_with_state(bestiary_storybook(), state_with_pc());
+        let enc_a = create_encounter(&session, vec![goblin_spec(1)]).await;
+        let enc_b = create_encounter(&session, vec![goblin_spec(1)]).await;
+        assert_ne!(enc_a, enc_b);
+        let key_a = enemy_views(&session, &enc_a)[0].instance_id.clone().unwrap();
+        let key_b = enemy_views(&session, &enc_b)[0].instance_id.clone().unwrap();
+        assert_ne!(key_a, key_b, "实例键带遭遇 id → 天然隔离");
+
+        // 按实例键寻址，精确打第二场的那只（两场都有 e1）。
+        session
+            .strike_enemy(
+                key_b.clone(),
+                AttackChoice { skill_id: Some("sk-hit".into()), ..Default::default() },
+                None,
+            )
+            .await;
+        assert_eq!(res_hp_of(&session, &key_b), 4);
+        assert_eq!(res_hp_of(&session, &key_a), 7, "同模板的另一场不受影响");
+        assert_eq!(enemy_hp(&session, &enc_a, 0), 7);
+        assert_eq!(enemy_hp(&session, &enc_b, 0), 4);
+    }
+
+    /// 验收 4：Intent::EnemyStrike 走同一内核——命中用怪物自身属性，
+    /// 难度 = 目标派生 AC，伤害扣目标 resources.hp。
+    #[tokio::test]
+    async fn enemy_strike_uses_monster_attributes_and_target_derived_ac() {
+        // PC dex 10 → 派生 AC = 10（不是回落 12）；怪物 dex 70 → 修正夹到该维度上限 10。
+        let mut sb = bestiary_storybook();
+        sb["characters"][0]["attributes"] = serde_json::json!({ "str": 8, "dex": 70 });
+        let mut base = state_with_pc();
+        base.characters.get_mut("char-a").unwrap().attributes =
+            serde_json::json!({ "str": 70, "dex": 10 }).as_object().unwrap().clone();
+        let (session, sink) = session_with_state(sb.clone(), base.clone());
+        let _enc = create_encounter(&session, vec![goblin_spec(1)]).await;
+        session
+            .handle_intent(
+                Intent::EnemyStrike {
+                    enemy_id: "e1".into(),
+                    target_id: None,
+                    skill_id: Some("sk-bow".into()),
+                },
+                None,
+            )
+            .await;
+        let narrative = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match &e.event {
+                PlayEvent::Resolution(p) if p.outcome.as_deref() == Some("enemy_strike") => {
+                    p.narrative.clone()
+                }
+                _ => None,
+            })
+            .next_back()
+            .unwrap_or_default();
+        // 修正来自**怪物自己**的 dex 70（夹到该维度修正上限 10）；若误用 PC 的 dex 10 会是 0。
+        assert!(narrative.contains("修正 10"), "命中必须用怪物自身属性：{narrative}");
+        assert!(narrative.contains("≥ 10"), "难度 = 目标派生 AC 10：{narrative}");
+        assert!(!narrative.contains("未命中"), "{narrative}");
+        let hp = session.projection().characters["char-a"]["resources"]["hp"]
+            .as_f64()
+            .unwrap();
+        assert!(hp < 30.0, "伤害必须落到目标 resources.hp：{hp}");
+
+        // 同一内核的另一方向也走同一条变更路径：重放后玩家 HP 一致。
+        let persisted = persisted_of(&session);
+        let (restarted, _sink2) = session_with_state(sb, base);
+        restarted.replay(&persisted);
+        assert_eq!(
+            serde_json::to_value(session.projection()).unwrap(),
+            serde_json::to_value(restarted.projection()).unwrap()
+        );
+    }
+
+    /// 验收 3（续）：EnemyStrike 缺省用图鉴条目的第一条攻击技能；
+    /// 敌人与目标都能按名字 / 任意 id 形态寻址。
+    #[tokio::test]
+    async fn enemy_strike_defaults_to_first_bestiary_attack() {
+        let (session, sink) = session_with_state(bestiary_storybook(), state_with_pc());
+        let _enc = create_encounter(&session, vec![goblin_spec(1)]).await;
+        session
+            .handle_intent(
+                Intent::EnemyStrike {
+                    enemy_id: "地精".into(),
+                    target_id: Some("char-a".into()),
+                    skill_id: None,
+                },
+                None,
+            )
+            .await;
+        let narrative = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match &e.event {
+                PlayEvent::Resolution(p) if p.outcome.as_deref() == Some("enemy_strike") => {
+                    p.narrative.clone()
+                }
+                _ => None,
+            })
+            .next_back()
+            .unwrap_or_default();
+        assert!(narrative.contains("弯刀"), "缺省 = 数据卡第一条攻击技能：{narrative}");
+        assert!(narrative.contains("米拉"), "目标按 id 寻址：{narrative}");
+    }
+
+    /// 判定 C5 验收 1（另一方向）：EnemyStrike 也发 CheckResultPayload，署名攻方（敌人）；
+    /// 玩家被攻击时同样看得到骰面。
+    #[tokio::test]
+    async fn enemy_strike_emits_check_result_for_the_ui() {
+        let mut sb = bestiary_storybook();
+        sb["characters"][0]["attributes"] = serde_json::json!({ "str": 8, "dex": 70 });
+        let mut base = state_with_pc();
+        base.characters.get_mut("char-a").unwrap().attributes =
+            serde_json::json!({ "str": 70, "dex": 10 }).as_object().unwrap().clone();
+        let (session, sink) = session_with_state(sb, base);
+        let _enc = create_encounter(&session, vec![goblin_spec(1)]).await;
+        session
+            .handle_intent(
+                Intent::EnemyStrike {
+                    enemy_id: "e1".into(),
+                    target_id: None,
+                    skill_id: Some("sk-bow".into()),
+                },
+                None,
+            )
+            .await;
+        let events = sink.0.lock().unwrap().clone();
+        let check = check_result_of(&events).expect("enemy_strike 必须发 CheckResult");
+        assert_eq!(check.actor, ActorRef { id: "mon-goblin".into(), name: "地精".into() });
+        assert_eq!(check.attribute, "dex", "用怪物自己的判定属性");
+        assert_eq!(check.r#mod, 10, "dex 70 → 夹到该维度修正上限 10");
+        assert_eq!(check.expr.as_deref(), Some("1d20"));
+        assert_eq!(check.rolls.as_ref().map(Vec::len), Some(1));
+        assert_eq!(check.target, 10, "难度 = 目标派生 AC 10");
+        assert_eq!(check.result, check.total >= 10);
+        assert_eq!(check.kind, Some(CheckKind::Attack));
+    }
+
+    /// 验收 4（续）：故事书没有 derived.ac 时回落 12。
+    #[tokio::test]
+    async fn derived_ac_falls_back_to_12_without_derived_declaration() {
+        let sb = serde_json::json!({
+            "characters": [{
+                "id": "mon-plain", "name": "石像", "kind": "monster",
+                "attributes": { "str": 10 },
+                "resources": { "hp": 9 }
+            }],
+            "skills": []
+        });
+        let (session, _sink) = session_with_state(sb, state_with_pc());
+        let enc = create_encounter(
+            &session,
+            vec![octopus_types::EnemySpec {
+                name: "石像".into(),
+                hp: None,
+                ac: None,
+                template_id: Some("mon-plain".into()),
+                count: None,
+                skill_id: None,
+            }],
+        )
+        .await;
+        let views = enemy_views(&session, &enc);
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].ac, 12, "缺失 derived.ac → 12");
+        assert_eq!(views[0].hp, 9, "生命资源叫 hp 也认得");
+    }
+
+    /// 验收 6（回归）：无 template_id 的临时敌人行为与改动前逐字一致——
+    /// 条目契约只有 id/name/hp/max/ac，且不产生任何角色实例。
+    #[tokio::test]
+    async fn temp_enemy_without_template_behaves_as_before() {
+        let (session, sink) = session_with_state(bestiary_storybook(), state_with_pc());
+        let enc = create_encounter(&session, vec![temp_spec("灰狼", 11, 12)]).await;
+        let delta = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match &e.event {
+                PlayEvent::StateUpdate(p) => Some(p.clone()),
+                _ => None,
+            })
+            .next_back()
+            .expect("遭遇 delta");
+        assert_eq!(delta.changes[0].domain, DeltaDomain::Encounter);
+        assert_eq!(
+            delta.changes[0].value["enemies"][0],
+            serde_json::json!({ "id": "e1", "name": "灰狼", "hp": 11, "max": 11, "ac": 12 }),
+            "临时敌人条目的形状必须与改动前逐字一致（无新增字段）"
+        );
+        assert_eq!(
+            delta.changes[0].value["enemies"][0].as_object().unwrap().len(),
+            5,
+            "不许多出 instance_id / template_id / scene_id / location_id / attacks"
+        );
+        assert_eq!(delta.changes.len(), 1, "临时敌人不产生实例 delta");
+        assert!(
+            session
+                .state
+                .lock()
+                .unwrap()
+                .characters
+                .values()
+                .all(|c| c.kind != "monster"),
+            "临时敌人不产生角色实例"
+        );
+        // 旧路径的结算：条目自身是权威。
+        session
+            .strike_enemy(
+                "e1".into(),
+                AttackChoice { skill_id: Some("sk-hit".into()), ..Default::default() },
+                None,
+            )
+            .await;
+        assert_eq!(enemy_hp(&session, &enc, 0), 8, "11 - 3");
+    }
+
+    /// 验收 7：personas / present_npcs / present_actors 均不含 kind=monster。
+    #[tokio::test]
+    async fn monster_instances_never_leak_into_persona_channels() {
+        let (session, _sink) = session_with_state(bestiary_storybook(), state_with_pc());
+        let enc = create_encounter(&session, vec![goblin_spec(1)]).await;
+        let key = enemy_views(&session, &enc)[0].instance_id.clone().unwrap();
+        // 模板带 background：不做 kind 门控的话它会被人格档案收下。
+        assert!(
+            session.rules.personas(&["mon-goblin".to_string()], 6).is_empty(),
+            "怪物不参与扮演，不该占人格预算"
+        );
+        assert!(
+            session.present_npcs().iter().all(|a| a.id != "mon-goblin"),
+            "怪物不会说话，不当未署名台词的回落对象"
+        );
+        let st = session.state.lock().unwrap();
+        assert!(
+            present_actors(&st).iter().all(|a| a.id != "mon-goblin"),
+            "怪物不进「在场角色」名单"
+        );
+        assert!(st.characters.contains_key(&key), "但实例确实在实例表里（可寻址）");
+    }
+
+    /// 验收 9：旧命令日志（Encounter delta 无 instance_id / attacks 等新字段）照常重放——
+    /// 老日志不会命中 field="instance" 的插入分支，临时敌人路径与改动前逐字一致。
+    #[tokio::test]
+    async fn old_command_log_with_temp_enemy_replays_unchanged() {
+        let (session, _sink) = session_with_state(bestiary_storybook(), state_with_pc());
+        let envelope = |seq: u64, event: PlayEvent| PersistedEvent {
+            request_id: None,
+            envelope: EventEnvelope {
+                id: format!("ev-{seq}"),
+                seq,
+                round: 1,
+                ts: "2025-01-01T00:00:00Z".into(),
+                actor: None,
+                intent_id: None,
+                event,
+            },
+        };
+        let persisted = vec![
+            envelope(
+                1,
+                PlayEvent::StateUpdate(StateUpdatePayload {
+                    changes: vec![StateDelta {
+                        domain: DeltaDomain::Encounter,
+                        entity_id: "enc-old".into(),
+                        field: "encounter".into(),
+                        op: DeltaOp::Add,
+                        value: json!({
+                            "id": "enc-old", "name": "旧遭遇",
+                            "enemies": [{ "id": "e1", "name": "灰狼", "hp": 11, "max": 11, "ac": 12 }],
+                            "active": true
+                        }),
+                    }],
+                }),
+            ),
+            envelope(
+                2,
+                PlayEvent::Resolution(ResolutionPayload {
+                    intent_id: None,
+                    status: ResolutionStatus::Ok,
+                    rejection_code: None,
+                    narrative: Some("旧日志的一击".into()),
+                    outcome: Some("strike".into()),
+                    triggered_events: None,
+                    // 旧实现原样落库的两条 delta：角色域落在条目 id 上（当时没有实例，是 no-op）。
+                    state_changes: vec![
+                        StateDelta {
+                            domain: DeltaDomain::Character,
+                            entity_id: "e1".into(),
+                            field: "resources.hp".into(),
+                            op: DeltaOp::Add,
+                            value: json!(-3),
+                        },
+                        StateDelta {
+                            domain: DeltaDomain::Encounter,
+                            entity_id: "enc-old".into(),
+                            field: "encounter".into(),
+                            op: DeltaOp::Set,
+                            value: json!({ "enemies": [
+                                { "id": "e1", "name": "灰狼", "hp": 8, "max": 11, "ac": 12 }
+                            ] }),
+                        },
+                    ],
+                }),
+            ),
+        ];
+        session.replay(&persisted);
+        let st = session.state.lock().unwrap();
+        assert_eq!(st.encounters["enc-old"]["enemies"][0]["hp"].as_i64(), Some(8));
+        assert!(
+            st.characters.values().all(|c| c.kind != "monster"),
+            "旧日志不产生怪物实例（field=instance 分支不被命中）"
+        );
+        assert_eq!(session.current_seq(), 2);
+    }
+
+    /// 验收 8：导入的 LMoP 草稿在遭遇创建后能真正产生怪物实例，
+    /// 且 AC 由 derived 公式 + 挂接护甲算出来（地精 = 10 + 2 + 3 = 15）。
+    #[tokio::test]
+    async fn lmop_draft_bestiary_creates_real_instances() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../story_example/lmop-storybook.draft.json"
+        );
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            eprintln!("跳过：找不到 LMoP 草稿 {path}");
+            return;
+        };
+        let sb: Value = serde_json::from_str(&raw).expect("LMoP 草稿是合法 JSON");
+        let scene_id = sb
+            .pointer("/skeleton/0/scenes/0/id")
+            .and_then(Value::as_str)
+            .expect("草稿有骨架场景")
+            .to_string();
+        let scene_location = sb
+            .pointer("/skeleton/0/scenes/0/location_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let mut st = state_with_pc();
+        st.scene_id = scene_id;
+        st.scene_title = "LMoP".into();
+        let (session, _sink) = session_with_state(sb, st);
+        let enc = create_encounter(
+            &session,
+            vec![octopus_types::EnemySpec {
+                name: "地精".into(),
+                hp: None,
+                ac: None,
+                template_id: Some("mon-goblin".into()),
+                count: Some(2),
+                skill_id: None,
+            }],
+        )
+        .await;
+        let views = enemy_views(&session, &enc);
+        assert_eq!(views.len(), 2);
+        let key = views[0].instance_id.clone().unwrap();
+        let inst = instance_of(&session, &key);
+        assert_eq!(inst.kind, "monster");
+        assert_eq!(inst.resources["res-hp"].as_i64(), Some(7), "附录 B：HP 7");
+        assert_eq!(inst.attributes["dex"].as_i64(), Some(14));
+        assert_eq!(views[0].ac, 15, "10 + dex_mod(2) + armor-goblin(3)");
+        assert_eq!(views[0].hp, 7);
+        assert_eq!(inst.location_id, scene_location, "怪物实例继承遭遇地点");
+        assert_eq!(views[0].attacks[0].skill_id, "sk-goblin-scimitar");
+        assert_eq!(views[0].attacks[0].damage, "1d6+2");
+    }
+
+    // ============================================================
+    // 地图 P5：剧情关联（触发点预置遭遇 · 遭遇叙事锚 · encounter_cleared）
+    // ============================================================
+
+    /// P5 测试故事书：洞穴场景（地点 loc-cave）+ 两条图鉴怪物 + 触发点 tr-ambush。
+    ///
+    /// 场景目标 g-clear 用 encounter_cleared —— 顺带验证「遭遇建成 → 打完 → 目标达成」。
+    fn p5_storybook(condition: Value, encounter: Option<Value>) -> Value {
+        let mut trigger = json!({
+            "id": "tr-ambush",
+            "title": "洞穴伏击",
+            "hint": "阴影里有东西在动。",
+            "condition": condition,
+        });
+        if let Some(enc) = encounter {
+            trigger["encounter"] = enc;
+        }
+        json!({
+            "attribute_dimensions": [
+                { "key": "str", "baseline": 10, "modifier_step": 2, "min": 1, "max": 30 }
+            ],
+            "characters": [
+                { "id": "mon-goblin", "name": "地精", "kind": "monster",
+                  "attributes": { "str": 8 }, "resources": { "res-hp": 7 },
+                  "skills": ["sk-cleave"] },
+                { "id": "mon-wolf", "name": "灰狼", "kind": "monster",
+                  "attributes": { "str": 12 }, "resources": { "res-hp": 11 },
+                  "skills": ["sk-cleave"] }
+            ],
+            "skills": [
+                { "id": "sk-cleave", "name": "横扫", "attribute": "str",
+                  "check": { "lua": "return { total = 100, margin = 100 }" },
+                  "effect": { "immediate": [
+                      { "kind": "damage", "amount": "99", "resource": "res-hp" } ] } }
+            ],
+            "skeleton": [{ "id": "ch-1", "scenes": [{
+                "id": "sc-cave", "title": "洞穴", "location_id": "loc-cave",
+                "goals": [
+                    { "id": "g-clear", "text": "清剿地精", "primary": true,
+                      "condition": { "op": "encounter_cleared" } }
+                ],
+                "triggers": [trigger]
+            }] }],
+            "world": { "locations": [
+                { "id": "loc-cave", "name": "洞穴" },
+                { "id": "loc-trail", "name": "山道" }
+            ] }
+        })
+    }
+
+    /// P5 世界状态：当前场景 = sc-cave（骨架里声明了 loc-cave）。
+    fn p5_state() -> WorldState {
+        let mut st = state_with_pc();
+        st.scene_id = "sc-cave".into();
+        st.scene_title = "洞穴".into();
+        st
+    }
+
+    fn ambush_preset() -> Value {
+        json!({
+            "name": "游荡的地精",
+            "note": "触发点预置",
+            "enemies": [{ "template_id": "mon-goblin", "count": 2 }]
+        })
+    }
+
+    fn only_encounter(session: &Arc<Session>) -> (String, EncounterView) {
+        let st = session.state.lock().unwrap();
+        assert_eq!(st.encounters.len(), 1, "应当正好一场遭遇");
+        let (id, raw) = st.encounters.iter().next().unwrap();
+        (
+            id.clone(),
+            serde_json::from_value(raw.clone()).expect("EncounterView"),
+        )
+    }
+
+    /// 验收 2 / 3（地图 P5 §6.3 / §6.4）：触发点被标记 fired 后自动建遭遇——
+    /// 与 Intent::Encounter **同一条创建路径**（图鉴实例克隆 + 地点继承），叙事锚创建时快照。
+    #[tokio::test]
+    async fn fired_trigger_spawns_preset_encounter() {
+        let mut st = p5_state();
+        st.flags.insert("ambush".into(), json!(true));
+        let condition = json!({ "op": "flag_set", "flag": "ambush" });
+        let (session, sink) =
+            session_with_state(p5_storybook(condition.clone(), Some(ambush_preset())), st);
+        assert!(session.state.lock().unwrap().encounters.is_empty(), "求值前没有遭遇");
+        session.evaluate_turn_end();
+
+        let (enc_id, view) = only_encounter(&session);
+        assert_eq!(view.name, "游荡的地精");
+        assert_eq!(view.note.as_deref(), Some("触发点预置"));
+        // §6.4 叙事锚：创建时快照（不是查询时推导）。
+        assert_eq!(view.scene_id.as_deref(), Some("sc-cave"));
+        assert_eq!(view.location_id.as_deref(), Some("loc-cave"), "缺省继承场景地点");
+        assert_eq!(view.goal_id.as_deref(), Some("g-clear"), "关联等这场遭遇清空的目标");
+        assert_eq!(view.template_ids, vec!["mon-goblin".to_string()]);
+
+        // T5 的实例克隆路径原样复用（键 / 模板快照 / 地点）。
+        assert_eq!(view.enemies.len(), 2);
+        for (i, enemy) in view.enemies.iter().enumerate() {
+            let key = enemy.instance_id.clone().expect("实例键");
+            assert_eq!(key, format!("enc-{enc_id}:mon-goblin#{}", i + 1));
+            assert_eq!(enemy.template_id.as_deref(), Some("mon-goblin"));
+            assert_eq!(enemy.scene_id.as_deref(), Some("sc-cave"));
+            assert_eq!(enemy.location_id.as_deref(), Some("loc-cave"));
+            assert_eq!(enemy.attacks.len(), 1);
+        }
+        {
+            let st = session.state.lock().unwrap();
+            assert_eq!(st.progress.triggers.get("tr-ambush"), Some(&json!(true)));
+            let key = view.enemies[0].instance_id.clone().unwrap();
+            let inst = st.characters.get(&key).expect("怪物实例");
+            assert_eq!(inst.resources["res-hp"].as_i64(), Some(7));
+            assert_eq!(inst.location_id.as_deref(), Some("loc-cave"));
+            assert_eq!(inst.kind, "monster");
+        }
+
+        // 事件顺序：先落触发点 fired，再落遭遇（重放逐条一致的前提）。
+        let events = sink.0.lock().unwrap().clone();
+        let order: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match &e.event {
+                PlayEvent::StateUpdate(p) => Some(
+                    if p.changes.iter().any(|c| c.domain == DeltaDomain::Encounter) {
+                        "encounter"
+                    } else {
+                        "progress"
+                    },
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, vec!["progress", "encounter"], "先标记 fired，再建遭遇");
+
+        // 重放一致：锚来自日志快照，重放后投影逐字相同。
+        let persisted = persisted_of(&session);
+        let mut st2 = p5_state();
+        st2.flags.insert("ambush".into(), json!(true));
+        let (restarted, _sink2) =
+            session_with_state(p5_storybook(condition, Some(ambush_preset())), st2);
+        restarted.replay(&persisted);
+        assert_eq!(
+            serde_json::to_value(session.projection()).unwrap(),
+            serde_json::to_value(restarted.projection()).unwrap(),
+            "重放后投影逐字一致"
+        );
+        assert_eq!(session.current_seq(), restarted.current_seq());
+    }
+
+    /// 地图 P5 §6.3：预置声明的地点覆盖场景地点，怪物实例跟着走；name 缺省回落触发点标题。
+    #[tokio::test]
+    async fn preset_location_overrides_scene_location() {
+        let mut st = p5_state();
+        st.flags.insert("ambush".into(), json!(true));
+        let (session, _sink) = session_with_state(
+            p5_storybook(
+                json!({ "op": "flag_set", "flag": "ambush" }),
+                Some(json!({
+                    "location_id": "loc-trail",
+                    "enemies": [{ "template_id": "mon-wolf" }]
+                })),
+            ),
+            st,
+        );
+        session.evaluate_turn_end();
+        let (_, view) = only_encounter(&session);
+        assert_eq!(view.name, "洞穴伏击", "预置没写 name → 回落触发点标题");
+        assert_eq!(view.location_id.as_deref(), Some("loc-trail"));
+        assert_eq!(view.template_ids, vec!["mon-wolf".to_string()]);
+        let key = view.enemies[0].instance_id.clone().unwrap();
+        let st = session.state.lock().unwrap();
+        assert_eq!(st.characters[&key].location_id.as_deref(), Some("loc-trail"));
+    }
+
+    /// 验收 6（地图 P5 §6.8）：掷表遭遇**不新增任何封闭字段**。链路是
+    /// Lua 挂载点掷 engine_rng → 已有原语 apply_effect(set_flag) → 触发点 condition: flag_set
+    /// + encounter 预置 → 回合末求值 fired 时建遭遇；表本身只活在 Lua 里。
+    #[tokio::test]
+    async fn lua_wandering_table_drives_preset_encounter() {
+        // 同种子（会话 seed = 42）下的第一颗 d20，据此断言掷表分支。
+        let mut probe = DeterministicRng::new(42);
+        let roll = probe.range_inclusive(1, 20);
+
+        let mut sb = p5_storybook(
+            json!({ "op": "flag_set", "flag": "wander_high" }),
+            Some(json!({
+                "name": "游荡怪物（高）",
+                "enemies": [{ "template_id": "mon-goblin" }]
+            })),
+        );
+        sb["skeleton"][0]["scenes"][0]["triggers"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "id": "tr-wander-low",
+                "title": "游荡怪物（低）",
+                "condition": { "op": "flag_set", "flag": "wander_low" },
+                "encounter": {
+                    "name": "游荡怪物（低）",
+                    "enemies": [{ "template_id": "mon-wolf" }]
+                }
+            }));
+        sb["lua_mounts"] = json!([{
+            "id": "wandering-table",
+            "mount": "event",
+            "source": "local roll = host.engine_rng(1, 20)\nif roll >= 11 then host.apply_effect('', { kind = 'set_flag', flag = 'wander_high' }) else host.apply_effect('', { kind = 'set_flag', flag = 'wander_low' }) end"
+        }]);
+
+        let (session, sink) = session_with_state(sb, p5_state());
+        // 进入区域：场景事件 → 挂载点链 → 掷表 → set_flag（已有原语，不是新类型）。
+        session.dispatch_event("scene");
+        let events = sink.0.lock().unwrap().clone();
+        assert_eq!(
+            rng_logged(&events),
+            probe.consumed,
+            "掷表必须真的消耗引擎 RNG：与探针同一确定性序列"
+        );
+
+        let high = roll >= 11;
+        let flags = session.state.lock().unwrap().flags.clone();
+        let expected = if high { "wander_high" } else { "wander_low" };
+        let other = if high { "wander_low" } else { "wander_high" };
+        assert_eq!(flags.get(expected), Some(&json!(true)), "掷表结果决定置位哪个标记");
+        assert!(flags.get(other).is_none());
+
+        // 回合末求值：条件成立 → 触发点 fired → 按预置建遭遇。
+        session.evaluate_turn_end();
+        let (_, view) = only_encounter(&session);
+        assert_eq!(
+            view.template_ids,
+            vec![if high { "mon-goblin" } else { "mon-wolf" }.to_string()],
+            "掷表结果必须驱动遭遇内容"
+        );
+        assert_eq!(view.enemies[0].name, if high { "地精" } else { "灰狼" });
+        assert_eq!(view.location_id.as_deref(), Some("loc-cave"), "表项没写地点 → 继承场景");
+        let st = session.state.lock().unwrap();
+        assert_eq!(
+            st.progress.triggers.get(if high { "tr-ambush" } else { "tr-wander-low" }),
+            Some(&json!(true))
+        );
+    }
+
+    /// 验收 4 / 7（地图 P5 §6.5）：encounter_cleared 让清剿有自然判据；
+    /// 没有 encounter 预置的旧故事书照常只标记 fired，一场遭遇都不建，System 文案逐字不变。
+    #[tokio::test]
+    async fn encounter_cleared_completes_goal_and_legacy_trigger_stays_quiet() {
+        let mut st = p5_state();
+        st.flags.insert("ambush".into(), json!(true));
+        let condition = json!({ "op": "flag_set", "flag": "ambush" });
+        let (session, _sink) =
+            session_with_state(p5_storybook(condition.clone(), Some(ambush_preset())), st);
+        session.evaluate_turn_end();
+
+        // 敌人还活着 → 清剿目标未达成。
+        session.evaluate_turn_end();
+        assert_ne!(
+            session.projection().progress.goals.get("g-clear"),
+            Some(&json!(true)),
+            "还有活着的敌人时不得判定清剿完成"
+        );
+        let quest = session
+            .projection()
+            .quests
+            .into_iter()
+            .find(|q| q.id == "g-clear")
+            .expect("清剿任务");
+        assert!(!quest.done);
+        assert_eq!(quest.location_id.as_deref(), Some("loc-cave"), "任务继承场景地点");
+
+        // 打光两只 → encounter_cleared 成立 → 目标达成。
+        for enemy in ["e1", "e2"] {
+            session
+                .handle_intent(
+                    Intent::Strike { enemy_id: enemy.into(), skill_id: Some("sk-cleave".into()) },
+                    None,
+                )
+                .await;
+        }
+        session.evaluate_turn_end();
+        assert_eq!(
+            session.projection().progress.goals.get("g-clear"),
+            Some(&json!(true)),
+            "敌人全灭 → encounter_cleared 成立"
+        );
+        assert!(session
+            .projection()
+            .quests
+            .iter()
+            .any(|q| q.id == "g-clear" && q.done));
+
+        // 回归：同一场景里没有 encounter 预置的触发点只标记 fired，不建遭遇、文案不变。
+        let mut st2 = p5_state();
+        st2.flags.insert("ambush".into(), json!(true));
+        let (legacy, legacy_sink) = session_with_state(p5_storybook(condition, None), st2);
+        legacy.evaluate_turn_end();
+        {
+            let st = legacy.state.lock().unwrap();
+            assert!(st.encounters.is_empty(), "没有 encounter 预置就不该建遭遇");
+            assert_eq!(st.progress.triggers.get("tr-ambush"), Some(&json!(true)));
+        }
+        let text = legacy_sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|e| match &e.event {
+                PlayEvent::System(p) if p.code.as_deref() == Some("skeleton_progress") => {
+                    Some(p.text.clone())
+                }
+                _ => None,
+            })
+            .expect("skeleton_progress");
+        assert_eq!(text, "剧情触发：tr-ambush", "旧故事书的提示语逐字不变");
+    }
+
+    /// 验收 5：声明 repeatable 的触发点在条件**由假变真**时可再次触发（边沿语义），
+    /// 并再次走预置遭遇链路；条件持续为真不重复；重放后世界状态逐字一致。
+    #[tokio::test]
+    async fn repeatable_trigger_refires_on_edge_and_replays() {
+        let mut sb = p5_storybook(json!({ "op": "flag_set", "flag": "ambush" }), Some(ambush_preset()));
+        sb["skeleton"][0]["scenes"][0]["triggers"][0]["repeatable"] = json!(true);
+        let mut st = p5_state();
+        st.flags.insert("ambush".into(), json!(true));
+        let (session, _sink) = session_with_state(sb.clone(), st);
+
+        // ① 首次触发：建遭遇 + 落 {fired, active}（不再是一次性的裸 true）。
+        session.evaluate_turn_end();
+        assert_eq!(session.state.lock().unwrap().encounters.len(), 1);
+        assert_eq!(
+            session.state.lock().unwrap().progress.triggers.get("tr-ambush"),
+            Some(&json!({ "fired": true, "active": true }))
+        );
+
+        // ② 条件持续为真：不重复触发、不重复建遭遇。
+        session.evaluate_turn_end();
+        assert_eq!(session.state.lock().unwrap().encounters.len(), 1, "持续为真不重复触发");
+
+        // ③ 条件转假：不触发，但把 active=false 落库（边沿依赖的「上一次值」）。
+        session.state.lock().unwrap().flags.remove("ambush");
+        session.evaluate_turn_end();
+        assert_eq!(
+            session.state.lock().unwrap().progress.triggers.get("tr-ambush"),
+            Some(&json!({ "fired": true, "active": false }))
+        );
+
+        // ④ 条件再由假变真：再次触发，并再建一场预置遭遇（旧实现整局只触发一次）。
+        session.state.lock().unwrap().flags.insert("ambush".into(), json!(true));
+        session.evaluate_turn_end();
+        assert_eq!(session.state.lock().unwrap().encounters.len(), 2, "边沿再次触发 → 再出遭遇");
+
+        // ⑤ 重放一致：整段日志重放后投影逐字相同（active 由 delta 承载，不靠重跑条件）。
+        let persisted = persisted_of(&session);
+        let mut st2 = p5_state();
+        st2.flags.insert("ambush".into(), json!(true));
+        let (restarted, _sink2) = session_with_state(sb, st2);
+        restarted.replay(&persisted);
+        assert_eq!(
+            serde_json::to_value(session.projection()).unwrap(),
+            serde_json::to_value(restarted.projection()).unwrap(),
+            "重放后投影逐字一致"
+        );
+        assert_eq!(session.current_seq(), restarted.current_seq());
+    }
+
+    /// 验收 6：没有 repeatable 声明的旧故事书，触发点的 delta 与文案逐字不变
+    /// （domain / field / op / value 与历史一致；进度值仍是裸 true）。
+    #[tokio::test]
+    async fn one_shot_trigger_delta_stays_byte_identical() {
+        let mut st = p5_state();
+        st.flags.insert("ambush".into(), json!(true));
+        let (session, sink) = session_with_state(
+            p5_storybook(json!({ "op": "flag_set", "flag": "ambush" }), None),
+            st,
+        );
+        session.evaluate_turn_end();
+        let events = sink.0.lock().unwrap().clone();
+        let changes = events
+            .iter()
+            .find_map(|e| match &e.event {
+                PlayEvent::StateUpdate(p)
+                    if p.changes.iter().any(|c| c.domain == DeltaDomain::Trigger) =>
+                {
+                    Some(p.changes.clone())
+                }
+                _ => None,
+            })
+            .expect("触发点进度 StateUpdate");
+        assert_eq!(changes.len(), 1, "旧故事书只落一条进度 delta");
+        let d = &changes[0];
+        assert_eq!(d.domain, DeltaDomain::Trigger);
+        assert_eq!(d.entity_id, "tr-ambush");
+        assert_eq!(d.field, "fired");
+        assert_eq!(d.op, DeltaOp::Set);
+        assert_eq!(d.value, json!(true), "一次性触发点仍落裸 true");
+        let text = events
+            .iter()
+            .find_map(|e| match &e.event {
+                PlayEvent::System(p) if p.code.as_deref() == Some("skeleton_progress") => {
+                    Some(p.text.clone())
+                }
+                _ => None,
+            })
+            .expect("skeleton_progress");
+        assert_eq!(text, "剧情触发：tr-ambush", "旧故事书的提示语逐字不变");
+    }
+
+    /// 验收 3（地图 P5 §6.4）：导演即兴遭遇（Intent::Encounter）同样快照场景 / 地点 / 目标；
+    /// 临时敌人不计入 template_ids。
+    #[tokio::test]
+    async fn director_encounter_snapshots_scene_and_goal() {
+        let (session, _sink) = session_with_state(
+            p5_storybook(json!({ "op": "flag_set", "flag": "never" }), None),
+            p5_state(),
+        );
+        let enc = create_encounter(&session, vec![goblin_spec(1)]).await;
+        let st = session.state.lock().unwrap();
+        let view: EncounterView =
+            serde_json::from_value(st.encounters[&enc].clone()).unwrap();
+        assert_eq!(view.scene_id.as_deref(), Some("sc-cave"));
+        assert_eq!(view.location_id.as_deref(), Some("loc-cave"));
+        assert_eq!(view.goal_id.as_deref(), Some("g-clear"));
+        assert_eq!(view.template_ids, vec!["mon-goblin".to_string()]);
+        drop(st);
+
+        // 临时敌人（AI 现编）：锚照样快照，但没有图鉴模板。
+        let temp = create_encounter(&session, vec![temp_spec("灰狼", 11, 12)]).await;
+        let st = session.state.lock().unwrap();
+        let view: EncounterView =
+            serde_json::from_value(st.encounters[&temp].clone()).unwrap();
+        assert!(view.template_ids.is_empty());
+        assert_eq!(view.goal_id.as_deref(), Some("g-clear"));
+        assert_eq!(view.location_id.as_deref(), Some("loc-cave"));
+    }
+
+    /// 验收 5（地图 P5 §6.2）：QuestView 的地点继承所属场景（推导，不落库）；
+    /// 章节地点 = 其 scenes 的 location_id 并集（推导，不存冗余字段）。
+    #[tokio::test]
+    async fn quest_location_is_derived_and_chapters_union_their_scenes() {
+        let (session, _sink) = session_with_state(
+            p5_storybook(json!({ "op": "flag_set", "flag": "never" }), None),
+            p5_state(),
+        );
+        let quests = session.projection().quests;
+        let clear = quests.iter().find(|q| q.id == "g-clear").expect("骨架任务");
+        assert_eq!(clear.location_id.as_deref(), Some("loc-cave"));
+
+        // 导演新增的任务不属于任何场景 → 没有可继承的地点。
+        session
+            .handle_intent(
+                Intent::Quest { text: "临时任务".into(), hidden: false, primary: false },
+                None,
+            )
+            .await;
+        let gm = session
+            .projection()
+            .quests
+            .into_iter()
+            .find(|q| q.text == "临时任务")
+            .expect("导演任务");
+        assert_eq!(gm.location_id, None);
+
+        // 章节地点：并集推导（骨架里 sc-cave 声明 loc-cave）。
+        let chapters = session.chapter_locations();
+        assert_eq!(chapters.len(), 1);
+        assert_eq!(chapters[0].chapter_id, "ch-1");
+        assert_eq!(chapters[0].location_ids, vec!["loc-cave".to_string()]);
+
+        // 世界状态里绝没有「章节地点」这种冗余字段（只在场景上声明）。
+        assert!(
+            session.projection().locations.iter().all(|l| l.get("location_ids").is_none()),
+            "地点条目不该被回写派生字段"
+        );
+    }
 }
 

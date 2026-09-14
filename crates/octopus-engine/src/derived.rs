@@ -30,6 +30,33 @@ pub fn check_formula(src: &str) -> Result<Vec<String>, String> {
     Ok(p.collect.unwrap_or_default())
 }
 
+/// 按声明顺序求值一整套派生值（#2 / 图鉴 M2 §4.4）：变量 = 属性 + 之前已算出的派生值。
+///
+/// - `attrs` = 实例属性（调用方已并入挂接定义 / 已装备物品的修正）；
+/// - `defs` = (key, formula)，顺序即故事书 derived[] 的声明顺序（后者可引用前者）；
+/// - `modifiers` = 同名修正（add 累加 → max 取高 → set 覆盖），与前端 computeDerived 同口径。
+///
+/// 求值失败的派生值**不写入**（后续引用它的公式同样失败）：宁可少一个派生值，
+/// 也不要写入一个由错误算出来的数。
+pub fn compute_derived(
+    attrs: &HashMap<String, f64>,
+    defs: &[(String, String)],
+    modifiers: &HashMap<String, crate::modifiers::AttrModifier>,
+) -> HashMap<String, f64> {
+    let mut vars = attrs.clone();
+    for (key, value) in vars.iter_mut() {
+        if let Some(m) = modifiers.get(key) {
+            *value = m.apply(*value);
+        }
+    }
+    for (key, formula) in defs {
+        let Ok(v) = eval_formula(formula, &vars) else { continue };
+        let v = modifiers.get(key).map(|m| m.apply(v)).unwrap_or(v);
+        vars.insert(key.clone(), v);
+    }
+    vars
+}
+
 struct Parser<'a> {
     c: &'a [char],
     i: usize,
@@ -144,6 +171,31 @@ mod tests {
     fn eval_unknown_var_errors() {
         let vars = HashMap::new();
         assert!(eval_formula("foo + 1", &vars).is_err());
+    }
+
+    /// 图鉴 M2 §4.4：派生值按声明顺序求值，变量 = 属性 + 之前已算的派生值，
+    /// 并叠加同名修正（挂接定义 / 已装备物品）——与前端口径一致。
+    #[test]
+    fn compute_derived_follows_declaration_order_and_modifiers() {
+        let mut attrs = HashMap::new();
+        attrs.insert("str".to_string(), 8.0);
+        attrs.insert("dex".to_string(), 14.0);
+        let defs = vec![
+            ("dex_mod".to_string(), "floor((dex - 10) / 2)".to_string()),
+            ("ac".to_string(), "10 + dex_mod".to_string()),
+        ];
+        // 挂接定义 monster-armor 给出 ac +3（LMoP 地精：10 + 2 + 3 = 15）。
+        let mut mods = HashMap::new();
+        mods.insert(
+            "ac".to_string(),
+            crate::modifiers::AttrModifier { add: 3, max: None, set: None },
+        );
+        let out = compute_derived(&attrs, &defs, &mods);
+        assert_eq!(out.get("dex_mod"), Some(&2.0));
+        assert_eq!(out.get("ac"), Some(&15.0));
+        // 缺失变量的派生值不写入（宁缺毋滥）。
+        let out2 = compute_derived(&attrs, &[("ac".to_string(), "10 + wis_mod".to_string())], &HashMap::new());
+        assert_eq!(out2.get("ac"), None);
     }
 
     #[test]

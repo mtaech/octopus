@@ -14,7 +14,7 @@ use rig::providers::openai;
 use rig::streaming::{StreamedAssistantContent, ToolCallDeltaContent};
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::Stream;
@@ -992,6 +992,18 @@ fn model_context_window(provider: &ProviderConfig, model: &str) -> Option<u64> {
 /// 摘要请求逐字重放当前 surface 前缀（system + 旧检查点 + 新遮蔽段）+ 末尾指令，
 /// 复用供应商的热缓存——只有指令与输出未命中（DSH summarizer 的同款做法）。
 #[allow(clippy::too_many_arguments)]
+/// 结对对话请求体里带 thread_id 时必须是自己线程（路径上没有 id，靠这里 fail-closed）。
+async fn ensure_thread_owner(
+    app: &AppState,
+    req: &PairChatRequest,
+    user_id: &str,
+) -> Result<(), ApiError> {
+    match req.thread_id.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        Some(thread_id) => crate::auth::ensure_pair_thread_owner(app, thread_id, user_id).await,
+        None => Ok(()),
+    }
+}
+
 async fn plan_pair_compaction(
     app: &AppState,
     req: &PairChatRequest,
@@ -1292,8 +1304,10 @@ fn split_choice(choice: &[AssistantContent]) -> (String, Vec<Value>) {
 /// 非流式对话接口（rig CompletionModel）
 pub async fn pair_chat(
     State(app): State<Arc<AppState>>,
+    Extension(user): Extension<crate::auth::CurrentUser>,
     Json(req): Json<PairChatRequest>,
 ) -> Result<Json<PairChatResponse>, ApiError> {
+    ensure_thread_owner(&app, &req, user.id()).await?;
     let (provider, model, temp, max_tokens, sampling) = resolve_provider_and_model(&req)?;
     let client = build_pair_client(&provider)?;
     let rig_model = client.completion_model(model.clone());
@@ -1390,8 +1404,10 @@ fn reasoning_text_of(r: &Reasoning) -> String {
 /// 流式 SSE 结对对话接口（rig 流式 CompletionModel；多步工具循环仍在前端）
 pub async fn pair_chat_stream(
     State(app): State<Arc<AppState>>,
+    Extension(user): Extension<crate::auth::CurrentUser>,
     Json(req): Json<PairChatRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    ensure_thread_owner(&app, &req, user.id()).await?;
     let (provider, model, temp, max_tokens, sampling) = resolve_provider_and_model(&req)?;
     let model_id = model.clone();
     let client = build_pair_client(&provider)?;

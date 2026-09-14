@@ -4,8 +4,10 @@ pub mod maintenance;
 pub mod pair_message;
 pub mod pair_thread;
 pub mod save;
+pub mod session;
 pub mod snapshot;
 pub mod storybook;
+pub mod user;
 
 pub use archived_command::Entity as ArchivedCommand;
 pub use command::Entity as Command;
@@ -13,5 +15,7 @@ pub use maintenance::Entity as Maintenance;
 pub use pair_message::Entity as PairMessage;
 pub use pair_thread::Entity as PairThread;
 pub use save::Entity as Save;
+pub use session::Entity as Session;
 pub use snapshot::Entity as Snapshot;
 pub use storybook::Entity as Storybook;
+pub use user::Entity as User;

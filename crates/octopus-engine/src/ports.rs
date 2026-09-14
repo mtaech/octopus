@@ -82,6 +82,12 @@ pub struct TurnContext {
     pub scene_title: String,
     /// 当前场景描述（骨架 scenes[].description）：给 AI 场景基调，避免它自由发挥到别处。
     pub scene_description: Option<String>,
+    /// 当前场景所在地点的**显示名**（骨架 scenes[].location_id → world.locations[] 的 name；
+    /// 地点表里查不到该 id 时回落 id 本身）：AI 得知道自己此刻在哪。
+    ///
+    /// 注意位置（AGENTS.md 上下文缓存不变量）：这个值逐回合会变，只允许进**回合用户提示词**
+    /// （rig_provider 的 turn 骨架），绝不允许进系统 preamble / Lua protocol.preamble(ctx)。
+    pub location: Option<String>,
     pub controlled: String,
     pub player_text: String,
     pub channel: RoundChannel,

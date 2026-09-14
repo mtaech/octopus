@@ -13,18 +13,22 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use octopus_types::{
-    CheckKind, CheckerDef, CheckMode, DeltaDomain, DeltaOp, RejectionCode, SkillCheck, SkillDef,
-    StateDelta, StatusDef,
+    CheckKind, CheckerDef, CheckMode, CondExpr, DeltaDomain, DeltaOp, RejectionCode, SkillCheck,
+    SkillDef, StateDelta, StatusDef, StatusInstance,
 };
 use serde_json::Value;
 
 use crate::effects::{resolve_effect, EffectResolution};
 use crate::error::EngineError;
 use crate::modifiers::AttrModifier;
-use crate::lua_host::{LuaHost, LuaHostContext, LuaMount, LuaRegistry, LuaRequest};
+use crate::lua_host::{
+    CheckModifier, LuaCheckContext, LuaHost, LuaHostContext, LuaMount, LuaRegistry, LuaRequest,
+    MountEnv,
+};
 use crate::resolve::{
-    apply_check_bonus, degree_thresholds, resolve_declarative_check, resolve_lua_check,
-    ModifierProfile, ResolvedCheck, DEFAULT_BASELINE,
+    apply_check_bonus, apply_forced_result, checker_dice, compare, degree_thresholds,
+    level_for_margin, resolve_checker, resolve_lua_check, roll_dice, ModifierProfile,
+    ResolvedCheck, DEFAULT_BASELINE,
 };
 use crate::rng::DeterministicRng;
 
@@ -52,6 +56,127 @@ pub struct CommandContext<'a> {
     pub profiles: Option<&'a HashMap<String, ModifierProfile>>,
     /// 角色模板 → 属性修正（挂接定义 + 已装备物品）。
     pub attribute_bonuses: Option<&'a HashMap<String, HashMap<String, AttrModifier>>>,
+    /// 调用方追加的固定判定修正（武器命中加值 / 临时加值）——通用原语，不含任何规则集语义。
+    pub extra_bonus: i64,
+    /// 效果是否必须判定成功才结算（命中门）——通用原语；缺省沿用「结果交叙事」的既有语义。
+    pub effect_requires_success: bool,
+    /// 挂载点 `when` 条件闸门（世界快照由调用方——session——组装）。
+    /// None = 声明了 `when` 的挂载点脚本一律跳过（不瞎跑）。
+    pub mount_gate: Option<&'a dyn Fn(&CondExpr) -> bool>,
+}
+
+/// 判定修正累加器（通用原语）：挂载点在判定前 / 后收集，引擎负责应用。
+///
+/// 引擎只认识「掷两次取高/低」「加值」「改难度」「覆盖结果」这四个动作；
+/// 「什么时候加、加多少、何时强制成败」全在 Lua 脚本里。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CheckAdjustments {
+    /// 取高 / 取低的净次数（互相抵消）：正 = 掷两次取高，负 = 取低，0 = 单次。
+    pub keep: i64,
+    /// 固定加值合计（正负均可）。
+    pub add: i64,
+    /// 难度修正合计（正数更难）。
+    pub dc: i64,
+    /// 结果覆盖（判定 C4）：Some(true) = 强制成功，Some(false) = 强制失败；
+    /// 同一个判定里多次覆盖以**最后一条**为准（脚本顺序即优先级）。
+    pub force: Option<bool>,
+}
+
+impl CheckAdjustments {
+    /// 吸收一批 Lua 请求里的判定修正，返回其余请求（顺序不变）。
+    pub(crate) fn absorb(&mut self, requests: Vec<LuaRequest>) -> Vec<LuaRequest> {
+        let mut rest = Vec::with_capacity(requests.len());
+        for req in requests {
+            match req {
+                LuaRequest::ModifyCheck { mode, amount } => match mode {
+                    CheckModifier::KeepHigh => self.keep += 1,
+                    CheckModifier::KeepLow => self.keep -= 1,
+                    CheckModifier::Add => self.add += amount,
+                    CheckModifier::Difficulty => self.dc += amount,
+                    CheckModifier::ForceSuccess => self.force = Some(true),
+                    CheckModifier::ForceFail => self.force = Some(false),
+                },
+                other => rest.push(other),
+            }
+        }
+        rest
+    }
+
+    /// 掷骰策略：取高 / 取低互相抵消（净 0 = 单次掷骰，行为与不声明挂载点时逐字一致）。
+    pub(crate) fn roll_policy(&self) -> RollPolicy {
+        if self.keep > 0 {
+            RollPolicy::KeepHigh
+        } else if self.keep < 0 {
+            RollPolicy::KeepLow
+        } else {
+            RollPolicy::Single
+        }
+    }
+}
+
+/// 掷骰策略（通用动作）：单次 / 掷两次取高 / 掷两次取低。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RollPolicy {
+    Single,
+    KeepHigh,
+    KeepLow,
+}
+
+/// 已判定结果 → Lua 只读快照（判定后挂载点读它决定「接下来做什么」）。
+pub(crate) fn check_context(resolved: &ResolvedCheck) -> LuaCheckContext {
+    LuaCheckContext {
+        attribute: resolved.attribute.clone(),
+        kind: Some(resolved.kind),
+        resolved: true,
+        expr: resolved.expr.clone(),
+        total: resolved.total,
+        target: resolved.target,
+        margin: resolved.margin,
+        result: resolved.result,
+        level: Some(resolved.level),
+        rolls: resolved.rolls.clone(),
+    }
+}
+
+/// 判定签名 → Lua 只读快照（**掷骰前**挂载点读它决定「对哪一类判定做什么」）。
+///
+/// 判定签名（属性 / 判定种类 / 难度）在掷骰前已经确定，这里只是把**已知事实**交给钩子，
+/// 不是新语义：`resolved = false`，结果字段一律不下发。
+pub(crate) fn check_signature(attribute: &str, kind: CheckKind, target: i64) -> LuaCheckContext {
+    LuaCheckContext {
+        attribute: attribute.to_string(),
+        kind: Some(kind),
+        target,
+        ..Default::default()
+    }
+}
+
+/// 判定**后**修正：加值（重算 total / margin / 结果 / 档位）与难度修正（重算后三者），
+/// 最后按需施加**结果覆盖**（通用原语，见 `resolve::apply_forced_result`）。
+///
+/// 掷骰已是既成事实，所以后置的「取高/取低」不生效——那只在掷骰前有意义。
+pub(crate) fn apply_post_roll_adjustments(
+    check: &mut ResolvedCheck,
+    add: i64,
+    dc: i64,
+    mode: CheckMode,
+    thresholds: &[i64],
+    force: Option<bool>,
+) {
+    if add == 0 && dc == 0 && force.is_none() {
+        return;
+    }
+    check.target += dc;
+    // add 走既有原语（它同时并入 r#mod 并重算档位）；add == 0 时它会提前返回。
+    apply_check_bonus(check, add, mode, thresholds);
+    if dc != 0 {
+        check.margin = check.total - check.target;
+        check.result = compare(check.total, check.target, mode);
+        check.level = level_for_margin(check.margin, thresholds);
+    }
+    if let Some(success) = force {
+        apply_forced_result(check, success);
+    }
 }
 
 /// 结算产物（Commit / Feedback 阶段消费）。
@@ -176,10 +301,30 @@ fn skill_checker<'a>(skill: &'a SkillDef, global: Option<&'a CheckerDef>) -> Opt
     }
 }
 
+/// 判定属性解析优先级（判定 C2 §4）：技能声明 → 内联判定器 → 调用方指定 → 全局 → 'str'。
+///
+/// 「技能声明」是作者对「这一招用哪个维度」的表达；全局 world.check.attribute 只是缺省。
+fn resolve_attribute(skill: &SkillDef, global: Option<&CheckerDef>, explicit: Option<&str>) -> String {
+    skill
+        .attribute
+        .clone()
+        .or_else(|| match skill.check.as_ref() {
+            Some(SkillCheck::Def(def)) => def.attribute.clone(),
+            _ => None,
+        })
+        .or_else(|| explicit.map(str::to_string))
+        .or_else(|| global.and_then(|c| c.attribute.clone()))
+        .unwrap_or_else(|| "str".to_string())
+}
+
 /// 跑一次判定：Lua 判定器不持锁（其内部 engine_rng 会自己加锁）；声明式才短暂加锁。
 ///
 /// 公开给 session 的 check 意图复用（#04/#12：check 与技能走同一判定器路径），
 /// 避免两套判定语义。
+///
+/// `policy` = 通用掷骰策略（单次 / 掷两次取高 / 掷两次取低）。单次时与历史逐字一致：
+/// 只调一次 resolve_checker、只掷一次骰。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_check(
     checker: &CheckerDef,
     attribute: &str,
@@ -188,8 +333,10 @@ pub(crate) fn run_check(
     profile: ModifierProfile,
     rng: &Mutex<DeterministicRng>,
     lua: Option<(&LuaHost, &LuaHostContext)>,
+    policy: RollPolicy,
 ) -> Result<ResolvedCheck, EngineError> {
     if let Some(script) = checker.lua.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        // Lua 判定器自己掷骰（脚本内 host.engine_rng）：策略由脚本自行表达，引擎不重复掷。
         let (host, ctx) = lua.ok_or_else(|| {
             EngineError::Lua("判定器声明了 lua 脚本，但未提供 LuaHost".to_string())
         })?;
@@ -206,26 +353,61 @@ pub(crate) fn run_check(
         return Ok(out);
     }
     let mut guard = rng.lock().map_err(|_| poisoned())?;
-    resolve_declarative_check(checker, attribute, value, difficulty, profile, &mut guard)
+    // 声明式分支统一走 resolve_checker（lua 传 None = 不走 Lua 分支），与分派入口同名同义。
+    let mut best = resolve_checker(checker, attribute, value, difficulty, profile, &mut guard, None)?;
+    if policy == RollPolicy::Single || !best.rolled {
+        return Ok(best);
+    }
+    // 「掷两次取高/低」：再掷一次同一骰式，保留更优的一组（RNG 消耗 = 骰式的两倍）。
+    let Some(dice) = checker_dice(checker) else {
+        return Ok(best);
+    };
+    let extra = roll_dice(&dice, &mut guard)?;
+    let total = extra.total + best.r#mod;
+    let better = match policy {
+        RollPolicy::KeepHigh => total > best.total,
+        RollPolicy::KeepLow => total < best.total,
+        RollPolicy::Single => false,
+    };
+    if better {
+        let mode = checker.mode.unwrap_or(CheckMode::Gte);
+        best.expr = Some(extra.expr);
+        best.rolls = extra.rolls;
+        best.total = total;
+        best.margin = total - best.target;
+        best.result = compare(best.total, best.target, mode);
+        best.level = level_for_margin(best.margin, degree_thresholds(checker));
+    }
+    Ok(best)
 }
 
-/// 执行某挂载点：注册表脚本按序跑；技能自身 lua 钩子挂在 PreResolve。
-fn run_mount(skill: &SkillDef, mount: LuaMount, ctx: &CommandContext<'_>) -> Result<(), EngineError> {
-    let Some((host, lua_ctx)) = ctx.lua else {
-        return Ok(());
+/// 执行某挂载点：注册表脚本按序跑（含 `when` 闸门）；技能自身 lua 钩子挂在 PreResolve。
+///
+/// 返回该挂载点新产生的写请求（顺序 = 脚本执行顺序）。Drain 放在每次挂载点之后，
+/// 调用方才能把「判定修正」挑出来当场应用，而不是等到最后一起丢掉。
+fn run_mount(
+    skill: &SkillDef,
+    mount: LuaMount,
+    ctx: &CommandContext<'_>,
+    lua_ctx: &LuaHostContext,
+    check: Option<&LuaCheckContext>,
+) -> Result<Vec<LuaRequest>, EngineError> {
+    let Some((host, _)) = ctx.lua else {
+        return Ok(Vec::new());
     };
+    let env = MountEnv { gate: ctx.mount_gate, check };
     if let Some(registry) = ctx.registry {
-        registry.run_chain(host, mount, lua_ctx)?;
+        registry.run_chain_with(host, mount, lua_ctx, &env)?;
     }
     if mount == LuaMount::PreResolve {
         if let Some(script) = skill.lua.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             let mut skill_ctx = lua_ctx.clone();
             skill_ctx.script_id = format!("{}:lua", skill.id);
             skill_ctx.skill = Some(serde_json::to_value(skill).unwrap_or(Value::Null));
-            host.run_hook(script, LuaMount::PreResolve, &skill_ctx)?;
+            host.run_hook_with(script, LuaMount::PreResolve, &skill_ctx, &env)?;
         }
     }
-    Ok(())
+    Ok(host.drain_requests())
 }
 
 /// 结算一次技能使用：Validate -> Resolve（Lua 挂载点 + 判定 + 效果）-> Commit 数据。
@@ -245,20 +427,54 @@ pub fn execute_skill(
 
     let before = ctx.rng.lock().map_err(|_| poisoned())?.consumed.len();
     let actor = ctx.actor;
-    let target_entity = ctx.target;
+    let declared_target = ctx.target_id;
     let actor_id = ctx.actor_id.to_string();
-    let target_id = ctx.target_id.unwrap_or(ctx.actor_id).to_string();
-    let difficulty = ctx.difficulty;
-    let attribute = ctx.attribute.clone().unwrap_or_default();
+    // 结算语义：不给目标 = 自目标（目标回落成施法者本人）。
+    let target_id = declared_target.unwrap_or(ctx.actor_id).to_string();
+    // Lua 上下文的 target 必须与结算语义一致：自目标时指向施法者本人，
+    // 而不是 None。否则规则包读 host.target 拿到 nil，会静默不结算（例如豁免成功后补效果）。
+    let target_entity = match declared_target {
+        // 调用方给了目标：沿用（解析不到实例时也保持「目标不是自己」）。
+        Some(_) => ctx.target,
+        None => Some(actor),
+    };
     let global_checker = ctx.global_checker;
     let lua = ctx.lua;
-
-    // [2] Resolve：判定前/后 Lua 修正 + 核心判定。
-    run_mount(skill, LuaMount::CheckPreRoll, ctx)?;
-
+    let extra_bonus = ctx.extra_bonus;
+    let effect_requires_success = ctx.effect_requires_success;
+    // 判定属性（判定 C2）：技能声明 → 内联判定器 → 调用方指定 → 全局 → 'str'。
+    let attribute = resolve_attribute(skill, global_checker, ctx.attribute.as_deref());
+    // 判定种类 / 比较方向在掷骰前就确定：check_pre_roll 的签名要用它，所以先解析。
     let checker_kind = skill_checker(skill, global_checker)
         .and_then(|c| c.kind)
         .unwrap_or(CheckKind::Attribute);
+    let check_mode = skill_checker(skill, global_checker)
+        .and_then(|c| c.mode)
+        .unwrap_or(CheckMode::Gte);
+    // 挂载点上下文用本地副本：判定后要往它里面放判定结果快照。
+    let mut mount_ctx = lua.map(|(_, c)| c.clone()).unwrap_or_default();
+    // 同步 target：Lua 看到的 target 语义与结算语义一致（自目标 = 施法者本人）。
+    mount_ctx.target_id = Some(target_id.clone());
+    mount_ctx.target = target_entity.cloned();
+    let mut requests: Vec<LuaRequest> = Vec::new();
+
+    // [2] Resolve：判定前/后 Lua 修正 + 核心判定。
+    // 判定前（CheckPreRoll）：收集 → 掷骰前应用（取高/取低、改难度、加值）。
+    // 签名（属性 / 种类 / 难度）在掷骰前已经确定，一并交给钩子；没有判定就没有签名。
+    let signature = skill_checker(skill, global_checker)
+        .is_some()
+        .then(|| check_signature(&attribute, checker_kind, ctx.difficulty));
+    let mut adjustments = CheckAdjustments::default();
+    requests.extend(adjustments.absorb(run_mount(
+        skill,
+        LuaMount::CheckPreRoll,
+        ctx,
+        &mount_ctx,
+        signature.as_ref(),
+    )?));
+    let difficulty = ctx.difficulty + adjustments.dc;
+    mount_ctx.difficulty = Some(difficulty);
+    let policy = adjustments.roll_policy();
     let check = match skill_checker(skill, global_checker) {
         Some(checker) => {
             // 豁免由「目标」掷骰（本人是施加方）；攻击 / 属性检定由本人掷骰。
@@ -281,10 +497,11 @@ pub fn execute_skill(
                 .and_then(|m| m.get(&attribute))
                 .copied()
                 .unwrap_or_default();
-            let mut resolved = run_check(checker, &attribute, value, difficulty, profile, ctx.rng, lua)?;
+            let mut resolved =
+                run_check(checker, &attribute, value, difficulty, profile, ctx.rng, lua, policy)?;
             apply_check_bonus(
                 &mut resolved,
-                skill_modifier_bonus(skill, &attribute),
+                skill_modifier_bonus(skill, &attribute) + extra_bonus + adjustments.add,
                 checker.mode.unwrap_or(CheckMode::Gte),
                 degree_thresholds(checker),
             );
@@ -292,22 +509,72 @@ pub fn execute_skill(
         }
         None => None,
     };
+    let mut check = check;
+    let thresholds = skill_checker(skill, global_checker)
+        .map(degree_thresholds)
+        .unwrap_or(&crate::resolve::DEFAULT_DEGREE_THRESHOLDS);
+    // 判定前挂载点的结果覆盖（判定 C4）：掷骰前就能声明「这次必定成功 / 失败」，
+    // 在掷骰之后兑现——骰面照掷、RNG 记账不变，只覆盖结果与档位。
+    if let (Some(resolved), Some(success)) = (check.as_mut(), adjustments.force) {
+        apply_forced_result(resolved, success);
+    }
+    // 判定结果快照（判定期之后才存在）：判定后挂载点读它决定接下来做什么。
+    let mut check_snapshot = check.as_ref().map(check_context);
 
-    run_mount(skill, LuaMount::CheckPostRoll, ctx)?;
-    run_mount(skill, LuaMount::PreResolve, ctx)?;
+    // 判定后（CheckPostRoll）：收集 → 掷骰后应用（改 total / margin / 档位 / 覆盖结果）。
+    let mut post = CheckAdjustments::default();
+    requests.extend(post.absorb(run_mount(
+        skill,
+        LuaMount::CheckPostRoll,
+        ctx,
+        &mount_ctx,
+        check_snapshot.as_ref(),
+    )?));
+    if let Some(resolved) = check.as_mut() {
+        apply_post_roll_adjustments(resolved, post.add, post.dc, check_mode, thresholds, post.force);
+        // 快照刷新为**后置修正之后**的值：PreResolve / PostResolve 读到的是最终判定。
+        check_snapshot = Some(check_context(resolved));
+    }
+
+    requests.extend(run_mount(
+        skill,
+        LuaMount::PreResolve,
+        ctx,
+        &mount_ctx,
+        check_snapshot.as_ref(),
+    )?);
 
     // [2b] 核心效果 + 消耗扣减（效果求值可能掷骰，临时持锁）。
     let empty_status_defs = HashMap::new();
     let status_defs = ctx.status_defs.unwrap_or(&empty_status_defs);
     // 豁免：失败（result = false）才结算效果；其余判定保持「结果交 AI 叙事」的既有语义。
-    let effect_applies = match (&check, checker_kind) {
-        (Some(resolved), CheckKind::Save) => !resolved.result,
-        _ => true,
+    // 调用方要求命中门时（攻击类入口），一律以判定结果决定是否结算效果。
+    let effect_applies = if effect_requires_success {
+        check.as_ref().map(|c| c.result).unwrap_or(true)
+    } else {
+        match (&check, checker_kind) {
+            (Some(resolved), CheckKind::Save) => !resolved.result,
+            _ => true,
+        }
     };
     let mut effects = match &skill.effect {
         Some(effect) if effect_applies => {
+            // 同名状态的叠加策略（#12 ③）：以**施法者当前状态**为基座合并 add / max。
+            // ctx.actor 是结算时点的角色实例快照，读不到时按「没有已有状态」处理（= 旧 replace）。
+            let current_statuses: Vec<StatusInstance> = ctx
+                .actor
+                .get("statuses")
+                .and_then(|v| serde_json::from_value::<Vec<StatusInstance>>(v.clone()).ok())
+                .unwrap_or_default();
             let mut guard = ctx.rng.lock().map_err(|_| poisoned())?;
-            resolve_effect(effect, &actor_id, &target_id, &mut guard, status_defs)?
+            resolve_effect(
+                effect,
+                &actor_id,
+                &target_id,
+                &mut guard,
+                status_defs,
+                &current_statuses,
+            )?
         }
         _ => EffectResolution::default(),
     };
@@ -315,13 +582,19 @@ pub fn execute_skill(
         effects.deltas.push(resource_delta(&actor_id, &cost.resource, -cost.amount));
     }
 
-    run_mount(skill, LuaMount::PostResolve, ctx)?;
+    requests.extend(run_mount(
+        skill,
+        LuaMount::PostResolve,
+        ctx,
+        &mount_ctx,
+        check_snapshot.as_ref(),
+    )?);
+    // Lua 判定器脚本自己也可能写请求：挂载点跑完后兜底收一次，不漏。
+    if let Some((host, _)) = ctx.lua {
+        requests.extend(host.drain_requests());
+    }
 
     // [3] Commit 数据：RNG 消耗 + Lua 请求。
-    let requests = ctx
-        .lua
-        .map(|(host, _)| host.drain_requests())
-        .unwrap_or_default();
     let rng_consumed = {
         let guard = ctx.rng.lock().map_err(|_| poisoned())?;
         guard.consumed[before..].to_vec()
@@ -382,6 +655,9 @@ pub fn execute_declarative_skill(
         status_defs: None,
         profiles: None,
         attribute_bonuses: None,
+        extra_bonus: 0,
+        effect_requires_success: false,
+        mount_gate: None,
     };
     execute_skill(skill, &mut ctx)
 }
@@ -389,8 +665,80 @@ pub fn execute_declarative_skill(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use octopus_types::{CheckerDef, EffectDef, ImmediateEffect, ResourceCost};
+    use octopus_types::{
+        CheckerDef, EffectDef, ImmediateEffect, LuaMountDef, ResourceCost, SuccessLevel,
+    };
     use serde_json::json;
+
+    /// 造一条规则集挂载点声明（文档里的 `lua_mounts` 条目形状）。
+    fn md(id: &str, mount: &str, source: &str) -> LuaMountDef {
+        LuaMountDef {
+            id: id.into(),
+            mount: mount.into(),
+            source: source.into(),
+            when: None,
+            enabled: None,
+        }
+    }
+
+    /// 以注册表 + 挂载点闸门跑一次技能结算，返回产物与 RNG 全量消耗。
+    fn run_with_mounts(
+        skill: &SkillDef,
+        seed: u64,
+        difficulty: i64,
+        mounts: &[LuaMountDef],
+        mount_gate: Option<&dyn Fn(&CondExpr) -> bool>,
+    ) -> (CommandOutcome, Vec<u64>) {
+        let host = LuaHost::new(seed).unwrap();
+        let mut registry = LuaRegistry::new();
+        for def in mounts {
+            registry.register_def(def);
+        }
+        let a = actor(json!({ "hp": 30, "mana": 20 }));
+        let lua_ctx = LuaHostContext {
+            script_id: "mount-test".into(),
+            actor_id: "char-a".into(),
+            actor: a.clone(),
+            difficulty: Some(difficulty),
+            ..Default::default()
+        };
+        let rng = Mutex::new(DeterministicRng::new(seed));
+        let out = {
+            let mut ctx = CommandContext {
+                actor_id: "char-a",
+                actor: &a,
+                target_id: None,
+                target: None,
+                difficulty,
+                attribute: Some("str".into()),
+                global_checker: None,
+                rng: &rng,
+                lua: Some((&host, &lua_ctx)),
+                registry: Some(&registry),
+                status_defs: None,
+                profiles: None,
+                attribute_bonuses: None,
+                extra_bonus: 0,
+                effect_requires_success: false,
+                mount_gate,
+            };
+            execute_skill(skill, &mut ctx).unwrap()
+        };
+        let consumed = rng.lock().unwrap().consumed.clone();
+        (out, consumed)
+    }
+
+    fn plain_check_skill() -> SkillDef {
+        SkillDef {
+            id: "sk-t".into(),
+            name: "判定".into(),
+            check: Some(SkillCheck::Def(CheckerDef {
+                dice: Some("1d20".into()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
 
     fn skill_fire() -> SkillDef {
         SkillDef {
@@ -482,6 +830,9 @@ mod tests {
             status_defs: None,
             profiles: None,
             attribute_bonuses: None,
+            extra_bonus: 0,
+            effect_requires_success: false,
+            mount_gate: None,
         };
         let out = execute_skill(&skill, &mut ctx).unwrap();
         let events: Vec<String> = out
@@ -519,6 +870,9 @@ mod tests {
             status_defs: None,
             profiles: None,
             attribute_bonuses: None,
+            extra_bonus: 0,
+            effect_requires_success: false,
+            mount_gate: None,
         };
         assert!(execute_skill(&SkillDef::default(), &mut ctx).is_err());
     }
@@ -570,6 +924,9 @@ mod tests {
             status_defs: None,
             profiles: Some(&profiles),
             attribute_bonuses: Some(&bonuses),
+            extra_bonus: 0,
+            effect_requires_success: false,
+            mount_gate: None,
         };
         let out = execute_skill(&skill, &mut ctx).unwrap();
         let check = out.check.expect("check present");
@@ -596,6 +953,9 @@ mod tests {
             status_defs: None,
             profiles: None,
             attribute_bonuses: None,
+            extra_bonus: 0,
+            effect_requires_success: false,
+            mount_gate: None,
         };
         let out = execute_item_skill("it-wand", &skill, &mut ctx).unwrap();
         assert_eq!(out.rejection, Some(RejectionCode::ItemNotOwned));
@@ -646,8 +1006,471 @@ mod tests {
             status_defs: None,
             profiles: None,
             attribute_bonuses: None,
+            extra_bonus: 0,
+            effect_requires_success: false,
+            mount_gate: None,
         };
         let out = execute_item_skill("it-wand", &skill, &mut ctx).unwrap();
         assert_eq!(out.outcome.as_deref(), Some("it-wand::sk-fire"));
+    }
+
+    /// 判定属性优先级（判定 C2 §4）：技能声明 → 内联判定器 → 全局 world.check → 'str'。
+    #[test]
+    fn attribute_priority_skill_then_checker_then_global_then_default() {
+        let a = actor(json!({ "hp": 30 }));
+        let global = CheckerDef {
+            dice: Some("1d20".into()),
+            attribute: Some("con".into()),
+            ..Default::default()
+        };
+        let rng = Mutex::new(DeterministicRng::new(5));
+        let build = |skill_attribute: Option<&str>, checker_attribute: Option<&str>| SkillDef {
+            id: "sk".into(),
+            name: "技能".into(),
+            attribute: skill_attribute.map(str::to_string),
+            check: Some(SkillCheck::Def(CheckerDef {
+                dice: Some("1d20".into()),
+                attribute: checker_attribute.map(str::to_string),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        for (skill_attribute, checker_attribute, want) in [
+            (Some("dex"), Some("int"), "dex"),
+            (None, Some("int"), "int"),
+            (None, None, "con"),
+        ] {
+            let skill = build(skill_attribute, checker_attribute);
+            let mut ctx = CommandContext {
+                actor_id: "char-a",
+                actor: &a,
+                target_id: None,
+                target: None,
+                difficulty: 10,
+                attribute: None,
+                global_checker: Some(&global),
+                rng: &rng,
+                lua: None,
+                registry: None,
+                status_defs: None,
+                profiles: None,
+                attribute_bonuses: None,
+                extra_bonus: 0,
+                effect_requires_success: false,
+                mount_gate: None,
+            };
+            let out = execute_skill(&skill, &mut ctx).unwrap();
+            assert_eq!(out.check.expect("check").attribute, want);
+        }
+        // 三级声明全缺省 → 回落 'str'（向后兼容）。
+        let skill = build(None, None);
+        let mut ctx = CommandContext {
+            actor_id: "char-a",
+            actor: &a,
+            target_id: None,
+            target: None,
+            difficulty: 10,
+            attribute: None,
+            global_checker: None,
+            rng: &rng,
+            lua: None,
+            registry: None,
+            status_defs: None,
+            profiles: None,
+            attribute_bonuses: None,
+            extra_bonus: 0,
+            effect_requires_success: false,
+            mount_gate: None,
+        };
+        let out = execute_skill(&skill, &mut ctx).unwrap();
+        assert_eq!(out.check.expect("check").attribute, "str");
+    }
+
+    /// `check: "world"`（Ref）必须读全局判定器的骰式 / 修正 / 阈值，而不是静默换骰（修 D3）。
+    #[test]
+    fn ref_checker_reads_global_dice_modifier_and_thresholds() {
+        let mut skill = skill_fire();
+        skill.cost.clear();
+        skill.check = Some(SkillCheck::Ref("world".into()));
+        let a = actor(json!({ "hp": 30 }));
+        let mut fixed = std::collections::BTreeMap::new();
+        fixed.insert("str".to_string(), 50i64);
+        let global = CheckerDef {
+            dice: Some("1d4".into()),
+            attribute_modifier: Some(fixed),
+            degree_thresholds: Some(vec![1000, 1000, 1000]),
+            ..Default::default()
+        };
+        let rng = Mutex::new(DeterministicRng::new(7));
+        let out =
+            execute_declarative_skill(&skill, "char-a", &a, None, None, "str", 5, Some(&global), &rng)
+                .unwrap();
+        let check = out.check.expect("check");
+        assert_eq!(check.expr.as_deref(), Some("1d4"), "骰式取自全局判定器（裸 1d20 = 未生效）");
+        assert!(check.rolled);
+        assert_eq!(check.r#mod, 50, "修正取自全局判定器");
+        assert_eq!(
+            check.level,
+            SuccessLevel::Fail,
+            "阈值取自全局判定器（默认阈值下同一差值会落到更高档）"
+        );
+    }
+
+    /// 调用方追加的固定判定修正并入 total / margin（武器命中加值的通用落点）。
+    #[test]
+    fn extra_bonus_is_added_to_check_total() {
+        let skill = skill_fire();
+        let a = actor(json!({ "mana": 20, "hp": 30 }));
+        let rng = Mutex::new(DeterministicRng::new(2024));
+        let mut ctx = CommandContext {
+            actor_id: "char-a",
+            actor: &a,
+            target_id: None,
+            target: None,
+            difficulty: 12,
+            attribute: Some("str".into()),
+            global_checker: None,
+            rng: &rng,
+            lua: None,
+            registry: None,
+            status_defs: None,
+            profiles: None,
+            attribute_bonuses: None,
+            extra_bonus: 5,
+            effect_requires_success: false,
+            mount_gate: None,
+        };
+        let out = execute_skill(&skill, &mut ctx).unwrap();
+        let check = out.check.expect("check");
+        assert_eq!(check.r#mod, 9, "属性修正 4 + 调用方加值 5");
+        assert_eq!(check.total, check.rolls.iter().sum::<i64>() + 9);
+        assert_eq!(check.margin, check.total - 12);
+    }
+
+    /// 命中门（通用原语）：判定不成立时不结算效果，也不掷伤害骰。
+    #[test]
+    fn effect_requires_success_skips_effect_when_check_fails() {
+        let skill = skill_fire();
+        let a = actor(json!({ "mana": 20, "hp": 30 }));
+        let rng = Mutex::new(DeterministicRng::new(3));
+        let mut ctx = CommandContext {
+            actor_id: "char-a",
+            actor: &a,
+            target_id: None,
+            target: None,
+            difficulty: 10_000,
+            attribute: Some("str".into()),
+            global_checker: None,
+            rng: &rng,
+            lua: None,
+            registry: None,
+            status_defs: None,
+            profiles: None,
+            attribute_bonuses: None,
+            extra_bonus: 0,
+            effect_requires_success: true,
+            mount_gate: None,
+        };
+        let out = execute_skill(&skill, &mut ctx).unwrap();
+        assert!(!out.check.as_ref().expect("check").result, "难度极高必然判定失败");
+        assert!(
+            !out.deltas().iter().any(|d| d.field == "resources.hp"),
+            "判定失败不得结算伤害"
+        );
+        assert_eq!(out.rng_consumed.len(), 1, "未命中只掷命中骰，不掷伤害骰");
+    }
+
+    // ---------- 规则集挂载点：判定原语（通用动作，不含规则集语义） ----------
+
+    /// 取高/取低 = 掷两次取优：RNG 消耗 = 2，且同种子逐字可重放。
+    #[test]
+    fn pre_roll_keep_high_rolls_twice_and_replays() {
+        let skill = plain_check_skill();
+        let mounts = [md("gate", "check_pre_roll", "host.modify_check('keep_high')")];
+        let (out, consumed) = run_with_mounts(&skill, 2024, 12, &mounts, None);
+        assert_eq!(consumed.len(), 2, "取高 = 掷两次");
+        assert_eq!(out.rng_consumed.len(), 2);
+        let check = out.check.clone().expect("check");
+        // 独立探针：同一序列的前两颗 d20，取大者即取高的结果。
+        let mut probe = DeterministicRng::new(2024);
+        let d1 = probe.range_inclusive(1, 20);
+        let d2 = probe.range_inclusive(1, 20);
+        assert_eq!(check.rolls, vec![d1.max(d2)]);
+        assert_eq!(check.total, d1.max(d2) + check.r#mod);
+        assert_eq!(check.margin, check.total - 12);
+        assert_eq!(
+            check.level,
+            level_for_margin(check.margin, &crate::resolve::DEFAULT_DEGREE_THRESHOLDS)
+        );
+
+        // 同种子重跑 → 骰面与消耗逐字一致。
+        let (again, consumed2) = run_with_mounts(&skill, 2024, 12, &mounts, None);
+        assert_eq!(out.check, again.check);
+        assert_eq!(consumed, consumed2);
+    }
+
+    /// 取低同样掷两次，取较小者。
+    #[test]
+    fn pre_roll_keep_low_rolls_twice() {
+        let skill = plain_check_skill();
+        let (out, consumed) = run_with_mounts(
+            &skill,
+            99,
+            12,
+            &[md("g", "check_pre_roll", "host.modify_check('keep_low')")],
+            None,
+        );
+        assert_eq!(consumed.len(), 2);
+        let mut probe = DeterministicRng::new(99);
+        let d1 = probe.range_inclusive(1, 20);
+        let d2 = probe.range_inclusive(1, 20);
+        assert_eq!(out.check.expect("check").rolls, vec![d1.min(d2)]);
+    }
+
+    /// 判定前改难度：check_pre_roll 的 `dc` 在掷骰前生效（target 已改）。
+    #[test]
+    fn pre_roll_dc_shifts_target_before_rolling() {
+        let skill = plain_check_skill();
+        let (base, _) = run_with_mounts(&skill, 5, 12, &[], None);
+        assert_eq!(base.check.expect("base").target, 12);
+        let (out, consumed) = run_with_mounts(
+            &skill,
+            5,
+            12,
+            &[md("dc", "check_pre_roll", "host.modify_check('dc', -4)")],
+            None,
+        );
+        assert_eq!(consumed.len(), 1, "改难度不额外掷骰");
+        assert_eq!(out.check.expect("check").target, 8);
+    }
+
+    /// 判定后加值 / 改难度：重算 total、margin 与成功度分档。
+    #[test]
+    fn post_roll_add_and_dc_recompute_total_margin_level() {
+        let skill = plain_check_skill();
+        // 先用探针算出裸判定，把难度卡在「险胜」（margin = -1）这一档上。
+        let mut probe = DeterministicRng::new(2024);
+        let d = probe.range_inclusive(1, 20);
+        let base_mod = 4; // str 70 → floor((70-50)/5)
+        let difficulty = d + base_mod + 1; // margin = -1 → 险胜
+        let (base, _) = run_with_mounts(&skill, 2024, difficulty, &[], None);
+        let bc = base.check.expect("base check");
+        assert_eq!(bc.margin, -1);
+        assert_eq!(bc.level, SuccessLevel::Barely);
+
+        // +6 → margin 5 → 成功；total / 修正同步改写。
+        let (out, consumed) = run_with_mounts(
+            &skill,
+            2024,
+            difficulty,
+            &[md("prof", "check_post_roll", "host.modify_check('add', 6)")],
+            None,
+        );
+        assert_eq!(consumed.len(), 1, "判定后修正不额外掷骰");
+        let c = out.check.expect("check");
+        assert_eq!(c.total, bc.total + 6);
+        assert_eq!(c.r#mod, bc.r#mod + 6);
+        assert_eq!(c.margin, 5);
+        assert_eq!(c.level, SuccessLevel::Success);
+
+        // 难度 -12 → margin 11 → 大成功（分档随之重算）。
+        let (out2, _) = run_with_mounts(
+            &skill,
+            2024,
+            difficulty,
+            &[md("ease", "check_post_roll", "host.modify_check('dc', -12)")],
+            None,
+        );
+        let c2 = out2.check.expect("check2");
+        assert_eq!(c2.total, bc.total, "只改难度不改总值");
+        assert_eq!(c2.target, difficulty - 12);
+        assert_eq!(c2.margin, 11);
+        assert_eq!(c2.level, SuccessLevel::Great);
+    }
+
+    /// 判定结果对 check_post_roll / pre_resolve 脚本可见（改总值、按结果发效果由此可写）。
+    #[test]
+    fn post_roll_scripts_can_read_check_snapshot() {
+        let skill = plain_check_skill();
+        let (out, _) = run_with_mounts(
+            &skill,
+            11,
+            3,
+            &[md(
+                "branch",
+                "check_post_roll",
+                "if host.check_result then host.modify_resource('char-a', 'mana', -host.check_total) else host.modify_resource('char-a', 'mana', 1) end",
+            )],
+            None,
+        );
+        let c = out.check.expect("check");
+        assert!(c.result, "难度 3 必成功");
+        assert_eq!(
+            out.requests,
+            vec![LuaRequest::ModifyResource {
+                target: "char-a".into(),
+                resource: "mana".into(),
+                amount: -c.total
+            }]
+        );
+    }
+
+    /// 施加即时效果 / 加减资源走 outbox 请求（引擎再校验与落状态）。
+    #[test]
+    fn effect_and_resource_requests_reach_outcome() {
+        let (out, _) = run_with_mounts(
+            &SkillDef::default(),
+            1,
+            12,
+            &[md(
+                "burst",
+                "pre_resolve",
+                "host.apply_effect('char-b', { kind = 'damage', amount = '3d6', resource = 'hp' }); host.modify_resource('char-a', 'mana', -3); host.modify_resource('char-a', 'mana', 5)",
+            )],
+            None,
+        );
+        assert!(out
+            .requests
+            .iter()
+            .any(|r| matches!(r, LuaRequest::ApplyEffect { target, .. } if target == "char-b")));
+        assert_eq!(
+            out.requests
+                .iter()
+                .filter(|r| matches!(r, LuaRequest::ModifyResource { .. }))
+                .count(),
+            2
+        );
+        assert!(out.rng_consumed.is_empty(), "即时效果在 session 侧结算，不在命令内核掷骰");
+    }
+
+    /// 未知修正名 / 非法效果形状当场报错（fail-fast，不静默丢规则）。
+    #[test]
+    fn invalid_mount_requests_are_rejected() {
+        for script in [
+            "host.modify_check('luck')",
+            "host.apply_effect('x', { kind = 'bogus' })",
+            "host.modify_check('add', 'six')",
+        ] {
+            let host = LuaHost::new(1).unwrap();
+            let mut registry = LuaRegistry::new();
+            registry.register("bad", LuaMount::PreResolve, script);
+            let a = actor(json!({ "hp": 30 }));
+            let lua_ctx =
+                LuaHostContext { script_id: "t".into(), actor: a.clone(), ..Default::default() };
+            let rng = Mutex::new(DeterministicRng::new(1));
+            let mut ctx = CommandContext {
+                actor_id: "char-a",
+                actor: &a,
+                target_id: None,
+                target: None,
+                difficulty: 12,
+                attribute: None,
+                global_checker: None,
+                rng: &rng,
+                lua: Some((&host, &lua_ctx)),
+                registry: Some(&registry),
+                status_defs: None,
+                profiles: None,
+                attribute_bonuses: None,
+                extra_bonus: 0,
+                effect_requires_success: false,
+                mount_gate: None,
+            };
+            assert!(
+                execute_skill(&SkillDef::default(), &mut ctx).is_err(),
+                "非法挂载点请求必须当场报错：{script}"
+            );
+        }
+    }
+
+    /// when 闸门：条件不成立即跳过（引擎只做「成立才跑」）。
+    #[test]
+    fn mount_gate_skips_scripts_when_condition_is_false() {
+        let skill = plain_check_skill();
+        let mut def = md("gated", "check_pre_roll", "host.modify_check('keep_high')");
+        def.when = Some(CondExpr::FlagSet { flag: "focused".into() });
+        let mounts = [def];
+
+        let gate_false = |_: &CondExpr| false;
+        let (out, consumed) =
+            run_with_mounts(&skill, 3, 12, &mounts, Some(&gate_false));
+        assert_eq!(consumed.len(), 1, "闸门不成立 → 只有裸判定掷一颗");
+        assert_eq!(out.check.expect("check").target, 12);
+
+        let gate_true = |_: &CondExpr| true;
+        let (out2, consumed2) = run_with_mounts(&skill, 3, 12, &mounts, Some(&gate_true));
+        assert_eq!(consumed2.len(), 2, "闸门成立 → 取高掷两次");
+        assert!(out2.check.is_some());
+    }
+
+    /// 向后兼容：没有 lua_mounts（注册表缺失或为空）时，骰序与消耗逐字不变。
+    #[test]
+    fn absent_or_empty_mounts_keep_dice_order_identical() {
+        let skill = plain_check_skill();
+        let (empty, consumed) = run_with_mounts(&skill, 7, 12, &[], None);
+        let a = actor(json!({ "hp": 30, "mana": 20 }));
+        let rng = Mutex::new(DeterministicRng::new(7));
+        let absent =
+            execute_declarative_skill(&skill, "char-a", &a, None, None, "str", 12, None, &rng)
+                .unwrap();
+        let mut probe = DeterministicRng::new(7);
+        let d = probe.range_inclusive(1, 20);
+        assert_eq!(consumed, probe.consumed, "RNG 消耗逐字不变");
+        assert_eq!(consumed.len(), 1);
+        assert_eq!(empty.check, absent.check);
+        assert_eq!(empty.rng_consumed, absent.rng_consumed);
+        assert_eq!(empty.check.expect("check").rolls, vec![d]);
+    }
+
+    /// 缺陷 3（GAP-D）：技能路径的 check_pre_roll 也拿得到判定**签名**
+    /// （属性 / 种类 / 难度），且结果字段仍是 nil——「只对某一类判定取高/取低」
+    /// 因此能在掷骰前表达。
+    #[test]
+    fn pre_roll_sees_check_signature_in_skill_path() {
+        let skill = SkillDef {
+            id: "sk-sig".into(),
+            name: "签名".into(),
+            check: Some(SkillCheck::Def(CheckerDef {
+                dice: Some("1d20".into()),
+                kind: Some(CheckKind::Save),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        // 命中签名才取高；同时断言结果字段在掷骰前不可见（total / result / rolled 皆 nil）。
+        let script = "local c = host.check\nif c and c.attribute == 'str' and c.kind == 'save' and c.target == 9 and c.total == nil and c.result == nil and c.resolved == false and host.check_kind == 'save' and host.check_attribute == 'str' and host.check_target == 9 and host.check_total == nil then host.modify_check('keep_high') end";
+        let (out, consumed) =
+            run_with_mounts(&skill, 2024, 9, &[md("gate", "check_pre_roll", script)], None);
+        assert_eq!(consumed.len(), 2, "签名可见 → 取高生效（掷两次）");
+        let check = out.check.expect("check");
+        assert_eq!(check.kind, CheckKind::Save);
+        assert_eq!(check.target, 9);
+
+        // 签名不匹配（kind 是 attribute 而非 save）→ 不取高，只掷一次。
+        let script2 = "local c = host.check\nif c and c.kind == 'attribute' then host.modify_check('keep_high') end";
+        let (out2, consumed2) =
+            run_with_mounts(&skill, 2024, 9, &[md("gate", "check_pre_roll", script2)], None);
+        assert_eq!(consumed2.len(), 1, "签名不匹配 → 不取高");
+        assert_eq!(out2.check.expect("check2").rolls.len(), 1);
+    }
+
+    /// 缺陷 3：没有判定就没有签名——不会凭空造判定事实。
+    #[test]
+    fn pre_roll_has_no_signature_without_a_check() {
+        let script = "if host.check ~= nil then host.trigger_event('signature_without_check') end";
+        let (out, consumed) =
+            run_with_mounts(&SkillDef::default(), 5, 12, &[md("probe", "check_pre_roll", script)], None);
+        assert_eq!(consumed.len(), 0, "无判定：不掷骰");
+        assert!(out.requests.is_empty(), "无判定时 check_pre_roll 不该看到签名：{:?}", out.requests);
+    }
+
+    /// 缺陷 3：check_post_roll 的判定快照在既有字段上补骰式 expr。
+    #[test]
+    fn post_roll_snapshot_carries_dice_expr() {
+        let skill = plain_check_skill();
+        let script = "if host.check_expr == '1d20' and host.check.expr == '1d20' and host.check.resolved == true then host.modify_check('add', 3) end";
+        let (out, _) =
+            run_with_mounts(&skill, 7, 12, &[md("expr", "check_post_roll", script)], None);
+        assert_eq!(out.check.expect("check").r#mod, 4 + 3, "post_roll 读到 expr 才加值");
     }
 }

@@ -1,7 +1,11 @@
 //! lua_lint：编辑期 Lua 静态预检（#23 ② 校验范围）。
 //!
 //! 只编译不执行：语法错误 + 字节码拒绝 + scoped env 白名单越权扫描。
-//! 覆盖位置：skill.lua / skill.check.lua / world.check.lua / goal、trigger 条件里的 lua op。
+//! 覆盖位置：skill.lua / skill.check.lua / world.check.lua / goal、trigger 条件里的 lua op /
+//! storybook.lua_mounts 的 source 与 when 条件（规则集脚本同样过发布门）。
+//!
+//! `lua_mounts` 的扫描**不看挂载点名**：判定 / 效果 / 时机（`status_tick` / `turn_end` /
+//! `scene_end`）等所有挂载点的源码走同一条预检；挂载点名本身是否合法由 validate 的白名单负责。
 
 use mlua::chunk::ChunkMode;
 use mlua::{Lua, LuaOptions, StdLib};
@@ -96,6 +100,26 @@ pub fn lint_storybook(sb: &Value) -> Vec<LuaIssue> {
             }
         }
     }
+    // 规则集挂载点（lua_mounts）：source 是脚本正文，when 里可能有 lua 条件。
+    // enabled: false 的条目也检查——它仍在故事书里，重新启用时不该才发现写错了。
+    if let Some(mounts) = sb.get("lua_mounts").and_then(Value::as_array) {
+        for (i, m) in mounts.iter().enumerate() {
+            let id = m.get("id").and_then(Value::as_str).map(str::trim).unwrap_or("");
+            let target = if id.is_empty() {
+                format!("lua_mounts[{i}]")
+            } else {
+                format!("lua_mount:{id}")
+            };
+            if let Some(script) = m.get("source").and_then(Value::as_str) {
+                if !script.trim().is_empty() {
+                    scripts.push((target.clone(), "source".to_string(), script.to_string()));
+                }
+            }
+            if let Some(cond) = m.get("when") {
+                walk_cond(cond, &target, &mut scripts);
+            }
+        }
+    }
     if let Some(script) = sb.pointer("/world/check/lua").and_then(Value::as_str) {
         if !script.trim().is_empty() {
             scripts.push(("world.check".to_string(), "check.lua".to_string(), script.to_string()));
@@ -170,6 +194,56 @@ mod tests {
         let err = lint_script(&lua, "return math.random()").unwrap_err();
         assert!(err.contains("白名单"), "{err}");
         assert!(lint_script(&lua, "\u{1b}LuaQ").is_err());
+    }
+
+    /// 规则集挂载点（lua_mounts）同样过发布门：source 与 when 里的 lua 条件都预检。
+    #[test]
+    fn storybook_scan_covers_lua_mounts() {
+        let sb = json!({ "lua_mounts": [
+            { "id": "bad-syntax", "mount": "event", "source": "return (" },
+            { "id": "bad-api", "mount": "event", "source": "os.time()" },
+            { "id": "when", "mount": "event", "source": "return 1",
+              "when": { "op": "lua", "script": "io.write('x')" } },
+            { "id": "fine", "mount": "check_pre_roll", "source": "host.modify_check('add', 2)" }
+        ]});
+        let issues = lint_storybook(&sb);
+        assert_eq!(issues.len(), 3, "{issues:?}");
+        assert!(issues
+            .iter()
+            .any(|i| i.target == "lua_mount:bad-syntax" && i.code == "lua_syntax_error"));
+        assert!(issues
+            .iter()
+            .any(|i| i.target == "lua_mount:bad-api" && i.code == "lua_forbidden_api"));
+        assert!(issues
+            .iter()
+            .any(|i| i.target == "lua_mount:when" && i.code == "lua_forbidden_api"));
+        assert!(!issues.iter().any(|i| i.target == "lua_mount:fine"));
+    }
+
+    /// 时机挂载点（status_tick / turn_end / scene_end）与判定挂载点同一套预检：
+    /// 越权 API、语法错误、when 里的 lua 条件都被拦；合法脚本放行。
+    #[test]
+    fn storybook_scan_covers_timing_mounts() {
+        let sb = json!({ "lua_mounts": [
+            { "id": "tick-ok", "mount": "status_tick",
+              "source": "if host.status_id then host.remove_status(host.actor.id, host.status_id) end" },
+            { "id": "tick-bad-api", "mount": "status_tick", "source": "os.time()" },
+            { "id": "turn-bad-syntax", "mount": "turn_end", "source": "return (" },
+            { "id": "scene-bad-when", "mount": "scene_end", "source": "return 1",
+              "when": { "op": "lua", "script": "require('x')" } }
+        ]});
+        let issues = lint_storybook(&sb);
+        assert_eq!(issues.len(), 3, "{issues:?}");
+        assert!(issues
+            .iter()
+            .any(|i| i.target == "lua_mount:tick-bad-api" && i.code == "lua_forbidden_api"));
+        assert!(issues
+            .iter()
+            .any(|i| i.target == "lua_mount:turn-bad-syntax" && i.code == "lua_syntax_error"));
+        assert!(issues
+            .iter()
+            .any(|i| i.target == "lua_mount:scene-bad-when" && i.code == "lua_forbidden_api"));
+        assert!(!issues.iter().any(|i| i.target == "lua_mount:tick-ok"));
     }
 
     #[test]

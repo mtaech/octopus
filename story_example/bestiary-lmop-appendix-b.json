@@ -1,0 +1,3391 @@
+{
+	"_meta": {
+		"provenance": {
+			"note": "由 scripts/import-bestiary.mjs --vendor-from 从官方 5e 数据抽取：条目逐字段原样，未做改写。",
+			"sources": {
+				"bestiary-lmop.json": "https://5e.kiwee.top/data/bestiary/bestiary-lmop.json",
+				"bestiary-mm.json": "https://5e.kiwee.top/data/bestiary/bestiary-mm.json",
+				"bestiary-dmg.json": "https://5e.kiwee.top/data/bestiary/bestiary-dmg.json"
+			},
+			"selection": "《凡戴尔的失落矿坑》附录 B 中不在 bestiary-lmop.json 内的条目（按附录顺序）",
+			"origins": {
+				"熊地精": "bestiary-mm.json",
+				"平民": "bestiary-mm.json",
+				"邪教徒": "bestiary-mm.json",
+				"变形怪": "bestiary-mm.json",
+				"燃焰之颅": "bestiary-mm.json",
+				"食尸鬼": "bestiary-mm.json",
+				"巨蜘蛛": "bestiary-mm.json",
+				"地精": "bestiary-mm.json",
+				"穴居攫怪": "bestiary-mm.json",
+				"大地精": "bestiary-mm.json",
+				"诺斯怪": "bestiary-mm.json",
+				"赭果冻": "bestiary-mm.json",
+				"食人魔": "bestiary-mm.json",
+				"兽人": "bestiary-mm.json",
+				"枭熊": "bestiary-mm.json",
+				"骷髅": "bestiary-mm.json",
+				"观察者眼魔": "bestiary-mm.json",
+				"蚊蝠": "bestiary-mm.json",
+				"枯枝怪": "bestiary-mm.json",
+				"狼": "bestiary-mm.json",
+				"青年绿龙": "bestiary-mm.json",
+				"丧尸": "bestiary-mm.json"
+			}
+		},
+		"count": 22
+	},
+	"monster": [
+		{
+			"ENG_name": "Bugbear",
+			"name": "熊地精",
+			"type": {
+				"type": "humanoid",
+				"tags": [
+					"类地精"
+				]
+			},
+			"source": "MM",
+			"page": 33,
+			"srd": true,
+			"basicRules": true,
+			"referenceSources": [
+				"CRCotN",
+				"EFR",
+				"EGW",
+				"ERLW",
+				"GoS",
+				"HftT",
+				"IDRotF",
+				"KftGV",
+				"LMoP",
+				"OotA",
+				"OoW",
+				"PaBTSO",
+				"PotA",
+				"QftIS",
+				"RMBRE",
+				"SKT",
+				"TCE",
+				"TftYP",
+				"TftYP-AtG",
+				"TftYP-TSC",
+				"TftYP-WPM",
+				"WBtW",
+				"WDH",
+				"WDMM"
+			],
+			"reprintedAs": [
+				"熊地精武者|XMM"
+			],
+			"size": [
+				"M"
+			],
+			"alignment": [
+				"C",
+				"E"
+			],
+			"ac": [
+				{
+					"ac": 16,
+					"from": [
+						"{@item 兽皮甲|phb}",
+						"{@item 盾牌|phb}"
+					]
+				}
+			],
+			"hp": {
+				"average": 27,
+				"formula": "5d8 + 5"
+			},
+			"speed": {
+				"walk": 30
+			},
+			"str": 15,
+			"dex": 14,
+			"con": 13,
+			"int": 8,
+			"wis": 11,
+			"cha": 9,
+			"skill": {
+				"stealth": "+6",
+				"survival": "+2"
+			},
+			"senses": [
+				"黑暗视觉 60 尺"
+			],
+			"passive": 10,
+			"languages": [
+				"通用语",
+				"地精语"
+			],
+			"cr": "1",
+			"trait": [
+				{
+					"ENG_name": "Brute",
+					"name": "残暴",
+					"entries": [
+						"熊地精用近战武器命中敌人时，其伤害掷骰额外增加一粒该武器的伤害骰（已包含在攻击项中）。"
+					]
+				},
+				{
+					"ENG_name": "Surprise Attack",
+					"name": "突袭攻击",
+					"entries": [
+						"如果熊地精在战斗的第一轮中偷袭一个生物并命中它，目标将从此次攻击中额外受到7（{@damage 2d6}）点伤害。"
+					]
+				}
+			],
+			"action": [
+				{
+					"ENG_name": "Morningstar",
+					"name": "钉头锤",
+					"entries": [
+						"{@atk mw} 命中{@hit 4}，触及5尺，单一目标。{@h}造成11（{@damage 2d8 + 2}）点穿刺伤害。"
+					]
+				},
+				{
+					"ENG_name": "Javelin",
+					"name": "标枪",
+					"entries": [
+						"{@atk mw,rw} 命中{@hit 4}，触及5尺或射程30/120尺，单一目标。{@h}近战时9（{@damage 2d6 + 2}）点穿刺伤害，或远程时5（{@damage 1d6 + 2}）点穿刺伤害。"
+					]
+				}
+			],
+			"environment": [
+				"幽暗地域",
+				"草地",
+				"森林"
+			],
+			"soundClip": {
+				"type": "internal",
+				"path": "bestiary/bugbear.opus"
+			},
+			"attachedItems": [
+				"标枪|phb",
+				"钉头锤|phb"
+			],
+			"traitTags": [
+				"残暴"
+			],
+			"senseTags": [
+				"D"
+			],
+			"languageTags": [
+				"C",
+				"GO"
+			],
+			"damageTags": [
+				"P"
+			],
+			"miscTags": [
+				"MLW",
+				"MW",
+				"RW",
+				"THW"
+			],
+			"hasToken": true,
+			"hasFluff": true,
+			"hasFluffImages": true
+		},
+		{
+			"ENG_name": "Commoner",
+			"name": "平民",
+			"type": {
+				"type": "humanoid",
+				"tags": [
+					"任意种族"
+				]
+			},
+			"source": "MM",
+			"page": 345,
+			"srd": true,
+			"basicRules": true,
+			"referenceSources": [
+				"AATM",
+				"BGDIA",
+				"BMT",
+				"CM",
+				"CoA",
+				"CoS",
+				"CRCotN",
+				"DC",
+				"DD",
+				"DIP",
+				"DSotDQ",
+				"EFR",
+				"EGW",
+				"ERLW",
+				"FS",
+				"GoS",
+				"GotSF",
+				"HFStCM",
+				"HotDQ",
+				"IDRotF",
+				"JttRC",
+				"KftGV",
+				"LLK",
+				"LMoP",
+				"LoX",
+				"MOT",
+				"NRH-CoI",
+				"OotA",
+				"OoW",
+				"PaBTSO",
+				"PotA",
+				"QftIS",
+				"RMBRE",
+				"RoT",
+				"SatO",
+				"SCC-CK",
+				"SCC-TMM",
+				"SKT",
+				"SLW",
+				"TCE",
+				"TftYP",
+				"TftYP-AtG",
+				"TftYP-DiT",
+				"TftYP-TFoF",
+				"TftYP-THSoT",
+				"TftYP-TSC",
+				"ToA",
+				"ToFW",
+				"ToR",
+				"VEoR",
+				"WBtW",
+				"WDH",
+				"WDMM"
+			],
+			"reprintedAs": [
+				"平民|XMM"
+			],
+			"size": [
+				"M"
+			],
+			"alignment": [
+				"A"
+			],
+			"ac": [
+				10
+			],
+			"hp": {
+				"average": 4,
+				"formula": "1d8"
+			},
+			"speed": {
+				"walk": 30
+			},
+			"str": 10,
+			"dex": 10,
+			"con": 10,
+			"int": 10,
+			"wis": 10,
+			"cha": 10,
+			"passive": 10,
+			"languages": [
+				"任何一种语言（通常是通用语）"
+			],
+			"cr": "0",
+			"action": [
+				{
+					"ENG_name": "Club",
+					"name": "短棒",
+					"entries": [
+						"{@atk mw} 命中{@hit 2}，触及5尺，单一目标。{@h}2 ({@damage 1d4}) 点钝击伤害。"
+					]
+				}
+			],
+			"environment": [
+				"极地",
+				"荒漠",
+				"海岸",
+				"草地",
+				"丘陵",
+				"城市",
+				"森林"
+			],
+			"soundClip": {
+				"type": "internal",
+				"path": "bestiary/commoner.opus"
+			},
+			"altArt": [
+				{
+					"ENG_name": "Commoner",
+					"name": "平民",
+					"source": "EGW"
+				}
+			],
+			"attachedItems": [
+				"短棒|phb"
+			],
+			"languageTags": [
+				"C",
+				"X"
+			],
+			"damageTags": [
+				"B"
+			],
+			"miscTags": [
+				"MLW",
+				"MW"
+			],
+			"hasToken": true,
+			"hasFluff": true,
+			"translator": "不全书"
+		},
+		{
+			"ENG_name": "Cultist",
+			"name": "邪教徒",
+			"type": {
+				"type": "humanoid",
+				"tags": [
+					"任意种族"
+				]
+			},
+			"source": "MM",
+			"page": 345,
+			"srd": true,
+			"basicRules": true,
+			"referenceSources": [
+				"AATM",
+				"BGDIA",
+				"BMT",
+				"CM",
+				"CoS",
+				"DC",
+				"DD",
+				"DIP",
+				"EGW",
+				"FS",
+				"GoS",
+				"HftT",
+				"HotDQ",
+				"IDRotF",
+				"IMR",
+				"JttRC",
+				"KftGV",
+				"KKW",
+				"LLK",
+				"LMoP",
+				"MOT",
+				"OotA",
+				"PaBTSO",
+				"PotA",
+				"QftIS",
+				"RMBRE",
+				"RoT",
+				"SKT",
+				"SLW",
+				"US",
+				"VEoR",
+				"VNotEE",
+				"WDH",
+				"WDMM"
+			],
+			"reprintedAs": [
+				"邪教徒|XMM"
+			],
+			"size": [
+				"M"
+			],
+			"alignment": [
+				"L",
+				"NX",
+				"C",
+				"NY",
+				"E"
+			],
+			"ac": [
+				{
+					"ac": 12,
+					"from": [
+						"{@item 皮甲|phb}"
+					]
+				}
+			],
+			"hp": {
+				"average": 9,
+				"formula": "2d8"
+			},
+			"speed": {
+				"walk": 30
+			},
+			"str": 11,
+			"dex": 12,
+			"con": 10,
+			"int": 10,
+			"wis": 11,
+			"cha": 10,
+			"skill": {
+				"deception": "+2",
+				"religion": "+2"
+			},
+			"passive": 10,
+			"languages": [
+				"任何一种语言（通常是通用语）"
+			],
+			"cr": "1/8",
+			"trait": [
+				{
+					"ENG_name": "Dark Devotion",
+					"name": "黑暗忠诚",
+					"entries": [
+						"邪教徒为抵抗{@condition 魅惑}和{@condition 恐慌}而进行的豁免检定具有优势。"
+					]
+				}
+			],
+			"action": [
+				{
+					"ENG_name": "Scimitar",
+					"name": "弯刀",
+					"entries": [
+						"{@atk mw} 命中{@hit 3}，触及5尺，单一生物。{@h}4（{@damage 1d6 + 1}）点挥砍伤害。"
+					]
+				}
+			],
+			"environment": [
+				"城市"
+			],
+			"soundClip": {
+				"type": "internal",
+				"path": "bestiary/cultist.opus"
+			},
+			"altArt": [
+				{
+					"ENG_name": "Diabolical Cultist",
+					"name": "邪魔邪教徒",
+					"source": "MTF",
+					"page": 18
+				},
+				{
+					"ENG_name": "Cultist",
+					"name": "邪教徒",
+					"source": "RMBRE"
+				}
+			],
+			"attachedItems": [
+				"弯刀|phb"
+			],
+			"languageTags": [
+				"C",
+				"X"
+			],
+			"damageTags": [
+				"S"
+			],
+			"miscTags": [
+				"MLW",
+				"MW"
+			],
+			"hasToken": true,
+			"hasFluff": true,
+			"hasFluffImages": true,
+			"translator": "不全书"
+		},
+		{
+			"ENG_name": "Doppelganger",
+			"name": "变形怪",
+			"type": {
+				"type": "monstrosity",
+				"tags": [
+					"变形生物"
+				]
+			},
+			"source": "MM",
+			"page": 82,
+			"srd": true,
+			"basicRules": true,
+			"referenceSources": [
+				"BGDIA",
+				"BMT",
+				"CoA",
+				"EGW",
+				"HftT",
+				"HotDQ",
+				"IDRotF",
+				"IMR",
+				"JttRC",
+				"KftGV",
+				"LMoP",
+				"OotA",
+				"OoW",
+				"PaBTSO",
+				"PotA",
+				"QftIS",
+				"SatO",
+				"SKT",
+				"TftYP",
+				"TftYP-THSoT",
+				"ToA",
+				"ToFW",
+				"WDH",
+				"WDMM"
+			],
+			"reprintedAs": [
+				"变形怪|XMM"
+			],
+			"size": [
+				"M"
+			],
+			"alignment": [
+				"N"
+			],
+			"ac": [
+				14
+			],
+			"hp": {
+				"average": 52,
+				"formula": "8d8 + 16"
+			},
+			"speed": {
+				"walk": 30
+			},
+			"str": 11,
+			"dex": 18,
+			"con": 14,
+			"int": 11,
+			"wis": 12,
+			"cha": 14,
+			"skill": {
+				"deception": "+6",
+				"insight": "+3"
+			},
+			"senses": [
+				"黑暗视觉 60 尺"
+			],
+			"passive": 11,
+			"conditionImmune": [
+				"魅惑"
+			],
+			"languages": [
+				"通用语"
+			],
+			"cr": "3",
+			"trait": [
+				{
+					"ENG_name": "Shapechanger",
+					"name": "变形生物",
+					"entries": [
+						"变形怪用它的动作变形为一个它曾见过的小型或中型体型的类人生物，或是用该动作恢复其真实形态。除体型外，它的所有数据在每个形态时均相同，其着装和携带的装备也不会随变形发生变化。变形怪死亡时将恢复其真实形态。"
+					]
+				},
+				{
+					"ENG_name": "Ambusher",
+					"name": "伏击",
+					"entries": [
+						"战斗开始的第一轮里，变形怪对任何成功受其{@status 突袭}的生物所发动的攻击检定具有优势。"
+					]
+				},
+				{
+					"ENG_name": "Surprise Attack",
+					"name": "突袭攻击",
+					"entries": [
+						"如果变形怪在战斗的第一轮中出其不意地攻击一个生物并且命中，目标将额外受到10（{@damage 3d6}）点伤害。"
+					]
+				}
+			],
+			"action": [
+				{
+					"ENG_name": "Multiattack",
+					"name": "多重攻击",
+					"entries": [
+						"变形怪发动两次近战攻击。"
+					]
+				},
+				{
+					"ENG_name": "Slam",
+					"name": "猛击",
+					"entries": [
+						"{@atk mw} 命中{@hit 6}，触及 5 尺，单一目标。{@h}7（{@damage 1d6 + 4}）的钝击伤害。"
+					]
+				},
+				{
+					"ENG_name": "Read Thoughts",
+					"name": "读心",
+					"entries": [
+						"变形怪用魔法读取其60尺内一个生物的表层思想。该效应可穿透一些障碍物，但无法穿透3尺厚的木质或土质，2尺厚的石质，2寸厚的金属质或一薄层的铅板。目标身处该距离内时，变形怪只要保持{@status 专注}就可以持续阅读思想（如同{@status 专注||专注于}一个法术）。读取目标的思想时，变形怪对该目标进行的感知（{@skill 洞悉}）和魅力（{@skill 欺瞒}，{@skill 威吓}，{@skill 游说}）检定具有优势。"
+					]
+				}
+			],
+			"environment": [
+				"幽暗地域",
+				"城市"
+			],
+			"soundClip": {
+				"type": "internal",
+				"path": "bestiary/doppelganger.opus"
+			},
+			"traitTags": [
+				"伏击",
+				"变形生物"
+			],
+			"senseTags": [
+				"D"
+			],
+			"actionTags": [
+				"多重攻击"
+			],
+			"languageTags": [
+				"C"
+			],
+			"damageTags": [
+				"B"
+			],
+			"miscTags": [
+				"MW"
+			],
+			"hasToken": true,
+			"hasFluff": true,
+			"hasFluffImages": true
+		},
+		{
+			"ENG_name": "Flameskull",
+			"name": "燃焰之颅",
+			"type": "undead",
+			"source": "MM",
+			"page": 134,
+			"basicRules": true,
+			"referenceSources": [
+				"BGDIA",
+				"CM",
+				"CoA",
+				"CoS",
+				"CRCotN",
+				"DSotDQ",
+				"GoS",
+				"HftT",
+				"IDRotF",
+				"JttRC",
+				"LMoP",
+				"PaBTSO",
+				"PotA",
+				"QftIS",
+				"RMBRE",
+				"RtG",
+				"SatO",
+				"SCC-ARiR",
+				"SDW",
+				"TCE",
+				"ToA",
+				"VEoR",
+				"WBtW",
+				"WDH",
+				"WDMM"
+			],
+			"reprintedAs": [
+				"燃焰之颅|XMM"
+			],
+			"size": [
+				"T"
+			],
+			"alignment": [
+				"N",
+				"E"
+			],
+			"ac": [
+				13
+			],
+			"hp": {
+				"average": 40,
+				"formula": "9d4 + 18"
+			},
+			"speed": {
+				"walk": 0,
+				"fly": {
+					"number": 40,
+					"condition": "(悬浮)"
+				},
+				"canHover": true
+			},
+			"str": 1,
+			"dex": 17,
+			"con": 14,
+			"int": 16,
+			"wis": 10,
+			"cha": 11,
+			"skill": {
+				"arcana": "+5",
+				"perception": "+2"
+			},
+			"senses": [
+				"黑暗视觉 60 尺"
+			],
+			"passive": 12,
+			"resist": [
+				"闪电",
+				"暗蚀",
+				"穿刺"
+			],
+			"immune": [
+				"寒冷",
+				"火焰",
+				"毒素"
+			],
+			"conditionImmune": [
+				"魅惑",
+				"恐慌",
+				"麻痹",
+				"中毒",
+				"倒地"
+			],
+			"languages": [
+				"通用语"
+			],
+			"cr": "4",
+			"spellcasting": [
+				{
+					"ENG_name": "Spellcasting",
+					"name": "施法",
+					"type": "spellcasting",
+					"headerEntries": [
+						"燃焰之颅作为5级施法者，其施法属性为智力（法术{@dc 13}，法术攻击命中{@hit 5}）。它施法时不需要任何姿势或材料成分。燃焰之颅准备了下列法师法术："
+					],
+					"spells": {
+						"0": {
+							"spells": [
+								"{@spell 法师之手}"
+							]
+						},
+						"1": {
+							"slots": 3,
+							"spells": [
+								"{@spell 魔法飞弹}",
+								"{@spell 护盾术}"
+							]
+						},
+						"2": {
+							"slots": 2,
+							"spells": [
+								"{@spell 朦胧术}",
+								"{@spell 炽焰法球}"
+							]
+						},
+						"3": {
+							"slots": 1,
+							"spells": [
+								"{@spell 火球术}"
+							]
+						}
+					},
+					"ability": "int"
+				}
+			],
+			"trait": [
+				{
+					"ENG_name": "Illumination",
+					"name": "照明",
+					"entries": [
+						"燃焰之颅散发出15尺半径微光光照，或者15尺明亮光照以及其外15尺的微光光照。它可以用一个动作在两者间转换。"
+					]
+				},
+				{
+					"ENG_name": "Magic Resistance",
+					"name": "魔法抗性",
+					"entries": [
+						"燃焰之颅为抵抗法术和其它魔法效应而作的豁免检定具有优势。"
+					]
+				},
+				{
+					"ENG_name": "Rejuvenation",
+					"name": "复生",
+					"entries": [
+						"如果燃焰之颅被摧毁，它会在1小时内恢复所有生命值，除非在其遗骸上洒上{@item 圣水 (扁瓶)|PHB|圣水}，或对其施放{@spell 解除魔法}或{@spell 移除诅咒}法术。"
+					]
+				}
+			],
+			"action": [
+				{
+					"ENG_name": "Multiattack",
+					"name": "多重攻击",
+					"entries": [
+						"燃焰之颅发动两次火焰射线攻击。"
+					]
+				},
+				{
+					"ENG_name": "Fire Ray",
+					"name": "火焰射线",
+					"entries": [
+						"{@atk rs} 命中{@hit 5}，射程30尺，单一目标。{@h}10 ({@damage 3d6}) 点火焰伤害。"
+					]
+				}
+			],
+			"environment": [
+				"幽暗地域"
+			],
+			"soundClip": {
+				"type": "internal",
+				"path": "bestiary/flameskull.opus"
+			},
+			"altArt": [
+				{
+					"ENG_name": "Flameskull",
+					"name": "燃焰之颅",
+					"source": "RMBRE"
+				}
+			],
+			"traitTags": [
+				"照明",
+				"魔法抗性",
+				"复生"
+			],
+			"senseTags": [
+				"D"
+			],
+			"actionTags": [
+				"多重攻击"
+			],
+			"languageTags": [
+				"C"
+			],
+			"damageTags": [
+				"F"
+			],
+			"damageTagsSpell": [
+				"F",
+				"O"
+			],
+			"spellcastingTags": [
+				"CW"
+			],
+			"miscTags": [
+				"AOE"
+			],
+			"savingThrowForcedSpell": [
+				"敏捷"
+			],
+			"hasToken": true,
+			"hasFluff": true,
+			"hasFluffImages": true,
+			"translator": "不全书"
+		},
+		{
+			"ENG_name": "Ghoul",
+			"name": "食尸鬼",
+			"type": "undead",
+			"source": "MM",
+			"page": 148,
+			"srd": true,
+			"basicRules": true,
+			"referenceSources": [
+				"AATM",
+				"BGDIA",
+				"BMT",
+				"CM",
+				"CoS",
+				"DC",
+				"DIP",
+				"DoSI",
+				"GoS",
+				"HftT",
+				"HoL",
+				"IDRotF",
+				"JttRC",
+				"KftGV",
+				"LMoP",
+				"NRH-AT",
+				"OotA",
+				"OoW",
+				"PaBTSO",
+				"PotA",
+				"PSI",
+				"QftIS",
+				"RMBRE",
+				"SatO",
+				"SDW",
+				"SLW",
+				"TCE",
+				"TftYP",
+				"TftYP-DiT",
+				"TftYP-WPM",
+				"ToA",
+				"VEoR",
+				"WBtW",
+				"WDMM"
+			],
+			"reprintedAs": [
+				"食尸鬼|XMM"
+			],
+			"size": [
+				"M"
+			],
+			"alignment": [
+				"C",
+				"E"
+			],
+			"ac": [
+				12
+			],
+			"hp": {
+				"average": 22,
+				"formula": "5d8"
+			},
+			"speed": {
+				"walk": 30
+			},
+			"str": 13,
+			"dex": 15,
+			"con": 10,
+			"int": 7,
+			"wis": 10,
+			"cha": 6,
+			"senses": [
+				"黑暗视觉 60 尺"
+			],
+			"passive": 10,
+			"immune": [
+				"毒素"
+			],
+			"conditionImmune": [
+				"魅惑",
+				"力竭",
+				"中毒"
+			],
+			"languages": [
+				"通用语"
+			],
+			"cr": "1",
+			"action": [
+				{
+					"ENG_name": "Bite",
+					"name": "啃咬",
+					"entries": [
+						"{@atk mw} 命中{@hit 2}，触及5尺，单一生物。{@h}9 ({@damage 2d6 + 2}) 点穿刺伤害。"
+					]
+				},
+				{
+					"ENG_name": "Claws",
+					"name": "爪击",
+					"entries": [
+						"{@atk mw} 命中{@hit 4}，触及5尺，单一目标。{@h}7 ({@damage 2d4 + 2}) 点挥砍伤害。如果目标为不是精灵也不是不死生物的其他生物，则该目标必须进行一次{@dc 10}的体质豁免，豁免失败则陷入1分钟的{@condition 麻痹}状态。目标可以在每个自己的回合结束时再次进行豁免，豁免成功则终止自己身上的该效应。"
+					]
+				}
+			],
+			"environment": [
+				"幽暗地域",
+				"沼泽",
+				"城市"
+			],
+			"soundClip": {
+				"type": "internal",
+				"path": "bestiary/ghoul.opus"
+			},
+			"altArt": [
+				{
+					"ENG_name": "Ghoul",
+					"name": "食尸鬼",
+					"source": "DIP"
+				}
+			],
+			"senseTags": [
+				"D"
+			],
+			"languageTags": [
+				"C"
+			],
+			"damageTags": [
+				"P",
+				"S"
+			],
+			"miscTags": [
+				"MW"
+			],
+			"conditionInflict": [
+				"麻痹"
+			],
+			"savingThrowForced": [
+				"体质"
+			],
+			"hasToken": true,
+			"hasFluff": true,
+			"hasFluffImages": true,
+			"translator": "不全书"
+		},
+		{
+			"ENG_name": "Giant Spider",
+			"name": "巨蜘蛛",
+			"type": "beast",
+			"source": "MM",
+			"page": 328,
+			"srd": true,
+			"basicRules": true,
+			"referenceSources": [
+				"BGDIA",
+				"BMT",
+				"CoA",
+				"CoS",
+				"CRCotN",
+				"DIP",
+				"DSotDQ",
+				"EGW",
+				"ERLW",
+				"GoS",
+				"HftT",
+				"HotDQ",
+				"LMoP",
+				"LRDT",
+				"MOT",
+				"OotA",
+				"OoW",
+				"PaBTSO",
+				"PSX",
+				"QftIS",
+				"RMBRE",
+				"RoT",
+				"SKT",
+				"TCE",
+				"TftYP",
+				"TftYP-DiT",
+				"TftYP-THSoT",
+				"ToA",
+				"US",
+				"VEoR",
+				"WDH",
+				"WDMM"
+			],
+			"reprintedAs": [
+				"巨蜘蛛|XMM"
+			],
+			"size": [
+				"L"
+			],
+			"alignment": [
+				"U"
+			],
+			"ac": [
+				{
+					"ac": 14,
+					"from": [
+						"天生护甲"
+					]
+				}
+			],
+			"hp": {
+				"average": 26,
+				"formula": "4d10 + 4"
+			},
+			"speed": {
+				"walk": 30,
+				"climb": 30
+			},
+			"str": 14,
+			"dex": 16,
+			"con": 12,
+			"int": 2,
+			"wis": 11,
+			"cha": 4,
+			"skill": {
+				"stealth": "+7"
+			},
+			"senses": [
+				"盲视 10 尺",
+				"黑暗视觉 60 尺"
+			],
+			"passive": 10,
+			"cr": "1",
+			"trait": [
+				{
+					"ENG_name": "Spider Climb",
+					"name": "蛛行",
+					"entries": [
+						"蜘蛛可以攀爬在难以攀爬的表面上，包括倒吊在天花板上，且不需要进行属性检定。"
+					]
+				},
+				{
+					"ENG_name": "Web Sense",
+					"name": "蛛网感知",
+					"entries": [
+						"与蛛网接触时，蜘蛛可以知晓其他与该蛛网接触生物的准确位置。"
+					]
+				},
+				{
+					"ENG_name": "Web Walker",
+					"name": "蛛网行者",
+					"entries": [
+						"蜘蛛在蛛网上移动时无视蛛网造成的移动限制。"
+					]
+				}
+			],
+			"action": [
+				{
+					"ENG_name": "Bite",
+					"name": "啃咬",
+					"entries": [
+						"{@atk mw} 命中{@hit 5}，触及5尺，单一生物。{@h}7 ({@damage 1d8 + 3}) 点穿刺伤害，目标必须进行一次{@dc 11}的体质豁免，豁免失败则受到9（{@damage 2d8}）点毒素伤害，豁免成功则伤害减半。如果该毒素伤害将目标生命值降至0，则目标伤势稳定但{@condition 中毒}1小时。恢复生命值无法让目标摆脱该中毒效应，且其在此期间同时陷入{@condition 麻痹}和{@condition 中毒}状态。"
+					]
+				},
+				{
+					"ENG_name": "Web {@recharge 5}",
+					"name": "蛛网{@recharge 5}",
+					"entries": [
+						"{@atk rw} 命中{@hit 5}，射程30/60尺，单一生物。{@h}目标受蛛网{@condition 束缚}。作为一个动作项，被{@condition 束缚}者可以进行一次{@dc 12}的力量检定，检定通过则挣脱蛛网。蛛网可以被攻击和被破坏（AC 10，5点生命值，火焰易伤，免疫钝击、毒素和心灵伤害）。"
+					]
+				}
+			],
+			"environment": [
+				"幽暗地域",
+				"森林",
+				"沼泽",
+				"城市",
+				"荒漠"
+			],
+			"soundClip": {
+				"type": "internal",
+				"path": "bestiary/giant-spider.opus"
+			},
+			"traitTags": [
+				"蛛行",
+				"蛛网感知",
+				"蛛网行者"
+			],
+			"senseTags": [
+				"B",
+				"D"
+			],
+			"damageTags": [
+				"I",
+				"P"
+			],
+			"miscTags": [
+				"MW",
+				"RW"
+			],
+			"conditionInflict": [
+				"麻痹",
+				"中毒",
+				"束缚"
+			],
+			"savingThrowForced": [
+				"体质"
+			],
+			"hasToken": true,
+			"hasFluff": true,
+			"hasFluffImages": true,
+			"translator": "不全书"
+		},
+		{
+			"ENG_name": "Goblin",
+			"name": "地精",
+			"type": {
+				"type": "humanoid",
+				"tags": [
+					"类地精"
+				]
+			},
+			"source": "MM",
+			"page": 166,
+			"srd": true,
+			"basicRules": true,
+			"referenceSources": [
+				"BGDIA",
+				"BMT",
+				"CRCotN",
+				"DSotDQ",
+				"EFR",
+				"EGW",
+				"ERLW",
+				"GoS",
+				"HftT",
+				"IDRotF",
+				"KKW",
+				"LMoP",
+				"OotA",
+				"OoW",
+				"PaBTSO",
+				"PotA",
+				"RMBRE",
+				"SatO",
+				"SKT",
+				"TCE",
+				"TftYP",
+				"TftYP-TSC",
+				"ToA",
+				"US",
+				"WBtW",
+				"WDH",
+				"WDMM"
+			],
+			"reprintedAs": [
+				"地精武者|XMM"
+			],
+			"size": [
+				"S"
+			],
+			"alignment": [
+				"N",
+				"E"
+			],
+			"ac": [
+				{
+					"ac": 15,
+					"from": [
+						"{@item 皮甲|phb}",
+						"{@item 盾牌|phb}"
+					]
+				}
+			],
+			"hp": {
+				"average": 7,
+				"formula": "2d6"
+			},
+			"speed": {
+				"walk": 30
+			},
+			"str": 8,
+			"dex": 14,
+			"con": 10,
+			"int": 10,
+			"wis": 8,
+			"cha": 8,
+			"skill": {
+				"stealth": "+6"
+			},
+			"senses": [
+				"黑暗视觉 60 尺"
+			],
+			"passive": 9,
+			"languages": [
+				"通用语",
+				"地精语"
+			],
+			"cr": "1/4",
+			"trait": [
+				{
+					"ENG_name": "Nimble Escape",
+					"name": "迅捷逃逸",
+					"entries": [
+						"地精可在自己的回合，以一个附赠动作来执行{@action 撤离}或{@action 躲藏}动作。"
+					]
+				}
+			],
+			"action": [
+				{
+					"ENG_name": "Scimitar",
+					"name": "弯刀",
+					"entries": [
+						"{@atk mw} 命中{@hit 4}，触及5尺，单一目标。{@h}5 ({@damage 1d6 + 2}) 点挥砍伤害。"
+					]
+				},
+				{
+					"ENG_name": "Shortbow",
+					"name": "短弓",
+					"entries": [
+						"{@atk rw} 命中{@hit 4}，射程80/320尺，单一目标。{@h}5（{@damage 1d6 + 2}）点穿刺伤害。"
+					]
+				}
+			],
+			"environment": [
+				"幽暗地域",
+				"草地",
+				"森林",
+				"丘陵"
+			],
+			"soundClip": {
+				"type": "internal",
+				"path": "bestiary/goblin.opus"
+			},
+			"altArt": [
+				{
+					"ENG_name": "Goblin",
+					"name": "地精语",
+					"source": "RMBRE"
+				}
+			],
+			"attachedItems": [
+				"弯刀|phb",
+				"短弓|phb"
+			],
+			"senseTags": [
+				"D"
+			],
+			"languageTags": [
+				"C",
+				"GO"
+			],
+			"damageTags": [
+				"P",
+				"S"
+			],
+			"miscTags": [
+				"MLW",
+				"MW",
+				"RNG",
+				"RW"
+			],
+			"hasToken": true,
+			"hasFluff": true,
+			"hasFluffImages": true,
+			"translator": "不全书"
+		},
+		{
+			"ENG_name": "Grick",
+			"name": "穴居攫怪",
+			"type": "monstrosity",
+			"source": "MM",
+			"page": 173,
+			"srd": true,
+			"basicRules": true,
+			"referenceSources": [
+				"CM",
+				"CoS",
+				"DSotDQ",
+				"KftGV",
+				"LMoP",
+				"OotA",
+				"PaBTSO",
+				"PotA",
+				"QftIS",
+				"TftYP",
+				"TftYP-DiT",
+				"TftYP-TFoF",
+				"WDMM"
+			],
+			"reprintedAs": [
+				"穴居攫怪|XMM"
+			],
+			"size": [
+				"M"
+			],
+			"alignment": [
+				"N"
+			],
+			"ac": [
+				{
+					"ac": 14,
+					"from": [
+						"天生护甲"
+					]
+				}
+			],
+			"hp": {
+				"average": 27,
+				"formula": "6d8"
+			},
+			"speed": {
+				"walk": 30,
+				"climb": 30
+			},
+			"str": 14,
+			"dex": 14,
+			"con": 11,
+			"int": 3,
+			"wis": 14,
+			"cha": 5,
+			"senses": [
+				"黑暗视觉 60 尺"
+			],
+			"passive": 12,
+			"resist": [
+				{
+					"resist": [
+						"钝击",
+						"穿刺",
+						"挥砍"
+					],
+					"note": "来自非魔法攻击",
+					"cond": true
+				}
+			],
+			"cr": "2",
+			"trait": [
+				{
+					"ENG_name": "Stone Camouflage",
+					"name": "岩地伪装",
+					"entries": [
+						"穴居攫怪在岩石地形中进行躲藏时所作的敏捷（{@skill 隐匿}）检定具有优势。"
+					]
+				}
+			],
+			"action": [
+				{
+					"ENG_name": "Multiattack",
+					"name": "多重攻击",
+					"entries": [
+						"穴居攫怪使用它的触须发动一次攻击，如果该攻击命中，则它可以对同一目标再发动一次喙啄攻击。"
+					]
+				},
+				{
+					"ENG_name": "Tentacles",
+					"name": "触须",
+					"entries": [
+						"{@atk mw} 命中{@hit 4}，触及5尺，单一目标。{@h}9（{@damage 2d6 + 2}）点挥砍伤害。"
+					]
+				},
+				{
+					"ENG_name": "Beak",
+					"name": "喙啄",
+					"entries": [
+						"{@atk mw} 命中{@hit 4}，触及5尺，单一目标。{@h}5 ({@damage 1d6 + 2}) 点穿刺伤害。"
+					]
+				}
+			],
+			"environment": [
+				"幽暗地域",
+				"森林"
+			],
+			"soundClip": {
+				"type": "internal",
+				"path": "bestiary/grick.opus"
+			},
+			"altArt": [
+				{
+					"ENG_name": "Crystal Grick",
+					"name": "水晶穴居攫怪",
+					"source": "PaBTSO"
+				}
+			],
+			"traitTags": [
+				"伪装"
+			],
+			"senseTags": [
+				"D"
+			],
+			"actionTags": [
+				"多重攻击",
+				"触须"
+			],
+			"damageTags": [
+				"P",
+				"S"
+			],
+			"miscTags": [
+				"MW"
+			],
+			"hasToken": true,
+			"hasFluff": true,
+			"hasFluffImages": true,
+			"translator": "不全书"
+		},
+		{
+			"ENG_name": "Hobgoblin",
+			"name": "大地精",
+			"type": {
+				"type": "humanoid",
+				"tags": [
+					"类地精"
+				]
+			},
+			"source": "MM",
+			"page": 186,
+			"srd": true,
+			"basicRules": true,
+			"referenceSources": [
+				"BGDIA",
+				"DSotDQ",
+				"EGW",
+				"ERLW",
+				"GoS",
+				"HotDQ",
+				"LMoP",
+				"OoW",
+				"PaBTSO",
+				"PotA",
+				"QftIS",
+				"RMBRE",
+				"SKT",
+				"TftYP",
+				"TftYP-TSC",
+				"US",
+				"WBtW",
+				"WDMM"
+			],
+			"reprintedAs": [
+				"大地精武者|XMM"
+			],
+			"size": [
+				"M"
+			],
+			"alignment": [
+				"L",
+				"E"
+			],
+			"ac": [
+				{
+					"ac": 18,
+					"from": [
+						"{@item 链甲|phb}",
+						"{@item 盾牌|phb}"
+					]
+				}
+			],
+			"hp": {
+				"average": 11,
+				"formula": "2d8 + 2"
+			},
+			"speed": {
+				"walk": 30
+			},
+			"str": 13,
+			"dex": 12,
+			"con": 12,
+			"int": 10,
+			"wis": 10,
+			"cha": 9,
+			"senses": [
+				"黑暗视觉 60 尺"
+			],
+			"passive": 10,
+			"languages": [
+				"通用语",
+				"地精语"
+			],
+			"cr": "1/2",
+			"trait": [
+				{
+					"ENG_name": "Martial Advantage",
+					"name": "成军优势",
+					"entries": [
+						"每回合一次，如果攻击的敌人大地精5英尺范围内有一个没有处于 {@condition 失能} 状态的盟友，大地精可以用武器攻击对该敌人额外造成7点（{@damage 2d6}）伤害。"
+					]
+				}
+			],
+			"action": [
+				{
+					"ENG_name": "Longsword",
+					"name": "长剑",
+					"entries": [
+						"{@atk mw} 命中{@hit 3}，触及5尺，单一目标。{@h}5（{@damage 1d8 + 1}）点挥砍伤害，或如果用双手使用则为6（{@damage 1d10 + 1}）点挥砍伤害。"
+					]
+				},
+				{
+					"ENG_name": "Longbow",
+					"name": "长弓",
+					"entries": [
+						"{@atk rw} 命中{@hit 3}，射程150/600 尺，单一目标。{@h}5（{@damage 1d8 + 1}）点穿刺伤害。"
+					]
+				}
+			],
+			"environment": [
+				"幽暗地域",
+				"草地",
+				"森林",
+				"丘陵",
+				"荒漠"
+			],
+			"soundClip": {
+				"type": "internal",
+				"path": "bestiary/hobgoblin.opus"
+			},
+			"attachedItems": [
+				"长弓|phb",
+				"长剑|phb"
+			],
+			"senseTags": [
+				"D"
+			],
+			"languageTags": [
+				"C",
+				"GO"
+			],
+			"damageTags": [
+				"P",
+				"S"
+			],
+			"miscTags": [
+				"MLW",
+				"MW",
+				"RNG",
+				"RW"
+			],
+			"hasToken": true,
+			"hasFluff": true,
+			"hasFluffImages": true
+		},
+		{
+			"ENG_name": "Nothic",
+			"name": "诺斯怪",
+			"type": "aberration",
+			"source": "MM",
+			"page": 236,
+			"basicRules": true,
+			"referenceSources": [
+				"BGDIA",
+				"BMT",
+				"CoA",
+				"CoS",
+				"EGW",
+				"IDRotF",
+				"JttRC",
+				"KftGV",
+				"LMoP",
+				"MOT",
+				"NRH-AT",
+				"OotA",
+				"OoW",
+				"PaBTSO",
+				"PotA",
+				"RMBRE",
+				"ToA",
+				"ToFW",
+				"VEoR",
+				"WDMM"
+			],
+			"reprintedAs": [
+				"诺斯怪|XMM"
+			],
+			"size": [
+				"M"
+			],
+			"alignment": [
+				"N",
+				"E"
+			],
+			"ac": [
+				{
+					"ac": 15,
+					"from": [
+						"天生护甲"
+					]
+				}
+			],
+			"hp": {
+				"average": 45,
+				"formula": "6d8 + 18"
+			},
+			"speed": {
+				"walk": 30
+			},
+			"str": 14,
+			"dex": 16,
+			"con": 16,
+			"int": 13,
+			"wis": 10,
+			"cha": 8,
+			"skill": {
+				"arcana": "+3",
+				"insight": "+4",
+				"perception": "+2",
+				"stealth": "+5"
+			},
+			"senses": [
+				"真实视觉 120 尺"
+			],
+			"passive": 12,
+			"languages": [
+				"地底通用语"
+			],
+			"cr": "2",
+			"trait": [
+				{
+					"ENG_name": "Keen Sight",
+					"name": "敏锐视觉",
+					"entries": [
+						"诺斯怪依赖视力进行的感知（{@skill 察觉}）检定具有优势。"
+					]
+				}
+			],
+			"action": [
+				{
+					"ENG_name": "Multiattack",
+					"name": "多重攻击",
+					"entries": [
+						"诺斯怪发动两次爪击。"
+					]
+				},
+				{
+					"ENG_name": "Claw",
+					"name": "爪击",
+					"entries": [
+						"{@atk mw}命中{@hit 4}，触及5尺，单一目标。{@h}6（{@damage 1d6 + 3}）点挥砍伤害。"
+					]
+				},
+				{
+					"ENG_name": "Rotting Gaze",
+					"name": "腐朽凝视",
+					"entries": [
+						"诺斯怪指定其周边30尺内一个它能看到的生物。该目标必须成功通过一次{@dc 12}的体质豁免以抵抗该魔法，否则将受10（{@damage 3d6}）点暗蚀伤害。"
+					]
+				},
+				{
+					"ENG_name": "Weird Insight",
+					"name": "怪异洞悉",
+					"entries": [
+						"诺斯怪指定其周边30尺内一个它能看到的生物。该目标必须以其魅力（{@skill 欺瞒}）检定对抗该诺斯怪的感知（{@skill 洞悉}）检定。如果诺斯怪胜出，则它以魔法得知一件与目标相关的事实或秘密。如果目标免疫{@condition 魅惑}，则它将在该检定对抗中直接胜出。"
+					]
+				}
+			],
+			"environment": [
+				"幽暗地域"
+			],
+			"soundClip": {
+				"type": "internal",
+				"path": "bestiary/nothic.opus"
+			},
+			"traitTags": [
+				"敏锐感官"
+			],
+			"senseTags": [
+				"U"
+			],
+			"actionTags": [
+				"多重攻击"
+			],
+			"languageTags": [
+				"U"
+			],
+			"damageTags": [
+				"N",
+				"S"
+			],
+			"miscTags": [
+				"MW"
+			],
+			"savingThrowForced": [
+				"体质"
+			],
+			"hasToken": true,
+			"hasFluff": true,
+			"hasFluffImages": true,
+			"translator": "不全书"
+		},
+		{
+			"ENG_name": "Ochre Jelly",
+			"name": "赭果冻",
+			"type": "ooze",
+			"source": "MM",
+			"page": 243,
+			"srd": true,
+			"basicRules": true,
+			"referenceSources": [
+				"BGDIA",
+				"BMT",
+				"CRCotN",
+				"DIP",
+				"ERLW",
+				"GoS",
+				"HftT",
+				"JttRC",
+				"LMoP",
+				"OotA",
+				"PaBTSO",
+				"PotA",
+				"QftIS",
+				"RMBRE",
+				"SCC-CK",
+				"SCC-HfMT",
+				"TftYP",
+				"TftYP-THSoT",
+				"TftYP-ToH",
+				"WDMM"
+			],
+			"reprintedAs": [
+				"赭果冻|XMM"
+			],
+			"size": [
+				"L"
+			],
+			"alignment": [
+				"U"
+			],
+			"ac": [
+				8
+			],
+			"hp": {
+				"average": 45,
+				"formula": "6d10 + 12"
+			},
+			"speed": {
+				"walk": 10,
+				"climb": 10
+			},
+			"str": 15,
+			"dex": 6,
+			"con": 14,
+			"int": 2,
+			"wis": 6,
+			"cha": 1,
+			"senses": [
+				"盲视60尺（范围外视为目盲）"
+			],
+			"passive": 8,
+			"resist": [
+				"强酸"
+			],
+			"immune": [
+				"闪电",
+				"挥砍"
+			],
+			"conditionImmune": [
+				"目盲",
+				"魅惑",
+				"耳聋",
+				"力竭",
+				"恐慌",
+				"倒地"
+			],
+			"cr": "2",
+			"trait": [
+				{
+					"ENG_name": "Amorphous",
+					"name": "无定形",
+					"entries": [
+						"赭冻怪能够轻松穿过最窄1寸宽的狭窄空间而不用挤进去。"
+					]
+				},
+				{
+					"ENG_name": "Spider Climb",
+					"name": "蛛行",
+					"entries": [
+						"赭冻怪无需进行属性检定就能攀爬于困难表面，包括倒挂在天花板上。"
+					]
+				}
+			],
+			"action": [
+				{
+					"ENG_name": "Pseudopod",
+					"name": "伪足",
+					"entries": [
+						"{@atk mw} 命中{@hit 4}，触及5尺，单一目标。{@h}9（{@damage 2d6 + 2}）点钝击伤害加上3（{@damage 1d6}）点强酸伤害。"
+					]
+				}
+			],
+			"reaction": [
+				{
+					"ENG_name": "Split",
+					"name": "分裂",
+					"entries": [
+						"当一只中型或更大体型的赭冻怪受到闪电或挥砍伤害，而此时其生命值至少为10时，它将分裂成两个新的赭冻怪。每一只新的赭冻怪拥有原赭冻怪一半的生命值（向下取整）。新的赭冻怪比原来的体型小一级。"
+					]
+				}
+			],
+			"environment": [
+				"幽暗地域"
+			],
+			"soundClip": {
+				"type": "internal",
+				"path": "bestiary/ochre-jelly.opus"
+			},
+			"traitTags": [
+				"无定形",
+				"蛛行"
+			],
+			"senseTags": [
+				"B"
+			],
+			"damageTags": [
+				"A",
+				"B"
+			],
+			"miscTags": [
+				"MW"
+			],
+			"hasToken": true,
+			"hasFluff": true,
+			"hasFluffImages": true,
+			"translator": "不全书"
+		},
+		{
+			"ENG_name": "Ogre",
+			"name": "食人魔",
+			"type": "giant",
+			"source": "MM",
+			"page": 237,
+			"srd": true,
+			"basicRules": true,
+			"referenceSources": [
+				"BGDIA",
+				"CM",
+				"CRCotN",
+				"DIP",
+				"DSotDQ",
+				"EGW",
+				"ERLW",
+				"GoS",
+				"HftT",
+				"HotDQ",
+				"IDRotF",
+				"KftGV",
+				"LMoP",
+				"OotA",
+				"OoW",
+				"PaBTSO",
+				"PotA",
+				"PSZ",
+				"QftIS",
+				"RMBRE",
+				"RoT",
+				"SatO",
+				"SjA",
+				"SKT",
+				"SLW",
+				"TftYP",
+				"TftYP-AtG",
+				"TftYP-TFoF",
+				"TftYP-WPM",
+				"US",
+				"WDH",
+				"WDMM"
+			],
+			"reprintedAs": [
+				"食人魔|XMM"
+			],
+			"size": [
+				"L"
+			],
+			"alignment": [
+				"C",
+				"E"
+			],
+			"ac": [
+				{
+					"ac": 11,
+					"from": [
+						"{@item 兽皮甲|phb}"
+					]
+				}
+			],
+			"hp": {
+				"average": 59,
+				"formula": "7d10 + 21"
+			},
+			"speed": {
+				"walk": 40
+			},
+			"str": 19,
+			"dex": 8,
+			"con": 16,
+			"int": 5,
+			"wis": 7,
+			"cha": 7,
+			"senses": [
+				"黑暗视觉 60 尺"
+			],
+			"passive": 8,
+			"languages": [
+				"通用语",
+				"巨人语"
+			],
+			"cr": "2",
+			"action": [
+				{
+					"ENG_name": "Greatclub",
+					"name": "巨棒",
+					"entries": [
+						"{@atk mw} 命中{@hit 6}，触及5尺，单一目标。{@h}13（{@damage 2d8 + 4}）点钝击伤害。"
+					]
+				},
+				{
+					"ENG_name": "Javelin",
+					"name": "标枪",
+					"entries": [
+						"{@atk mw,rw} 命中{@hit 6}，触及5尺或射程30/120尺，单一目标。{@h}11 ({@damage 2d6 + 4}) 点穿刺伤害。"
+					]
+				}
+			],
+			"environment": [
+				"草地",
+				"森林",
+				"沼泽",
+				"丘陵",
+				"荒漠",
+				"海岸",
+				"极地",
+				"幽暗地域",
+				"山地"
+			],
+			"soundClip": {
+				"type": "internal",
+				"path": "bestiary/ogre.opus"
+			},
+			"attachedItems": [
+				"巨棒|phb",
+				"标枪|phb"
+			],
+			"senseTags": [
+				"D"
+			],
+			"languageTags": [
+				"C",
+				"GI"
+			],
+			"damageTags": [
+				"B",
+				"P"
+			],
+			"miscTags": [
+				"MLW",
+				"MW",
+				"RW",
+				"THW"
+			],
+			"hasToken": true,
+			"hasFluff": true,
+			"hasFluffImages": true,
+			"translator": "不全书"
+		},
+		{
+			"ENG_name": "Orc",
+			"name": "兽人",
+			"type": {
+				"type": "humanoid",
+				"tags": [
+					"兽人"
+				]
+			},
+			"source": "MM",
+			"page": 246,
+			"srd": true,
+			"basicRules": true,
+			"referenceSources": [
+				"CRCotN",
+				"DIP",
+				"EGW",
+				"ERLW",
+				"GoS",
+				"HftT",
+				"HotDQ",
+				"IDRotF",
+				"LMoP",
+				"OotA",
+				"PaBTSO",
+				"PotA",
+				"RMBRE",
+				"SKT",
+				"TftYP",
+				"TftYP-AtG",
+				"TftYP-DiT",
+				"TftYP-TFoF",
+				"ToA",
+				"US"
+			],
+			"reprintedAs": [
+				"打手|XMM"
+			],
+			"size": [
+				"M"
+			],
+			"alignment": [
+				"C",
+				"E"
+			],
+			"ac": [
+				{
+					"ac": 13,
+					"from": [
+						"{@item 兽皮甲|phb}"
+					]
+				}
+			],
+			"hp": {
+				"average": 15,
+				"formula": "2d8 + 6"
+			},
+			"speed": {
+				"walk": 30
+			},
+			"str": 16,
+			"dex": 12,
+			"con": 16,
+			"int": 7,
+			"wis": 11,
+			"cha": 10,
+			"skill": {
+				"intimidation": "+2"
+			},
+			"senses": [
+				"黑暗视觉 60 尺"
+			],
+			"passive": 10,
+			"languages": [
+				"通用语",
+				"兽人语"
+			],
+			"cr": "1/2",
+			"trait": [
+				{
+					"ENG_name": "Aggressive",
+					"name": "好斗",
+					"entries": [
+						"作为一个附赠动作项，兽人可以向一个它能看见的敌对生物移动至多相当于其速度的距离。"
+					]
+				}
+			],
+			"action": [
+				{
+					"ENG_name": "Greataxe",
+					"name": "巨斧",
+					"entries": [
+						"{@atk mw} 命中{@hit 5}，触及5尺，单一目标。{@h}9（{@damage 1d12 + 3}）点挥砍伤害。"
+					]
+				},
+				{
+					"ENG_name": "Javelin",
+					"name": "标枪",
+					"entries": [
+						"{@atk mw,rw} 命中{@hit 5}，触及5尺或射程30/120尺，单一目标。{@h}6（{@damage 1d6 + 3}）点穿刺伤害。"
+					]
+				}
+			],
+			"environment": [
+				"幽暗地域",
+				"山地",
+				"草地",
+				"森林",
+				"沼泽",
+				"丘陵",
+				"极地"
+			],
+			"soundClip": {
+				"type": "internal",
+				"path": "bestiary/orc.opus"
+			},
+			"altArt": [
+				{
+					"ENG_name": "Iceshield Orc",
+					"name": "冰盾兽人",
+					"source": "PotA"
+				}
+			],
+			"attachedItems": [
+				"巨斧|phb",
+				"标枪|phb"
+			],
+			"traitTags": [
+				"好斗"
+			],
+			"senseTags": [
+				"D"
+			],
+			"languageTags": [
+				"C",
+				"O"
+			],
+			"damageTags": [
+				"P",
+				"S"
+			],
+			"miscTags": [
+				"MLW",
+				"MW",
+				"RW",
+				"THW"
+			],
+			"hasToken": true,
+			"hasFluff": true,
+			"hasFluffImages": true,
+			"translator": "不全书"
+		},
+		{
+			"ENG_name": "Owlbear",
+			"name": "枭熊",
+			"type": "monstrosity",
+			"source": "MM",
+			"page": 249,
+			"srd": true,
+			"basicRules": true,
+			"referenceSources": [
+				"BMT",
+				"CRCotN",
+				"DIP",
+				"DoSI",
+				"EGW",
+				"GoS",
+				"HftT",
+				"IDRotF",
+				"IMR",
+				"LMoP",
+				"LRDT",
+				"NRH-AT",
+				"PaBTSO",
+				"PotA",
+				"QftIS",
+				"RMBRE",
+				"RtG",
+				"SCC-CK",
+				"SDW",
+				"SKT",
+				"TftYP",
+				"TftYP-DiT",
+				"WBtW",
+				"WDH",
+				"WDMM"
+			],
+			"reprintedAs": [
+				"枭熊|XMM"
+			],
+			"size": [
+				"L"
+			],
+			"alignment": [
+				"U"
+			],
+			"ac": [
+				{
+					"ac": 13,
+					"from": [
+						"天生护甲"
+					]
+				}
+			],
+			"hp": {
+				"average": 59,
+				"formula": "7d10 + 21"
+			},
+			"speed": {
+				"walk": 40
+			},
+			"str": 20,
+			"dex": 12,
+			"con": 17,
+			"int": 3,
+			"wis": 12,
+			"cha": 7,
+			"skill": {
+				"perception": "+3"
+			},
+			"senses": [
+				"黑暗视觉 60 尺"
+			],
+			"passive": 13,
+			"cr": "3",
+			"trait": [
+				{
+					"ENG_name": "Keen Sight and Smell",
+					"name": "敏锐视嗅觉",
+					"entries": [
+						"枭熊依赖视觉或嗅觉进行的感知（{@skill 察觉}）检定具有优势。"
+					]
+				}
+			],
+			"action": [
+				{
+					"ENG_name": "Multiattack",
+					"name": "多重攻击",
+					"entries": [
+						"枭发动两次攻击：一次喙啄和一次爪击。"
+					]
+				},
+				{
+					"ENG_name": "Beak",
+					"name": "喙啄",
+					"entries": [
+						"{@atk mw} 命中{@hit 7}，触及 5 尺，单一生物。{@h}10 ({@damage 1d10 + 5}) 点穿刺伤害。"
+					]
+				},
+				{
+					"ENG_name": "Claws",
+					"name": "爪击",
+					"entries": [
+						"{@atk mw} 命中{@hit 7}，触及5尺，单一目标。{@h}14 ({@damage 2d8 + 5})点挥砍伤害。"
+					]
+				}
+			],
+			"environment": [
+				"森林"
+			],
+			"soundClip": {
+				"type": "internal",
+				"path": "bestiary/owlbear.opus"
+			},
+			"altArt": [
+				{
+					"ENG_name": "Owlbear",
+					"name": "枭熊",
+					"source": "RMBRE"
+				}
+			],
+			"traitTags": [
+				"敏锐感官"
+			],
+			"senseTags": [
+				"D"
+			],
+			"actionTags": [
+				"多重攻击"
+			],
+			"damageTags": [
+				"P",
+				"S"
+			],
+			"miscTags": [
+				"MW"
+			],
+			"hasToken": true,
+			"hasFluff": true,
+			"hasFluffImages": true,
+			"translator": "不全书"
+		},
+		{
+			"ENG_name": "Skeleton",
+			"name": "骷髅",
+			"type": "undead",
+			"source": "MM",
+			"page": 272,
+			"srd": true,
+			"basicRules": true,
+			"referenceSources": [
+				"AATM",
+				"BGDIA",
+				"BMT",
+				"CoS",
+				"CRCotN",
+				"DC",
+				"DIP",
+				"DSotDQ",
+				"GoS",
+				"HftT",
+				"IMR",
+				"JttRC",
+				"KftGV",
+				"LLK",
+				"LMoP",
+				"LRDT",
+				"NRH-ASS",
+				"NRH-AT",
+				"OotA",
+				"OoW",
+				"PaBTSO",
+				"PotA",
+				"QftIS",
+				"RMBRE",
+				"RtG",
+				"SatO",
+				"SDW",
+				"SKT",
+				"TCE",
+				"TftYP",
+				"TftYP-DiT",
+				"TftYP-TFoF",
+				"TftYP-TSC",
+				"ToA",
+				"ToFW",
+				"VEoR",
+				"WBtW",
+				"WDH",
+				"WDMM",
+				"XMtS"
+			],
+			"reprintedAs": [
+				"骷髅|XMM"
+			],
+			"size": [
+				"M"
+			],
+			"alignment": [
+				"L",
+				"E"
+			],
+			"ac": [
+				{
+					"ac": 13,
+					"from": [
+						"残破护甲"
+					]
+				}
+			],
+			"hp": {
+				"average": 13,
+				"formula": "2d8 + 4"
+			},
+			"speed": {
+				"walk": 30
+			},
+			"str": 10,
+			"dex": 14,
+			"con": 15,
+			"int": 6,
+			"wis": 8,
+			"cha": 5,
+			"senses": [
+				"黑暗视觉 60 尺"
+			],
+			"passive": 9,
+			"immune": [
+				"毒素"
+			],
+			"vulnerable": [
+				"钝击"
+			],
+			"conditionImmune": [
+				"力竭",
+				"中毒"
+			],
+			"languages": [
+				"能理解它生前所说的所有语言，但不能说话"
+			],
+			"cr": "1/4",
+			"action": [
+				{
+					"ENG_name": "Shortsword",
+					"name": "短剑",
+					"entries": [
+						"{@atk mw} 命中{@hit 4}，触及5尺，单一目标。{@h}5 ({@damage 1d6 + 2}) 点穿刺伤害。"
+					]
+				},
+				{
+					"ENG_name": "Shortbow",
+					"name": "短弓",
+					"entries": [
+						"{@atk rw} 命中{@hit 4}，射程80/320尺，单一目标。{@h}5（{@damage 1d6 + 2}）点穿刺伤害。"
+					]
+				}
+			],
+			"environment": [
+				"城市"
+			],
+			"soundClip": {
+				"type": "internal",
+				"path": "bestiary/skeleton.opus"
+			},
+			"attachedItems": [
+				"短弓|phb",
+				"短剑|phb"
+			],
+			"senseTags": [
+				"D"
+			],
+			"languageTags": [
+				"CS",
+				"LF"
+			],
+			"damageTags": [
+				"P"
+			],
+			"miscTags": [
+				"MLW",
+				"MW",
+				"RNG",
+				"RW"
+			],
+			"hasToken": true,
+			"hasFluff": true,
+			"hasFluffImages": true,
+			"translator": "不全书"
+		},
+		{
+			"ENG_name": "Spectator",
+			"name": "观察者眼魔",
+			"type": "aberration",
+			"group": [
+				"眼魔"
+			],
+			"source": "MM",
+			"page": 30,
+			"basicRules": true,
+			"referenceSources": [
+				"IDRotF",
+				"KftGV",
+				"LMoP",
+				"OotA",
+				"PaBTSO",
+				"QftIS",
+				"RMBRE",
+				"SCC-ARiR",
+				"SjA",
+				"ToFW",
+				"WDH",
+				"WDMM"
+			],
+			"reprintedAs": [
+				"观察者眼魔|XMM"
+			],
+			"size": [
+				"M"
+			],
+			"alignment": [
+				"L",
+				"N"
+			],
+			"ac": [
+				{
+					"ac": 14,
+					"from": [
+						"天生护甲"
+					]
+				}
+			],
+			"hp": {
+				"average": 39,
+				"formula": "6d8 + 12"
+			},
+			"speed": {
+				"walk": 0,
+				"fly": {
+					"number": 30,
+					"condition": "(悬浮)"
+				},
+				"canHover": true
+			},
+			"str": 8,
+			"dex": 14,
+			"con": 14,
+			"int": 13,
+			"wis": 14,
+			"cha": 11,
+			"skill": {
+				"perception": "+6"
+			},
+			"senses": [
+				"黑暗视觉 120 尺"
+			],
+			"passive": 16,
+			"conditionImmune": [
+				"倒地"
+			],
+			"languages": [
+				"深潜语",
+				"地底通用语",
+				"心灵感应 120 尺"
+			],
+			"cr": "3",
+			"action": [
+				{
+					"ENG_name": "Bite",
+					"name": "啃咬",
+					"entries": [
+						"{@atk mw} 命中{@hit 1}，触及5尺，单一目标。{@h}2 ({@damage 1d6 - 1}) 点穿刺伤害。"
+					]
+				},
+				{
+					"ENG_name": "Eye Rays",
+					"name": "眼波射线",
+					"entries": [
+						"观察者眼魔从下列选项中选择发射两束魔法眼波射线，并指定身边90尺内它可以看到的一到两个目标。每种射线观察者在一回合中只能使用一次：",
+						{
+							"type": "list",
+							"style": "list-hang-notitle",
+							"items": [
+								{
+									"ENG_name": "1. Confusion Ray",
+									"name": "1. 困惑射线",
+									"type": "itemSub",
+									"entry": "目标必须进行一次{@dc 13}的感知豁免，豁免失败者直至其下回合结束前都无法执行任何反应。该生物在其自己回合中将无法移动，并使用其动作对可及范围内随机的某个生物发动一次近战或远程攻击。如果受术目标无法攻击，则其在自己回合中什么都不做。"
+								},
+								{
+									"ENG_name": "2. Paralyzing Ray",
+									"name": "2. 麻痹射线",
+									"type": "itemSub",
+									"entry": "目标必须进行一次{@dc 13}的体质豁免，豁免失败者将陷入1分钟的{@condition 麻痹}。该目标可以在每个其自己回合结束时再进行一次该豁免，豁免成功则终止该效应。"
+								},
+								{
+									"ENG_name": "3. Fear Ray",
+									"name": "3. 恐惧射线",
+									"type": "itemSub",
+									"entry": "目标必须进行一次{@dc 13}的感知豁免，豁免失败者将陷入1分钟的{@condition 恐慌}状态。该目标可以在每个其自己回合结束时再进行一次该豁免，豁免成功则终止该效应。"
+								},
+								{
+									"ENG_name": "4. Wounding Ray",
+									"name": "4. 致伤射线",
+									"type": "itemSub",
+									"entry": "目标必须进行一次{@dc 13}的体质豁免，豁免失败者将受到16（{@damage 3d10}）点暗蚀伤害，豁免成功则伤害减半。"
+								}
+							]
+						}
+					]
+				},
+				{
+					"ENG_name": "Create Food and Water",
+					"name": "造粮术",
+					"entries": [
+						"观察者眼魔以魔法制造足够维持自己24小时供给的食物和饮用水。"
+					]
+				}
+			],
+			"reaction": [
+				{
+					"ENG_name": "Spell Reflection",
+					"name": "法术反射",
+					"entries": [
+						"如果观察者眼魔通过了对法术的豁免检定，或者对其发动的法术攻击未命中时，它可指定身边30尺范围内一个它能看见的其他生物（包括施法者），使那个生物代替观察者眼魔作为该法术的目标。如果该法术迫使目标进行豁免检定，则被指定的生物必须自行进行豁免。若该法术发动一次攻击，则该法术必须对被指定生物重掷攻击检定。"
+					]
+				}
+			],
+			"environment": [
+				"幽暗地域"
+			],
+			"soundClip": {
+				"type": "internal",
+				"path": "bestiary/spectator.opus"
+			},
+			"altArt": [
+				{
+					"ENG_name": "Forge of Spells Spectator",
+					"name": "法术熔炉观察者眼魔",
+					"source": "PaBTSO"
+				},
+				{
+					"ENG_name": "Spectator",
+					"name": "观察者眼魔",
+					"source": "RMBRE"
+				}
+			],
+			"senseTags": [
+				"SD"
+			],
+			"languageTags": [
+				"DS",
+				"TP",
+				"U"
+			],
+			"damageTags": [
+				"N",
+				"P"
+			],
+			"miscTags": [
+				"MW"
+			],
+			"conditionInflict": [
+				"恐慌",
+				"麻痹"
+			],
+			"savingThrowForced": [
+				"体质",
+				"感知"
+			],
+			"hasToken": true,
+			"hasFluff": true,
+			"hasFluffImages": true
+		},
+		{
+			"ENG_name": "Stirge",
+			"name": "蚊蝠",
+			"type": "beast",
+			"source": "MM",
+			"page": 284,
+			"srd": true,
+			"basicRules": true,
+			"referenceSources": [
+				"BGDIA",
+				"DIP",
+				"DoSI",
+				"EGW",
+				"GoS",
+				"HftT",
+				"HotDQ",
+				"IMR",
+				"KftGV",
+				"LLK",
+				"LMoP",
+				"OotA",
+				"PaBTSO",
+				"PotA",
+				"QftIS",
+				"RMBRE",
+				"SCC-CK",
+				"TftYP",
+				"TftYP-TFoF",
+				"ToA",
+				"TTP",
+				"US",
+				"WDH",
+				"WDMM"
+			],
+			"reprintedAs": [
+				"蚊蝠|XMM"
+			],
+			"size": [
+				"T"
+			],
+			"alignment": [
+				"U"
+			],
+			"ac": [
+				{
+					"ac": 14,
+					"from": [
+						"天生护甲"
+					]
+				}
+			],
+			"hp": {
+				"average": 2,
+				"formula": "1d4"
+			},
+			"speed": {
+				"walk": 10,
+				"fly": 40
+			},
+			"str": 4,
+			"dex": 16,
+			"con": 11,
+			"int": 2,
+			"wis": 8,
+			"cha": 6,
+			"senses": [
+				"黑暗视觉 60 尺"
+			],
+			"passive": 9,
+			"cr": "1/8",
+			"action": [
+				{
+					"ENG_name": "Blood Drain",
+					"name": "吸取血液",
+					"entries": [
+						"{@atk mw} 命中{@hit 5}，触及5尺，单一生物。{@h}5（{@damage 1d4 + 3}）点穿刺伤害，且蚊蝠贴在目标身上。贴上身之后，蚊蝠将不再发动攻击，而目标生物在该蚊蝠的回合开始时将因失血而使其生命值受5（{@dice 1d4 + 3}）的损失。",
+						"蚊蝠可以花费5尺移动力从目标生物身上脱离。它通常会在吸完10点生命值，或者目标死亡后自行脱离。包括目标生物在内的任意生物都可以花一个动作将蚊蝠从自己或是从别人身上拽下来。"
+					]
+				}
+			],
+			"environment": [
+				"草地",
+				"森林",
+				"沼泽",
+				"丘陵",
+				"城市",
+				"荒漠",
+				"海岸",
+				"山地",
+				"幽暗地域"
+			],
+			"soundClip": {
+				"type": "internal",
+				"path": "bestiary/stirge.opus"
+			},
+			"senseTags": [
+				"D"
+			],
+			"damageTags": [
+				"P"
+			],
+			"miscTags": [
+				"MW"
+			],
+			"hasToken": true,
+			"hasFluff": true,
+			"hasFluffImages": true,
+			"translator": "不全书"
+		},
+		{
+			"ENG_name": "Twig Blight",
+			"name": "枯枝怪",
+			"type": "plant",
+			"source": "MM",
+			"page": 32,
+			"basicRules": true,
+			"referenceSources": [
+				"CoS",
+				"DIP",
+				"GoS",
+				"HftT",
+				"LMoP",
+				"NRH-AVitW",
+				"PaBTSO",
+				"PSI",
+				"RMBRE",
+				"TftYP",
+				"TftYP-TSC",
+				"WBtW"
+			],
+			"reprintedAs": [
+				"枯枝怪|XMM"
+			],
+			"size": [
+				"S"
+			],
+			"alignment": [
+				"N",
+				"E"
+			],
+			"ac": [
+				{
+					"ac": 13,
+					"from": [
+						"天生护甲"
+					]
+				}
+			],
+			"hp": {
+				"average": 4,
+				"formula": "1d6 + 1"
+			},
+			"speed": {
+				"walk": 20
+			},
+			"str": 6,
+			"dex": 13,
+			"con": 12,
+			"int": 4,
+			"wis": 8,
+			"cha": 3,
+			"skill": {
+				"stealth": "+3"
+			},
+			"senses": [
+				"盲视60尺（范围外视为目盲）"
+			],
+			"passive": 9,
+			"vulnerable": [
+				"火焰"
+			],
+			"conditionImmune": [
+				"目盲",
+				"耳聋"
+			],
+			"languages": [
+				"理解通用语，但不会说"
+			],
+			"cr": "1/8",
+			"trait": [
+				{
+					"ENG_name": "False Appearance",
+					"name": "无定形",
+					"entries": [
+						"当枯萎怪保持不动，它无法被与一株枯木区分开来。"
+					]
+				}
+			],
+			"action": [
+				{
+					"ENG_name": "Claws",
+					"name": "爪击",
+					"entries": [
+						"{@atk mw} 命中{@hit 3}，触及5尺，单一目标。{@h}3 ({@damage 1d4 + 1}) 点穿刺伤害。"
+					]
+				}
+			],
+			"environment": [
+				"森林"
+			],
+			"soundClip": {
+				"type": "internal",
+				"path": "bestiary/twig-blight.opus"
+			},
+			"altArt": [
+				{
+					"ENG_name": "Twig Blight",
+					"name": "枯枝怪",
+					"source": "DIP"
+				}
+			],
+			"traitTags": [
+				"无定形"
+			],
+			"senseTags": [
+				"B"
+			],
+			"languageTags": [
+				"C",
+				"CS"
+			],
+			"damageTags": [
+				"P"
+			],
+			"miscTags": [
+				"MW"
+			],
+			"hasToken": true,
+			"hasFluff": true,
+			"hasFluffImages": true,
+			"translator": "不全书"
+		},
+		{
+			"ENG_name": "Wolf",
+			"name": "狼",
+			"type": "beast",
+			"source": "MM",
+			"page": 341,
+			"srd": true,
+			"basicRules": true,
+			"referenceSources": [
+				"BMT",
+				"CM",
+				"CoA",
+				"CoS",
+				"DD",
+				"EGW",
+				"FS",
+				"GoS",
+				"HftT",
+				"HotDQ",
+				"IDRotF",
+				"LK",
+				"LMoP",
+				"PaBTSO",
+				"PotA",
+				"QftIS",
+				"RoT",
+				"SKT",
+				"TCE",
+				"WDH"
+			],
+			"reprintedAs": [
+				"狼|XMM"
+			],
+			"size": [
+				"M"
+			],
+			"alignment": [
+				"U"
+			],
+			"ac": [
+				{
+					"ac": 13,
+					"from": [
+						"天生护甲"
+					]
+				}
+			],
+			"hp": {
+				"average": 11,
+				"formula": "2d8 + 2"
+			},
+			"speed": {
+				"walk": 40
+			},
+			"str": 12,
+			"dex": 15,
+			"con": 12,
+			"int": 3,
+			"wis": 12,
+			"cha": 6,
+			"skill": {
+				"perception": "+3",
+				"stealth": "+4"
+			},
+			"passive": 13,
+			"cr": "1/4",
+			"trait": [
+				{
+					"ENG_name": "Keen Hearing and Smell",
+					"name": "敏锐嗅听觉",
+					"entries": [
+						"狼在依赖听觉或嗅觉的感知（{@skill 察觉}）检定上具有优势。"
+					]
+				},
+				{
+					"ENG_name": "Pack Tactics",
+					"name": "集群战术",
+					"entries": [
+						"狼至少有一个未处于{@condition 失能}的盟友在目标生物5尺内时，它对该生物发动的攻击检定有优势。"
+					]
+				}
+			],
+			"action": [
+				{
+					"ENG_name": "Bite",
+					"name": "啃咬",
+					"entries": [
+						"{@atk mw} 命中{@hit 4}，触及5尺，单一目标。{@h}7（{@damage 2d4 + 2}）点穿刺伤害。如果目标是一个生物，则目标必须进行一次{@dc 11}的力量豁免，豁免失败则应击{@condition 倒地}。"
+					]
+				}
+			],
+			"environment": [
+				"草地",
+				"森林",
+				"丘陵"
+			],
+			"soundClip": {
+				"type": "internal",
+				"path": "bestiary/wolf.opus"
+			},
+			"traitTags": [
+				"敏锐感官",
+				"集群战术"
+			],
+			"damageTags": [
+				"P"
+			],
+			"miscTags": [
+				"MW"
+			],
+			"conditionInflict": [
+				"倒地"
+			],
+			"savingThrowForced": [
+				"力量"
+			],
+			"hasToken": true,
+			"hasFluffImages": true,
+			"translator": "不全书"
+		},
+		{
+			"ENG_name": "Young Green Dragon",
+			"name": "青年绿龙",
+			"type": "dragon",
+			"group": [
+				"色彩龙"
+			],
+			"source": "MM",
+			"page": 94,
+			"srd": true,
+			"basicRules": true,
+			"referenceSources": [
+				"BGDIA",
+				"BMT",
+				"HftT",
+				"LK",
+				"LMoP",
+				"OoW",
+				"PaBTSO",
+				"RMBRE",
+				"SKT",
+				"WDMM"
+			],
+			"reprintedAs": [
+				"青年绿龙|XMM"
+			],
+			"size": [
+				"L"
+			],
+			"alignment": [
+				"L",
+				"E"
+			],
+			"ac": [
+				{
+					"ac": 18,
+					"from": [
+						"天生护甲"
+					]
+				}
+			],
+			"hp": {
+				"average": 136,
+				"formula": "16d10 + 48"
+			},
+			"speed": {
+				"walk": 40,
+				"fly": 80,
+				"swim": 40
+			},
+			"str": 19,
+			"dex": 12,
+			"con": 17,
+			"int": 16,
+			"wis": 13,
+			"cha": 15,
+			"save": {
+				"dex": "+4",
+				"con": "+6",
+				"wis": "+4",
+				"cha": "+5"
+			},
+			"skill": {
+				"deception": "+5",
+				"perception": "+7",
+				"stealth": "+4"
+			},
+			"senses": [
+				"盲视 30 尺",
+				"黑暗视觉 120 尺"
+			],
+			"passive": 17,
+			"immune": [
+				"毒素"
+			],
+			"conditionImmune": [
+				"中毒"
+			],
+			"languages": [
+				"通用语",
+				"龙语"
+			],
+			"cr": "8",
+			"trait": [
+				{
+					"ENG_name": "Amphibious",
+					"name": "水陆两栖",
+					"entries": [
+						"该龙可以在空气和水中呼吸。"
+					]
+				}
+			],
+			"action": [
+				{
+					"ENG_name": "Multiattack",
+					"name": "多重攻击",
+					"entries": [
+						"龙发动三次攻击，一次啃咬和两次爪击。"
+					]
+				},
+				{
+					"ENG_name": "Bite",
+					"name": "啃咬",
+					"entries": [
+						"{@atk mw} 命中{@hit 7}，触及10尺，单一目标。{@h}15（{@damage 2d10 + 4}）点穿刺伤害加上7（{@damage 2d6}）点毒素伤害。"
+					]
+				},
+				{
+					"ENG_name": "Claw",
+					"name": "爪击",
+					"entries": [
+						"{@atk mw} 命中{@hit 7}，触及5尺，单一目标。{@h}11 ({@damage 2d6 + 4}) 点挥砍伤害。"
+					]
+				},
+				{
+					"ENG_name": "Poison Breath {@recharge 5}",
+					"name": "毒性吐息 {@recharge 5}",
+					"entries": [
+						"龙呼出毒气并覆盖一处30尺的锥状区域，该区域内的每个生物都必须进行一次{@dc 14}的体质豁免，豁免失败者将受到42（{@damage 12d6}）点毒素伤害，豁免成功则伤害减半。"
+					]
+				}
+			],
+			"variant": [
+				{
+					"ENG_name": "Customizing Dragons",
+					"name": "定制龙类",
+					"type": "inset",
+					"source": "FTD",
+					"page": 33,
+					"entries": [
+						"你可以定制任何龙的数据以反映龙的独特能力。像下面这样的小改动是很容易做到的，而且对龙的挑战等级没有影响。",
+						{
+							"ENG_name": "Languages",
+							"name": "语言",
+							"type": "entries",
+							"entries": [
+								"大多数龙喜欢说龙语，但为了与盟友和仆从打交道同样也需要学习通用语。鉴于龙的高智力和长寿命，它们可以很容易地学习其他语言。你可以将一些额外语言添加到龙的资料卡中。"
+							]
+						},
+						{
+							"ENG_name": "Skills",
+							"name": "技能",
+							"type": "entries",
+							"entries": [
+								"大多数龙都具有{@skill 察觉}和{@skill 隐匿}技能的熟练项，许多龙还有额外的技能熟练。和语言一样，你可以定制龙的技能列表（甚至将他们对某些技能的熟练翻倍）以反映其特殊的兴趣和技巧。你也可以给龙提供工具熟练，特别是当龙在人形状态下花费了一段时间训练时。"
+							]
+						},
+						{
+							"ENG_name": "Spells",
+							"name": "法术",
+							"type": "entries",
+							"entries": [
+								"{@note 请参阅下方的\"变体：龙类天生施法者\"小节。}"
+							]
+						},
+						{
+							"ENG_name": "Other Traits and Actions",
+							"name": "其他特性与动作",
+							"type": "entries",
+							"entries": [
+								"您可以借用其他怪物的特性和动作来为龙增添独特的风味。考虑以下示例：",
+								{
+									"type": "list",
+									"style": "list-hang-notitle",
+									"items": [
+										{
+											"ENG_name": "Flyby",
+											"name": "飞掠",
+											"type": "item",
+											"entries": [
+												"龙那超凡的飞行技巧使其能迅速飞出敌人的威胁范围。",
+												"当龙飞出敌人的攻击范围时，它不会引发借机攻击。"
+											]
+										},
+										{
+											"ENG_name": "Mimicry",
+											"name": "拟声",
+											"type": "item",
+											"entries": [
+												"对狡猾的龙来说，模仿冒险者或他们的盟友可能是一个有趣并且的确有用的技巧。",
+												"龙可以模仿任何它曾听过的声音，包括声线。生物成功通过一次{@dc 13}的感知（{@skill 洞悉}）检定后便可认出其模仿的本质。"
+											]
+										},
+										{
+											"ENG_name": "Rejuvenation",
+											"name": "复生",
+											"type": "item",
+											"entries": [
+												"在你的战役中，你可能会将作为物质位面重要组成成分的龙类设定为几乎不可能被完全杀死的存在。就像巫妖的灵魂被保存在命匣里一样，龙的生命精华可能会被保存在它最初出现的蛋里、它的宝库里，或者世界中心的一个巨大洞穴里。",
+												"如果它拥有一个保存生命精华的物品，被杀死的龙将在{@dice 1d10}天内获得新的身体，恢复所有生命值并再次活跃。新的身体出现在物品周围5尺内。"
+											]
+										},
+										{
+											"ENG_name": "Special Senses",
+											"name": "特殊感官",
+											"type": "item",
+											"entries": [
+												"多数龙都有{@sense 盲视}和{@sense 黑暗视觉}。你可以将{@sense 盲视}升级为{@sense 真实视觉}，或者你可以给一条有掘地速度的龙赋予{@sense 震颤感知|MM}。"
+											]
+										}
+									]
+								}
+							]
+						}
+					]
+				}
+			],
+			"environment": [
+				"森林"
+			],
+			"dragonCastingColor": "绿",
+			"dragonAge": "青年",
+			"soundClip": {
+				"type": "internal",
+				"path": "bestiary/green-dragon.opus"
+			},
+			"altArt": [
+				{
+					"ENG_name": "Young Green Dragon",
+					"name": "青年绿龙",
+					"source": "RMBRE"
+				}
+			],
+			"traitTags": [
+				"水陆两栖"
+			],
+			"senseTags": [
+				"B",
+				"SD"
+			],
+			"actionTags": [
+				"吐息武器",
+				"多重攻击"
+			],
+			"languageTags": [
+				"C",
+				"DR"
+			],
+			"damageTags": [
+				"I",
+				"P",
+				"S"
+			],
+			"miscTags": [
+				"AOE",
+				"MW",
+				"RCH"
+			],
+			"savingThrowForced": [
+				"体质"
+			],
+			"hasToken": true,
+			"hasFluff": true,
+			"hasFluffImages": true,
+			"translator": "不全书"
+		},
+		{
+			"ENG_name": "Zombie",
+			"name": "丧尸",
+			"type": "undead",
+			"source": "MM",
+			"page": 316,
+			"srd": true,
+			"basicRules": true,
+			"referenceSources": [
+				"AATM",
+				"BGDIA",
+				"BMT",
+				"CoS",
+				"DC",
+				"DIP",
+				"DoSI",
+				"DSotDQ",
+				"EGW",
+				"ERLW",
+				"FS",
+				"GoS",
+				"HftT",
+				"JttRC",
+				"KftGV",
+				"KKW",
+				"LMoP",
+				"OotA",
+				"OoW",
+				"PaBTSO",
+				"PotA",
+				"PSI",
+				"QftIS",
+				"RMBRE",
+				"RtG",
+				"SatO",
+				"SDW",
+				"SLW",
+				"TCE",
+				"TftYP",
+				"TftYP-DiT",
+				"TftYP-THSoT",
+				"ToA",
+				"ToFW",
+				"VEoR",
+				"VNotEE",
+				"WBtW",
+				"WDMM"
+			],
+			"reprintedAs": [
+				"丧尸|XMM"
+			],
+			"size": [
+				"M"
+			],
+			"alignment": [
+				"N",
+				"E"
+			],
+			"ac": [
+				8
+			],
+			"hp": {
+				"average": 22,
+				"formula": "3d8 + 9"
+			},
+			"speed": {
+				"walk": 20
+			},
+			"str": 13,
+			"dex": 6,
+			"con": 16,
+			"int": 3,
+			"wis": 6,
+			"cha": 5,
+			"save": {
+				"wis": "+0"
+			},
+			"senses": [
+				"黑暗视觉 60 尺"
+			],
+			"passive": 8,
+			"immune": [
+				"毒素"
+			],
+			"conditionImmune": [
+				"中毒"
+			],
+			"languages": [
+				"能理解它生前所说的所有语言，但不能说话"
+			],
+			"cr": "1/4",
+			"trait": [
+				{
+					"ENG_name": "Undead Fortitude",
+					"name": "不死坚韧",
+					"entries": [
+						"当僵尸因受非光耀非重击伤害而使其生命值减至0时，它必须进行一次DC为5＋所受伤害值的体质豁免，豁免成功则生命值降至1。"
+					]
+				}
+			],
+			"action": [
+				{
+					"ENG_name": "Slam",
+					"name": "猛击",
+					"entries": [
+						"{@atk mw} 命中{@hit 3}，触及5尺，单一目标。{@h}4 ({@damage 1d6 + 1}) 点钝击伤害。"
+					]
+				}
+			],
+			"environment": [
+				"城市"
+			],
+			"soundClip": {
+				"type": "internal",
+				"path": "bestiary/zombie.opus"
+			},
+			"altArt": [
+				{
+					"ENG_name": "Dwarf Zombie",
+					"name": "矮人僵尸",
+					"source": "PaBTSO"
+				}
+			],
+			"traitTags": [
+				"不死坚韧"
+			],
+			"senseTags": [
+				"D"
+			],
+			"languageTags": [
+				"CS",
+				"LF"
+			],
+			"damageTags": [
+				"B"
+			],
+			"miscTags": [
+				"MW"
+			],
+			"hasToken": true,
+			"hasFluff": true,
+			"hasFluffImages": true,
+			"translator": "不全书"
+		}
+	]
+}

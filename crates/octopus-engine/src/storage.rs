@@ -10,8 +10,9 @@ use sea_orm::{
 use serde_json::Value;
 
 use octopus_types::{
-    ArchivedCommandRecord, CommandRecord, EventEnvelope, LegacyDefinition, MaintenanceRow,
-    NarrativeOverride, PlayEvent, SaveDetail, SaveListItem, SavePackage,
+    ArchivedCommandRecord, CommandRecord, EventEnvelope, IssueSeverity, LegacyDefinition,
+    MaintenanceRow, NarrativeOverride, PlayEvent, SaveDetail, SaveListItem, SavePackage,
+    StorybookExportRecord, StorybookPackage, STORYBOOK_PACKAGE_FORMAT,
 };
 use migration::{Migrator, MigratorTrait};
 
@@ -19,6 +20,23 @@ use crate::{entities, error::EngineError, seed::seed_storybooks};
 
 pub fn now_iso() -> String {
     Utc::now().to_rfc3339()
+}
+
+/// 把故事书自述身份（`meta.id` / `meta.title`）改挂到本地。
+/// 导入方分配新 id 或加「(导入)」后缀后必须同步：`meta` 是书内权威身份，
+/// 只改数据库列会在下一次保存草稿时被书内旧值覆盖回去。
+fn set_storybook_meta(draft: &mut Value, id: &str, title: &str) {
+    let Some(obj) = draft.as_object_mut() else {
+        return;
+    };
+    let meta = obj
+        .entry("meta".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    let Some(meta) = meta.as_object_mut() else {
+        return;
+    };
+    meta.insert("id".to_string(), Value::String(id.to_string()));
+    meta.insert("title".to_string(), Value::String(title.to_string()));
 }
 
 /// 空遗留区不落库（NULL），避免无遗留的存档多出一列无意义空数组。
@@ -279,6 +297,8 @@ pub fn normalize_sqlite_url(path: &str) -> String {
 #[derive(Clone)]
 pub struct SqliteStore {
     db: DatabaseConnection,
+    /// 库文件路径（内存库为 `:memory:`）。只用于管理后台展示规模，不参与任何查询。
+    path: String,
 }
 
 impl SqliteStore {
@@ -291,7 +311,12 @@ impl SqliteStore {
         // 在连接池任一连线上设置一次即对整库生效。
         Self::enable_wal(&db).await;
         Self::run_migrations(&db).await?;
-        let store = Self { db };
+        let store = Self {
+            db,
+            path: path.to_string(),
+        };
+        // 账户先于种子：种子故事书要挂到默认管理员名下。
+        store.ensure_default_admin().await?;
         store.seed_if_empty().await?;
         Ok(store)
     }
@@ -321,13 +346,31 @@ impl SqliteStore {
         opt.max_connections(1);
         let db = Database::connect(opt).await?;
         Self::run_migrations(&db).await?;
-        let store = Self { db };
+        let store = Self {
+            db,
+            path: ":memory:".to_string(),
+        };
+        // 账户先于种子：种子故事书要挂到默认管理员名下。
+        store.ensure_default_admin().await?;
         store.seed_if_empty().await?;
         Ok(store)
     }
 
     pub fn conn(&self) -> &DatabaseConnection {
         &self.db
+    }
+
+    /// 库文件路径（内存库为 `:memory:`）。
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// 库文件字节数；内存库 / 取不到元信息时为 0。
+    pub fn db_bytes(&self) -> u64 {
+        if self.path == ":memory:" {
+            return 0;
+        }
+        std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0)
     }
 
     pub async fn run_migrations(db: &DatabaseConnection) -> Result<(), EngineError> {
@@ -356,6 +399,7 @@ impl SqliteStore {
                 draft_version: Set(sb.revision as i64),
                 updated_at: Set(now.clone()),
                 released_at: Set(Some(now.clone())),
+                owner_id: Set(Some(crate::accounts::DEFAULT_ADMIN_USER_ID.to_string())),
             };
             active.insert(&self.db).await?;
         }
@@ -364,11 +408,20 @@ impl SqliteStore {
 
     // ---------- 故事书 ----------
 
-    pub async fn list_storybooks(&self, released_only: bool) -> Result<Vec<Value>, EngineError> {
+    /// 故事书列表（多账户）：
+    /// - `released_only = false` → **只看自己的**（书架 = 我的创作，含未发布草稿）；
+    /// - `released_only = true` → 所有**已发布**的书，跨账户共享（谁能开档游玩）。
+    pub async fn list_storybooks_for(
+        &self,
+        owner_id: &str,
+        released_only: bool,
+    ) -> Result<Vec<Value>, EngineError> {
         let mut query = entities::storybook::Entity::find()
             .order_by_desc(entities::storybook::Column::UpdatedAt);
         if released_only {
             query = query.filter(entities::storybook::Column::ReleasedJson.is_not_null());
+        } else {
+            query = query.filter(entities::storybook::Column::OwnerId.eq(owner_id.to_string()));
         }
         let rows = query.all(&self.db).await?;
         let result = rows
@@ -437,6 +490,7 @@ impl SqliteStore {
         &self,
         title: Option<&str>,
         initial: &Value,
+        owner_id: &str,
     ) -> Result<StorybookRow, EngineError> {
         let id = format!("sb-{}", uuid::Uuid::new_v4().simple());
         let resolved_title = title
@@ -476,6 +530,7 @@ impl SqliteStore {
             draft_version: Set(1),
             updated_at: Set(now.clone()),
             released_at: Set(None),
+            owner_id: Set(Some(owner_id.to_string())),
         };
         active.insert(&self.db).await?;
 
@@ -625,9 +680,121 @@ impl SqliteStore {
         Ok(res.rows_affected > 0)
     }
 
+    // ---------- 自包含故事书包（导出 / 导入） ----------
+
+    pub async fn export_storybook_package(&self, id: &str) -> Result<StorybookPackage, EngineError> {
+        let row = self
+            .get_storybook(id)
+            .await?
+            .ok_or_else(|| EngineError::StorybookNotFound(id.to_string()))?;
+        Ok(StorybookPackage {
+            format: STORYBOOK_PACKAGE_FORMAT.to_string(),
+            version: 1,
+            exported_at: now_iso(),
+            storybook: StorybookExportRecord {
+                id: row.id,
+                title: row.title,
+                revision: row.revision,
+                updated_at: row.updated_at,
+                released_at: row.released_at,
+                published: row.published,
+                draft: row.draft,
+                released: row.released,
+            },
+        })
+    }
+
+    /// 导入故事书包：分配新 id（与原库冲突时加「(导入)」后缀）后重建一条本地记录。
+    /// 草稿版本令牌不随包走，从 1 起算；发布快照**校验通过才保留发布态**，
+    /// 否则退化为草稿——导入不是发布门，不能让未校验内容直接可开档。
+    pub async fn import_storybook_package(
+        &self,
+        pkg: &StorybookPackage,
+        owner_id: &str,
+    ) -> Result<StorybookRow, EngineError> {
+        if pkg.format != STORYBOOK_PACKAGE_FORMAT {
+            return Err(EngineError::InvalidAsset(format!(
+                "无效的故事书包格式，缺少 {STORYBOOK_PACKAGE_FORMAT} 标识"
+            )));
+        }
+
+        let record = &pkg.storybook;
+        let exists = self.get_storybook(&record.id).await?.is_some();
+        let (new_id, new_title) = if exists || record.id.trim().is_empty() {
+            (
+                format!("sb-{}", uuid::Uuid::new_v4().simple()),
+                format!("{} (导入)", record.title),
+            )
+        } else {
+            (record.id.clone(), record.title.clone())
+        };
+
+        // 草稿与已发布快照都要升格，并把书内自述身份改挂到本地（id 与可能加了后缀的标题）
+        let mut draft = record.draft.clone();
+        crate::upcast::upcast_storybook(&mut draft);
+        set_storybook_meta(&mut draft, &new_id, &new_title);
+
+        let mut released = record.released.clone();
+        if let Some(rel) = released.as_mut() {
+            crate::upcast::upcast_storybook(rel);
+            set_storybook_meta(rel, &new_id, &new_title);
+        }
+
+        let keeps_release = match released.as_ref() {
+            Some(rel) => !crate::validate_storybook(rel)
+                .iter()
+                .any(|i| matches!(i.severity, IssueSeverity::Error)),
+            None => false,
+        };
+        if !keeps_release {
+            released = None;
+        }
+
+        let now = now_iso();
+        let revision = if keeps_release { record.revision } else { 0 };
+        let released_at = if keeps_release {
+            Some(record.released_at.clone().unwrap_or_else(|| now.clone()))
+        } else {
+            None
+        };
+
+        let active = entities::storybook::ActiveModel {
+            id: Set(new_id.clone()),
+            title: Set(new_title.clone()),
+            draft_json: Set(serde_json::to_string(&draft)?),
+            released_json: Set(released
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?),
+            revision: Set(revision as i64),
+            draft_version: Set(1),
+            updated_at: Set(now.clone()),
+            released_at: Set(released_at.clone()),
+            owner_id: Set(Some(owner_id.to_string())),
+        };
+        active.insert(&self.db).await?;
+
+        Ok(StorybookRow {
+            id: new_id,
+            title: new_title,
+            revision,
+            draft_version: 1,
+            updated_at: now,
+            released_at,
+            published: keeps_release,
+            draft,
+            released,
+        })
+    }
+
     // ---------- 存档 ----------
 
-    pub async fn insert_save(&self, d: &SaveDetail, auto_confirm: bool) -> Result<(), EngineError> {
+    pub async fn insert_save(
+        &self,
+        d: &SaveDetail,
+        auto_confirm: bool,
+        owner_id: &str,
+    ) -> Result<(), EngineError> {
         let storybook_json = serde_json::to_string(&d.storybook)?;
         let active = entities::save::ActiveModel {
             id: Set(d.item.id.clone()),
@@ -641,6 +808,7 @@ impl SqliteStore {
             is_sandbox: Set(d.item.is_sandbox.unwrap_or(false)),
             storybook_json: Set(storybook_json),
             auto_confirm: Set(auto_confirm),
+            owner_id: Set(Some(owner_id.to_string())),
             model_provider_id: Set(None),
             model: Set(None),
             reasoning_effort: Set(None),
@@ -654,8 +822,10 @@ impl SqliteStore {
         Ok(())
     }
 
-    pub async fn list_saves(&self) -> Result<Vec<SaveListItem>, EngineError> {
+    /// 存档列表：多账户隔离的唯一入口（别人的存档既不出现，也访问不到）。
+    pub async fn list_saves_for(&self, owner_id: &str) -> Result<Vec<SaveListItem>, EngineError> {
         let rows = entities::save::Entity::find()
+            .filter(entities::save::Column::OwnerId.eq(owner_id.to_string()))
             .order_by_desc(entities::save::Column::LastPlayedAt)
             .all(&self.db)
             .await?;
@@ -704,6 +874,22 @@ impl SqliteStore {
         crate::upcast::upcast_storybook(&mut storybook);
         let item = save_item_from_model(m, latest_released);
         Ok(Some(SaveDetail { item, storybook, legacy }))
+    }
+
+    /// 只取列表项（不加载内嵌故事书）：手动存档等「按 id 回填响应」的场景用。
+    pub async fn save_item(&self, id: &str) -> Result<Option<SaveListItem>, EngineError> {
+        let Some(m) = entities::save::Entity::find_by_id(id.to_string())
+            .one(&self.db)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let latest_released = self
+            .get_storybook(&m.storybook_id)
+            .await?
+            .filter(|sb| sb.published)
+            .map(|sb| sb.revision);
+        Ok(Some(save_item_from_model(m, latest_released)))
     }
 
     pub async fn rename_save(&self, id: &str, title: &str) -> Result<Option<SaveListItem>, EngineError> {
@@ -1885,7 +2071,11 @@ impl SqliteStore {
         })
     }
 
-    pub async fn import_save_package(&self, pkg: &SavePackage) -> Result<SaveListItem, EngineError> {
+    pub async fn import_save_package(
+        &self,
+        pkg: &SavePackage,
+        owner_id: &str,
+    ) -> Result<SaveListItem, EngineError> {
         if pkg.format != "octopus-save-package" {
             return Err(EngineError::Internal("无效的存档包格式，缺少 octopus-save-package 标识".to_string()));
         }
@@ -1913,6 +2103,8 @@ impl SqliteStore {
         let pkg_archived = pkg.archived_commands.clone();
         let pkg_maintenance = pkg.maintenance.clone();
         let detail_to_save = detail.clone();
+        // 事务闭包要求 'static：归属先复制成自有 String 再 move 进去。
+        let owner = owner_id.to_string();
 
         self.db
             .transaction::<_, (), EngineError>(|txn| {
@@ -1932,6 +2124,7 @@ impl SqliteStore {
                         is_sandbox: Set(detail_to_save.item.is_sandbox.unwrap_or(false)),
                         storybook_json: Set(storybook_json),
                         auto_confirm: Set(false),
+                        owner_id: Set(Some(owner.clone())),
                         model_provider_id: Set(None),
                         model: Set(None),
                         reasoning_effort: Set(None),
@@ -2018,6 +2211,77 @@ mod tests {
     use octopus_types::{DeltaDomain, DeltaOp, StateDelta, StateUpdatePayload};
     use serde_json::json;
 
+    /// 故事书包往返：同库导入分配新 id +「(导入)」后缀，发布态 / 版次 / 封面引用都保持。
+    #[tokio::test]
+    async fn test_storybook_package_export_import_round_trip() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let original = store.get_storybook("sb-fallingstar").await.unwrap().unwrap();
+
+        let pkg = store.export_storybook_package("sb-fallingstar").await.unwrap();
+        assert_eq!(pkg.format, "octopus-storybook-package");
+        assert_eq!(pkg.storybook.title, original.title);
+        assert_eq!(pkg.storybook.revision, original.revision);
+        assert!(pkg.storybook.published);
+        assert_eq!(pkg.storybook.draft, original.draft);
+
+        let imported = store.import_storybook_package(&pkg, crate::accounts::DEFAULT_ADMIN_USER_ID).await.unwrap();
+        assert_ne!(imported.id, original.id);
+        assert!(imported.id.starts_with("sb-"));
+        assert_eq!(imported.title, format!("{} (导入)", original.title));
+        assert!(imported.published, "校验通过的发布快照要保持发布态");
+        assert_eq!(imported.revision, original.revision);
+        assert_eq!(imported.draft_version, 1, "草稿令牌不随包走");
+        // 书内自述身份要改挂本地（id 与标题都改：只改数据库列会被下一次保存草稿覆盖回去）
+        assert_eq!(imported.draft["meta"]["id"], json!(imported.id));
+        assert_eq!(imported.draft["meta"]["title"], json!(imported.title));
+        assert_eq!(
+            imported.released.as_ref().unwrap()["meta"]["id"],
+            json!(imported.id)
+        );
+        assert_eq!(
+            imported.released.as_ref().unwrap()["meta"]["title"],
+            json!(imported.title)
+        );
+        assert!(store.get_storybook(&imported.id).await.unwrap().is_some());
+
+        assert!(matches!(
+            store.export_storybook_package("sb-nonexistent").await,
+            Err(EngineError::StorybookNotFound(_))
+        ));
+    }
+
+    /// 导入不是发布门：快照校验不过就退化为草稿；外来格式拒收。
+    #[tokio::test]
+    async fn test_storybook_package_import_guards() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+
+        // 发布快照被改坏（缺 meta.id）→ 只留草稿，不带发布态
+        let mut broken = store.export_storybook_package("sb-fallingstar").await.unwrap();
+        broken.storybook.released = Some(json!({ "meta": { "title": "坏快照" } }));
+        let imported = store.import_storybook_package(&broken, crate::accounts::DEFAULT_ADMIN_USER_ID).await.unwrap();
+        assert!(!imported.published);
+        assert!(imported.released.is_none());
+        assert_eq!(imported.revision, 0);
+        assert!(imported.released_at.is_none());
+        assert_eq!(imported.draft["meta"]["id"], json!(imported.id), "草稿照常导入");
+
+        // 没有发布快照的包（纯草稿导出）→ 草稿
+        let mut draft_only = store.export_storybook_package("sb-fallingstar").await.unwrap();
+        draft_only.storybook.released = None;
+        draft_only.storybook.published = false;
+        let imported = store.import_storybook_package(&draft_only, crate::accounts::DEFAULT_ADMIN_USER_ID).await.unwrap();
+        assert!(!imported.published);
+        assert!(imported.released.is_none());
+
+        // 外来格式（存档包标识）拒收
+        let mut foreign = store.export_storybook_package("sb-fallingstar").await.unwrap();
+        foreign.format = "octopus-save-package".to_string();
+        assert!(matches!(
+            store.import_storybook_package(&foreign, crate::accounts::DEFAULT_ADMIN_USER_ID).await,
+            Err(EngineError::InvalidAsset(_))
+        ));
+    }
+
     #[tokio::test]
     async fn test_create_and_save_draft() {
         let store = SqliteStore::open_in_memory().await.unwrap();
@@ -2025,7 +2289,7 @@ mod tests {
             "meta": { "title": "初始标题" },
             "world": { "premise": "世界设定" }
         });
-        let row = store.create_storybook_draft(None, &initial).await.unwrap();
+        let row = store.create_storybook_draft(None, &initial, crate::accounts::DEFAULT_ADMIN_USER_ID).await.unwrap();
         assert!(row.id.starts_with("sb-"));
         assert_eq!(row.title, "初始标题");
         assert_eq!(row.revision, 0);
@@ -2066,7 +2330,7 @@ mod tests {
                 "goals": [{ "id": "g1", "text": "目标", "condition": { "op": "beat_fired", "beat_id": "b1" } }]
             }] }]
         });
-        let row = store.create_storybook_draft(None, &legacy).await.unwrap();
+        let row = store.create_storybook_draft(None, &legacy, crate::accounts::DEFAULT_ADMIN_USER_ID).await.unwrap();
 
         // 读回来即为当前结构
         let fetched = store.get_storybook(&row.id).await.unwrap().unwrap();
@@ -2094,7 +2358,7 @@ mod tests {
             "meta": { "title": "幂等测试" },
             "content": 123
         });
-        let row = store.create_storybook_draft(None, &initial).await.unwrap();
+        let row = store.create_storybook_draft(None, &initial, crate::accounts::DEFAULT_ADMIN_USER_ID).await.unwrap();
         assert_eq!(row.draft_version, 1);
         let updated_at = row.updated_at.clone();
 
@@ -2112,7 +2376,7 @@ mod tests {
     async fn test_optimistic_locking_conflict() {
         let store = SqliteStore::open_in_memory().await.unwrap();
         let initial = json!({ "meta": { "title": "锁测试" } });
-        let row = store.create_storybook_draft(None, &initial).await.unwrap();
+        let row = store.create_storybook_draft(None, &initial, crate::accounts::DEFAULT_ADMIN_USER_ID).await.unwrap();
 
         // 客户端 A 更新成功，version 变为 2
         let draft_a = json!({ "meta": { "title": "A的修改" } });
@@ -2140,7 +2404,7 @@ mod tests {
     async fn test_atomic_publishing() {
         let store = SqliteStore::open_in_memory().await.unwrap();
         let initial = json!({ "meta": { "title": "发布测试" } });
-        let row = store.create_storybook_draft(None, &initial).await.unwrap();
+        let row = store.create_storybook_draft(None, &initial, crate::accounts::DEFAULT_ADMIN_USER_ID).await.unwrap();
         assert_eq!(row.revision, 0);
         assert_eq!(row.draft_version, 1);
         assert!(!row.published);
@@ -2172,7 +2436,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_storybook() {
         let store = SqliteStore::open_in_memory().await.unwrap();
-        let row = store.create_storybook_draft(Some("待删除"), &json!({})).await.unwrap();
+        let row = store.create_storybook_draft(Some("待删除"), &json!({}), crate::accounts::DEFAULT_ADMIN_USER_ID).await.unwrap();
         assert!(store.get_storybook(&row.id).await.unwrap().is_some());
 
         assert!(store.delete_storybook(&row.id).await.unwrap());
@@ -2183,7 +2447,7 @@ mod tests {
     #[tokio::test]
     async fn test_saves_and_commands_lifecycle() {
         let store = SqliteStore::open_in_memory().await.unwrap();
-        let saves = store.list_saves().await.unwrap();
+        let saves = store.list_saves_for(crate::accounts::DEFAULT_ADMIN_USER_ID).await.unwrap();
         assert_eq!(saves.len(), 0);
 
         let detail = SaveDetail {
@@ -2205,7 +2469,7 @@ mod tests {
             legacy: Vec::new(),
         };
 
-        store.insert_save(&detail, true).await.unwrap();
+        store.insert_save(&detail, true, crate::accounts::DEFAULT_ADMIN_USER_ID).await.unwrap();
         let fetched = store.get_save("save-1").await.unwrap().unwrap();
         assert_eq!(fetched.item.title, "测试存档");
         assert_eq!(fetched.item.is_sandbox, Some(false));
@@ -2288,7 +2552,7 @@ mod tests {
             storybook: json!({ "meta": { "title": "测试" } }),
             legacy: Vec::new(),
         };
-        store.insert_save(&detail, false).await.unwrap();
+        store.insert_save(&detail, false, crate::accounts::DEFAULT_ADMIN_USER_ID).await.unwrap();
         assert_eq!(store.get_save_model("sv-model").await.unwrap(), (None, None, None));
 
         store
@@ -2329,7 +2593,7 @@ mod tests {
             storybook: json!({ "meta": { "title": "测试故事书" } }),
             legacy: Vec::new(),
         };
-        store1.insert_save(&detail, false).await.unwrap();
+        store1.insert_save(&detail, false, crate::accounts::DEFAULT_ADMIN_USER_ID).await.unwrap();
         store1
             .append_command("sv-test-pkg", 1, 1, "round_start", "{\"input\":\"hello\"}")
             .await
@@ -2350,7 +2614,7 @@ mod tests {
 
         // 导入到全新实例 store2
         let store2 = SqliteStore::open_in_memory().await.unwrap();
-        let imported_item = store2.import_save_package(&pkg).await.unwrap();
+        let imported_item = store2.import_save_package(&pkg, crate::accounts::DEFAULT_ADMIN_USER_ID).await.unwrap();
         assert_eq!(imported_item.id, "sv-test-pkg");
         assert_eq!(imported_item.imported, Some(true));
 
@@ -2360,7 +2624,7 @@ mod tests {
         assert_eq!(m2.len(), 2); // 原维护记录 + 导入操作记录
 
         // 再次导入到 store2 -> 触发碰撞改名
-        let imported_again = store2.import_save_package(&pkg).await.unwrap();
+        let imported_again = store2.import_save_package(&pkg, crate::accounts::DEFAULT_ADMIN_USER_ID).await.unwrap();
         assert_ne!(imported_again.id, "sv-test-pkg");
         assert!(imported_again.title.contains("(导入)"));
     }
@@ -2528,7 +2792,7 @@ mod tests {
     async fn test_needs_upgrade_computed_from_released_revision() {
         let store = SqliteStore::open_in_memory().await.unwrap();
         let row = store
-            .create_storybook_draft(Some("书"), &json!({ "meta": { "title": "书" } }))
+            .create_storybook_draft(Some("书"), &json!({ "meta": { "title": "书" } }), crate::accounts::DEFAULT_ADMIN_USER_ID)
             .await
             .unwrap();
         let sb1 = store.publish_storybook(&row.id, 1).await.unwrap();
@@ -2538,6 +2802,7 @@ mod tests {
             .insert_save(
                 &save_detail("sv-nu", &row.id, 1, json!({ "meta": { "title": "书" } })),
                 false,
+                crate::accounts::DEFAULT_ADMIN_USER_ID,
             )
             .await
             .unwrap();
@@ -2555,7 +2820,7 @@ mod tests {
         let got = store.get_save("sv-nu").await.unwrap().unwrap();
         assert!(got.item.needs_upgrade, "故事书新版次发布后应提示升级");
         assert_eq!(got.item.latest_revision, 2);
-        let listed = store.list_saves().await.unwrap();
+        let listed = store.list_saves_for(crate::accounts::DEFAULT_ADMIN_USER_ID).await.unwrap();
         assert!(listed.iter().find(|s| s.id == "sv-nu").unwrap().needs_upgrade);
     }
 
@@ -2566,7 +2831,7 @@ mod tests {
         let old_sb = json!({ "meta": { "title": "书" }, "characters": [{ "id": "c1", "name": "甲" }] });
         let new_sb = json!({ "meta": { "title": "书" }, "characters": [] });
         store
-            .insert_save(&save_detail("sv-up", "sb-up", 1, old_sb), false)
+            .insert_save(&save_detail("sv-up", "sb-up", 1, old_sb), false, crate::accounts::DEFAULT_ADMIN_USER_ID)
             .await
             .unwrap();
 

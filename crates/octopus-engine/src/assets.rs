@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
-use octopus_types::SavePackage;
+use octopus_types::{SavePackage, StorybookPackage};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -22,6 +22,8 @@ use crate::error::EngineError;
 pub const MAX_ASSET_BYTES: usize = 8 * 1024 * 1024;
 /// 存档包内的清单条目名
 pub const BUNDLE_MANIFEST: &str = "save.json";
+/// 故事书包内的清单条目名
+pub const BOOK_BUNDLE_MANIFEST: &str = "storybook.json";
 /// 存档包内的资产目录前缀
 pub const BUNDLE_ASSET_DIR: &str = "assets/";
 
@@ -207,26 +209,30 @@ fn bundle_refs(pkg: &SavePackage) -> BTreeSet<String> {
     refs
 }
 
-/// 打包为 zip：`save.json` + `assets/<name>`。
+/// 打包为 zip：`<manifest_name>` + `assets/<name>`。
 /// 资产本身已是压缩格式，用 Stored 直存（更快，且不再膨胀）。
-pub fn pack_bundle(pkg: &SavePackage, assets: &AssetStore) -> Result<Vec<u8>, EngineError> {
-    let refs = bundle_refs(pkg);
+/// 存档包与故事书包共用这一份实现，只有清单条目名不同。
+fn write_bundle(
+    manifest_name: &str,
+    manifest: &[u8],
+    refs: &BTreeSet<String>,
+    assets: &AssetStore,
+) -> Result<Vec<u8>, EngineError> {
     let mut buf = Vec::new();
     {
         let mut zip = zip::ZipWriter::new(Cursor::new(&mut buf));
         let opts = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Stored);
 
-        zip.start_file(BUNDLE_MANIFEST, opts)
+        zip.start_file(manifest_name, opts)
             .map_err(|e| EngineError::Internal(format!("打包清单失败: {e}")))?;
-        let manifest = serde_json::to_vec_pretty(pkg)?;
-        zip.write_all(&manifest)
+        zip.write_all(manifest)
             .map_err(|e| EngineError::Internal(format!("写入清单失败: {e}")))?;
 
-        for name in &refs {
+        for name in refs {
             let Some(bytes) = assets.read_blocking(name) else {
-                // 缺图不致命：故事书 JSON 里的引用会指向 404，界面回落到占位
-                tracing::warn!(asset = %name, "存档包引用的资产不在库中，已跳过");
+                // 缺图不致命：JSON 里的引用会指向 404，界面回落到占位
+                tracing::warn!(asset = %name, "包内引用的资产不在库中，已跳过");
                 continue;
             };
             zip.start_file(format!("{BUNDLE_ASSET_DIR}{name}"), opts)
@@ -235,23 +241,19 @@ pub fn pack_bundle(pkg: &SavePackage, assets: &AssetStore) -> Result<Vec<u8>, En
                 .map_err(|e| EngineError::Internal(format!("写入资产失败: {e}")))?;
         }
         zip.finish()
-            .map_err(|e| EngineError::Internal(format!("收尾存档包失败: {e}")))?;
+            .map_err(|e| EngineError::Internal(format!("收尾 zip 包失败: {e}")))?;
     }
     Ok(buf)
 }
 
-/// 解开存档包。兼容两种输入：
-/// - **zip**（当前格式，含 `save.json` + `assets/`）
-/// - **旧版单 JSON**（历史导出的 `.octopus.json`，不含资产）
-pub fn unpack_bundle(bytes: &[u8]) -> Result<(SavePackage, Vec<(String, Vec<u8>)>), EngineError> {
-    if bytes.first() == Some(&b'{') {
-        let pkg: SavePackage = serde_json::from_slice(bytes)
-            .map_err(|e| EngineError::InvalidAsset(format!("存档 JSON 解析失败: {e}")))?;
-        return Ok((pkg, Vec::new()));
-    }
-
+/// 解开 zip 包：返回（清单文本，资产）。`what` = 包的称呼，只用于报错措辞。
+fn read_bundle(
+    bytes: &[u8],
+    manifest_name: &str,
+    what: &str,
+) -> Result<(String, Vec<(String, Vec<u8>)>), EngineError> {
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
-        .map_err(|e| EngineError::InvalidAsset(format!("存档包不是有效的 zip: {e}")))?;
+        .map_err(|e| EngineError::InvalidAsset(format!("{what}不是有效的 zip: {e}")))?;
 
     let mut manifest: Option<String> = None;
     let mut assets: Vec<(String, Vec<u8>)> = Vec::new();
@@ -259,13 +261,13 @@ pub fn unpack_bundle(bytes: &[u8]) -> Result<(SavePackage, Vec<(String, Vec<u8>)
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
-            .map_err(|e| EngineError::InvalidAsset(format!("读取存档包条目失败: {e}")))?;
+            .map_err(|e| EngineError::InvalidAsset(format!("读取{what}条目失败: {e}")))?;
         let entry_name = entry.name().to_string();
-        if entry_name == BUNDLE_MANIFEST {
+        if entry_name == manifest_name {
             let mut s = String::new();
             entry
                 .read_to_string(&mut s)
-                .map_err(|e| EngineError::InvalidAsset(format!("读取存档清单失败: {e}")))?;
+                .map_err(|e| EngineError::InvalidAsset(format!("读取{what}清单失败: {e}")))?;
             manifest = Some(s);
         } else if let Some(asset) = entry_name.strip_prefix(BUNDLE_ASSET_DIR) {
             if !is_valid_asset_name(asset) {
@@ -280,10 +282,57 @@ pub fn unpack_bundle(bytes: &[u8]) -> Result<(SavePackage, Vec<(String, Vec<u8>)
     }
 
     let manifest = manifest.ok_or_else(|| {
-        EngineError::InvalidAsset(format!("存档包缺少 {BUNDLE_MANIFEST}（可能不是 octopus 存档包）"))
+        EngineError::InvalidAsset(format!("{what}缺少 {manifest_name}（可能不是 octopus 包）"))
     })?;
+    Ok((manifest, assets))
+}
+
+/// 打包存档为 zip：`save.json` + `assets/<name>`。
+pub fn pack_bundle(pkg: &SavePackage, assets: &AssetStore) -> Result<Vec<u8>, EngineError> {
+    let manifest = serde_json::to_vec_pretty(pkg)?;
+    write_bundle(BUNDLE_MANIFEST, &manifest, &bundle_refs(pkg), assets)
+}
+
+/// 解开存档包。兼容两种输入：
+/// - **zip**（当前格式，含 `save.json` + `assets/`）
+/// - **旧版单 JSON**（历史导出的 `.octopus.json`，不含资产）
+pub fn unpack_bundle(bytes: &[u8]) -> Result<(SavePackage, Vec<(String, Vec<u8>)>), EngineError> {
+    if bytes.first() == Some(&b'{') {
+        let pkg: SavePackage = serde_json::from_slice(bytes)
+            .map_err(|e| EngineError::InvalidAsset(format!("存档 JSON 解析失败: {e}")))?;
+        return Ok((pkg, Vec::new()));
+    }
+
+    let (manifest, assets) = read_bundle(bytes, BUNDLE_MANIFEST, "存档包")?;
     let pkg: SavePackage = serde_json::from_str(&manifest)
         .map_err(|e| EngineError::InvalidAsset(format!("存档清单解析失败: {e}")))?;
+    Ok((pkg, assets))
+}
+
+/// 收集一本故事书包引用的全部资产：草稿 + 已发布快照（封面 / 立绘 / 插图 / 图标都在这两棵树里）。
+fn book_refs(pkg: &StorybookPackage) -> BTreeSet<String> {
+    let mut refs = BTreeSet::new();
+    collect_asset_refs(&pkg.storybook.draft, &mut refs);
+    if let Some(released) = &pkg.storybook.released {
+        collect_asset_refs(released, &mut refs);
+    }
+    refs
+}
+
+/// 打包故事书为 zip：`storybook.json` + `assets/<name>`。
+/// 「都导出」：草稿、已发布版次快照、以及两者引用的全部图片。
+pub fn pack_book_bundle(pkg: &StorybookPackage, assets: &AssetStore) -> Result<Vec<u8>, EngineError> {
+    let manifest = serde_json::to_vec_pretty(pkg)?;
+    write_bundle(BOOK_BUNDLE_MANIFEST, &manifest, &book_refs(pkg), assets)
+}
+
+/// 解开故事书包（zip：`storybook.json` + `assets/`）。
+pub fn unpack_book_bundle(
+    bytes: &[u8],
+) -> Result<(StorybookPackage, Vec<(String, Vec<u8>)>), EngineError> {
+    let (manifest, assets) = read_bundle(bytes, BOOK_BUNDLE_MANIFEST, "故事书包")?;
+    let pkg: StorybookPackage = serde_json::from_str(&manifest)
+        .map_err(|e| EngineError::InvalidAsset(format!("故事书清单解析失败: {e}")))?;
     Ok((pkg, assets))
 }
 #[cfg(test)]
@@ -395,6 +444,81 @@ mod tests {
         let store2 = AssetStore::open(tmp_root()).await.unwrap();
         store2.ingest(&assets).await.unwrap();
         assert_eq!(store2.read(&asset.name).await.unwrap(), png(b"cover"));
+    }
+
+    /// 一本最小故事书包：草稿与已发布快照同源（都指向同一张封面）。
+    fn sample_book_pkg(storybook: Value) -> StorybookPackage {
+        serde_json::from_value(json!({
+            "format": "octopus-storybook-package",
+            "version": 1,
+            "exported_at": "2026-01-01T00:00:00Z",
+            "storybook": {
+                "id": "sb-test",
+                "title": "测试书",
+                "revision": 2,
+                "updated_at": "2026-01-01T00:00:00Z",
+                "released_at": "2026-01-01T00:00:00Z",
+                "published": true,
+                "draft": storybook.clone(),
+                "released": storybook
+            }
+        }))
+        .expect("构造测试故事书包")
+    }
+
+    fn zip_entry_names(bytes: &[u8]) -> Vec<String> {
+        let mut ar = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        (0..ar.len())
+            .map(|i| ar.by_index(i).unwrap().name().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn book_bundle_round_trip_carries_assets() {
+        let store = AssetStore::open(tmp_root()).await.unwrap();
+        let cover = store.put(&png(b"cover")).await.unwrap();
+        let portrait = store.put(&png(b"portrait")).await.unwrap();
+
+        // 封面进草稿、立绘进已发布快照：两边引用的图都必须进包
+        let pkg = sample_book_pkg(json!({
+            "meta": { "id": "sb-test", "cover": { "asset": cover.name, "w": 8, "h": 8 } },
+            "characters": [ { "portrait": { "asset": portrait.name, "w": 4, "h": 4 } } ]
+        }));
+        let zip_bytes = pack_book_bundle(&pkg, &store).unwrap();
+
+        let names = zip_entry_names(&zip_bytes);
+        assert!(names.iter().any(|n| n == BOOK_BUNDLE_MANIFEST));
+        assert!(names
+            .iter()
+            .any(|n| n == &format!("{BUNDLE_ASSET_DIR}{}", cover.name)));
+        assert!(names
+            .iter()
+            .any(|n| n == &format!("{BUNDLE_ASSET_DIR}{}", portrait.name)));
+
+        let (back, assets) = unpack_book_bundle(&zip_bytes).unwrap();
+        assert_eq!(back.storybook.id, "sb-test");
+        assert_eq!(back.storybook.revision, 2);
+        assert!(back.storybook.published);
+        assert_eq!(assets.len(), 2);
+
+        // 解到另一个空库：ingest 后立绘与封面都能直接读回
+        let store2 = AssetStore::open(tmp_root()).await.unwrap();
+        store2.ingest(&assets).await.unwrap();
+        assert_eq!(store2.read(&portrait.name).await.unwrap(), png(b"portrait"));
+    }
+
+    #[tokio::test]
+    async fn book_and_save_bundles_do_not_masquerade() {
+        let store = AssetStore::open(tmp_root()).await.unwrap();
+        // 存档包（save.json）拿给故事书解包器 → 明确报错，不会解析出半个对象
+        let save_zip = pack_bundle(&sample_pkg(json!({})), &store).unwrap();
+        let err = unpack_book_bundle(&save_zip).unwrap_err().to_string();
+        assert!(err.contains(BOOK_BUNDLE_MANIFEST), "报错要指出缺的是故事书清单: {err}");
+
+        // 反向同理
+        let book_zip = pack_book_bundle(&sample_book_pkg(json!({})), &store).unwrap();
+        let err = unpack_bundle(&book_zip).unwrap_err().to_string();
+        assert!(err.contains(BUNDLE_MANIFEST), "报错要指出缺的是存档清单: {err}");
     }
 
     #[test]

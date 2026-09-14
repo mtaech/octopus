@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use mlua::chunk::ChunkMode;
 use mlua::{HookTriggers, Lua, LuaOptions, StdLib, Table, Value as LuaValue, VmState};
 use octopus_types::relationship_endpoint;
+use octopus_types::{CheckKind, CondExpr, ImmediateEffect, LuaMountDef, SuccessLevel};
 use serde_json::{json, Value};
 
 use crate::error::EngineError;
@@ -40,7 +41,8 @@ impl Default for SandboxLimits {
     }
 }
 
-/// Lua 挂载点（#04 的 7 个时机 + 协议插件；Validate 阶段无 Lua）。
+/// Lua 挂载点（#04 的判定 / 事件时机 + 「规则集走 Lua」的时机原语，另加协议插件；
+/// Validate 阶段无 Lua）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LuaMount {
     /// 判定修正（随机前）。
@@ -57,24 +59,64 @@ pub enum LuaMount {
     Event,
     /// 条件评估（goal / trigger）。
     Condition,
+    /// 状态结算时机（每个「角色 × 状态」一次）：引擎只派发时机与状态实例快照。
+    StatusTick,
+    /// 回合边界时机（该边界的状态结算完成后一次）。
+    TurnEnd,
+    /// 场景边界时机（该边界的状态结算完成后一次）。
+    SceneEnd,
     /// 协议插件（preamble / parse / normalize）：只读，不产生任何 LuaRequest。
     Protocol,
 }
 
 impl LuaMount {
-    /// 解析挂载点字符串（未知值回落到 PreResolve）。
-    pub fn from_str(s: &str) -> Self {
-        match s {
-            "check_pre_roll" => LuaMount::CheckPreRoll,
-            "check_post_roll" => LuaMount::CheckPostRoll,
-            "check" => LuaMount::Check,
-            "pre_resolve" => LuaMount::PreResolve,
-            "post_resolve" => LuaMount::PostResolve,
-            "event" => LuaMount::Event,
-            "condition" => LuaMount::Condition,
-            "protocol" => LuaMount::Protocol,
-            _ => LuaMount::PreResolve,
+    /// 故事书 `lua_mounts` 允许声明的挂载点。
+    ///
+    /// `protocol` 不在列：协议插件走独立的 `narrative.protocol` 声明，不进规则集挂载点表。
+    pub const DECLARABLE: [&'static str; 10] = [
+        "check_pre_roll",
+        "check_post_roll",
+        "check",
+        "pre_resolve",
+        "post_resolve",
+        "event",
+        "condition",
+        "status_tick",
+        "turn_end",
+        "scene_end",
+    ];
+
+    /// 严格解析挂载点字符串；未知值返回 None。
+    ///
+    /// 发布门用它拦截拼写错误——静默回落 PreResolve 会让「写错挂载点的规则」在
+    /// 一个不相干的时机悄悄生效，比报错难查得多。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "check_pre_roll" => Some(LuaMount::CheckPreRoll),
+            "check_post_roll" => Some(LuaMount::CheckPostRoll),
+            "check" => Some(LuaMount::Check),
+            "pre_resolve" => Some(LuaMount::PreResolve),
+            "post_resolve" => Some(LuaMount::PostResolve),
+            "event" => Some(LuaMount::Event),
+            "condition" => Some(LuaMount::Condition),
+            "status_tick" => Some(LuaMount::StatusTick),
+            "turn_end" => Some(LuaMount::TurnEnd),
+            "scene_end" => Some(LuaMount::SceneEnd),
+            "protocol" => Some(LuaMount::Protocol),
+            _ => None,
         }
+    }
+
+    /// 该挂载点是否可由故事书 `lua_mounts` 声明。
+    ///
+    /// `protocol` 是只读协议插件挂载点，走独立的 `narrative.protocol` 声明，不进规则集挂载点表。
+    pub fn is_declarable(self) -> bool {
+        LuaMount::DECLARABLE.contains(&self.as_str())
+    }
+
+    /// 解析挂载点字符串（未知值回落到 PreResolve；编辑器试跑等宽松入口用）。
+    pub fn from_str(s: &str) -> Self {
+        Self::parse(s).unwrap_or(LuaMount::PreResolve)
     }
 
     pub fn as_str(self) -> &'static str {
@@ -86,9 +128,120 @@ impl LuaMount {
             LuaMount::PostResolve => "post_resolve",
             LuaMount::Event => "event",
             LuaMount::Condition => "condition",
+            LuaMount::StatusTick => "status_tick",
+            LuaMount::TurnEnd => "turn_end",
+            LuaMount::SceneEnd => "scene_end",
             LuaMount::Protocol => "protocol",
         }
     }
+}
+
+/// 一次状态结算中被派发的状态实例快照（`status_tick` 挂载点的只读上下文）。
+///
+/// 引擎只提供**时机与事实**：谁、哪一个状态、还剩多久、本次按哪个单位结算。
+/// 要不要在此结束这个状态、按什么概率结束——全是规则包 Lua 的事，引擎不解释。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LuaStatusContext {
+    /// 状态实例 id（对应 `StatusInstance.id`）。
+    pub id: String,
+    /// 状态显示名。
+    pub name: String,
+    /// 剩余回合数（按回合结算的状态才有值）。
+    pub turns_left: Option<i32>,
+    /// 剩余场景数（按场景结算的状态才有值）。
+    pub scenes_left: Option<i32>,
+    /// 本次 tick 的单位：turns（回合边界）/ scenes（场景边界）。
+    pub unit: &'static str,
+    /// 本次结算后即将写入的剩余量（0 表示本次结算后到期移除）。
+    pub remaining: i32,
+}
+
+/// 判定修正动作（通用原语）：引擎只认识「掷两次取高/低」「给判定加 N」「改难度」
+/// 「覆盖判定结果」这四个动作。
+///
+/// 「优势 / 劣势 / 自然 1 / 自然 20」都是规则集词汇，属于 Lua 作者；脚本里写
+/// `if host.has_status('x') then host.modify_check('keep_high') end`，或按判定细节决定
+/// `host.modify_check('force_fail')`——引擎不认识那个状态 / 骰面代表什么，
+/// 只认识「掷两次取高」「强制失败」这些通用动作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckModifier {
+    /// 掷两次取高。
+    KeepHigh,
+    /// 掷两次取低。
+    KeepLow,
+    /// 给判定加 N（固定加值，可负）。
+    Add,
+    /// 改难度（正数更难；判定前生效）。
+    Difficulty,
+    /// 覆盖判定结果为**成功**（成功度至少中档；骰面 / 总值不动）。
+    ForceSuccess,
+    /// 覆盖判定结果为**失败**（成功度落到最低档；骰面 / 总值不动）。
+    ForceFail,
+}
+
+impl CheckModifier {
+    /// 解析脚本给的修正名；未知值返回 None（下发即报错，不静默忽略）。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "keep_high" | "high" => Some(CheckModifier::KeepHigh),
+            "keep_low" | "low" => Some(CheckModifier::KeepLow),
+            "add" | "bonus" => Some(CheckModifier::Add),
+            "dc" | "difficulty" => Some(CheckModifier::Difficulty),
+            "force_success" | "force_pass" | "succeed" => Some(CheckModifier::ForceSuccess),
+            "force_fail" | "force_failure" | "fail" => Some(CheckModifier::ForceFail),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CheckModifier::KeepHigh => "keep_high",
+            CheckModifier::KeepLow => "keep_low",
+            CheckModifier::Add => "add",
+            CheckModifier::Difficulty => "dc",
+            CheckModifier::ForceSuccess => "force_success",
+            CheckModifier::ForceFail => "force_fail",
+        }
+    }
+}
+
+/// 判定的只读快照（判定挂载点可读：改总值、按结果发效果都由脚本自行决定）。
+///
+/// 同一个结构承载两个阶段：
+/// - **掷骰前**（`resolved = false`）：判定**签名**——属性 / 种类 / 难度在掷骰前已经确定，
+///   钩子用它决定「对哪一类判定做什么」（取高 / 取低只有掷骰前有意义）。
+/// - **掷骰后**（`resolved = true`）：在签名之上再给结果事实——总值 / 差值 / 结果 / 档位 /
+///   骰面 / 骰式 `expr`。
+///
+/// 结果字段（total / margin / result / level / rolls）只在 `resolved = true` 时下发；
+/// 掷骰前读它们仍是 nil，钩子不会把「还没掷的 0」误当成判定结果。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LuaCheckContext {
+    pub attribute: String,
+    pub kind: Option<CheckKind>,
+    /// 判定是否已出结果：false = 掷骰前签名，true = 掷骰后快照（结果字段可用）。
+    pub resolved: bool,
+    /// 骰式字符串（声明式判定才有；Lua 判定 / 被动判定为 None）。
+    pub expr: Option<String>,
+    pub total: i64,
+    pub target: i64,
+    pub margin: i64,
+    pub result: bool,
+    pub level: Option<SuccessLevel>,
+    pub rolls: Vec<i64>,
+}
+
+/// 挂载点执行附加值：`when` 条件闸门 + 判定结果快照。
+///
+/// 刻意**不**并进 `LuaHostContext`：后者是跨 crate 的字面量构造契约（API 层逐字段构造），
+/// 加字段会破坏外部调用方；这些是「本次执行的额外输入」，用独立参数传递更稳。
+#[derive(Default)]
+pub struct MountEnv<'a> {
+    /// `when` 条件求值器（由调用方按世界快照构造）；None = 声明了 `when` 的脚本一律跳过。
+    pub gate: Option<&'a dyn Fn(&CondExpr) -> bool>,
+    /// 已掷骰判定的快照（判定后挂载点可读）。
+    pub check: Option<&'a LuaCheckContext>,
 }
 
 /// Lua 向引擎发起的写请求（请求-校验-执行：引擎负责校验与落状态）。
@@ -104,6 +257,12 @@ pub enum LuaRequest {
     TriggerEvent { event: String, payload: Value },
     /// 查询世界（返回过滤后的实体；由引擎解释）。
     QueryWorld { query: String },
+    /// 判定修正：掷两次取高/低 · 加值 · 难度 · 覆盖结果（只在判定挂载点被消费）。
+    ModifyCheck { mode: CheckModifier, amount: i64 },
+    /// 施加即时效果：复用既有 `ImmediateEffect` 封闭原语，不新增任何效果语义。
+    ApplyEffect { target: String, effect: Value },
+    /// 加减任意目标的资源（可正可负；target 为空 = 当前 actor）。
+    ModifyResource { target: String, resource: String, amount: i64 },
 }
 
 /// 归一化判定输出（#12）：脚本只能给最终值 total 与差值 margin，档位由引擎分。
@@ -217,7 +376,7 @@ impl LuaHost {
 
     /// 条件评估：脚本返回真值即成立（#12 / #13 的 lua 兜底）。
     pub fn run_condition(&self, script: &str, ctx: &LuaHostContext) -> Result<bool, EngineError> {
-        Ok(match self.eval_value(script, ctx, LuaMount::Condition)? {
+        Ok(match self.eval_value(script, ctx, LuaMount::Condition, &MountEnv::default(), None)? {
             LuaValue::Nil => false,
             LuaValue::Boolean(b) => b,
             _ => true,
@@ -226,7 +385,7 @@ impl LuaHost {
 
     /// 自定义判定脚本：只接受归一化的 { total, margin }（#12 契约）。
     pub fn run_check(&self, script: &str, ctx: &LuaHostContext) -> Result<LuaCheckOutcome, EngineError> {
-        let value = self.eval_value(script, ctx, LuaMount::Check)?;
+        let value = self.eval_value(script, ctx, LuaMount::Check, &MountEnv::default(), None)?;
         let LuaValue::Table(t) = value else {
             return Err(EngineError::Lua("check script must return a table { total, margin }".into()));
         };
@@ -238,7 +397,33 @@ impl LuaHost {
 
     /// 结算 / 事件钩子：只产生副作用（写请求），返回值忽略。
     pub fn run_hook(&self, script: &str, mount: LuaMount, ctx: &LuaHostContext) -> Result<(), EngineError> {
-        self.eval_value(script, ctx, mount).map(|_| ())
+        self.run_hook_with(script, mount, ctx, &MountEnv::default())
+    }
+
+    /// 同上，但带挂载点附加值（`when` 闸门 + 判定结果快照）。
+    pub fn run_hook_with(
+        &self,
+        script: &str,
+        mount: LuaMount,
+        ctx: &LuaHostContext,
+        env: &MountEnv<'_>,
+    ) -> Result<(), EngineError> {
+        self.eval_value(script, ctx, mount, env, None).map(|_| ())
+    }
+
+    /// 状态结算挂载点（`status_tick`）：额外把「正在结算的状态实例」暴露给脚本
+    ///（`host.status` / `host.status_id` / `host.status_turns_left` …）。
+    ///
+    /// 引擎只给事实快照；脚本据此掷骰、加减资源、移除状态——全由规则包决定。
+    pub fn run_hook_status(
+        &self,
+        script: &str,
+        mount: LuaMount,
+        ctx: &LuaHostContext,
+        env: &MountEnv<'_>,
+        status: &LuaStatusContext,
+    ) -> Result<(), EngineError> {
+        self.eval_value(script, ctx, mount, env, Some(status)).map(|_| ())
     }
 
     // ---------- 协议插件（LuaMount::Protocol） ----------
@@ -302,7 +487,7 @@ impl LuaHost {
         args: A,
         ctx: &LuaHostContext,
     ) -> Result<Option<LuaValue>, EngineError> {
-        let env = self.make_env(ctx, LuaMount::Protocol)?;
+        let env = self.make_env(ctx, LuaMount::Protocol, &MountEnv::default(), None)?;
         // 预置 protocol 命名空间：插件里 `protocol = protocol or {}` 或直接
         // `function protocol.parse(...)` 都能落到同一张表。
         let protocol = self.lua.create_table().map_err(lua_err)?;
@@ -347,8 +532,15 @@ impl LuaHost {
 
     // ---------- 内部 ----------
 
-    fn eval_value(&self, script: &str, ctx: &LuaHostContext, mount: LuaMount) -> Result<LuaValue, EngineError> {
-        let env = self.make_env(ctx, mount)?;
+    fn eval_value(
+        &self,
+        script: &str,
+        ctx: &LuaHostContext,
+        mount: LuaMount,
+        mount_env: &MountEnv<'_>,
+        status: Option<&LuaStatusContext>,
+    ) -> Result<LuaValue, EngineError> {
+        let env = self.make_env(ctx, mount, mount_env, status)?;
         self.instr.store(0, Ordering::Relaxed);
         self.lua
             .load(script)
@@ -371,7 +563,13 @@ impl LuaHost {
     }
 
     /// 构造本次执行的 scoped env：host 表 + 指向 globals 的只读白名单 __index。
-    fn make_env(&self, ctx: &LuaHostContext, mount: LuaMount) -> Result<Table, EngineError> {
+    fn make_env(
+        &self,
+        ctx: &LuaHostContext,
+        mount: LuaMount,
+        mount_env: &MountEnv<'_>,
+        status: Option<&LuaStatusContext>,
+    ) -> Result<Table, EngineError> {
         let lua = &self.lua;
         let env = lua.create_table().map_err(lua_err)?;
         // 写全局变量只落在 env；读全局走 __index → globals（此时 globals 已是最小白名单）。
@@ -382,6 +580,8 @@ impl LuaHost {
         let host = lua.create_table().map_err(lua_err)?;
         host.set("script_id", ctx.script_id.clone()).map_err(lua_err)?;
         host.set("mount", mount.as_str()).map_err(lua_err)?;
+        // 事件名 = 挂载点名（一个挂载点就是一个时机）：脚本可用 host.event 写通用分支。
+        host.set("event", mount.as_str()).map_err(lua_err)?;
         host.set("scene_id", ctx.scene_id.clone()).map_err(lua_err)?;
         host.set("round", ctx.round).map_err(lua_err)?;
         host.set("difficulty", ctx.difficulty).map_err(lua_err)?;
@@ -462,6 +662,26 @@ impl LuaHost {
         )
         .map_err(lua_err)?;
 
+        // 状态结算快照（status_tick 挂载点可读）：谁、哪个状态、还剩多久、按哪个单位结算。
+        // 引擎只给事实；「是否在此结束这个状态」由规则包 Lua 自己掷骰决定。
+        if let Some(status) = status {
+            let t = lua.create_table().map_err(lua_err)?;
+            t.set("id", status.id.clone()).map_err(lua_err)?;
+            t.set("name", status.name.clone()).map_err(lua_err)?;
+            t.set("turns_left", status.turns_left).map_err(lua_err)?;
+            t.set("scenes_left", status.scenes_left).map_err(lua_err)?;
+            t.set("unit", status.unit).map_err(lua_err)?;
+            t.set("remaining", status.remaining).map_err(lua_err)?;
+            // 平铺别名：脚本可直接读 host.status_id / host.status_turns_left 等。
+            host.set("status_id", status.id.clone()).map_err(lua_err)?;
+            host.set("status_name", status.name.clone()).map_err(lua_err)?;
+            host.set("status_turns_left", status.turns_left).map_err(lua_err)?;
+            host.set("status_scenes_left", status.scenes_left).map_err(lua_err)?;
+            host.set("status_unit", status.unit).map_err(lua_err)?;
+            host.set("status_remaining", status.remaining).map_err(lua_err)?;
+            host.set("status", t).map_err(lua_err)?;
+        }
+
         if let Some(target) = &ctx.target {
             let target = target.clone();
             let target_ref = lua.create_table().map_err(lua_err)?;
@@ -484,6 +704,57 @@ impl LuaHost {
 
         if let Some(skill) = &ctx.skill {
             host.set("definition", json_to_lua(lua, skill)?).map_err(lua_err)?;
+        }
+
+        // 判定快照（判定挂载点可读）：掷骰前下发**判定签名**（属性 / 种类 / 难度 / 骰式），
+        // 判定出结果后才追加结果事实。引擎只给事实；「对哪一类判定做什么」由规则包 Lua 决定
+        //（例如「豁免成功只结算一半」——「一半」是 Lua 的算术，引擎只提供 apply_effect）。
+        if let Some(check) = mount_env.check {
+            let t = lua.create_table().map_err(lua_err)?;
+            t.set("attribute", check.attribute.clone()).map_err(lua_err)?;
+            t.set("target", check.target).map_err(lua_err)?;
+            t.set("resolved", check.resolved).map_err(lua_err)?;
+            if let Some(expr) = &check.expr {
+                t.set("expr", expr.clone()).map_err(lua_err)?;
+            }
+            if let Some(kind) = check.kind {
+                let v = serde_json::to_value(kind).unwrap_or(Value::Null);
+                t.set("kind", json_to_lua(lua, &v)?).map_err(lua_err)?;
+            }
+            // 平铺别名（签名部分）：脚本可直接读 host.check_attribute / host.check_kind 等。
+            host.set("check_attribute", check.attribute.clone()).map_err(lua_err)?;
+            host.set("check_target", check.target).map_err(lua_err)?;
+            if let Some(expr) = &check.expr {
+                host.set("check_expr", expr.clone()).map_err(lua_err)?;
+            }
+            if let Some(kind) = check.kind {
+                let v = serde_json::to_value(kind).unwrap_or(Value::Null);
+                host.set("check_kind", json_to_lua(lua, &v)?).map_err(lua_err)?;
+            }
+            // 结果事实：只有判定已出结果才下发（掷骰前读 total / margin / result 仍是 nil）。
+            if check.resolved {
+                t.set("total", check.total).map_err(lua_err)?;
+                t.set("margin", check.margin).map_err(lua_err)?;
+                t.set("result", check.result).map_err(lua_err)?;
+                if let Some(level) = check.level {
+                    let v = serde_json::to_value(level).unwrap_or(Value::Null);
+                    t.set("level", json_to_lua(lua, &v)?).map_err(lua_err)?;
+                }
+                let rolls = lua.create_table().map_err(lua_err)?;
+                for (i, roll) in check.rolls.iter().enumerate() {
+                    rolls.set(i + 1, *roll).map_err(lua_err)?;
+                }
+                t.set("rolls", rolls).map_err(lua_err)?;
+                // 平铺别名（结果部分）：脚本可直接读 host.check_total / host.check_result 等。
+                host.set("check_total", check.total).map_err(lua_err)?;
+                host.set("check_margin", check.margin).map_err(lua_err)?;
+                host.set("check_result", check.result).map_err(lua_err)?;
+                if let Some(level) = check.level {
+                    let v = serde_json::to_value(level).unwrap_or(Value::Null);
+                    host.set("check_level", json_to_lua(lua, &v)?).map_err(lua_err)?;
+                }
+            }
+            host.set("check", t).map_err(lua_err)?;
         }
 
         let relationships = ctx.relationships.clone();
@@ -535,6 +806,25 @@ impl LuaHost {
             }};
         }
 
+        // 可失败的写入 API：参数非法即当场报错（作者立刻看到，而不是静默丢请求）。
+        macro_rules! push_try {
+            ($fname:literal, $body:expr) => {{
+                let outbox = self.outbox.clone();
+                host.set(
+                    $fname,
+                    lua.create_function(move |_, args| {
+                        let req = $body(args).map_err(mlua::Error::RuntimeError)?;
+                        if let Ok(mut q) = outbox.lock() {
+                            q.push(req);
+                        }
+                        Ok(())
+                    })
+                    .map_err(lua_err)?,
+                )
+                .map_err(lua_err)?;
+            }};
+        }
+
         // 协议插件是只读的：不注册任何世界写入 API（LuaRequest 在协议挂载点全部拒绝），
         // 插件只能返回意图，由引擎校验后结算。
         if mount != LuaMount::Protocol {
@@ -562,6 +852,31 @@ impl LuaHost {
             payload: json!({}),
         });
         push!("query_world", |query: String| LuaRequest::QueryWorld { query });
+
+        // ---- 通用原语（不含任何规则集语义：引擎不认识「优势 / 熟练 / 豁免」，只认识这些动作）----
+
+        // 判定修正：掷两次取高/低 · 加值 · 改难度 · 覆盖结果。名字必须命中通用动作表，否则当场报错。
+        push_try!("modify_check", |(mode, amount): (String, Option<i64>)| {
+            let parsed = CheckModifier::parse(&mode).ok_or_else(|| {
+                format!(
+                    "未知的判定修正「{mode}」（可用：keep_high / keep_low / add / dc / force_success / force_fail）"
+                )
+            })?;
+            Ok(LuaRequest::ModifyCheck { mode: parsed, amount: amount.unwrap_or(0) })
+        });
+
+        // 施加即时效果：形状按 ImmediateEffect 校验，结算走同一条 resolve_effect 路径。
+        push_try!("apply_effect", |(target, effect): (String, LuaValue)| {
+            let value = lua_to_json(&effect).map_err(|e| e.to_string())?;
+            serde_json::from_value::<ImmediateEffect>(value.clone())
+                .map_err(|e| format!("即时效果形状非法（kind / amount / resource）：{e}"))?;
+            Ok(LuaRequest::ApplyEffect { target, effect: value })
+        });
+
+        // 加减资源：可正可负、可指定目标（不受「当前 actor 消耗」限制）。
+        push!("modify_resource", |(target, resource, amount): (String, String, i64)| {
+            LuaRequest::ModifyResource { target, resource, amount }
+        });
         }
 
         // 调试输出：不产生副作用（避免脚本污染宿主 stdout）。
@@ -574,11 +889,13 @@ impl LuaHost {
 }
 
 /// 注册到某个挂载点的脚本。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MountedScript {
     pub id: String,
     pub mount: LuaMount,
     pub source: String,
+    /// 可选执行条件（`when`）：不成立即跳过；缺省恒执行。
+    pub when: Option<CondExpr>,
 }
 
 /// 挂载点 → 脚本注册表（#02 ③）：同一挂载点按注册顺序执行，任一脚本报错即中断（fail-fast）。
@@ -593,7 +910,48 @@ impl LuaRegistry {
     }
 
     pub fn register(&mut self, id: impl Into<String>, mount: LuaMount, source: impl Into<String>) {
-        self.scripts.push(MountedScript { id: id.into(), mount, source: source.into() });
+        self.scripts.push(MountedScript { id: id.into(), mount, source: source.into(), when: None });
+    }
+
+    /// 注册一条故事书挂载点声明；id / source / mount 非法即拒绝并返回 false。
+    ///
+    /// `enabled: false` 的条目直接不装载（发布门仍会静态校验它的源码）。
+    pub fn register_def(&mut self, def: &LuaMountDef) -> bool {
+        if def.enabled == Some(false) {
+            return false;
+        }
+        let Some(mount) = LuaMount::parse(&def.mount).filter(|m| m.is_declarable()) else {
+            return false;
+        };
+        let id = def.id.trim();
+        let source = def.source.trim();
+        if id.is_empty() || source.is_empty() {
+            return false;
+        }
+        self.scripts.push(MountedScript {
+            id: id.to_string(),
+            mount,
+            source: def.source.clone(),
+            when: def.when.clone(),
+        });
+        true
+    }
+
+    /// 从故事书 JSON 的 `lua_mounts` 声明装载规则集挂载点脚本。
+    ///
+    /// 发布门（validate + lua_lint）负责拦非法声明；运行期对坏条目静默跳过，
+    /// 保证旧故事书 / 手工 JSON 不会因一条坏声明整本开不了局。
+    /// 故事书随存档冻结，因此规则集脚本也随存档冻结（存档内嵌故事书已含则自然生效）。
+    pub fn from_storybook(storybook: &Value) -> Self {
+        let mut registry = Self::new();
+        if let Some(list) = storybook.get("lua_mounts").and_then(Value::as_array) {
+            for item in list {
+                if let Ok(def) = serde_json::from_value::<LuaMountDef>(item.clone()) {
+                    registry.register_def(&def);
+                }
+            }
+        }
+        registry
     }
 
     pub fn for_mount<'a>(&'a self, mount: LuaMount) -> impl Iterator<Item = &'a MountedScript> {
@@ -615,11 +973,46 @@ impl LuaRegistry {
         mount: LuaMount,
         ctx: &LuaHostContext,
     ) -> Result<usize, EngineError> {
+        self.run_chain_with(host, mount, ctx, &MountEnv::default())
+    }
+
+    /// 同上，但带挂载点附加值（`when` 闸门 + 判定结果快照）。
+    ///
+    /// `when` 不成立即跳过该脚本（不计入执行条数）；求值出错按「不成立」处理——
+    /// 与回合末骨架求值同一口径，坏条件不该中断整轮结算。
+    pub fn run_chain_with(
+        &self,
+        host: &LuaHost,
+        mount: LuaMount,
+        ctx: &LuaHostContext,
+        env: &MountEnv<'_>,
+    ) -> Result<usize, EngineError> {
+        self.run_chain_status(host, mount, ctx, env, None)
+    }
+
+    /// 同上，但额外携带「正在结算的状态实例」（`status_tick` 用）。
+    pub fn run_chain_status(
+        &self,
+        host: &LuaHost,
+        mount: LuaMount,
+        ctx: &LuaHostContext,
+        env: &MountEnv<'_>,
+        status: Option<&LuaStatusContext>,
+    ) -> Result<usize, EngineError> {
         let mut executed = 0;
         for script in self.for_mount(mount) {
+            if let Some(cond) = &script.when {
+                match env.gate {
+                    Some(gate) if gate(cond) => {}
+                    _ => continue,
+                }
+            }
             let mut script_ctx = ctx.clone();
             script_ctx.script_id = script.id.clone();
-            host.run_hook(&script.source, mount, &script_ctx)?;
+            match status {
+                Some(s) => host.run_hook_status(&script.source, mount, &script_ctx, env, s)?,
+                None => host.run_hook_with(&script.source, mount, &script_ctx, env)?,
+            }
             executed += 1;
         }
         Ok(executed)
@@ -948,6 +1341,229 @@ mod tests {
         let src2 = "function protocol.parse(raw) return { intents = {} } end";
         let out2 = host.run_protocol_parse(src2, "[]", &c).unwrap();
         assert_eq!(out2["intents"].as_array().map(Vec::len), Some(0));
+    }
+
+    #[test]
+    fn storybook_mounts_load_into_registry() {
+        let sb = json!({
+            "lua_mounts": [
+                { "id": "a", "mount": "check_pre_roll", "source": "host.modify_check('keep_high')" },
+                { "id": "b", "mount": "check_post_roll", "source": "host.modify_check('add', 6)", "enabled": true },
+                { "id": "off", "mount": "event", "source": "host.trigger_event('x')", "enabled": false },
+                { "id": "tick", "mount": "status_tick", "source": "host.remove_status(host.actor.id, host.status_id)" },
+                { "id": "tend", "mount": "turn_end", "source": "return 1" },
+                { "id": "send", "mount": "scene_end", "source": "return 1" },
+                { "id": "bad-mount", "mount": "check_after_roll", "source": "return 1" },
+                { "id": "protocol-mount", "mount": "protocol", "source": "return 1" },
+                { "id": "", "mount": "event", "source": "return 1" },
+                { "id": "no-source", "mount": "event", "source": "   " }
+            ]
+        });
+        let registry = LuaRegistry::from_storybook(&sb);
+        assert_eq!(registry.len(), 5, "非法 / 禁用条目不装载");
+        assert_eq!(registry.for_mount(LuaMount::CheckPreRoll).count(), 1);
+        assert_eq!(registry.for_mount(LuaMount::CheckPostRoll).count(), 1);
+        assert_eq!(registry.for_mount(LuaMount::StatusTick).count(), 1);
+        assert_eq!(registry.for_mount(LuaMount::TurnEnd).count(), 1);
+        assert_eq!(registry.for_mount(LuaMount::SceneEnd).count(), 1);
+        // 没有 lua_mounts 的故事书 → 空注册表（旧故事书行为逐字不变）。
+        assert!(LuaRegistry::from_storybook(&json!({ "skills": [] })).is_empty());
+        // 挂载点名解析：未知值不再静默回落 PreResolve。
+        assert_eq!(LuaMount::parse("check_pre_roll"), Some(LuaMount::CheckPreRoll));
+        assert_eq!(LuaMount::parse("check_after_roll"), None);
+        assert_eq!(LuaMount::from_str("check_after_roll"), LuaMount::PreResolve);
+    }
+
+    /// 时机原语（L4）：三个新挂载点名可声明、可解析、可回写；未知名仍被拦。
+    #[test]
+    fn timing_mount_names_round_trip_and_unknown_still_rejected() {
+        for (name, mount) in [
+            ("status_tick", LuaMount::StatusTick),
+            ("turn_end", LuaMount::TurnEnd),
+            ("scene_end", LuaMount::SceneEnd),
+        ] {
+            assert_eq!(LuaMount::parse(name), Some(mount));
+            assert_eq!(LuaMount::from_str(name), mount);
+            assert_eq!(mount.as_str(), name);
+            assert!(mount.is_declarable(), "{name} 必须可由故事书声明");
+            assert!(LuaMount::DECLARABLE.contains(&name));
+            // 严格解析对未知名仍返回 None（发布门据它报错）。
+            assert_eq!(LuaMount::parse("status_ticks"), None);
+            assert_eq!(LuaMount::parse("turn_ends"), None);
+            assert_eq!(LuaMount::parse("scene_ends"), None);
+        }
+    }
+
+    /// status_tick 上下文：脚本能读到被结算的角色与状态实例；其他挂载点看不到它。
+    #[test]
+    fn status_tick_context_is_visible_to_scripts() {
+        let host = LuaHost::new(1).unwrap();
+        let c = ctx(json!({
+            "id": "char-a",
+            "name": "米拉",
+            "resources": { "hp": 30 },
+            "statuses": [ { "id": "grasp", "name": "缠绕", "turns_left": 3 } ]
+        }));
+        let status = LuaStatusContext {
+            id: "grasp".into(),
+            name: "缠绕".into(),
+            turns_left: Some(3),
+            scenes_left: None,
+            unit: "turns",
+            remaining: 2,
+        };
+        host.run_hook_status(
+            "assert(host.mount == 'status_tick'); assert(host.event == 'status_tick');              assert(host.actor.id == 'char-a'); assert(host.status.id == 'grasp');              assert(host.status.name == '缠绕'); assert(host.status.turns_left == 3);              assert(host.status.scenes_left == nil); assert(host.status.unit == 'turns');              assert(host.status.remaining == 2); assert(host.status_id == 'grasp');              assert(host.status_turns_left == 3); assert(host.status_scenes_left == nil);              assert(host.actor.statuses[1].id == 'grasp');              host.remove_status(host.actor.id, host.status_id)",
+            LuaMount::StatusTick,
+            &c,
+            &MountEnv::default(),
+            &status,
+        )
+        .unwrap();
+        assert_eq!(
+            host.drain_requests(),
+            vec![LuaRequest::RemoveStatus { target: "char-a".into(), status: "grasp".into() }]
+        );
+        // 其他挂载点没有状态快照（向后兼容：旧脚本读不到新字段，也不会因此报错）。
+        assert!(host
+            .run_condition("return host.status == nil and host.status_id == nil", &c)
+            .unwrap());
+    }
+
+    #[test]
+    fn mount_when_gate_decides_whether_script_runs() {
+        let host = LuaHost::new(1).unwrap();
+        let c = ctx(json!({}));
+        let mut registry = LuaRegistry::new();
+        registry.register("always", LuaMount::Event, "host.trigger_event('always')");
+        registry.register_def(&LuaMountDef {
+            id: "gated".into(),
+            mount: "event".into(),
+            source: "host.trigger_event('gated')".into(),
+            when: Some(CondExpr::FlagSet { flag: "on".into() }),
+            enabled: None,
+        });
+        let events = |host: &LuaHost| -> Vec<String> {
+            host.drain_requests()
+                .into_iter()
+                .filter_map(|r| match r {
+                    LuaRequest::TriggerEvent { event, .. } => Some(event),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // 没有闸门 → 声明了 when 的脚本一律跳过（不瞎跑）。
+        assert_eq!(registry.run_chain(&host, LuaMount::Event, &c).unwrap(), 1);
+        assert_eq!(events(&host), vec!["always".to_string()]);
+
+        let gate_false = |_: &CondExpr| false;
+        let env = MountEnv { gate: Some(&gate_false), check: None };
+        assert_eq!(registry.run_chain_with(&host, LuaMount::Event, &c, &env).unwrap(), 1);
+        assert_eq!(events(&host), vec!["always".to_string()]);
+
+        let gate_true = |_: &CondExpr| true;
+        let env = MountEnv { gate: Some(&gate_true), check: None };
+        assert_eq!(registry.run_chain_with(&host, LuaMount::Event, &c, &env).unwrap(), 2);
+        assert_eq!(events(&host), vec!["always".to_string(), "gated".to_string()]);
+    }
+
+    #[test]
+    fn generic_write_primitives_push_requests() {
+        let host = LuaHost::new(1).unwrap();
+        let c = ctx(json!({}));
+        host.run_hook(
+            "host.modify_check('keep_high'); host.modify_check('add', 6); host.modify_check('dc', -2);              host.apply_effect('char-b', { kind = 'damage', amount = '3d6', resource = 'hp' });              host.modify_resource('char-c', 'mana', -3)",
+            LuaMount::CheckPreRoll,
+            &c,
+        )
+        .unwrap();
+        let reqs = host.drain_requests();
+        assert_eq!(reqs.len(), 5);
+        assert_eq!(reqs[0], LuaRequest::ModifyCheck { mode: CheckModifier::KeepHigh, amount: 0 });
+        assert_eq!(reqs[1], LuaRequest::ModifyCheck { mode: CheckModifier::Add, amount: 6 });
+        assert_eq!(reqs[2], LuaRequest::ModifyCheck { mode: CheckModifier::Difficulty, amount: -2 });
+        match &reqs[3] {
+            LuaRequest::ApplyEffect { target, effect } => {
+                assert_eq!(target, "char-b");
+                assert_eq!(effect["kind"], "damage");
+                assert_eq!(effect["amount"], "3d6");
+            }
+            other => panic!("expected apply_effect, got {other:?}"),
+        }
+        assert_eq!(
+            reqs[4],
+            LuaRequest::ModifyResource { target: "char-c".into(), resource: "mana".into(), amount: -3 }
+        );
+        // 引擎不认识的名字 / 非法效果形状 → 当场报错。
+        assert!(host.run_hook("host.modify_check('luck')", LuaMount::CheckPreRoll, &c).is_err());
+        assert!(host
+            .run_hook("host.apply_effect('x', { kind = 'bogus' })", LuaMount::PreResolve, &c)
+            .is_err());
+    }
+
+    /// 判定 C4：结果覆盖也是通用动作——引擎只认识「强制成功 / 强制失败」，
+    /// 不认识「自然 20 / 大成功」这类规则集词汇。
+    #[test]
+    fn modify_check_force_modes_are_generic_actions() {
+        let host = LuaHost::new(1).unwrap();
+        let c = ctx(json!({}));
+        host.run_hook(
+            "host.modify_check('force_fail'); host.modify_check('force_success')",
+            LuaMount::CheckPostRoll,
+            &c,
+        )
+        .unwrap();
+        assert_eq!(
+            host.drain_requests(),
+            vec![
+                LuaRequest::ModifyCheck { mode: CheckModifier::ForceFail, amount: 0 },
+                LuaRequest::ModifyCheck { mode: CheckModifier::ForceSuccess, amount: 0 },
+            ]
+        );
+        assert_eq!(CheckModifier::parse("force_success"), Some(CheckModifier::ForceSuccess));
+        assert_eq!(CheckModifier::parse("force_fail"), Some(CheckModifier::ForceFail));
+        // 不在通用动作表里的名字一律拒绝（规则集词汇到不了引擎；'luck' 已在上一个用例覆盖）。
+        assert_eq!(CheckModifier::parse("override"), None);
+    }
+
+    #[test]
+    fn check_snapshot_is_visible_to_post_roll_scripts() {
+        let host = LuaHost::new(1).unwrap();
+        let c = ctx(json!({}));
+        let check = LuaCheckContext {
+            attribute: "str".into(),
+            kind: Some(CheckKind::Save),
+            resolved: true,
+            expr: Some("1d20".into()),
+            total: 12,
+            target: 15,
+            margin: -3,
+            result: false,
+            level: Some(SuccessLevel::Barely),
+            rolls: vec![9],
+        };
+        // 判定前：没有快照。
+        assert!(host
+            .run_condition("return host.check == nil and host.check_result == nil", &c)
+            .unwrap());
+        // 判定后：脚本能读到判定结果（分档语义由 Lua 自己决定）。
+        let env = MountEnv { gate: None, check: Some(&check) };
+        host.run_hook_with(
+            "assert(host.check.total == 12); assert(host.check.margin == -3);              assert(host.check.result == false); assert(host.check_level == 'barely');              assert(host.check_kind == 'save'); assert(host.check.rolls[1] == 9);              host.modify_resource('char-a', 'mana', host.check.total)",
+            LuaMount::CheckPostRoll,
+            &c,
+            &env,
+        )
+        .unwrap();
+        assert_eq!(
+            host.drain_requests(),
+            vec![LuaRequest::ModifyResource {
+                target: "char-a".into(),
+                resource: "mana".into(),
+                amount: 12
+            }]
+        );
     }
 
     #[test]

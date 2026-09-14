@@ -14,6 +14,9 @@ pub struct Model {
     pub draft_version: i64,
     pub updated_at: String,
     pub released_at: Option<String>,
+    /// 作者账户：只有作者能改；已发布的书对所有人可读可开档。
+    #[sea_orm(nullable)]
+    pub owner_id: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -365,9 +365,28 @@ fn turn_prompt_inner(ctx: &TurnContext, include_memories: bool, prompts: &StoryP
                     .unwrap_or_default()
             ));
             for en in &e.enemies {
+                // 数据卡摘要（图鉴 M2 §4.6）：名字 / HP / AC / 可用攻击（技能名 + 伤害骰）。
+                // AI 不必再瞎编怪物能干什么；临时敌人没有图鉴攻击 → 这一段不出现。
+                let attacks = if en.attacks.is_empty() {
+                    String::new()
+                } else {
+                    let list: Vec<String> = en
+                        .attacks
+                        .iter()
+                        .map(|a| {
+                            let damage = a.damage.trim();
+                            if damage.is_empty() {
+                                a.name.clone()
+                            } else {
+                                format!("{} {}", a.name, damage)
+                            }
+                        })
+                        .collect();
+                    format!("（可用攻击：{}）", list.join("、"))
+                };
                 items.push_str(&format!(
-                    "  · {} {} HP {}/{} AC {}\n",
-                    en.id, en.name, en.hp, en.max, en.ac
+                    "  · {} {} HP {}/{} AC {}{}\n",
+                    en.id, en.name, en.hp, en.max, en.ac, attacks
                 ));
             }
         }
@@ -442,6 +461,15 @@ fn turn_prompt_inner(ctx: &TurnContext, include_memories: bool, prompts: &StoryP
     } else {
         ctx.scene_title.clone()
     };
+    // 当前地点（地图 P2 / 设计 §6.6）：紧跟场景标题，形如
+    // 「场景：碎星酒馆的夜晚（地点：碎星酒馆）」；场景未声明地点时这一段整体不出现
+    // （老故事书的提示词逐字不变）。
+    //
+    // 位置是关键：地点逐回合会变，只能进**回合用户提示词**（这个 turn 骨架），
+    // 绝不进系统 preamble——否则会击穿前缀缓存（AGENTS.md 上下文缓存不变量）。
+    if let Some(loc) = ctx.location.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        scene.push_str(&format!("（地点：{loc}）"));
+    }
     if let Some(desc) = ctx
         .scene_description
         .as_deref()
@@ -1899,6 +1927,7 @@ mod tests {
             scene_id: "sc-2".into(),
             scene_title: "三野猪小径".into(),
             scene_description: Some("秋雨与霜雾笼罩的商道，车队残骸散落。".into()),
+            location: None,
             controlled: "莱纳斯·晨星(char-linas)".into(),
             player_text: "新增一个主线任务「查明狼群巢穴的位置」".into(),
             channel: RoundChannel::Gm,
@@ -1917,6 +1946,8 @@ mod tests {
                 source: "gm".into(),
                 hidden: false,
                 primary: true,
+                // 地图 P5 的加性字段（QuestView 的地点继承所属场景）：测试字面量用默认值。
+                ..Default::default()
             }],
             encounters: vec![octopus_types::EncounterView {
                 id: "enc-1".into(),
@@ -1927,9 +1958,12 @@ mod tests {
                     hp: 7,
                     max: 11,
                     ac: 12,
+                    ..Default::default()
                 }],
                 note: None,
                 active: true,
+                // 地图 P5 的叙事锚（创建时快照）：测试字面量用默认值。
+                ..Default::default()
             }],
             scenes: vec![
                 octopus_engine::SceneBrief {
@@ -1977,6 +2011,124 @@ mod tests {
         );
     }
 
+    /// 图鉴 M2 §4.6：遭遇块升级为数据卡摘要——名字 / HP / AC / 可用攻击（技能名 + 伤害骰）。
+    /// 临时敌人（无 attacks）时这一段不出现，提示词与改动前一致。
+    #[test]
+    fn turn_prompt_renders_bestiary_data_card_attacks() {
+        use octopus_engine::TurnContext;
+        use octopus_types::{EnemyAttack, EnemyView, RoundChannel};
+        let enemy = |attacks: Vec<EnemyAttack>| EnemyView {
+            id: "e1".into(),
+            name: "地精".into(),
+            hp: 7,
+            max: 7,
+            ac: 15,
+            attacks,
+            ..Default::default()
+        };
+        let ctx_with = |attacks: Vec<EnemyAttack>| TurnContext {
+            save_id: "sv-1".into(),
+            round: 1,
+            scene_id: "sc-1".into(),
+            scene_title: "洞穴".into(),
+            scene_description: None,
+            location: None,
+            controlled: "米拉(char-a)".into(),
+            player_text: "上".into(),
+            channel: RoundChannel::Character,
+            characters: vec![],
+            personas: vec![],
+            lore: vec![],
+            premise: None,
+            narrative: vec![],
+            token_budget: 0,
+            focus: vec![],
+            canon: vec![],
+            quests: vec![],
+            encounters: vec![octopus_types::EncounterView {
+                id: "enc-1".into(),
+                name: "洞穴伏击".into(),
+                enemies: vec![enemy(attacks)],
+                note: None,
+                active: true,
+                // 地图 P5 的叙事锚（创建时快照）：测试字面量用默认值。
+                ..Default::default()
+            }],
+            scenes: vec![],
+            attributes: vec![],
+            model: None,
+            memories: vec![],
+            turn_feedback: vec![],
+            protocol: None,
+        };
+        let p = super::turn_prompt(&ctx_with(vec![
+            EnemyAttack {
+                skill_id: "sk-scimitar".into(),
+                name: "弯刀".into(),
+                damage: "1d6+2".into(),
+            },
+            EnemyAttack {
+                skill_id: "sk-bow".into(),
+                name: "短弓".into(),
+                damage: "1d6+2".into(),
+            },
+        ]));
+        assert!(p.contains("e1 地精 HP 7/7 AC 15"), "名字 / HP / AC 仍在：{p}");
+        assert!(p.contains("可用攻击：弯刀 1d6+2、短弓 1d6+2"), "技能名 + 伤害骰：{p}");
+        // 临时敌人（AI 现编）没有图鉴攻击 → 与改动前的提示词逐字一致。
+        let plain = super::turn_prompt(&ctx_with(vec![]));
+        assert!(plain.contains("e1 地精 HP 7/7 AC 15"));
+        assert!(!plain.contains("（可用攻击："), "无攻击摘要时不出现这一段");
+    }
+
+    /// 地点进回合提示词（设计 §6.6）：形如「场景：碎星酒馆的夜晚（地点：碎星酒馆）」，
+    /// 且只落在**用户消息**（turn 骨架）里——系统 preamble 必须逐回合稳定（AGENTS.md 硬约束）。
+    #[test]
+    fn turn_prompt_shows_current_location_but_preamble_stays_clean() {
+        use octopus_engine::{ProtocolSpec, TurnContext};
+        use octopus_types::RoundChannel;
+        let ctx = TurnContext {
+            save_id: "sv-1".into(),
+            round: 3,
+            scene_id: "sc-tavern".into(),
+            scene_title: "碎星酒馆的夜晚".into(),
+            scene_description: Some("窗外的雨敲打着木板。".into()),
+            location: Some("碎星酒馆".into()),
+            controlled: "米拉(char-mira)".into(),
+            player_text: "环顾四周".into(),
+            channel: RoundChannel::Character,
+            characters: vec![],
+            personas: vec![],
+            lore: vec![],
+            premise: None,
+            narrative: vec![],
+            token_budget: 0,
+            focus: vec![],
+            canon: vec![],
+            quests: vec![],
+            encounters: vec![],
+            scenes: vec![],
+            attributes: vec![],
+            model: None,
+            memories: vec![],
+            turn_feedback: vec![],
+            protocol: None,
+        };
+        let p = super::turn_prompt(&ctx);
+        assert!(p.contains("场景：碎星酒馆的夜晚（地点：碎星酒馆）"), "地点要跟在场景标题后面：{p}");
+        assert!(p.contains("场景描述：窗外的雨敲打着木板。"), "描述仍在地点之后");
+        // 系统层（默认协议 preamble）逐回合稳定：地点绝不进去，否则前缀缓存整段失效。
+        let adapter = octopus_engine::build_protocol_adapter(&ProtocolSpec::default());
+        let preamble = adapter.tool_preamble(&ctx).unwrap_or_else(|| adapter.preamble(&ctx));
+        assert!(!preamble.contains("碎星酒馆"), "地点不得进系统 preamble（缓存前缀必须稳定）");
+        // 旧故事书（场景未声明地点）：提示词与加入地点之前逐字一致。
+        let mut no_loc = ctx.clone();
+        no_loc.location = None;
+        let p2 = super::turn_prompt(&no_loc);
+        assert!(!p2.contains("（地点"), "未声明地点时不该出现地点段");
+        assert!(p2.contains("场景：碎星酒馆的夜晚\n场景描述：窗外的雨敲打着木板。"));
+    }
+
     #[test]
     fn parses_actor_id_on_speak_and_emote() {
         // 说话人归属随意图下发；旁白可省略。
@@ -2006,6 +2158,7 @@ mod tests {
             scene_id: "sc-1".into(),
             scene_title: "酒馆".into(),
             scene_description: None,
+            location: None,
             controlled: "char-a".into(),
             player_text: "把短剑给雨果".into(),
             channel: RoundChannel::Character,
@@ -2047,6 +2200,7 @@ mod tests {
             scene_id: "sc-1".into(),
             scene_title: "酒馆".into(),
             scene_description: None,
+            location: None,
             controlled: "米拉(char-mira)".into(),
             player_text: "「伊莎，来杯麦酒。」".into(),
             channel: RoundChannel::Character,
@@ -2095,6 +2249,7 @@ mod tests {
             scene_id: "sc-1".into(),
             scene_title: "暗影森林入口".into(),
             scene_description: None,
+            location: None,
             controlled: "米拉(char-mira)".into(),
             player_text: "我们走进暗影森林。".into(),
             channel: RoundChannel::Character,
@@ -2136,6 +2291,7 @@ mod tests {
             scene_id: "sc-1".into(),
             scene_title: "酒馆".into(),
             scene_description: None,
+            location: None,
             controlled: "米拉(char-mira)".into(),
             player_text: "我试试".into(),
             channel: RoundChannel::Character,
@@ -2191,6 +2347,7 @@ mod tests {
             scene_id: "sc-1".into(),
             scene_title: "酒馆".into(),
             scene_description: None,
+            location: None,
             controlled: "米拉(char-mira)".into(),
             player_text: "你好".into(),
             channel: RoundChannel::Character,
@@ -2357,6 +2514,7 @@ mod tests {
             scene_id: "sc-1".into(),
             scene_title: "酒馆".into(),
             scene_description: None,
+            location: None,
             controlled: "米拉(char-mira)".into(),
             player_text: "你还记得那座古堡吗？".into(),
             channel: RoundChannel::Character,

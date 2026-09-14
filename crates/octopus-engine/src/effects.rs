@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use octopus_types::{
     AttributeModifier, DeltaDomain, DeltaOp, EffectDef, ImmediateEffect, StateDelta, StatusDef,
-    StatusInstance, StatusUnit,
+    StatusInstance, StatusStack, StatusUnit,
 };
 
 use crate::error::EngineError;
@@ -151,14 +151,63 @@ pub fn build_status_instance(
     }
 }
 
+/// 按声明的叠加策略把「新施加的状态」并入「已有同名状态」（#12 ③）。
+///
+/// - \`Replace\`（缺省 / 未声明）：新实例原样覆盖；
+/// - \`Add\`：时长相加（turns / scenes 各按自己的单位相加）；
+/// - \`Max\`：取时长更长的那个。
+///
+/// 只合并**同 id** 的状态；没有已有实例时原样返回新实例。id / name 一律以新实例为准。
+pub fn merge_status(
+    existing: Option<&StatusInstance>,
+    incoming: StatusInstance,
+    stack: Option<StatusStack>,
+) -> StatusInstance {
+    let Some(old) = existing else { return incoming };
+    match stack.unwrap_or(StatusStack::Replace) {
+        StatusStack::Replace => incoming,
+        StatusStack::Add => StatusInstance {
+            turns_left: add_duration(old.turns_left, incoming.turns_left),
+            scenes_left: add_duration(old.scenes_left, incoming.scenes_left),
+            ..incoming
+        },
+        StatusStack::Max => StatusInstance {
+            turns_left: max_duration(old.turns_left, incoming.turns_left),
+            scenes_left: max_duration(old.scenes_left, incoming.scenes_left),
+            ..incoming
+        },
+    }
+}
+
+/// 时长相加：两侧都有值才算和；只有一侧有值时保留它（跨单位声明是作者错误，不猜）。
+fn add_duration(a: Option<i32>, b: Option<i32>) -> Option<i32> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.saturating_add(y)),
+        (x, None) => x,
+        (None, y) => y,
+    }
+}
+
+fn max_duration(a: Option<i32>, b: Option<i32>) -> Option<i32> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (x, None) => x,
+        (None, y) => y,
+    }
+}
+
 /// 结算一个效果声明（不含延后的条件触发；触发链在回合末求值）。
 /// status_defs 为故事书顶层状态声明表，effect.status 是状态 id 引用。
+///
+/// \`current_statuses\` 是施法者当前的同名状态实例表，供 \`stack\` 策略合并
+///（add / max）；传空表等价于「没有已有状态」，行为与旧版 replace 逐字一致。
 pub fn resolve_effect(
     effect: &EffectDef,
     actor_id: &str,
     target_id: &str,
     rng: &mut DeterministicRng,
     status_defs: &HashMap<String, StatusDef>,
+    current_statuses: &[StatusInstance],
 ) -> Result<EffectResolution, EngineError> {
     let before = rng.consumed.len();
     let mut out = EffectResolution::default();
@@ -168,9 +217,14 @@ pub fn resolve_effect(
     }
     if let Some(list) = &effect.status {
         for id in list {
-            let instance = build_status_ref(id, status_defs);
-            out.deltas.push(status_delta(actor_id, &instance));
-            out.statuses.push(instance);
+            let incoming = build_status_ref(id, status_defs);
+            let merged = merge_status(
+                current_statuses.iter().find(|s| s.id == incoming.id),
+                incoming,
+                status_defs.get(id).and_then(|d| d.stack),
+            );
+            out.deltas.push(status_delta(actor_id, &merged));
+            out.statuses.push(merged);
         }
     }
     if let Some(mods) = &effect.modifiers {
@@ -250,7 +304,7 @@ mod tests {
         };
         let defs = status_defs_with("burn", "灼烧", 3, StatusUnit::Turns);
         let mut rng = DeterministicRng::new(5);
-        let out = resolve_effect(&effect, "char-a", "char-b", &mut rng, &defs).unwrap();
+        let out = resolve_effect(&effect, "char-a", "char-b", &mut rng, &defs, &[]).unwrap();
         assert_eq!(out.rng_consumed, 1);
         assert_eq!(out.statuses.len(), 1);
         assert_eq!(out.statuses[0].turns_left, Some(3));
@@ -258,6 +312,54 @@ mod tests {
         assert_eq!(out.deltas.len(), 2); // 资源 + 状态
         assert_eq!(out.deltas[1].field, "status");
         assert_eq!(out.modifiers, vec![AttributeModifier { attribute: "str".into(), value: 2 }]);
+    }
+
+    fn inst(id: &str, turns: Option<i32>, scenes: Option<i32>) -> StatusInstance {
+        StatusInstance { id: id.into(), name: id.into(), turns_left: turns, scenes_left: scenes }
+    }
+
+    #[test]
+    fn merge_status_add_sums_durations() {
+        let old = inst("burn", Some(2), None);
+        let new = inst("burn", Some(3), None);
+        let merged = merge_status(Some(&old), new, Some(StatusStack::Add));
+        assert_eq!(merged.turns_left, Some(5), "add 把剩余时长相加");
+    }
+
+    #[test]
+    fn merge_status_max_keeps_longer_duration() {
+        let old = inst("burn", Some(5), None);
+        let new = inst("burn", Some(2), None);
+        let merged = merge_status(Some(&old), new, Some(StatusStack::Max));
+        assert_eq!(merged.turns_left, Some(5), "max 保留更长的那个");
+        let merged2 = merge_status(Some(&inst("burn", Some(1), None)), inst("burn", Some(4), None), Some(StatusStack::Max));
+        assert_eq!(merged2.turns_left, Some(4));
+    }
+
+    #[test]
+    fn merge_status_replace_is_the_default_and_overwrites() {
+        let old = inst("burn", Some(5), None);
+        // 未声明 stack（None）与显式 Replace 等价：新实例原样覆盖。
+        for stack in [None, Some(StatusStack::Replace)] {
+            let merged = merge_status(Some(&old), inst("burn", Some(1), None), stack);
+            assert_eq!(merged.turns_left, Some(1), "replace 用新时长");
+        }
+    }
+
+    #[test]
+    fn merge_status_without_existing_returns_incoming() {
+        let merged = merge_status(None, inst("burn", Some(3), None), Some(StatusStack::Add));
+        assert_eq!(merged.turns_left, Some(3));
+    }
+
+    #[test]
+    fn merge_status_handles_scene_unit_separately_from_turns() {
+        // 单位不同的声明是作者错误：只合并各自单位上「两侧都有值」的项，不跨单位相加。
+        let old = inst("bless", None, Some(2));
+        let new = inst("bless", Some(1), None);
+        let merged = merge_status(Some(&old), new, Some(StatusStack::Add));
+        assert_eq!(merged.turns_left, Some(1), "turns 只有一侧有值 → 保留它");
+        assert_eq!(merged.scenes_left, Some(2), "scenes 只有一侧有值 → 保留它");
     }
 
     #[test]

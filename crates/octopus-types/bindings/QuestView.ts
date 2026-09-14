@@ -7,4 +7,9 @@ export type QuestView = { id: string, text: string, done: boolean,
 /**
  * skeleton = 故事书骨架；gm = 导演运行时新增
  */
-source: string, hidden: boolean, primary: boolean, };
+source: string, hidden: boolean, primary: boolean, 
+/**
+ * 所属场景的地点（地图 P5 §6.2）：投影时从场景**推导**，不落库、不存字段。
+ * 导演运行时新增的任务不属于任何场景 → None。
+ */
+location_id?: string | null, };

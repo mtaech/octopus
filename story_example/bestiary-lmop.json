@@ -1,0 +1,823 @@
+{
+	"_meta": {
+		"dependencies": {
+			"monster": [
+				"MM"
+			]
+		},
+		"otherSources": {
+			"monster": {
+				"MM": "LMoP"
+			}
+		}
+	},
+	"monster": [
+		{
+			"ENG_name": "Ash Zombie",
+			"name": "灰烬丧尸",
+			"type": "undead",
+			"source": "LMoP",
+			"page": 31,
+			"reprintedAs": [
+				"灰烬丧尸|PaBTSO"
+			],
+			"size": [
+				"M"
+			],
+			"alignment": [
+				"N",
+				"E"
+			],
+			"ac": [
+				8
+			],
+			"hp": {
+				"average": 22,
+				"formula": "3d8 + 9"
+			},
+			"speed": {
+				"walk": 20
+			},
+			"str": 13,
+			"dex": 6,
+			"con": 16,
+			"int": 3,
+			"wis": 6,
+			"cha": 5,
+			"save": {
+				"wis": "+0"
+			},
+			"senses": [
+				"黑暗视觉 60 尺"
+			],
+			"passive": 8,
+			"immune": [
+				"毒素"
+			],
+			"conditionImmune": [
+				"中毒"
+			],
+			"languages": [
+				"能理解它生前所说的所有语言，但不能说话"
+			],
+			"cr": "1/4",
+			"trait": [
+				{
+					"ENG_name": "Undead Fortitude",
+					"name": "不死坚韧",
+					"entries": [
+						"当丧尸由于受到非光耀非重击伤害而使其生命值降低至0时，它必须进行一次DC为5+所受伤害值的体质豁免，豁免成功则生命值改为降低至1。"
+					]
+				},
+				{
+					"ENG_name": "Ash Puff",
+					"name": "灰烬喷发",
+					"entries": [
+						"丧尸第一次受到伤害时，其5尺范围内的任何活体生物必须成功通过{@dc 10}的体质豁免检定，否则在攻击检定、豁免检定和属性检定上获得劣势，持续1分钟。生物可以在其每回合结束时重复进行豁免检定，若成功则提前终止效应。"
+					]
+				}
+			],
+			"action": [
+				{
+					"ENG_name": "Slam",
+					"name": "猛击",
+					"entries": [
+						"{@atk mw} 命中{@hit 3}，触及5尺，单一目标。{@h}4 ({@damage 1d6 + 1}) 点钝击伤害。"
+					]
+				}
+			],
+			"traitTags": [
+				"不死坚韧"
+			],
+			"senseTags": [
+				"D"
+			],
+			"languageTags": [
+				"CS",
+				"LF"
+			],
+			"damageTags": [
+				"B"
+			],
+			"miscTags": [
+				"MW"
+			],
+			"savingThrowForced": [
+				"体质"
+			],
+			"hasToken": true,
+			"hasFluff": true
+		},
+		{
+			"ENG_name": "Evil Mage",
+			"name": "邪恶法师",
+			"type": {
+				"type": "humanoid",
+				"tags": [
+					"人类"
+				]
+			},
+			"source": "LMoP",
+			"page": 57,
+			"referenceSources": [
+				"RMBRE"
+			],
+			"size": [
+				"M"
+			],
+			"alignment": [
+				"L",
+				"E"
+			],
+			"ac": [
+				12
+			],
+			"hp": {
+				"average": 22,
+				"formula": "5d8"
+			},
+			"speed": {
+				"walk": 30
+			},
+			"str": 9,
+			"dex": 14,
+			"con": 11,
+			"int": 17,
+			"wis": 12,
+			"cha": 11,
+			"save": {
+				"int": "+5",
+				"wis": "+3"
+			},
+			"skill": {
+				"arcana": "+5",
+				"history": "+5"
+			},
+			"passive": 11,
+			"languages": [
+				"通用语",
+				"龙语",
+				"矮人语",
+				"精灵语"
+			],
+			"cr": "1",
+			"spellcasting": [
+				{
+					"ENG_name": "Spellcasting",
+					"name": "施法",
+					"type": "spellcasting",
+					"headerEntries": [
+						"该法师是一个4级施法者，使用智力作为其施法能力（法术豁免{@dc 13}；法术攻击命中需要{@hit 5}）。法师知道以下来自法师法术列表的法术："
+					],
+					"spells": {
+						"0": {
+							"spells": [
+								"{@spell 光亮术}",
+								"{@spell 法师之手}",
+								"{@spell 电爪}"
+							]
+						},
+						"1": {
+							"slots": 4,
+							"spells": [
+								"{@spell 魅惑类人}",
+								"{@spell 魔法飞弹}"
+							]
+						},
+						"2": {
+							"slots": 3,
+							"spells": [
+								"{@spell 定身类人}",
+								"{@spell 迷踪步}"
+							]
+						}
+					},
+					"ability": "int"
+				}
+			],
+			"action": [
+				{
+					"ENG_name": "Quarterstaff",
+					"name": "长棍",
+					"entries": [
+						"{@atk mw} 命中{@hit 1}，触及5尺，单一目标。{@h}3 ({@damage 1d8 - 1}) 钝击伤害。"
+					]
+				}
+			],
+			"altArt": [
+				{
+					"ENG_name": "Evil Mage",
+					"name": "邪恶法师",
+					"source": "RMBRE"
+				}
+			],
+			"attachedItems": [
+				"长棍|phb"
+			],
+			"languageTags": [
+				"C",
+				"D",
+				"DR",
+				"E"
+			],
+			"damageTags": [
+				"B"
+			],
+			"damageTagsSpell": [
+				"L",
+				"O"
+			],
+			"spellcastingTags": [
+				"CW"
+			],
+			"miscTags": [
+				"MLW",
+				"MW"
+			],
+			"savingThrowForcedSpell": [
+				"敏捷",
+				"感知"
+			],
+			"hasToken": true,
+			"hasFluff": true
+		},
+		{
+			"ENG_name": "Gundren Rockseeker",
+			"name": "刚铎·寻岩者",
+			"isNpc": true,
+			"isNamedCreature": true,
+			"source": "LMoP",
+			"page": 41,
+			"reprintedAs": [
+				"刚铎·寻岩者|PaBTSO"
+			],
+			"_copy": {
+				"ENG_name": "Commoner",
+				"name": "平民",
+				"source": "MM",
+				"_templates": [
+					{
+						"ENG_name": "Mountain Dwarf",
+						"name": "山地矮人",
+						"source": "PHB"
+					}
+				]
+			},
+			"hasToken": true,
+			"translator": "不全书"
+		},
+		{
+			"ENG_name": "Mormesk the Wraith",
+			"name": "缚灵·墨梅斯克",
+			"type": "undead",
+			"isNpc": true,
+			"isNamedCreature": true,
+			"source": "LMoP",
+			"page": 59,
+			"reprintedAs": [
+				"缚灵·墨梅斯克|PaBTSO"
+			],
+			"size": [
+				"M"
+			],
+			"alignment": [
+				"N",
+				"E"
+			],
+			"ac": [
+				13
+			],
+			"hp": {
+				"average": 45,
+				"formula": "6d8 + 18"
+			},
+			"speed": {
+				"walk": 0,
+				"fly": 60
+			},
+			"str": 6,
+			"dex": 16,
+			"con": 16,
+			"int": 12,
+			"wis": 14,
+			"cha": 15,
+			"senses": [
+				"黑暗视觉 60 尺"
+			],
+			"passive": 12,
+			"resist": [
+				"强酸",
+				"寒冷",
+				"火焰",
+				"闪电",
+				"雷鸣",
+				{
+					"resist": [
+						"钝击",
+						"穿刺",
+						"挥砍"
+					],
+					"note": "非银质武器且非魔法攻击的",
+					"cond": true
+				}
+			],
+			"immune": [
+				"暗蚀",
+				"毒素"
+			],
+			"conditionImmune": [
+				"魅惑",
+				"受擒",
+				"麻痹",
+				"石化",
+				"中毒",
+				"倒地",
+				"束缚"
+			],
+			"languages": [
+				"通用语",
+				"炼狱语"
+			],
+			"cr": "3",
+			"trait": [
+				{
+					"ENG_name": "Incorporeal Movement",
+					"name": "虚体移动",
+					"entries": [
+						"幽魂可以穿过物体或其他生物，但不能停留在那里。"
+					]
+				},
+				{
+					"ENG_name": "Sunlight Sensitivity",
+					"name": "日照敏感",
+					"entries": [
+						"在阳光下，邪灵在攻击骰上处于劣势，并且在依赖视力的感知（{@skill 察觉}）检定上也处于劣势。"
+					]
+				}
+			],
+			"action": [
+				{
+					"ENG_name": "Life Drain",
+					"name": "吸取生命",
+					"entries": [
+						"{@atk mw} {@hit 5} 攻击命中，触及 5 尺，单一生物。 {@h}16 ({@damage 3d8 + 3}) 点暗蚀伤害，且目标必须进行一次 {@dc 13} 体质豁免，豁免失败则其生命值上限降低等同于所受伤害的数值。若此攻击将目标的生命值上限降低至 0，则目标死亡。目标生命值上限的降低效果持续到目标完成一次长休为止。"
+					]
+				}
+			],
+			"traitTags": [
+				"虚体移动",
+				"日照敏感"
+			],
+			"senseTags": [
+				"D"
+			],
+			"languageTags": [
+				"C",
+				"I"
+			],
+			"damageTags": [
+				"N"
+			],
+			"miscTags": [
+				"HPR",
+				"MW"
+			],
+			"savingThrowForced": [
+				"体质"
+			],
+			"hasToken": true,
+			"hasFluff": true,
+			"hasFluffImages": true
+		},
+		{
+			"ENG_name": "Nezznar the Black Spider",
+			"name": "\"黑蜘蛛\"那兹纳尔",
+			"type": {
+				"type": "humanoid",
+				"tags": [
+					"精灵"
+				]
+			},
+			"isNpc": true,
+			"isNamedCreature": true,
+			"source": "LMoP",
+			"page": 59,
+			"reprintedAs": [
+				"涅兹纳尔·蜘蛛|PaBTSO"
+			],
+			"size": [
+				"M"
+			],
+			"alignment": [
+				"N",
+				"E"
+			],
+			"ac": [
+				11,
+				{
+					"ac": 14,
+					"condition": "{@spell 法师护甲}时",
+					"braces": true
+				}
+			],
+			"hp": {
+				"average": 27,
+				"formula": "6d8"
+			},
+			"speed": {
+				"walk": 30
+			},
+			"str": 9,
+			"dex": 13,
+			"con": 10,
+			"int": 16,
+			"wis": 14,
+			"cha": 13,
+			"save": {
+				"int": "+5",
+				"wis": "+4"
+			},
+			"skill": {
+				"arcana": "+5",
+				"perception": "+4",
+				"stealth": "+3"
+			},
+			"senses": [
+				"黑暗视觉 120 尺"
+			],
+			"passive": 14,
+			"languages": [
+				"精灵语",
+				"地底通用语"
+			],
+			"cr": "2",
+			"spellcasting": [
+				{
+					"ENG_name": "Innate Spellcasting",
+					"name": "天生施法",
+					"type": "spellcasting",
+					"headerEntries": [
+						"Nezznar天生能够施展以下法术，无需任何材料成分："
+					],
+					"will": [
+						"{@spell 舞光术}"
+					],
+					"daily": {
+						"1e": [
+							"{@spell 黑暗术}",
+							"{@spell 妖火} (豁免{@dc 12})"
+						]
+					}
+				},
+				{
+					"ENG_name": "Spellcasting",
+					"name": "施法",
+					"type": "spellcasting",
+					"headerEntries": [
+						"内兹纳是一名4级施法者，使用智力作为他的施法能力（法术豁免{@dc 13}；{@hit 5}命中法术攻击）。内兹纳从法师的法术列表中准备了以下法术："
+					],
+					"spells": {
+						"0": {
+							"spells": [
+								"{@spell 法师之手}",
+								"{@spell 冷冻射线}",
+								"{@spell 电爪}"
+							]
+						},
+						"1": {
+							"slots": 4,
+							"spells": [
+								"{@spell 法师护甲}",
+								"{@spell 魔法飞弹}",
+								"{@spell 护盾术}"
+							]
+						},
+						"2": {
+							"slots": 3,
+							"spells": [
+								"{@spell 隐形术}",
+								"{@spell 暗示术}"
+							]
+						}
+					},
+					"ability": "int"
+				}
+			],
+			"trait": [
+				{
+					"ENG_name": "Special Equipment",
+					"name": "特殊装备",
+					"entries": [
+						"Nezznar拥有一根{@item 蜘蛛法杖|LMoP}。"
+					]
+				},
+				{
+					"ENG_name": "Fey Ancestry",
+					"name": "妖精血统",
+					"entries": [
+						"Nezznar 在对抗被{@condition 魅惑}的豁免检定上有优势，魔法也无法使他入睡。"
+					]
+				},
+				{
+					"ENG_name": "Sunlight Sensitivity",
+					"name": "日照敏感",
+					"entries": [
+						"当Nezznar或其目标处于阳光下时，他在攻击检定时具有劣势。"
+					]
+				}
+			],
+			"action": [
+				{
+					"ENG_name": "Spider Staff",
+					"name": "蜘蛛法杖",
+					"entries": [
+						"{@atk mw} 命中{@hit 1}，触及5尺，单一目标。{@h}2 ({@damage 1d6 - 1}) 钝击伤害加上3 ({@damage 1d6}) 毒素伤害。"
+					]
+				}
+			],
+			"traitTags": [
+				"妖精血统",
+				"日照敏感"
+			],
+			"senseTags": [
+				"SD"
+			],
+			"languageTags": [
+				"E",
+				"U"
+			],
+			"damageTags": [
+				"B",
+				"I"
+			],
+			"damageTagsSpell": [
+				"C",
+				"L",
+				"O"
+			],
+			"spellcastingTags": [
+				"CW",
+				"I"
+			],
+			"miscTags": [
+				"MW"
+			],
+			"conditionInflictSpell": [
+				"隐形"
+			],
+			"savingThrowForcedSpell": [
+				"敏捷",
+				"感知"
+			],
+			"hasToken": true,
+			"hasFluff": true,
+			"hasFluffImages": true
+		},
+		{
+			"ENG_name": "Nundro Rockseeker",
+			"name": "南卓·寻岩者",
+			"isNpc": true,
+			"isNamedCreature": true,
+			"source": "LMoP",
+			"page": 50,
+			"reprintedAs": [
+				"南卓·寻岩者|PaBTSO"
+			],
+			"_copy": {
+				"ENG_name": "Commoner",
+				"name": "平民",
+				"source": "MM",
+				"_templates": [
+					{
+						"ENG_name": "Mountain Dwarf",
+						"name": "山地矮人",
+						"source": "PHB"
+					}
+				]
+			},
+			"hasToken": true,
+			"translator": "不全书"
+		},
+		{
+			"ENG_name": "Redbrand Ruffian",
+			"name": "红标帮恶霸",
+			"type": {
+				"type": "humanoid",
+				"tags": [
+					"人类"
+				]
+			},
+			"source": "LMoP",
+			"page": 61,
+			"reprintedAs": [
+				"红标帮恶霸|PaBTSO"
+			],
+			"size": [
+				"M"
+			],
+			"alignment": [
+				"N",
+				"E"
+			],
+			"ac": [
+				{
+					"ac": 14,
+					"from": [
+						"{@item 镶钉皮甲|phb|镶钉皮甲}"
+					]
+				}
+			],
+			"hp": {
+				"average": 16,
+				"formula": "3d8 + 3"
+			},
+			"speed": {
+				"walk": 30
+			},
+			"str": 11,
+			"dex": 14,
+			"con": 12,
+			"int": 9,
+			"wis": 9,
+			"cha": 11,
+			"skill": {
+				"intimidation": "+2"
+			},
+			"passive": 9,
+			"languages": [
+				"通用语"
+			],
+			"cr": "1/2",
+			"action": [
+				{
+					"ENG_name": "Multiattack",
+					"name": "多重攻击",
+					"entries": [
+						"这个流氓进行了两次近战攻击。"
+					]
+				},
+				{
+					"ENG_name": "Shortsword",
+					"name": "短剑",
+					"entries": [
+						"{@atk mw} 命中{@hit 4}，触及5尺，单一目标。{@h}5 ({@damage 1d6 + 2}) 点穿刺伤害。"
+					]
+				}
+			],
+			"attachedItems": [
+				"短剑|phb"
+			],
+			"actionTags": [
+				"多重攻击"
+			],
+			"languageTags": [
+				"C"
+			],
+			"damageTags": [
+				"P"
+			],
+			"miscTags": [
+				"MLW",
+				"MW"
+			],
+			"hasToken": true,
+			"hasFluff": true
+		},
+		{
+			"ENG_name": "Sildar Hallwinter",
+			"name": "修达·霍温特",
+			"type": {
+				"type": "humanoid",
+				"tags": [
+					"人类"
+				]
+			},
+			"isNpc": true,
+			"isNamedCreature": true,
+			"source": "LMoP",
+			"page": 61,
+			"reprintedAs": [
+				"修达·霍温特|PaBTSO"
+			],
+			"size": [
+				"M"
+			],
+			"alignment": [
+				"N",
+				"G"
+			],
+			"ac": [
+				{
+					"ac": 16,
+					"from": [
+						"{@item 链甲|phb}"
+					]
+				}
+			],
+			"hp": {
+				"average": 27,
+				"formula": "5d8 + 5"
+			},
+			"speed": {
+				"walk": 30
+			},
+			"str": 13,
+			"dex": 10,
+			"con": 12,
+			"int": 10,
+			"wis": 11,
+			"cha": 10,
+			"save": {
+				"str": "+3",
+				"con": "+3"
+			},
+			"skill": {
+				"perception": "+2"
+			},
+			"passive": 12,
+			"languages": [
+				"通用语"
+			],
+			"cr": "1",
+			"action": [
+				{
+					"ENG_name": "Multiattack",
+					"name": "多重攻击",
+					"entries": [
+						"Sildar 进行两次近战攻击。"
+					]
+				},
+				{
+					"ENG_name": "Longsword",
+					"name": "长剑",
+					"entries": [
+						"{@atk mw} 命中{@hit 3}，触及5尺，单一目标。{@h}5 ({@damage 1d8 + 1}) 点挥砍伤害。"
+					]
+				},
+				{
+					"ENG_name": "Heavy Crossbow",
+					"name": "重弩",
+					"entries": [
+						"{@atk rw} 命中{@hit 2}，射程100/400尺，单一目标。{@h}5（{@damage 1d10}）点穿刺伤害。"
+					]
+				}
+			],
+			"reaction": [
+				{
+					"ENG_name": "Parry",
+					"name": "格挡",
+					"entries": [
+						"当攻击者用近战攻击命中Sildar，并且Sildar可以看到攻击者时，他可以掷一个{@dice 1d6}，并将掷出的数字加到他的AC上，以对抗触发攻击，前提是他手持近战武器。"
+					]
+				}
+			],
+			"attachedItems": [
+				"重弩|phb",
+				"长剑|phb"
+			],
+			"actionTags": [
+				"多重攻击",
+				"格挡"
+			],
+			"languageTags": [
+				"C"
+			],
+			"damageTags": [
+				"P",
+				"S"
+			],
+			"miscTags": [
+				"MLW",
+				"MW",
+				"RNG",
+				"RW"
+			],
+			"hasToken": true,
+			"hasFluff": true
+		},
+		{
+			"ENG_name": "Venomfang",
+			"name": "毒牙",
+			"isNpc": true,
+			"isNamedCreature": true,
+			"source": "LMoP",
+			"page": 63,
+			"_copy": {
+				"ENG_name": "Young Green Dragon",
+				"name": "青年绿龙",
+				"source": "MM",
+				"_mod": {
+					"*": {
+						"mode": "replaceTxt",
+						"replace": "龙",
+						"with": "毒牙",
+						"flags": "i"
+					}
+				}
+			},
+			"hasToken": true,
+			"hasFluffImages": true,
+			"translator": "不全书"
+		}
+	]
+}

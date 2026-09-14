@@ -27,6 +27,12 @@ pub struct WorldState {
     pub progress: SkeletonProgress,
     pub locations: Vec<Value>,
     pub meta: ProjectionMeta,
+    /// 技能冷却起点（#01）：实例键 → 技能 id → 上次使用所在回合号。
+    ///
+    /// 只由 \`apply_delta\`（Character 域的 \`cooldown.<skill_id>\` 字段）写入，随命令日志重放，
+    /// 所以重开进程 / 重放后冷却不会凭空消失。旧存档缺省为空表。
+    #[serde(default)]
+    pub cooldowns: BTreeMap<String, BTreeMap<String, u32>>,
     pub rng_seed: u64,
     /// 已消耗的 RNG 取值次数（#06 ②）：由命令日志的 rng_consume 事件重放累加。
     ///
@@ -62,6 +68,8 @@ impl WorldState {
                         .to_string(),
                     hidden: v.get("hidden").and_then(Value::as_bool).unwrap_or(false),
                     primary: v.get("primary").and_then(Value::as_bool).unwrap_or(false),
+                    // 导演新增的任务不属于任何场景 → 没有可继承的地点（地图 P5）。
+                    location_id: None,
                 })
             })
             .collect();
@@ -83,6 +91,14 @@ impl WorldState {
             locations: self.locations.clone(),
             meta: self.meta.clone(),
         }
+    }
+
+    /// 插入 / 替换一个**完整角色实例**（图鉴 M2）：怪物克隆走 delta 的唯一变更路径。
+    ///
+    /// 与 `push_status` 之类的「改已存在项」不同，实例表原本没有任何插入入口——
+    /// 图鉴模板不在开档时实例化（`build_state` 跳过 kind=monster），遭遇创建时才克隆。
+    pub fn upsert_instance(&mut self, key: &str, instance: CharacterInstance) {
+        self.characters.insert(key.to_string(), instance);
     }
 
     pub fn push_status(&mut self, instance_id: &str, status: StatusInstance) {

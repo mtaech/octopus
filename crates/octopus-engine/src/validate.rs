@@ -8,12 +8,50 @@ use octopus_types::{
 };
 use serde_json::Value;
 
+use crate::lua_host::LuaMount;
 use crate::protocol::{is_known_intent, ProtocolMode, KNOWN_INTENTS, NARRATIVE_INTENTS};
 
 /// 协议 instructions 的建议长度上限（超出记 Warning）：它会随系统层注入并计入 token 预算。
 const PROTOCOL_INSTRUCTIONS_WARN_CHARS: usize = 4000;
 /// 协议 Lua 源码的建议长度上限（超出记 Warning）。
 const PROTOCOL_LUA_WARN_CHARS: usize = 20000;
+
+/// 判定属性声明校验（判定 C1）：`attribute` / `opposed_attribute` 必须是
+/// `attribute_dimensions` 里已声明的 key——拼错立刻可见，而不是静默回落 str / 0 分。
+/// null 与空串视为「未声明」（与 dice 的处理一致）。
+fn check_declared_attribute(
+    dimension_keys: &HashSet<String>,
+    label: &str,
+    field: &str,
+    value: Option<&Value>,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let Some(av) = value.filter(|v| !v.is_null()) else {
+        return;
+    };
+    let Some(declared) = av.as_str().map(str::trim) else {
+        issues.push(ValidationIssue {
+            severity: IssueSeverity::Error,
+            code: "invalid_check_attribute".to_string(),
+            target: Some(label.to_string()),
+            message: format!("{field} must be a string attribute dimension key"),
+            related_refs: None,
+        });
+        return;
+    };
+    if declared.is_empty() {
+        return;
+    }
+    if !dimension_keys.contains(declared) {
+        issues.push(ValidationIssue {
+            severity: IssueSeverity::Error,
+            code: "unknown_check_attribute".to_string(),
+            target: Some(label.to_string()),
+            message: format!("{field} '{declared}' is not declared in attribute_dimensions"),
+            related_refs: Some(vec![declared.to_string()]),
+        });
+    }
+}
 
 /// 校验故事书静态结构、字段与引用完整性
 pub fn validate_storybook(sb: &Value) -> Vec<ValidationIssue> {
@@ -234,8 +272,168 @@ pub fn validate_storybook(sb: &Value) -> Vec<ValidationIssue> {
         }
     }
 
-    // 6. characters: each character has `id`, `name`, `kind` ("pc" | "npc"). Check duplicate IDs (emit Error "duplicate_character_id").
+    // 4b. maps：地图是世界层的**地点投影**（地图 P1）——引擎不求值，但结构错误必须在发布前暴露。
+    // 校验：地图 id 唯一 / name 必填 / pin 的 location_id 必须存在 / 归一化坐标 0..1 / parent_id 无环。
+    let map_slice: Vec<&Value> =
+        if let Some(arr) = sb.pointer("/world/maps").and_then(|v| v.as_array()) {
+            arr.iter().collect()
+        } else if let Some(arr) = sb.get("maps").and_then(|v| v.as_array()) {
+            arr.iter().collect()
+        } else {
+            Vec::new()
+        };
+
+    // 第一遍：收集全部地图 id（parent_id 可能前向引用，必须两遍扫）。
+    let mut map_ids: HashSet<String> = HashSet::new();
+    let mut map_id_order: Vec<String> = Vec::new();
+    for (i, m) in map_slice.iter().enumerate() {
+        let id = m.get("id").and_then(|v| v.as_str()).map(str::trim).unwrap_or("");
+        let name = m.get("name").and_then(|v| v.as_str()).map(str::trim).unwrap_or("");
+        let target = if id.is_empty() { format!("map[{i}]") } else { format!("map:{id}") };
+
+        if id.is_empty() {
+            issues.push(ValidationIssue {
+                severity: IssueSeverity::Error,
+                code: "missing_id".to_string(),
+                target: Some(target.clone()),
+                message: "Map id must be a non-empty string".to_string(),
+                related_refs: None,
+            });
+        } else if !map_ids.insert(id.to_string()) {
+            issues.push(ValidationIssue {
+                severity: IssueSeverity::Error,
+                code: "duplicate_map_id".to_string(),
+                target: Some(target.clone()),
+                message: format!("Duplicate map id: '{id}'"),
+                related_refs: Some(vec![id.to_string()]),
+            });
+        } else {
+            map_id_order.push(id.to_string());
+        }
+
+        if name.is_empty() {
+            issues.push(ValidationIssue {
+                severity: IssueSeverity::Error,
+                code: "missing_name".to_string(),
+                target: Some(target),
+                message: "Map name must be a non-empty string".to_string(),
+                related_refs: None,
+            });
+        }
+    }
+
+    // 第二遍：pin 锚点与 parent_id 引用。
+    let mut map_parent: HashMap<String, String> = HashMap::new();
+    for (i, m) in map_slice.iter().enumerate() {
+        let id = m.get("id").and_then(|v| v.as_str()).map(str::trim).unwrap_or("");
+        let target = if id.is_empty() { format!("map[{i}]") } else { format!("map:{id}") };
+
+        if let Some(pins) = m.get("pins").and_then(|v| v.as_array()) {
+            for (pi, pin) in pins.iter().enumerate() {
+                let pin_target = format!("{target}.pins[{pi}]");
+                let loc_id = pin
+                    .get("location_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .unwrap_or("");
+                if loc_id.is_empty() || !location_ids.contains(loc_id) {
+                    issues.push(ValidationIssue {
+                        severity: IssueSeverity::Error,
+                        code: "dangling_map_pin_location_ref".to_string(),
+                        target: Some(pin_target.clone()),
+                        message: format!(
+                            "Map pin location_id '{loc_id}' does not exist in world.locations"
+                        ),
+                        related_refs: if loc_id.is_empty() {
+                            None
+                        } else {
+                            Some(vec![loc_id.to_string()])
+                        },
+                    });
+                }
+                // 归一化坐标：换分辨率 / 换底图不破版，所以必须是 0..1 的数值。
+                for axis in ["x", "y"] {
+                    let ok = pin
+                        .get(axis)
+                        .and_then(Value::as_f64)
+                        .is_some_and(|n| (0.0..=1.0).contains(&n));
+                    if !ok {
+                        issues.push(ValidationIssue {
+                            severity: IssueSeverity::Error,
+                            code: "invalid_map_pin_coordinate".to_string(),
+                            target: Some(pin_target.clone()),
+                            message: format!(
+                                "Map pin {axis} must be a normalized number in 0..1"
+                            ),
+                            related_refs: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        if let Some(pid) = m
+            .get("parent_id")
+            .filter(|v| !v.is_null())
+            .and_then(|v| v.as_str())
+        {
+            let pid = pid.trim();
+            if !pid.is_empty() {
+                if pid == id || !map_ids.contains(pid) {
+                    issues.push(ValidationIssue {
+                        severity: IssueSeverity::Error,
+                        code: "dangling_map_parent_ref".to_string(),
+                        target: Some(target),
+                        message: format!(
+                            "Map parent_id '{pid}' is invalid (self-reference or non-existent)"
+                        ),
+                        related_refs: Some(vec![pid.to_string()]),
+                    });
+                } else if !id.is_empty() {
+                    map_parent.insert(id.to_string(), pid.to_string());
+                }
+            }
+        }
+    }
+
+    // parent_id 环检测：locations 只挡自环，地图显式要求无环（世界图 → 区域图 → 地牢图）。
+    // 每个环只报一次，输出顺序按声明顺序（可复现）。
+    {
+        let mut in_reported_cycle: HashSet<String> = HashSet::new();
+        for start in &map_id_order {
+            if in_reported_cycle.contains(start) {
+                continue;
+            }
+            let mut chain: Vec<&str> = Vec::new();
+            let mut cur: &str = start.as_str();
+            loop {
+                if let Some(pos) = chain.iter().position(|n| *n == cur) {
+                    let cycle: Vec<String> = chain[pos..].iter().map(|s| s.to_string()).collect();
+                    for n in &cycle {
+                        in_reported_cycle.insert(n.clone());
+                    }
+                    issues.push(ValidationIssue {
+                        severity: IssueSeverity::Error,
+                        code: "map_parent_cycle".to_string(),
+                        target: Some(format!("map:{start}")),
+                        message: format!("Map parent_id forms a cycle: {}", cycle.join(" -> ")),
+                        related_refs: Some(cycle),
+                    });
+                    break;
+                }
+                chain.push(cur);
+                match map_parent.get(cur) {
+                    Some(p) => cur = p.as_str(),
+                    None => break,
+                }
+            }
+        }
+    }
+
+    // 6. characters: each character has `id`, `name`, `kind` ("pc" | "npc" | "monster"). Check duplicate IDs (emit Error "duplicate_character_id").
     let mut character_ids = HashSet::new();
+    // 图鉴 M1 / 地图 P5 §6.3：只有 kind = "monster" 的条目能作触发点预置遭遇的模板。
+    let mut monster_ids = HashSet::new();
     if let Some(chars) = sb.get("characters").and_then(|v| v.as_array()) {
         for (i, c) in chars.iter().enumerate() {
             let id = c
@@ -284,14 +482,18 @@ pub fn validate_storybook(sb: &Value) -> Vec<ValidationIssue> {
                 });
             }
 
-            if !matches!(kind, "pc" | "npc") {
+            if !matches!(kind, "pc" | "npc" | "monster") {
                 issues.push(ValidationIssue {
                     severity: IssueSeverity::Error,
                     code: "invalid_character_kind".to_string(),
                     target: Some(target.clone()),
-                    message: format!("Character kind '{kind}' is invalid; must be 'pc' or 'npc'"),
+                    message: format!(
+                        "Character kind '{kind}' is invalid; must be 'pc', 'npc' or 'monster'"
+                    ),
                     related_refs: None,
                 });
+            } else if kind == "monster" && !id.is_empty() {
+                monster_ids.insert(id.to_string());
             }
 
             // 人物写作提示（借鉴 SillyTavern 角色卡指南）：描写宜精不宜长，对话示例最关键。
@@ -324,6 +526,113 @@ pub fn validate_storybook(sb: &Value) -> Vec<ValidationIssue> {
                     ),
                     related_refs: None,
                 });
+            }
+        }
+    }
+
+    // 6a2. lua_mounts: 规则集挂载点脚本（「规则集走 Lua」①）。
+    // id 必填且唯一、mount 名合法（拼错即报错，不静默回落）、source 非空；
+    // 源码语法 / 白名单由第 6 步的 lua_lint 统一预检（错误码 lua_syntax_error / lua_forbidden_api）。
+    if let Some(raw) = sb.get("lua_mounts") {
+        if !raw.is_null() && !raw.is_array() {
+            issues.push(ValidationIssue {
+                severity: IssueSeverity::Error,
+                code: "invalid_lua_mounts".to_string(),
+                target: Some("lua_mounts".to_string()),
+                message: "lua_mounts must be an array of { id, mount, source, when?, enabled? }"
+                    .to_string(),
+                related_refs: None,
+            });
+        }
+    }
+    let mut lua_mount_ids = HashSet::new();
+    if let Some(mounts) = sb.get("lua_mounts").and_then(Value::as_array) {
+        for (i, m) in mounts.iter().enumerate() {
+            let id = m.get("id").and_then(Value::as_str).map(str::trim).unwrap_or("");
+            let target = if id.is_empty() {
+                format!("lua_mounts[{i}]")
+            } else {
+                format!("lua_mount:{id}")
+            };
+            if id.is_empty() {
+                issues.push(ValidationIssue {
+                    severity: IssueSeverity::Error,
+                    code: "missing_id".to_string(),
+                    target: Some(target.clone()),
+                    message: "Lua mount id must be a non-empty string".to_string(),
+                    related_refs: None,
+                });
+            } else if !lua_mount_ids.insert(id.to_string()) {
+                issues.push(ValidationIssue {
+                    severity: IssueSeverity::Error,
+                    code: "duplicate_lua_mount_id".to_string(),
+                    target: Some(target.clone()),
+                    message: format!("Duplicate lua mount id: '{id}'"),
+                    related_refs: Some(vec![id.to_string()]),
+                });
+            }
+            match m.get("mount").and_then(Value::as_str).map(str::trim) {
+                None | Some("") => issues.push(ValidationIssue {
+                    severity: IssueSeverity::Error,
+                    code: "missing_lua_mount".to_string(),
+                    target: Some(target.clone()),
+                    message: format!(
+                        "Lua mount must declare a mount point（可用：{}）",
+                        LuaMount::DECLARABLE.join(" / ")
+                    ),
+                    related_refs: None,
+                }),
+                Some(name) if !LuaMount::parse(name).is_some_and(LuaMount::is_declarable) => {
+                    issues.push(ValidationIssue {
+                        severity: IssueSeverity::Error,
+                        code: "invalid_lua_mount".to_string(),
+                        target: Some(target.clone()),
+                        message: format!(
+                            "未知的挂载点 '{name}'（可用：{}）",
+                            LuaMount::DECLARABLE.join(" / ")
+                        ),
+                        related_refs: Some(vec![name.to_string()]),
+                    });
+                }
+                Some(_) => {}
+            }
+            if m
+                .get("source")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+            {
+                issues.push(ValidationIssue {
+                    severity: IssueSeverity::Error,
+                    code: "missing_lua_mount_source".to_string(),
+                    target: Some(target.clone()),
+                    message: "Lua mount source must be a non-empty script".to_string(),
+                    related_refs: None,
+                });
+            }
+            if let Some(enabled) = m.get("enabled").filter(|v| !v.is_null()) {
+                if !enabled.is_boolean() {
+                    issues.push(ValidationIssue {
+                        severity: IssueSeverity::Error,
+                        code: "invalid_lua_mount_enabled".to_string(),
+                        target: Some(target.clone()),
+                        message: "Lua mount enabled must be a boolean".to_string(),
+                        related_refs: None,
+                    });
+                }
+            }
+            if let Some(when) = m.get("when").filter(|v| !v.is_null()) {
+                if serde_json::from_value::<CondExpr>(when.clone()).is_err() {
+                    issues.push(ValidationIssue {
+                        severity: IssueSeverity::Error,
+                        code: "invalid_lua_mount_when".to_string(),
+                        target: Some(target),
+                        message: "Lua mount when must be a condition expression (CondExpr)"
+                            .to_string(),
+                        related_refs: None,
+                    });
+                }
             }
         }
     }
@@ -984,8 +1293,17 @@ pub fn validate_storybook(sb: &Value) -> Vec<ValidationIssue> {
         }
     }
 
-    // 6c. checkers：判定种类 / 被动基数合法性（world.check 与 skills[].check）。
+    // 6c. checkers：判定种类 / 被动基数合法性（world.check 与 skills[].check）+ 判定属性可声明（C1）。
     {
+        // 已声明属性维度 key：attribute / opposed_attribute 必须命中它。
+        let mut dimension_keys: HashSet<String> = HashSet::new();
+        if let Some(dims) = sb.get("attribute_dimensions").and_then(|v| v.as_array()) {
+            for d in dims {
+                if let Some(k) = d.get("key").and_then(|v| v.as_str()) {
+                    dimension_keys.insert(k.to_string());
+                }
+            }
+        }
         let mut checkers: Vec<(String, &Value)> = Vec::new();
         if let Some(c) = sb.get("world").and_then(|w| w.get("check")) {
             checkers.push(("world.check".to_string(), c));
@@ -1003,7 +1321,8 @@ pub fn validate_storybook(sb: &Value) -> Vec<ValidationIssue> {
             // 表现为「无骰判定 → 0 分 → 必失败」，这里必须提前暴露。
             const KNOWN_CHECK_KEYS: &[&str] = &[
                 "dice", "mode", "attribute_modifier", "modifier_formula", "degree_thresholds",
-                "lua", "kind", "passive_base", "type", "attributes", "default_dc",
+                "lua", "kind", "passive_base", "attribute", "opposed_attribute", "type",
+                "attributes", "default_dc",
             ];
             let dice_like = |s: &str| -> bool {
                 let s = s.trim().to_ascii_lowercase();
@@ -1068,6 +1387,56 @@ pub fn validate_storybook(sb: &Value) -> Vec<ValidationIssue> {
                         related_refs: None,
                     });
                 }
+            }
+            // 判定属性（C1）：判定器级 / 对抗方属性都必须是已声明维度。
+            check_declared_attribute(&dimension_keys, &label, "attribute", c.get("attribute"), &mut issues);
+            check_declared_attribute(
+                &dimension_keys,
+                &label,
+                "opposed_attribute",
+                c.get("opposed_attribute"),
+                &mut issues,
+            );
+            // modifier_formula（D12 / 判定 C4）：声明了就一定被求值——语法错误 / 未知变量
+            // 在发布门暴露，而不是运行期静默回落到缺省公式。变量与派生值同语法：
+            // v（夹取后属性值）/ value（原始值）/ baseline / step。
+            if let Some(formula) = c
+                .get("modifier_formula")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                match crate::derived::check_formula(formula) {
+                    Err(e) => issues.push(ValidationIssue {
+                        severity: IssueSeverity::Error,
+                        code: "modifier_formula_invalid".to_string(),
+                        target: Some(label.clone()),
+                        message: format!("modifier_formula invalid: {e}"),
+                        related_refs: None,
+                    }),
+                    Ok(vars) => {
+                        for v in vars {
+                            if !["v", "value", "baseline", "step"].contains(&v.as_str()) {
+                                issues.push(ValidationIssue {
+                                    severity: IssueSeverity::Error,
+                                    code: "modifier_formula_unknown_var".to_string(),
+                                    target: Some(label.clone()),
+                                    message: format!("modifier_formula references unknown variable '{v}' (known: v / value / baseline / step)"),
+                                    related_refs: Some(vec![v.clone()]),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // SkillDef.attribute（C1）：技能级判定属性同样必须命中 attribute_dimensions。
+        if let Some(skills) = sb.get("skills").and_then(|v| v.as_array()) {
+            for s in skills {
+                let id = s.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let label = format!("skill:{id}.attribute");
+                check_declared_attribute(&dimension_keys, &label, "attribute", s.get("attribute"), &mut issues);
             }
         }
     }
@@ -1808,6 +2177,32 @@ pub fn validate_storybook(sb: &Value) -> Vec<ValidationIssue> {
                                     &mut issues,
                                 );
                             }
+                            // 触发点预置遭遇（地图 P5 §6.3）：模板必须命中 kind = "monster" 的
+                            // 图鉴条目；地点必须已声明。没写 encounter 的旧故事书不受影响。
+                            if let Some(enc) = trigger.get("encounter") {
+                                if !enc.is_null() {
+                                    validate_encounter_preset(
+                                        enc,
+                                        &t_target,
+                                        &monster_ids,
+                                        &location_ids,
+                                        &mut issues,
+                                    );
+                                }
+                            }
+                            // repeatable（CONTEXT.md「剧情触发点」）：必须显式布尔——
+                            // 写成 "yes" / 1 会被运行期按 false 读，静默退回一次性。
+                            if let Some(rep) = trigger.get("repeatable") {
+                                if rep.as_bool().is_none() {
+                                    issues.push(ValidationIssue {
+                                        severity: IssueSeverity::Warning,
+                                        code: "invalid_trigger_repeatable".to_string(),
+                                        target: Some(t_target.clone()),
+                                        message: "trigger repeatable must be a boolean (non-boolean values are read as false = 一次性)".to_string(),
+                                        related_refs: None,
+                                    });
+                                }
+                            }
                         }
                     }
                 }
@@ -1868,6 +2263,89 @@ fn collect_declaration_keys(sb: &Value, field: &str) -> HashSet<String> {
         }
     }
     keys
+}
+
+/// 触发点预置遭遇的形状与引用校验（地图 P5 §6.3）。
+///
+/// 拦三件事：形状（enemies 必须是非空数组、每条要有 template_id）、
+/// 引用（template_id 必须命中 kind = "monster" 的图鉴条目）、地点（preset.location_id 必须已声明）。
+fn validate_encounter_preset(
+    enc: &Value,
+    target: &str,
+    monster_ids: &HashSet<String>,
+    all_location_ids: &HashSet<String>,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    if !enc.is_object() {
+        issues.push(ValidationIssue {
+            severity: IssueSeverity::Error,
+            code: "invalid_encounter_preset".to_string(),
+            target: Some(target.to_string()),
+            message: "Trigger encounter must be an object with a non-empty enemies array".to_string(),
+            related_refs: None,
+        });
+        return;
+    }
+
+    if let Some(loc) = enc
+        .get("location_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if !all_location_ids.contains(loc) {
+            issues.push(ValidationIssue {
+                severity: IssueSeverity::Error,
+                code: "dangling_location_ref".to_string(),
+                target: Some(target.to_string()),
+                message: format!(
+                    "Trigger encounter references non-existent location '{loc}'"
+                ),
+                related_refs: Some(vec![loc.to_string()]),
+            });
+        }
+    }
+
+    let enemies = enc.get("enemies").and_then(Value::as_array);
+    let Some(enemies) = enemies.filter(|list| !list.is_empty()) else {
+        issues.push(ValidationIssue {
+            severity: IssueSeverity::Error,
+            code: "invalid_encounter_preset".to_string(),
+            target: Some(target.to_string()),
+            message: "Trigger encounter needs a non-empty enemies array".to_string(),
+            related_refs: None,
+        });
+        return;
+    };
+
+    for (idx, enemy) in enemies.iter().enumerate() {
+        let template_id = enemy
+            .get("template_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        if template_id.is_empty() {
+            issues.push(ValidationIssue {
+                severity: IssueSeverity::Error,
+                code: "invalid_encounter_preset".to_string(),
+                target: Some(format!("{target}.encounter.enemies[{idx}]")),
+                message: "Trigger encounter enemy needs a non-empty template_id".to_string(),
+                related_refs: None,
+            });
+            continue;
+        }
+        if !monster_ids.contains(template_id) {
+            issues.push(ValidationIssue {
+                severity: IssueSeverity::Error,
+                code: "dangling_monster_ref".to_string(),
+                target: Some(format!("{target}.encounter.enemies[{idx}]")),
+                message: format!(
+                    "Trigger encounter references '{template_id}', which is not a kind='monster' bestiary entry"
+                ),
+                related_refs: Some(vec![template_id.to_string()]),
+            });
+        }
+    }
 }
 
 fn validate_condition(
@@ -2286,6 +2764,45 @@ mod tests {
         );
     }
 
+    /// 判定 C4：modifier_formula 必须被校验——合法公式（D&D 的 floor((v-10)/2)）放行，
+    /// 语法错误 / 未知变量报 Error（发布门拦住，不靠运行期静默回落）。
+    #[test]
+    fn test_modifier_formula_is_validated() {
+        let mut sb = crate::seed::seed_storybooks()[0].json.clone();
+        sb["world"]["check"] = json!({ "dice": "1d20", "modifier_formula": "floor((v - 10) / 2)" });
+        let res = validate_storybook_result(&sb);
+        assert!(
+            !res.issues.iter().any(|i| i.code.starts_with("modifier_formula")),
+            "合法公式不应报错：{:?}",
+            res.issues
+        );
+        // 语法错误。
+        sb["world"]["check"] = json!({ "dice": "1d20", "modifier_formula": "(v - " });
+        let res = validate_storybook_result(&sb);
+        assert!(res.issues.iter().any(|i| i.code == "modifier_formula_invalid"
+            && matches!(i.severity, IssueSeverity::Error)));
+        // 未知变量（可用变量只有 v / value / baseline / step）。
+        sb["world"]["check"] = json!({ "dice": "1d20", "modifier_formula": "v + luck" });
+        let res = validate_storybook_result(&sb);
+        assert!(res.issues.iter().any(|i| i.code == "modifier_formula_unknown_var"
+            && matches!(i.severity, IssueSeverity::Error)));
+    }
+
+    /// 触发点 repeatable 必须是布尔：写成字符串会被运行期按 false 读，发布门报警。
+    #[test]
+    fn test_trigger_repeatable_must_be_boolean() {
+        let mut sb = crate::seed::seed_storybooks()[0].json.clone();
+        sb["skeleton"][0]["scenes"][0]["triggers"] = json!([
+            { "id": "tr-ok", "condition": { "op": "flag_set", "flag": "heard_dreams" }, "repeatable": true },
+            { "id": "tr-bad", "condition": { "op": "flag_set", "flag": "heard_dreams" }, "repeatable": "yes" }
+        ]);
+        let issues = validate_storybook(&sb);
+        let bad: Vec<_> = issues.iter().filter(|i| i.code == "invalid_trigger_repeatable").collect();
+        assert_eq!(bad.len(), 1, "只有非布尔值报警：{issues:?}");
+        assert_eq!(bad[0].target.as_deref(), Some("trigger:tr-bad"));
+        assert!(matches!(bad[0].severity, IssueSeverity::Warning));
+    }
+
     #[test]
     fn test_missing_title() {
         let mut sb = crate::seed::seed_storybooks()[0].json.clone();
@@ -2389,7 +2906,7 @@ mod tests {
         sb["characters"].as_array_mut().unwrap().push(json!({
             "id": "char-alien",
             "name": "外星人",
-            "kind": "monster"
+            "kind": "beast"
         }));
         let res = validate_storybook_result(&sb);
         assert!(!res.valid);
@@ -2401,6 +2918,223 @@ mod tests {
             .issues
             .iter()
             .any(|i| i.code == "invalid_character_kind"));
+        // 非法 kind 的消息必须列出三个合法值（作者照着改）。
+        let msg = &res
+            .issues
+            .iter()
+            .find(|i| i.code == "invalid_character_kind")
+            .unwrap()
+            .message;
+        assert!(msg.contains("monster"), "错误消息应列出 monster：{msg}");
+    }
+
+    /// 图鉴 M1：kind='monster' 通过校验；statblock 是纯展示块（引擎不读）；location_id 可声明。
+    #[test]
+    fn test_character_kind_accepts_monster_with_statblock() {
+        let mut sb = crate::seed::seed_storybooks()[0].json.clone();
+        sb["characters"].as_array_mut().unwrap().push(json!({
+            "id": "char-ash-zombie",
+            "name": "灰烬丧尸",
+            "kind": "monster",
+            "background": "",
+            "personality": "",
+            "attributes": { "str": 13, "wit": 6, "cha": 5 },
+            "resources": {},
+            "location_id": "loc-mine",
+            "statblock": {
+                "creatureType": "中型 不死生物，中立邪恶",
+                "traits": "伤害免疫：毒素；黑暗视觉 60 尺；语言：理解生前语言但不能说",
+                "challenge": "1/4",
+                "initiativeBonus": 2,
+                "actionsNote": "猛击：近战武器攻击 +3 命中，1d6+1 钝击伤害。"
+            }
+        }));
+        let res = validate_storybook_result(&sb);
+        let errors: Vec<_> = res
+            .issues
+            .iter()
+            .filter(|i| matches!(i.severity, IssueSeverity::Error))
+            .collect();
+        assert!(errors.is_empty(), "monster 条目必须合法：{errors:?}");
+        assert!(!res.issues.iter().any(|i| i.code == "invalid_character_kind"));
+    }
+
+    /// 地图 P5 §6.3：触发点预置遭遇——template_id 必须命中 kind='monster' 的图鉴条目。
+    #[test]
+    fn test_trigger_encounter_preset_requires_monster_templates() {
+        let base = || {
+            let mut sb = crate::seed::seed_storybooks()[0].json.clone();
+            sb["characters"].as_array_mut().unwrap().push(json!({
+                "id": "mon-goblin",
+                "name": "地精",
+                "kind": "monster",
+                "attributes": { "str": 40 },
+                "resources": { "hp": 7 }
+            }));
+            sb
+        };
+        let set = |sb: &mut Value, preset: Value| {
+            sb["skeleton"][0]["scenes"][0]["triggers"][0]["encounter"] = preset;
+        };
+
+        // 旧故事书：没有 encounter → 逐字不变，且不产生任何新 issue。
+        let sb = base();
+        let res = validate_storybook_result(&sb);
+        assert!(res.valid, "旧故事书必须仍然合法：{:?}", res.issues);
+        assert!(!res
+            .issues
+            .iter()
+            .any(|i| i.code.contains("encounter") || i.code == "dangling_monster_ref"));
+
+        // 命中 kind='monster' 的图鉴条目 + 已声明地点 → 合法。
+        let mut sb = base();
+        set(&mut sb, json!({
+            "name": "游荡的地精",
+            "location_id": "loc-mine",
+            "enemies": [{ "template_id": "mon-goblin", "count": 2 }]
+        }));
+        let res = validate_storybook_result(&sb);
+        assert!(res.valid, "合法预置遭遇不得报错：{:?}", res.issues);
+
+        // 引用角色（kind='pc'）→ dangling_monster_ref（Error）。
+        let mut sb = base();
+        set(&mut sb, json!({ "enemies": [{ "template_id": "char-mira" }] }));
+        let res = validate_storybook_result(&sb);
+        assert!(!res.valid);
+        assert!(
+            res.issues.iter().any(|i| i.code == "dangling_monster_ref"
+                && matches!(i.severity, IssueSeverity::Error)),
+            "引用非怪物条目必须报错：{:?}",
+            res.issues
+        );
+
+        // 不存在的模板 → 同一个错误码。
+        let mut sb = base();
+        set(&mut sb, json!({ "enemies": [{ "template_id": "mon-ghost" }] }));
+        let res = validate_storybook_result(&sb);
+        assert!(res.issues.iter().any(|i| i.code == "dangling_monster_ref"));
+
+        // 形状：enemies 缺失 / 空数组 / 缺 template_id → invalid_encounter_preset。
+        for preset in [
+            json!({ "name": "空遭遇" }),
+            json!({ "enemies": [] }),
+            json!({ "enemies": [{ "count": 2 }] }),
+        ] {
+            let mut sb = base();
+            set(&mut sb, preset.clone());
+            let res = validate_storybook_result(&sb);
+            assert!(!res.valid, "形状非法必须拦下：{preset}");
+            assert!(
+                res.issues.iter().any(|i| i.code == "invalid_encounter_preset"),
+                "{preset} 应报 invalid_encounter_preset：{:?}",
+                res.issues
+            );
+        }
+
+        // 地点：preset.location_id 悬空 → dangling_location_ref。
+        let mut sb = base();
+        set(&mut sb, json!({
+            "location_id": "loc-void",
+            "enemies": [{ "template_id": "mon-goblin" }]
+        }));
+        let res = validate_storybook_result(&sb);
+        assert!(res
+            .issues
+            .iter()
+            .any(|i| i.code == "dangling_location_ref"
+                && matches!(i.severity, IssueSeverity::Error)));
+    }
+
+    /// 地图 P5 §6.5：encounter_cleared 是零参数 op，校验器不得把它当成未知 / 悬空引用。
+    #[test]
+    fn test_encounter_cleared_condition_validates_clean() {
+        let mut sb = crate::seed::seed_storybooks()[0].json.clone();
+        sb["skeleton"][0]["scenes"][0]["goals"][0]["condition"] =
+            json!({ "op": "encounter_cleared" });
+        let res = validate_storybook_result(&sb);
+        assert!(res.valid, "encounter_cleared 不该产生任何 issue：{:?}", res.issues);
+    }
+
+    /// 地图 P1：id 唯一 / name 必填 / pin 地点存在 / 坐标 0..1 / parent_id 无环。
+    #[test]
+    fn test_map_validation() {
+        let mut sb = crate::seed::seed_storybooks()[0].json.clone();
+        sb["world"]["maps"] = json!([
+            // 合法：世界图带一个锚点
+            { "id": "map-world", "name": "世界图", "pins": [
+                { "location_id": "loc-tavern", "x": 0.25, "y": 0.5, "label": "碎星酒馆" }
+            ] },
+            // id 重复 + name 缺失
+            { "id": "map-world", "name": "" },
+            // 悬空地点 + 坐标越界
+            { "id": "map-town", "name": "城镇图", "pins": [
+                { "location_id": "loc-ghost", "x": 1.5, "y": -0.1 }
+            ] },
+            // parent_id 悬空 + 自引用
+            { "id": "map-cave", "name": "地牢图", "parent_id": "map-nonexistent" },
+            { "id": "map-self", "name": "自环图", "parent_id": "map-self" },
+            // 两图成环
+            { "id": "map-a", "name": "图甲", "parent_id": "map-b" },
+            { "id": "map-b", "name": "图乙", "parent_id": "map-a" }
+        ]);
+        let res = validate_storybook_result(&sb);
+        let has = |code: &str| res.issues.iter().any(|i| i.code == code);
+        assert!(!res.valid);
+        assert!(has("duplicate_map_id"), "地图 id 必须唯一");
+        assert!(has("missing_name"), "地图 name 必填");
+        assert!(has("dangling_map_pin_location_ref"), "锚点地点必须存在");
+        assert!(has("invalid_map_pin_coordinate"), "坐标必须归一化在 0..1");
+        assert!(has("dangling_map_parent_ref"), "parent_id 不得悬空 / 自引用");
+        assert!(has("map_parent_cycle"), "parent_id 不得成环");
+        // 两个环成员只报一次
+        assert_eq!(
+            res.issues.iter().filter(|i| i.code == "map_parent_cycle").count(),
+            1
+        );
+        // 坐标错误：x 与 y 各一条
+        assert_eq!(
+            res.issues.iter().filter(|i| i.code == "invalid_map_pin_coordinate").count(),
+            2
+        );
+    }
+
+    /// 没有地图的旧故事书照常通过（纯加性）。
+    #[test]
+    fn test_map_absent_is_valid() {
+        let sb = crate::seed::seed_storybooks()[0].json.clone();
+        assert!(sb.pointer("/world/maps").is_none());
+        let res = validate_storybook_result(&sb);
+        assert!(res.valid, "无地图不应产生任何错误：{:?}", res.issues);
+    }
+
+    /// 判定 C1：声明的 attribute / opposed_attribute 必须在 attribute_dimensions 里，否则 Error。
+    #[test]
+    fn test_declared_attributes_must_exist() {
+        let mut sb = crate::seed::seed_storybooks()[0].json.clone();
+        // 合法：用已声明的 str / wit
+        sb["world"]["check"] = json!({ "dice": "1d20", "attribute": "str", "opposed_attribute": "wit" });
+        sb["skills"] = json!([
+            { "id": "sk-dagger", "name": "匕首", "attribute": "wit",
+              "check": { "dice": "1d20", "attribute": "wit" } },
+            // 非法：技能级属性拼错
+            { "id": "sk-bow", "name": "短弓", "attribute": "dex",
+              "check": { "dice": "1d20", "opposed_attribute": "perception" } },
+            // 非法：判定器属性给了非字符串
+            { "id": "sk-junk", "name": "坏技能", "check": { "dice": "1d20", "attribute": 3 } }
+        ]);
+        let res = validate_storybook_result(&sb);
+        assert!(!res.valid);
+        assert!(!res.issues.iter().any(|i| i.code == "unknown_check_field"), "新字段必须被识别：{:?}", res.issues);
+        let unknown: Vec<_> = res
+            .issues
+            .iter()
+            .filter(|i| i.code == "unknown_check_attribute")
+            .collect();
+        // dex（技能级）+ perception（判定器级）
+        assert_eq!(unknown.len(), 2, "应报两条未声明属性：{unknown:?}");
+        assert!(res.issues.iter().any(|i| i.code == "invalid_check_attribute"));
+        // 合法声明不得误报
+        assert!(!res.issues.iter().any(|i| i.target.as_deref() == Some("skill:sk-dagger.attribute")));
     }
 
     #[test]
@@ -2522,6 +3256,97 @@ mod tests {
             && matches!(i.severity, IssueSeverity::Error)), "relationship_types 悬空应报 Error");
         assert!(res.issues.iter().any(|i| i.code == "dangling_target_type_ref"
             && matches!(i.severity, IssueSeverity::Error)), "target_types 悬空应报 Error");
+    }
+
+    /// 规则集挂载点（lua_mounts）：合法声明放行；非法 mount 名 / 缺 id / 缺 source /
+    /// 重复 id / when 形状错误 / 语法错误一律挡发布。
+    #[test]
+    fn test_lua_mounts_validation() {
+        let mut sb = crate::seed::seed_storybooks()[0].json.clone();
+        sb["lua_mounts"] = json!([
+            { "id": "ok", "mount": "check_pre_roll", "source": "return 1",
+              "when": { "op": "flag_set", "flag": "x" } },
+            { "mount": "event", "source": "return 1" },
+            { "id": "bad-mount", "mount": "check_after_roll", "source": "return 1" },
+            { "id": "protocol-mount", "mount": "protocol", "source": "return 1" },
+            { "id": "bad-mount", "mount": "event", "source": "return 1" },
+            { "id": "no-source", "mount": "event", "source": "   " },
+            { "id": "bad-when", "mount": "event", "source": "return 1", "when": { "op": "nope" } },
+            { "id": "bad-enabled", "mount": "event", "source": "return 1", "enabled": "yes" },
+            { "id": "syntax", "mount": "event", "source": "return (" }
+        ]);
+        let res = validate_storybook_result(&sb);
+        let codes: Vec<&str> = res.issues.iter().map(|i| i.code.as_str()).collect();
+        assert!(codes.contains(&"missing_id"), "{codes:?}");
+        assert!(codes.contains(&"invalid_lua_mount"), "{codes:?}");
+        assert!(codes.contains(&"duplicate_lua_mount_id"), "{codes:?}");
+        assert!(codes.contains(&"missing_lua_mount_source"), "{codes:?}");
+        assert!(codes.contains(&"invalid_lua_mount_when"), "{codes:?}");
+        assert!(codes.contains(&"invalid_lua_mount_enabled"), "{codes:?}");
+        assert!(codes.contains(&"lua_syntax_error"), "{codes:?}");
+        // 合法条目自身不产生任何 issue。
+        assert!(!res
+            .issues
+            .iter()
+            .any(|i| i.target.as_deref() == Some("lua_mount:ok")));
+        // 非法 mount 名的报错要列出可用挂载点（作者能照抄）。
+        let msg = res
+            .issues
+            .iter()
+            .find(|i| i.code == "invalid_lua_mount")
+            .map(|i| i.message.clone())
+            .unwrap_or_default();
+        assert!(msg.contains("check_post_roll"), "{msg}");
+
+        // 非数组整体报错。
+        sb["lua_mounts"] = json!("nope");
+        assert!(validate_storybook(&sb)
+            .iter()
+            .any(|i| i.code == "invalid_lua_mounts"));
+
+        // 旧故事书（无 lua_mounts）不受影响。
+        let mut plain = crate::seed::seed_storybooks()[0].json.clone();
+        plain.as_object_mut().unwrap().remove("lua_mounts");
+        assert!(!validate_storybook(&plain)
+            .iter()
+            .any(|i| i.code.starts_with("invalid_lua_mount") || i.code.contains("lua_mount")));
+    }
+
+    /// 时机原语（L4）：`status_tick` / `turn_end` / `scene_end` 是合法挂载点名；
+    /// 拼错的名字仍被发布门拦下，且报错列出全部可用挂载点（作者能照抄）。
+    #[test]
+    fn test_lua_mounts_accepts_timing_mounts() {
+        let mut sb = crate::seed::seed_storybooks()[0].json.clone();
+        sb["lua_mounts"] = json!([
+            { "id": "tick", "mount": "status_tick",
+              "source": "if host.status_id == 'x' then host.remove_status(host.actor.id, 'x') end" },
+            { "id": "tend", "mount": "turn_end", "source": "return 1" },
+            { "id": "send", "mount": "scene_end", "source": "return 1" },
+            { "id": "typo", "mount": "status_ticks", "source": "return 1" },
+            { "id": "typo2", "mount": "scene_ends", "source": "return 1" }
+        ]);
+        let res = validate_storybook_result(&sb);
+        let flagged =
+            |id: &str| res.issues.iter().any(|i| i.target.as_deref() == Some(format!("lua_mount:{id}").as_str()));
+        for id in ["tick", "tend", "send"] {
+            assert!(!flagged(id), "合法时机挂载点 {id} 不该报错：{:?}", res.issues);
+        }
+        let invalid: Vec<&str> = res
+            .issues
+            .iter()
+            .filter(|i| i.code == "invalid_lua_mount")
+            .filter_map(|i| i.target.as_deref())
+            .collect();
+        assert_eq!(invalid, vec!["lua_mount:typo", "lua_mount:typo2"], "拼错的挂载点名必须被拦");
+        let msg = res
+            .issues
+            .iter()
+            .find(|i| i.code == "invalid_lua_mount")
+            .map(|i| i.message.clone())
+            .unwrap_or_default();
+        for name in ["status_tick", "turn_end", "scene_end"] {
+            assert!(msg.contains(name), "报错要列出可用挂载点 {name}：{msg}");
+        }
     }
 
     /// 声明区引用校验：规范写法（from/to）与旧写法（from_id/to_id）都算合法引用。

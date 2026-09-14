@@ -92,6 +92,13 @@ pub struct CheckerDef {
     /// 被动判定的基数（缺省 10；D&D 被动察觉 = 10 + 加值）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub passive_base: Option<i64>,
+    /// 判定属性维度 key（判定 C1）：技能未声明时用它，再缺省回落 'str'。
+    /// 必须命中故事书 attribute_dimensions 的 key，否则校验报 Error（不静默 0 分）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribute: Option<String>,
+    /// 对抗判定时对手所用的属性维度 key（判定 C1）；缺省同 attribute。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opposed_attribute: Option<String>,
     /// 兼容别名：故事书常写 type: "d20" / type: "d100" 表示骰子家族；
     /// 未显式给 dice 时据此推导（d20 → 1d20）。非骰式类型名（如 attribute）忽略。
     #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
@@ -123,6 +130,9 @@ pub enum CondExpr {
         r#type: String,
         value: f64,
     },
+    /// 当前场景的遭遇已清空（地图 P5 §6.5）：该场景的遭遇全部结束，或敌人全灭。
+    /// 让「清剿」有自然判据，不必绕道 flag_set 让导演记得设标记。
+    EncounterCleared {},
     Lua { script: String },
 }
 
@@ -276,10 +286,38 @@ pub struct SkillDef {
     pub target: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check: Option<SkillCheck>,
+    /// 判定属性维度 key（判定 C1）：声明后本技能用它掷骰（如匕首用 dex）。
+    /// 优先级：技能 → 判定器 → 全局 → 'str'；必须命中 attribute_dimensions。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribute: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effect: Option<EffectDef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lua: Option<String>,
+}
+
+/// 规则集插件：故事书声明的挂载点脚本（「规则集走 Lua」①）。
+///
+/// 引擎只提供**挂载时机**与**通用原语**（掷两次取高/低 · 加值 · 改难度 · 施加即时效果 ·
+/// 加减资源）；脚本里写的才是规则集自己的词汇（何时算优势、豁免怎么算、熟练给几点）。
+/// 一组具名脚本 = 一个规则集，随故事书发布、随存档冻结、可被静态校验与单独禁用。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, TS)]
+#[ts(export)]
+pub struct LuaMountDef {
+    /// 脚本 id（同一故事书内唯一）：per-script 存储区隔离 + 错误回溯用。
+    pub id: String,
+    /// 挂载时机：check_pre_roll / check_post_roll / check / pre_resolve / post_resolve /
+    /// event / condition / status_tick / turn_end / scene_end
+    /// （未知值发布门报错，不静默回落；protocol 走独立的 narrative.protocol 声明，不在列）。
+    pub mount: String,
+    /// 源文本；发布门走 lua_lint 静态预检（语法 + scoped env 白名单）。
+    pub source: String,
+    /// 可选：仅在条件成立时执行（复用 CondExpr）；缺省恒执行。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<CondExpr>,
+    /// 可选：false = 禁用该脚本（缺省启用）。禁用仍参与静态校验。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS)]
@@ -694,7 +732,14 @@ pub enum Intent {
         #[serde(default)]
         actor_id: Option<String>,
     },
-    Move { destination_id: String },
+    /// 移动。`character_id` 指名「移动的是谁」（图鉴 M2 补丁）：位置链路 P2 起 NPC /
+    /// 怪物也在实例表里，只有受控角色写得动已经不够用。缺省 = 意图归属的角色 → 受控角色
+    /// （旧协议 / 老模型不带该字段时行为逐字不变）。
+    Move {
+        destination_id: String,
+        #[serde(default)]
+        character_id: Option<String>,
+    },
     UseSkill { skill_id: String, #[serde(default)] target_id: Option<String> },
     UseItem { item_id: String, #[serde(default)] target_id: Option<String> },
     /// 与场景物件交互（#04 / #01 objects）：object_id 引用故事书 objects 的 id，
@@ -706,6 +751,11 @@ pub enum Intent {
         difficulty: Option<i64>,
         #[serde(default)]
         actor_id: Option<String>,
+        /// 对抗判定的对手（判定 C3）：角色实例（模板 id / 名字 / 实例键都能命中）或
+        /// 静态被动值的标识。给了对手 = 双方各掷一次比大小（对手命中不了实例时，
+        /// 用它的静态被动值）；判定器声明 mode = opposed 却不给对手 → 意图被驳回。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        opponent_id: Option<String>,
     },
     QueryWorld { query: String },
     /// 查询某个角色的私有资料（属性 / 资源 / 状态 / 物品 / 位置；#04 Query 类）。
@@ -733,6 +783,18 @@ pub enum Intent {
     /// 攻击遭遇内的某个敌人：命中与伤害**由引擎结算**，AI 不自己编结果。
     Strike {
         enemy_id: String,
+        #[serde(default)]
+        skill_id: Option<String>,
+    },
+    /// 遭遇内的敌人攻击某个角色（图鉴 M2 §4.2）：与 strike **同一个内核**的另一个方向。
+    ///
+    /// 需要独立意图而非复用 strike：strike 的语义写死了「受控角色打遭遇里的敌人」，
+    /// 反向复用会让「谁是攻方」含糊，也表达不了「3 只地精各打一次」。
+    /// target_id 缺省 = 受控角色（玩家）；skill_id 缺省 = 图鉴条目的第一个攻击技能。
+    EnemyStrike {
+        enemy_id: String,
+        #[serde(default)]
+        target_id: Option<String>,
         #[serde(default)]
         skill_id: Option<String>,
     },
@@ -769,6 +831,47 @@ pub struct EnemySpec {
     /// 防御值（缺省 12：越高越难打中）
     #[serde(default)]
     pub ac: Option<i64>,
+    /// 图鉴引用（图鉴 M1）：命中 storybook.characters[] 中 kind='monster' 的条目 id。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_id: Option<String>,
+    /// 展开数量（默认 1）：3 只地精 = 1 条 template_id + count=3。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
+    /// 覆盖攻击技能（缺省用图鉴条目的第一个攻击技能）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_id: Option<String>,
+}
+
+/// 触发点预置的遭遇（地图 P5 §6.3）：作者声明，不再靠导演 AI 即兴 spawn。
+///
+/// 引擎在触发点被标记 fired 之后按它自动建遭遇，走 Intent::Encounter 的**同一条创建路径**
+/// （图鉴实例克隆 + 地点继承）。掷表遭遇**不复用也不新增类型**——表是内容 / 规则集语义，
+/// 由 Lua 掷骰（engine_rng）→ set_flag → 触发点 condition: flag_set + 本预置表达
+/// （见 docs/rules-via-lua.md §6）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct EncounterPreset {
+    /// 遭遇名；缺省回落触发点标题。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// 遭遇地点；缺省继承触发时所在场景的 location_id（与 Intent::Encounter 同一口径）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location_id: Option<String>,
+    /// 引用的图鉴条目（kind = "monster"）与展开数量。
+    #[serde(default)]
+    pub enemies: Vec<EncounterPresetEnemy>,
+}
+
+/// 预置遭遇里的一条怪物模板引用（template_id 必须命中 kind = "monster" 的图鉴条目）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct EncounterPresetEnemy {
+    pub template_id: String,
+    /// 展开数量（缺省 1）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
 }
 
 /// 六种驳回码（#04 校验阶段）+ 玩家取消。
@@ -838,8 +941,23 @@ pub struct StatusInstance {
     pub scenes_left: Option<i32>,
 }
 
+/// 遭遇敌人可用的攻击（图鉴 M2 §4.6 的数据卡摘要）：技能名 + 伤害骰。
+///
+/// 展示型投影：提示词据此告诉 AI「这只怪能怎么打」，引擎的缺省攻击技能也取第一条
+/// （EnemySpec.skill_id 覆盖时它就是唯一一条）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct EnemyAttack {
+    /// 技能 id（命中 storybook.skills）。
+    pub skill_id: String,
+    pub name: String,
+    /// 伤害骰表达式（如 1d6+2）；未声明时为空串。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub damage: String,
+}
+
 /// 遭遇里的敌方单位（3a：只有名字与 HP；先攻/回合见后续）。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct EnemyView {
     /// 遭遇内寻址 id（e1、e2…）：玩家/引擎引用某个敌人时用它。
@@ -849,10 +967,30 @@ pub struct EnemyView {
     pub max: i64,
     /// 防御值：攻击判定的难度就是它（缺省 12）。
     pub ac: i64,
+    /// 背后的怪物实例键（图鉴 M1）；缺省 = 临时敌人（AI 现编 / 旧日志）。
+    /// 存在时 hp / ac 是该实例的投影；不存在时条目自身是权威（旧行为）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    /// 图鉴模板 id（图鉴 M1）：指向 storybook.characters[] 中 kind='monster' 的条目。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_id: Option<String>,
+    /// 遭遇创建时快照的场景 id（地图 P5）；缺省 = 未记录（旧日志）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene_id: Option<String>,
+    /// 遭遇发生地点（地图 P5）：怪物实例继承它，地图按它归位。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location_id: Option<String>,
+    /// 可用攻击（图鉴 M2 数据卡摘要）：名字 + 伤害骰，供提示词与缺省攻击技能。
+    /// 缺省为空 = 临时敌人 / 旧日志（AI 现编的敌人没有图鉴攻击）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attacks: Vec<EnemyAttack>,
 }
 
-/// 结构化遭遇：导演创建，投影给前端与提示词。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+/// 结构化遭遇：导演创建 / 触发点预置（§6.3），投影给前端与提示词。
+///
+/// 叙事与空间锚（scene / location / goal / template_ids）都是**创建时的快照**：
+/// 运行时事件必须可重放，查询「此刻的场景」在重放时会得到错误答案（§6.2）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct EncounterView {
     pub id: String,
@@ -861,10 +999,22 @@ pub struct EncounterView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     pub active: bool,
+    /// 创建时的场景（地图 P5 §6.4）：地图与提示词据此说明「这一战发生在哪一幕」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene_id: Option<String>,
+    /// 创建时的地点（缺省继承场景）；怪物实例也按它归位。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location_id: Option<String>,
+    /// 关联目标 id（可选）：创建时按所在场景推导后快照，任务面板据它显示「清剿中」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_id: Option<String>,
+    /// 涉及的图鉴模板 id（去重、按创建顺序）：临时敌人不计入。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub template_ids: Vec<String>,
 }
 
 /// 运行时任务（骨架目标 + 导演新增），投影给前端与提示词。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct QuestView {
     pub id: String,
@@ -874,6 +1024,10 @@ pub struct QuestView {
     pub source: String,
     pub hidden: bool,
     pub primary: bool,
+    /// 所属场景的地点（地图 P5 §6.2）：投影时从场景**推导**，不落库、不存字段。
+    /// 导演运行时新增的任务不属于任何场景 → None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
@@ -1154,6 +1308,138 @@ pub struct ApiErrorBody {
 }
 
 // ============================================================
+// 账户与登录（多账户；系统侧「账号」，区别于领域里的「玩家」）
+// ============================================================
+
+/// 账户的公开投影：任何响应里都不出现口令哈希。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+pub struct Account {
+    pub id: String,
+    pub username: String,
+    pub display_name: String,
+    pub is_admin: bool,
+    /// 仍在使用初始口令（默认管理员）；前端据此常驻提醒改密。
+    pub must_change_password: bool,
+    pub created_at: String,
+    pub last_login_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RegisterRequest {
+    pub username: String,
+    /// 留空则回落为用户名。
+    #[serde(default)]
+    #[ts(optional)]
+    pub display_name: Option<String>,
+    pub password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LoginRequest {
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LoginResponse {
+    /// 不透明登录令牌：前端以 `Authorization: Bearer <token>` 回传。
+    pub token: String,
+    pub expires_at: String,
+    pub account: Account,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ChangePasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+// ---- 管理后台（只有 is_admin 账户可达；见 docs/auth-accounts.md §9） ----
+
+/// 管理后台概览：一眼看清这台实例有多大、有多少人。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+pub struct AdminOverview {
+    // 计数在 JSON 里就是普通数字。ts-rs 默认把 u64 映射成 bigint，
+    // 而前端要拿它们做算术 / 格式化，所以显式纠正成 number（与真实载荷一致）。
+    #[ts(type = "number")]
+    pub users: u64,
+    #[ts(type = "number")]
+    pub admins: u64,
+    #[ts(type = "number")]
+    pub saves: u64,
+    #[ts(type = "number")]
+    pub storybooks: u64,
+    /// 未过期的登录态条数（≈ 当前有登录的设备数）。
+    #[ts(type = "number")]
+    pub active_sessions: u64,
+    /// 数据库文件路径（内存库为 ":memory:"）。
+    pub db_path: String,
+    #[ts(type = "number")]
+    pub db_bytes: u64,
+    pub version: String,
+}
+
+/// 管理后台：账户行（含内容统计）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+pub struct AdminUserRow {
+    pub id: String,
+    pub username: String,
+    pub display_name: String,
+    pub is_admin: bool,
+    pub must_change_password: bool,
+    pub created_at: String,
+    pub last_login_at: Option<String>,
+    #[ts(type = "number")]
+    pub saves: u64,
+    #[ts(type = "number")]
+    pub storybooks: u64,
+    #[ts(type = "number")]
+    pub active_sessions: u64,
+    /// 就是当前请求者自己：前端据此禁用「删除」（后端也会拒）。
+    pub is_self: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AdminCreateUserRequest {
+    pub username: String,
+    pub password: String,
+    /// 留空则回落为用户名。
+    #[serde(default)]
+    #[ts(optional)]
+    pub display_name: Option<String>,
+    /// 直接建成管理员（默认普通账户）。
+    #[serde(default)]
+    pub is_admin: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AdminUpdateUserRequest {
+    /// 省略 = 不改；空串 = 回落为用户名。
+    #[serde(default)]
+    #[ts(optional)]
+    pub display_name: Option<String>,
+    /// 省略 = 不改。
+    #[serde(default)]
+    #[ts(optional)]
+    pub is_admin: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AdminResetPasswordRequest {
+    pub new_password: String,
+}
+
+// ============================================================
 // 校验与故事书 API（#01 / #23）
 // ============================================================
 
@@ -1284,6 +1570,44 @@ pub struct SavePackage {
 }
 
 // ============================================================
+// 通用自包含故事书包（导出 / 导入）
+// ============================================================
+
+/// 故事书包里的故事书记录：草稿全文 + 已发布版次快照。
+/// 与 `StorybookDocument` 的区别：这是**可移植的交付物**——导入方按它重建一条本地记录，
+/// 因此不带本地并发令牌（`draft_version` 由导入方从 1 起算）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+#[ts(export)]
+pub struct StorybookExportRecord {
+    pub id: String,
+    pub title: String,
+    pub revision: u32,
+    pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released_at: Option<String>,
+    pub published: bool,
+    #[ts(type = "unknown")]
+    pub draft: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "unknown")]
+    pub released: Option<Value>,
+}
+
+/// 故事书包的格式标识（清单 `format` 字段；不匹配即拒收）
+pub const STORYBOOK_PACKAGE_FORMAT: &str = "octopus-storybook-package";
+
+/// 自包含故事书包：zip 容器 `.octopus-book.zip`，内含 `storybook.json`（本清单）+ `assets/`。
+/// 与存档包同构（zip + 清单 + 内容寻址资产），但按故事书粒度交付：不含命令日志与存档状态。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+#[ts(export)]
+pub struct StorybookPackage {
+    pub format: String,
+    pub version: u32,
+    pub exported_at: String,
+    pub storybook: StorybookExportRecord,
+}
+
+// ============================================================
 // 存档版次迁移（#14 ②）：dry-run 报告 → 逐项裁决 → 执行
 // ============================================================
 
@@ -1373,4 +1697,221 @@ pub struct NewOriginResult {
     pub archived_count: u64,
     /// 新原点的 seq（检查点所在序号；无事件时为 0）
     pub origin_seq: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 图鉴 M1 / 地图 P1 的字段扩展必须纯加性：旧命令日志（无新字段）反序列化后
+    /// 新字段全为 None，再序列化回去**逐字不变**（skip_serializing_if 生效）。
+    #[test]
+    fn enemy_view_old_log_shape_roundtrips_unchanged() {
+        let old = json!({ "id": "e1", "name": "灰狼", "hp": 7, "max": 11, "ac": 12 });
+        let view: EnemyView = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(view.instance_id, None);
+        assert_eq!(view.template_id, None);
+        assert_eq!(view.scene_id, None);
+        assert_eq!(view.location_id, None);
+        assert!(view.attacks.is_empty(), "旧数据没有攻击摘要");
+        assert_eq!(serde_json::to_value(&view).unwrap(), old);
+    }
+
+    #[test]
+    fn enemy_view_new_fields_roundtrip() {
+        let view = EnemyView {
+            id: "e1".into(),
+            name: "地精".into(),
+            hp: 7,
+            max: 7,
+            ac: 15,
+            instance_id: Some("enc-x:goblin#1".into()),
+            template_id: Some("char-goblin".into()),
+            scene_id: Some("sc-cave".into()),
+            location_id: Some("loc-cave".into()),
+            attacks: vec![EnemyAttack {
+                skill_id: "sk-goblin-scimitar".into(),
+                name: "弯刀".into(),
+                damage: "1d6+2".into(),
+            }],
+        };
+        let back: EnemyView = serde_json::from_value(serde_json::to_value(&view).unwrap()).unwrap();
+        assert_eq!(back, view);
+        assert_eq!(back.attacks[0].skill_id, "sk-goblin-scimitar");
+    }
+
+    #[test]
+    fn enemy_spec_old_intent_shape_roundtrips_unchanged() {
+        let old = json!({ "name": "灰狼", "hp": 11, "ac": 12 });
+        let spec: EnemySpec = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(spec.template_id, None);
+        assert_eq!(spec.count, None);
+        assert_eq!(spec.skill_id, None);
+        assert_eq!(serde_json::to_value(&spec).unwrap(), old);
+
+        // 最旧形态：只有 name。hp / ac 是既有字段（本来就序列化成 null）；
+        // 本次新增的图鉴字段必须完全不出现。
+        let oldest = json!({ "name": "灰狼" });
+        let spec: EnemySpec = serde_json::from_value(oldest).unwrap();
+        let out = serde_json::to_value(&spec).unwrap();
+        assert!(out.get("template_id").is_none(), "新增字段不得出现在旧数据里");
+        assert!(out.get("count").is_none(), "新增字段不得出现在旧数据里");
+        assert!(out.get("skill_id").is_none(), "新增字段不得出现在旧数据里");
+    }
+
+    /// 图鉴 M2 补丁：Intent::Move 新增 character_id（可选），旧协议日志逐字往返。
+    #[test]
+    fn move_intent_old_shape_roundtrips_unchanged() {
+        let old = json!({ "type": "move", "destination_id": "loc-tavern" });
+        let intent: Intent = serde_json::from_value(old).unwrap();
+        match &intent {
+            Intent::Move { destination_id, character_id } => {
+                assert_eq!(destination_id, "loc-tavern");
+                assert_eq!(*character_id, None);
+            }
+            other => panic!("应解析为 move：{other:?}"),
+        }
+        // 新字段是**可选加性**：旧日志（不带它）照常解析；新写入多一个 null，
+        // 与 actor_id / tone 等既有可选字段同口径（不 skip_serializing_if）。
+        let out = serde_json::to_value(&intent).unwrap();
+        assert_eq!(out.get("type").and_then(Value::as_str), Some("move"));
+        assert_eq!(out.get("destination_id").and_then(Value::as_str), Some("loc-tavern"));
+        assert!(out.get("character_id").is_some_and(Value::is_null));
+    }
+
+    /// 图鉴 M2：enemy_strike 意图（可选字段）往返，并只带 type 标记。
+    #[test]
+    fn enemy_strike_intent_roundtrips() {
+        let value = json!({ "type": "enemy_strike", "enemy_id": "e1" });
+        let intent: Intent = serde_json::from_value(value).unwrap();
+        match &intent {
+            Intent::EnemyStrike { enemy_id, target_id, skill_id } => {
+                assert_eq!(enemy_id, "e1");
+                assert_eq!(*target_id, None);
+                assert_eq!(*skill_id, None);
+            }
+            other => panic!("应解析为 enemy_strike：{other:?}"),
+        }
+    }
+
+    /// 判定 C3：Intent::Check 的 opponent_id 是纯加性可选字段——旧的 check 意图
+    /// （不带对手）解析后再序列化逐字不变；带对手时能被读出来。
+    #[test]
+    fn check_intent_opponent_is_additive() {
+        let old = json!({
+            "type": "check", "attribute": "dex", "difficulty": 12, "actor_id": null
+        });
+        let intent: Intent = serde_json::from_value(old.clone()).unwrap();
+        match &intent {
+            Intent::Check { opponent_id, .. } => assert_eq!(*opponent_id, None),
+            other => panic!("应解析为 check：{other:?}"),
+        }
+        assert_eq!(serde_json::to_value(&intent).unwrap(), old, "没给对手时不得多出字段");
+
+        let with = json!({ "type": "check", "attribute": "dex", "opponent_id": "char-goblin" });
+        let intent: Intent = serde_json::from_value(with).unwrap();
+        match &intent {
+            Intent::Check { opponent_id, .. } => {
+                assert_eq!(opponent_id.as_deref(), Some("char-goblin"))
+            }
+            other => panic!("应解析为 check：{other:?}"),
+        }
+    }
+
+    /// 判定 C1：旧判定器 / 旧技能日志不带 attribute，序列化结果不变。
+    #[test]
+    fn checker_and_skill_old_shape_roundtrips_unchanged() {
+        let checker_json = json!({ "dice": "1d20", "kind": "attack" });
+        let checker: CheckerDef = serde_json::from_value(checker_json.clone()).unwrap();
+        assert_eq!(checker.attribute, None);
+        assert_eq!(checker.opposed_attribute, None);
+        assert_eq!(serde_json::to_value(&checker).unwrap(), checker_json);
+
+        let skill_json = json!({ "id": "sk-bite", "name": "啃咬" });
+        let skill: SkillDef = serde_json::from_value(skill_json).unwrap();
+        assert_eq!(skill.attribute, None);
+        let out = serde_json::to_value(&skill).unwrap();
+        assert!(out.get("attribute").is_none(), "新增字段不得出现在旧数据里");
+    }
+
+    /// 遭遇整体（旧日志里 EncounterView 内嵌 enemies）也必须逐字往返。
+    #[test]
+    fn encounter_view_old_log_shape_roundtrips_unchanged() {
+        // 旧日志里 note 为 None 时本就被 skip（既有行为），故旧形态不含 note。
+        let old = json!({
+            "id": "enc-1",
+            "name": "狼群合围",
+            "enemies": [{ "id": "e1", "name": "灰狼", "hp": 7, "max": 11, "ac": 12 }],
+            "active": true
+        });
+        let view: EncounterView = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(view.enemies[0].instance_id, None);
+        assert_eq!(serde_json::to_value(&view).unwrap(), old);
+        // 地图 P5 的叙事锚同样是纯加性：旧日志解析后全为 None / 空，往返逐字不变。
+        assert_eq!(view.scene_id, None);
+        assert_eq!(view.location_id, None);
+        assert_eq!(view.goal_id, None);
+        assert!(view.template_ids.is_empty());
+    }
+
+    /// 地图 P5 §6.4：遭遇的叙事 / 空间锚（创建时快照）往返。
+    #[test]
+    fn encounter_view_anchor_fields_roundtrip() {
+        let view = EncounterView {
+            id: "enc-1".into(),
+            name: "游荡的地精".into(),
+            enemies: vec![],
+            note: Some("触发点预置".into()),
+            active: true,
+            scene_id: Some("sc-1".into()),
+            location_id: Some("loc-cave".into()),
+            goal_id: Some("g-clear".into()),
+            template_ids: vec!["mon-goblin".into(), "mon-wolf".into()],
+        };
+        let back: EncounterView = serde_json::from_value(serde_json::to_value(&view).unwrap()).unwrap();
+        assert_eq!(back, view);
+    }
+
+    /// 地图 P5 §6.2：QuestView 的地点是从场景推导的加性字段；旧投影逐字往返。
+    #[test]
+    fn quest_view_location_is_additive() {
+        let old = json!({
+            "id": "g1", "text": "打倒地精", "done": false,
+            "source": "skeleton", "hidden": false, "primary": true
+        });
+        let quest: QuestView = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(quest.location_id, None);
+        assert_eq!(serde_json::to_value(&quest).unwrap(), old);
+
+        let with_loc = QuestView { location_id: Some("loc-cave".into()), ..quest };
+        let back: QuestView =
+            serde_json::from_value(serde_json::to_value(&with_loc).unwrap()).unwrap();
+        assert_eq!(back.location_id.as_deref(), Some("loc-cave"));
+    }
+
+    /// 地图 P5 §6.5：encounter_cleared 是零参数 op，展开形态就是 { "op": "encounter_cleared" }。
+    #[test]
+    fn encounter_cleared_cond_roundtrips() {
+        let raw = json!({ "op": "encounter_cleared" });
+        let cond: CondExpr = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(cond, CondExpr::EncounterCleared {});
+        assert_eq!(serde_json::to_value(&cond).unwrap(), raw);
+    }
+
+    /// 地图 P5 §6.3：触发点预置遭遇的解析（旧的「没有 encounter」形状不受影响）。
+    #[test]
+    fn encounter_preset_parses_optional_fields() {
+        let raw = json!({
+            "name": "游荡怪物",
+            "enemies": [{ "template_id": "mon-goblin", "count": 2 }, { "template_id": "mon-wolf" }]
+        });
+        let preset: EncounterPreset = serde_json::from_value(raw).unwrap();
+        assert_eq!(preset.name.as_deref(), Some("游荡怪物"));
+        assert_eq!(preset.note, None);
+        assert_eq!(preset.location_id, None);
+        assert_eq!(preset.enemies.len(), 2);
+        assert_eq!(preset.enemies[0].count, Some(2));
+        assert_eq!(preset.enemies[1].count, None);
+    }
 }

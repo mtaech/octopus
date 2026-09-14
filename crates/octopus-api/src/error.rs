@@ -69,6 +69,11 @@ impl From<EngineError> for ApiError {
                 "current_draft_version": current_draft_version,
                 "updated_at": updated_at,
             })),
+            EngineError::Conflict(ref c) if c == "username_taken" => Self::new(
+                StatusCode::CONFLICT,
+                "username_taken",
+                "该用户名已被占用",
+            ),
             EngineError::Conflict(ref c) if c == "expired" => {
                 Self::new(StatusCode::CONFLICT, "expired", "该确认已超时过期")
             }

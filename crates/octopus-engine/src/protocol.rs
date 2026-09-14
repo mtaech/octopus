@@ -121,6 +121,7 @@ pub const KNOWN_INTENTS: &[&str] = &[
     "use_item",
     "interact",
     "strike",
+    "enemy_strike",
     "advance_scene",
     "query_world",
     "query_character",
@@ -153,6 +154,11 @@ const INTENT_CATALOG: &[(&str, &str, &str)] = &[
     ("use_item", "use_item {item_id, target_id?}", "使用物品"),
     ("interact", "interact {object_id, action}", "与场景物件交互（#01 objects）"),
     ("strike", "strike {enemy_id, skill_id?}", "攻击遭遇中的敌人（由引擎结算）"),
+    (
+        "enemy_strike",
+        "enemy_strike {enemy_id, target_id?, skill_id?}",
+        "遭遇中的敌人攻击某个角色（由引擎结算；target_id 缺省 = 受控角色）",
+    ),
     ("advance_scene", "advance_scene {target_scene_id?, abandon?}", "推进场景"),
     ("query_world", "query_world {query}", "查询世界"),
     (
@@ -167,7 +173,11 @@ const INTENT_CATALOG: &[(&str, &str, &str)] = &[
     ),
     ("intervene", "intervene {content}", "介入"),
     ("quest", "quest {text, hidden?, primary?}", "新增任务（导演）"),
-    ("encounter", "encounter {name, enemies:[{name,hp?,ac?}], note?}", "创建遭遇（导演）"),
+    (
+        "encounter",
+        "encounter {name, enemies:[{name,hp?,ac?,template_id?,count?,skill_id?}], note?}",
+        "创建遭遇（导演；template_id 引用图鉴模板，按 count 克隆实例）",
+    ),
     ("adjust", "adjust {character_id, resource, amount}", "调整资源（导演）"),
     ("status", "status {character_id, status_id, remove?}", "施加 / 移除状态（导演）"),
     ("summary", "summary {text}", "本回合微摘要（派生记忆，不进叙事）"),
@@ -201,6 +211,7 @@ pub fn intent_kind(intent: &Intent) -> &'static str {
         Intent::Quest { .. } => "quest",
         Intent::Adjust { .. } => "adjust",
         Intent::Strike { .. } => "strike",
+        Intent::EnemyStrike { .. } => "enemy_strike",
         Intent::Encounter { .. } => "encounter",
         Intent::Status { .. } => "status",
         Intent::Summary { .. } => "summary",
@@ -214,12 +225,12 @@ pub const SYSTEM_PREAMBLE: &str = "你是 Octopus 游戏的「AI 主持」：负
 1. 只输出一个 JSON 数组：全部内容都放进数组元素，不附加说明文字，不使用 Markdown 代码块。\n\
 2. 数组每个元素是一个「意图」对象，必须带 type 字段；可用类型：\n\
    narrate {content, actor_id?} 旁白；speak {content, actor_id, tone?} 角色台词；emote {content, actor_id, emotion?} 神态动作；\n\
-   check {attribute, difficulty?} 判定（attribute 只能填「可用判定属性」里列出的 key）；move {destination_id}；use_skill {skill_id, target_id?}；\n\
-   use_item {item_id, target_id?}；interact {object_id, action} 与场景物件交互；strike {enemy_id, skill_id?} 攻击遭遇中的敌人；advance_scene {target_scene_id?, abandon?}；query_world {query}；finish_turn {}\n\
+   check {attribute, difficulty?} 判定（attribute 只能填「可用判定属性」里列出的 key）；move {destination_id, character_id?}；use_skill {skill_id, target_id?}；\n\
+   use_item {item_id, target_id?}；interact {object_id, action} 与场景物件交互；strike {enemy_id, skill_id?} 攻击遭遇中的敌人；\n   enemy_strike {enemy_id, target_id?, skill_id?} 让遭遇中的敌人攻击某个角色（target_id 缺省 = 受控角色）；advance_scene {target_scene_id?, abandon?}；query_world {query}；finish_turn {}\n\
 3. speak / emote 带上 actor_id：只填「在场角色」名单里括号内的 id（如 char-isa），一次只扮演一个人；玩家受控角色的台词由玩家输入，你专注世界与 NPC 的回应。\n\
    **归属分清：角色的动作、神态与反应一律用 emote（带 actor_id）**；narrate 只写环境、天气、时间流逝、场景切换与玩家角色自己的动作，这类纯旁白可省略 actor_id。\n\
 4. 扮演 NPC 时以第一人称口吻，符合其背景、性格与对话示例的语气；引用实体时使用名单里给出的 id。\n\
-5. 玩家攻击「当前遭遇」里的敌人时，用 strike {enemy_id} 交给引擎结算；把引擎给出的结果叙述得有画面感。\n\
+5. 玩家攻击「当前遭遇」里的敌人时，用 strike {enemy_id} 交给引擎结算；敌人攻击角色时用 enemy_strike {enemy_id, target_id?}；把引擎给出的结果叙述得有画面感。\n\
 6. 每次输出 1-3 个意图；确实无事可做时输出 []。\n\
 7. 叙事、遭遇与场景推进都围绕【当前场景】与【当前任务】展开，保持一致。\n\
 8. 需要先打草稿 / 内心推演时，用 think {content} 意图写思考；引擎会把它折叠展示，不算叙事。\n\
@@ -234,7 +245,7 @@ pub const TOOL_PREAMBLE: &str = "你是 Octopus 游戏的「AI 主持」：负�
 2. speak / emote 带上 actor_id：只填「在场角色」名单里括号内的 id（如 char-isa），一次只扮演一个人；玩家受控角色的台词由玩家输入，你专注世界与 NPC 的回应。\n\
    **归属分清：角色的动作、神态与反应一律用 emote（带 actor_id）**；narrate 只写环境、天气、时间流逝、场景切换与玩家角色自己的动作，这类纯旁白可省略 actor_id。\n\
 3. 扮演 NPC 时以第一人称口吻，符合其背景、性格与对话示例的语气；引用实体时使用名单里给出的 id。\n\
-4. 玩家攻击「当前遭遇」里的敌人时，用 strike {enemy_id} 交给引擎结算；把引擎给出的结果叙述得有画面感。\n\
+4. 玩家攻击「当前遭遇」里的敌人时，用 strike {enemy_id} 交给引擎结算；敌人攻击角色时用 enemy_strike {enemy_id, target_id?}；把引擎给出的结果叙述得有画面感。\n\
 5. 每轮调用 1-3 个意图工具；确实无事可做时直接调用 finish_turn。\n\
 6. 叙事、遭遇与场景推进都围绕【当前场景】与【当前任务】展开，保持一致。\n\
 7. 需要先打草稿 / 内心推演时，用 think {content} 意图写思考；引擎会把它折叠展示，不算叙事。\n\
@@ -328,11 +339,24 @@ const INTENT_TOOLS: &[(&str, &str, &[(&str, &str, bool)])] = &[
         "判定（attribute 只能填「可用判定属性」里列出的 key）",
         &[("attribute", "string", true), ("difficulty", "integer", false), ("actor_id", "string", false)],
     ),
-    ("move", "移动", &[("destination_id", "string", true)]),
+    (
+        "move",
+        "移动",
+        &[("destination_id", "string", true), ("character_id", "string", false)],
+    ),
     ("use_skill", "使用技能", &[("skill_id", "string", true), ("target_id", "string", false)]),
     ("use_item", "使用物品", &[("item_id", "string", true), ("target_id", "string", false)]),
     ("interact", "与场景物件交互", &[("object_id", "string", true), ("action", "string", true)]),
     ("strike", "攻击遭遇中的敌人（由引擎结算）", &[("enemy_id", "string", true), ("skill_id", "string", false)]),
+    (
+        "enemy_strike",
+        "遭遇中的敌人攻击某个角色（由引擎结算；target_id 缺省 = 受控角色）",
+        &[
+            ("enemy_id", "string", true),
+            ("target_id", "string", false),
+            ("skill_id", "string", false),
+        ],
+    ),
     (
         "advance_scene",
         "推进场景",
@@ -351,6 +375,8 @@ const INTENT_TOOLS: &[(&str, &str, &[(&str, &str, bool)])] = &[
         "encounter",
         "创建遭遇（导演）",
         &[("name", "string", true), ("enemies", "array", true), ("note", "string", false)],
+        // enemies 每项 = EnemySpec {name, hp?, ac?, template_id?, count?, skill_id?}：
+        // template_id 命中图鉴模板（kind=monster）时按 count 克隆怪物实例。
     ),
     (
         "adjust",
@@ -824,6 +850,7 @@ mod tests {
             scene_id: "sc-1".into(),
             scene_title: "酒馆".into(),
             scene_description: None,
+            location: None,
             controlled: "米拉(char-mira)".into(),
             player_text: "你好".into(),
             channel: RoundChannel::Character,

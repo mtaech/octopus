@@ -20,6 +20,7 @@ mod m20260916_000017_create_snapshots;
 mod m20260917_000018_drop_roles_from_saves;
 mod m20260918_000019_create_ai_conversations;
 mod m20260919_000020_add_compaction_to_pair_threads;
+mod m20260920_000021_create_accounts;
 
 pub struct Migrator;
 
@@ -47,6 +48,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260917_000018_drop_roles_from_saves::Migration),
             Box::new(m20260918_000019_create_ai_conversations::Migration),
             Box::new(m20260919_000020_add_compaction_to_pair_threads::Migration),
+            Box::new(m20260920_000021_create_accounts::Migration),
         ]
     }
 }
@@ -54,6 +56,41 @@ impl MigratorTrait for Migrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 000021：账户两张表 + saves/storybooks 的归属列（列可空，回填在引擎侧）。
+    #[tokio::test]
+    async fn migration_creates_accounts_and_owner_columns() {
+        let path = std::env::temp_dir().join(format!(
+            "octopus-migrate-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // 与引擎一致：绝对路径 + mode=rwc（缺了 rwc，新建文件会报 unable to open）。
+        let mut opt = sea_orm::ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.display()));
+        opt.max_connections(1);
+        let db = sea_orm::Database::connect(opt).await.expect("打开临时库");
+        Migrator::up(&db, None).await.expect("跑全部迁移");
+
+        for sql in [
+            "SELECT id, username, display_name, password_hash, is_admin, must_change_password, \
+             created_at, updated_at, last_login_at FROM users LIMIT 0",
+            "SELECT token_hash, user_id, created_at, expires_at, last_seen_at, user_agent \
+             FROM sessions LIMIT 0",
+            "SELECT owner_id FROM saves LIMIT 0",
+            "SELECT owner_id FROM storybooks LIMIT 0",
+        ] {
+            db.query_all(sea_orm::Statement::from_string(
+                sea_orm::DbBackend::Sqlite,
+                sql.to_string(),
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("000021 后应能查询：{sql}\n{e}"));
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
 
     /// 回填：000013 之前只写了旧 model_* 的存档，升级后应得到 mode=shared 的 roles_json
     /// （主线与角色同模型），保证旧存档升级后行为不变。

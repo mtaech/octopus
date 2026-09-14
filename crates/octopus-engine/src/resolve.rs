@@ -180,8 +180,19 @@ impl ModifierProfile {
     }
 }
 
-/// 属性 → 修正：优先 attribute_modifier 固定映射；否则按维度声明的
-/// 基线 / 范围 / 步长算 floor((clamp(v) - baseline) / step)，再夹到该维度的修正范围。
+/// 属性 → 修正：优先 attribute_modifier 固定映射；否则按判定器声明的 `modifier_formula`
+/// 求值；再缺省用维度声明的基线 / 范围 / 步长算 floor((clamp(v) - baseline) / step)。
+/// 结果一律夹到该维度的修正范围（由 min / max / baseline / step 推出）。
+///
+/// `modifier_formula` 与派生值同语法（`crate::derived::eval_formula`：
+/// `+ - * / ( )` + floor / ceil / round / abs / min / max），可用变量：
+/// - `v`：**夹取后**的属性值（与缺省公式同口径，min / max 已生效）
+/// - `value`：原始属性值
+/// - `baseline` / `step`：该维度声明的中心与步长
+///
+/// D&D 的 `floor((v - 10) / 2)` 因此可直接算出；求值失败（语法错误 / 未知变量）静默回落到
+/// 缺省中心偏移公式——发布门（validate）会把非法公式挡成 Error，运行期不让一条坏公式
+/// 把整场判定打断。
 pub fn modifier_for(checker: &CheckerDef, attribute: &str, value: f64, profile: ModifierProfile) -> i64 {
     if let Some(map) = &checker.attribute_modifier {
         if let Some(fixed) = map.get(attribute) {
@@ -196,6 +207,23 @@ pub fn modifier_for(checker: &CheckerDef, attribute: &str, value: f64, profile: 
         v = v.min(hi);
     }
     let (lo, hi) = profile.modifier_bounds();
+    if let Some(formula) = checker
+        .modifier_formula
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("v".to_string(), v);
+        vars.insert("value".to_string(), value);
+        vars.insert("baseline".to_string(), profile.baseline);
+        vars.insert("step".to_string(), profile.step);
+        if let Ok(out) = crate::derived::eval_formula(formula, &vars) {
+            if out.is_finite() {
+                return (out.floor() as i64).clamp(lo, hi);
+            }
+        }
+    }
     (((v - profile.baseline) / profile.step).floor() as i64).clamp(lo, hi)
 }
 
@@ -221,6 +249,18 @@ pub fn level_for_margin(margin: i64, thresholds: &[i64]) -> SuccessLevel {
     }
 }
 
+/// 判定比较方向：`total` 是否达成 `target`。
+///
+/// 对抗（Opposed）的 `target` 是**对手的 total**（由调用方掷完对手后写入），比较方向与
+/// gte 同向——引擎不认识「对手是谁」，只认识「拿谁的总值当目标」。
+pub fn compare(total: i64, target: i64, mode: CheckMode) -> bool {
+    match mode {
+        CheckMode::Lte => total <= target,
+        CheckMode::Gte => total >= target,
+        CheckMode::Opposed => total >= target,
+    }
+}
+
 /// 给已解析的判定追加静态修正（同名 modifier 取 max 后由调用方传入），并重算 total / margin / 结果 / 档位。
 pub fn apply_check_bonus(
     check: &mut ResolvedCheck,
@@ -234,11 +274,38 @@ pub fn apply_check_bonus(
     check.r#mod += bonus;
     check.total += bonus;
     check.margin = check.total - check.target;
-    check.result = match mode {
-        CheckMode::Lte => check.total <= check.target,
-        CheckMode::Gte | CheckMode::Opposed => check.total >= check.target,
-    };
+    check.result = compare(check.total, check.target, mode);
     check.level = level_for_margin(check.margin, thresholds);
+}
+
+/// 对抗判定的目标写入（判定 C3）：`target` = 对手 total，重算 margin / 结果 / 档位。
+///
+/// 调用方（session）负责让对手**真的得过一次值**：角色实例掷一次骰，静态被动值算
+/// `passive_base` + 属性修正。这里只做「换目标 + 重新分档」，不含任何规则集语义。
+pub fn apply_opposed_target(check: &mut ResolvedCheck, opponent_total: i64, thresholds: &[i64]) {
+    check.target = opponent_total;
+    check.margin = check.total - opponent_total;
+    check.result = compare(check.total, opponent_total, CheckMode::Opposed);
+    check.level = level_for_margin(check.margin, thresholds);
+}
+
+/// 结果覆盖（通用原语，判定 C4）：把 `result` 置为给定值，并让成功度与结果不矛盾。
+///
+/// - 强制失败 → `result = false`、成功度落到最低档（`Fail`）
+/// - 强制成功 → `result = true`、成功度至少为中档（`Success`；已是更高档则保持）
+///
+/// **骰面 / 总值 / 差值 / 难度都不动**：覆盖的是「这一次判定算不算成功」，不是重写骰子。
+/// 引擎不判断**何时**该覆盖（自然 1 / 自然 20 / 剧情豁免都是规则包的叫法与判据）——那由
+/// `check_post_roll` 挂载点的 Lua 读取判定细节后自行决定；引擎只提供这个通用动作。
+pub fn apply_forced_result(check: &mut ResolvedCheck, success: bool) {
+    check.result = success;
+    if success {
+        if check.level == SuccessLevel::Fail {
+            check.level = SuccessLevel::Success;
+        }
+    } else {
+        check.level = SuccessLevel::Fail;
+    }
 }
 
 /// 声明式判定：掷骰（可选）+ 属性修正 → total / margin / 档位。
@@ -303,13 +370,10 @@ pub fn resolve_declarative_check(
     };
 
     let total = dice_total + r#mod + passive_base;
+    // 对抗时 target 由调用方掷完对手后改写（见 apply_opposed_target）；声明式入口只认难度。
     let target = difficulty;
     let margin = total - target;
-    let result = match mode {
-        CheckMode::Lte => total <= target,
-        // gte / opposed 由调用方给出对抗方数值后同样比较 >=
-        CheckMode::Gte | CheckMode::Opposed => total >= target,
-    };
+    let result = compare(total, target, mode);
     let level = level_for_margin(margin, degree_thresholds(checker));
 
     Ok(ResolvedCheck {
@@ -338,10 +402,7 @@ pub fn resolve_lua_check(
 ) -> Result<ResolvedCheck, EngineError> {
     let outcome = host.run_check(script, ctx)?;
     let target = outcome.total - outcome.margin;
-    let result = match mode {
-        CheckMode::Lte => outcome.total <= target,
-        CheckMode::Gte | CheckMode::Opposed => outcome.total >= target,
-    };
+    let result = compare(outcome.total, target, mode);
     Ok(ResolvedCheck {
         attribute: String::new(),
         expr: None,
@@ -604,5 +665,83 @@ mod tests {
         let d = ModifierProfile::for_storybook(&sb, "lck");
         assert_eq!(d.step, 5.0);
         assert_eq!(d.baseline, 50.0);
+    }
+
+    /// 判定 C4 验收 4：modifier_formula 真的被求值——D&D 的 floor((v - 10) / 2) 算得出来，
+    /// 不再是「作者能填、引擎忽略」。
+    #[test]
+    fn modifier_formula_is_evaluated() {
+        let profile = ModifierProfile { baseline: 10.0, min: Some(1.0), max: Some(30.0), step: 2.0 };
+        let checker = CheckerDef {
+            modifier_formula: Some("floor((v - 10) / 2)".into()),
+            ..Default::default()
+        };
+        assert_eq!(modifier_for(&checker, "dex", 14.0, profile), 2);
+        assert_eq!(modifier_for(&checker, "int", 16.0, profile), 3);
+        assert_eq!(modifier_for(&checker, "cha", 9.0, profile), -1);
+
+        // 与派生值同语法：value（原始值）/ baseline / step 都可读。
+        let scaled = CheckerDef {
+            modifier_formula: Some("floor((value - baseline) / step)".into()),
+            ..Default::default()
+        };
+        assert_eq!(modifier_for(&scaled, "dex", 14.0, profile), 2);
+        // 结果仍夹到该维度的修正范围（1..30 → -5..+10）。
+        let big = CheckerDef { modifier_formula: Some("100".into()), ..Default::default() };
+        assert_eq!(modifier_for(&big, "dex", 14.0, profile), 10);
+
+        // 语法错误静默回落到缺省中心偏移公式（发布门会把非法公式拦成 Error）。
+        let broken = CheckerDef { modifier_formula: Some("(v - ".into()), ..Default::default() };
+        assert_eq!(modifier_for(&broken, "dex", 14.0, profile), 2, "坏公式回落缺省公式");
+
+        // 验收 6：LMoP 的公式与维度缺省公式同值 → 1..30 全域逐字相等（旧存档零变化）。
+        let default = CheckerDef::default();
+        let lmop = CheckerDef {
+            modifier_formula: Some("floor((v - 10) / 2)".into()),
+            ..Default::default()
+        };
+        for v in 1..=30 {
+            assert_eq!(
+                modifier_for(&lmop, "dex", v as f64, profile),
+                modifier_for(&default, "dex", v as f64, profile),
+                "v={v} 时 LMoP 公式必须与缺省中心偏移逐字同值"
+            );
+        }
+
+        // attribute_modifier 固定映射仍然最优先。
+        let mut fixed = std::collections::BTreeMap::new();
+        fixed.insert("dex".to_string(), 7);
+        let checker = CheckerDef {
+            attribute_modifier: Some(fixed),
+            modifier_formula: Some("1000".into()),
+            ..Default::default()
+        };
+        assert_eq!(modifier_for(&checker, "dex", 14.0, profile), 7);
+    }
+
+    /// 判定 C4 验收 3：通用结果覆盖——强制失败落最低档，强制成功至少中档；
+    /// 骰面 / 总值 / 差值一律不动（覆盖的是结果，不是骰子）。
+    #[test]
+    fn forced_result_overrides_result_and_level_only() {
+        let checker = CheckerDef { dice: Some("1d20".into()), ..Default::default() };
+        let mut rng = DeterministicRng::new(5);
+        let mut check = resolve_declarative_check(
+            &checker,
+            "str",
+            70.0,
+            12,
+            ModifierProfile::default(),
+            &mut rng,
+        )
+        .unwrap();
+        let (total, margin, rolls) = (check.total, check.margin, check.rolls.clone());
+        apply_forced_result(&mut check, true);
+        assert!(check.result);
+        assert_ne!(check.level, SuccessLevel::Fail, "强制成功不得留在失败档");
+        assert_eq!((check.total, check.margin, check.rolls.clone()), (total, margin, rolls.clone()));
+        apply_forced_result(&mut check, false);
+        assert!(!check.result);
+        assert_eq!(check.level, SuccessLevel::Fail, "强制失败落到最低档");
+        assert_eq!((check.total, check.margin, check.rolls.clone()), (total, margin, rolls));
     }
 }

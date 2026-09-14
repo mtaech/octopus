@@ -68,7 +68,7 @@ pub const TURN_TEMPLATE_DEFAULT: &str = "【回合 {{round}}】\n（各段冲突
 pub const TURN_TEMPLATE_VARS: &[(&str, &str)] = &[
     ("round", "当前回合序号（从 1 开始）"),
     ("world", "世界前提 + 故事书 world 槽位叙述段"),
-    ("scene", "当前场景标题与描述"),
+    ("scene", "当前场景标题、当前地点与场景描述（地点形如「（地点：碎星酒馆）」，未声明地点时不出这一段）"),
     ("memories", "检索到的相关往事块（相关往事）"),
     ("controlled", "本回合受控角色名（或「未指定」）"),
     ("chars", "在场角色名单（名字(id)，顿号分隔）"),
@@ -108,7 +108,7 @@ pub const BLOCK_SCENES_DEFAULT: &str =
     "\n【可推进的场景】需要换场时用 advance_scene {target_scene_id}：\n{{items}}";
 
 /// 当前遭遇引导语。变量：{{items}}。
-pub const BLOCK_ENCOUNTERS_DEFAULT: &str = "\n【当前遭遇】\n{{items}}";
+pub const BLOCK_ENCOUNTERS_DEFAULT: &str = "\n【当前遭遇】（敌方数据卡：HP / AC / 可用攻击；攻击结算用 strike / enemy_strike 交给引擎）\n{{items}}";
 
 /// 人物设定引导语（人格档案 = 扮演依据）。变量：{{items}}。
 pub const BLOCK_PERSONAS_DEFAULT: &str =
@@ -139,7 +139,7 @@ pub const BLOCK_ATTRIBUTES_DEFAULT: &str =
     "可用判定属性（check 的 attribute 只能填这些）：{{items}}\n";
 
 /// 导演模式专属说明（仅导演回合注入，无变量）。
-pub const BLOCK_GM_DEFAULT: &str = "\n【导演模式】本回合是「导演」（人）在代替 GM 推进剧情，不是受控角色的言行：\n         - 把导演的意图扩写成叙事（narrate）与必要的对话/神态，保持既有文风；\n         - 不要替受控角色做决定，也不要让受控角色替导演发言；\n         - 导演专属意图：quest {text, hidden?, primary?} 新增任务；encounter {name, enemies:[{name,hp?,ac?}], note?} 创建结构化遭遇（ac=防御值，越高越难打中，缺省 12）；adjust {character_id, resource, amount} 调整资源；status {character_id, status_id, remove?} 施加/移除状态。\n         - 未署名的叙事归属「故事本身」，不要挂到玩家角色头上。\n";
+pub const BLOCK_GM_DEFAULT: &str = "\n【导演模式】本回合是「导演」（人）在代替 GM 推进剧情，不是受控角色的言行：\n         - 把导演的意图扩写成叙事（narrate）与必要的对话/神态，保持既有文风；\n         - 不要替受控角色做决定，也不要让受控角色替导演发言；\n         - 导演专属意图：quest {text, hidden?, primary?} 新增任务；encounter {name, enemies:[{name,hp?,ac?,template_id?,count?,skill_id?}], note?} 创建结构化遭遇（ac=防御值，越高越难打中，缺省 12；template_id 引用图鉴模板，按 count 克隆怪物实例，skill_id 覆盖缺省攻击技能）；adjust {character_id, resource, amount} 调整资源；status {character_id, status_id, remove?} 施加/移除状态。\n         - 未署名的叙事归属「故事本身」，不要挂到玩家角色头上。\n";
 
 /// 意图解析失败后的纠正消息（工具模式）。变量：{{error}}。
 pub const RETRY_TOOL_DEFAULT: &str = "你的上一次输出未被接受（原因：{{error}}）。请改用**原生工具调用**逐个调用意图工具（一次可并行调用多个，最后调用 finish_turn 收束）；不要用「[工具调用] 工具名 {…}」这类文字描述来代替真正的调用，也不要输出 JSON 数组。";

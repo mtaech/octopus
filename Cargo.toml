@@ -44,6 +44,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # LLM 应用框架：provider 客户端 / CompletionModel / Agent / 工具调用
 rig = { version = "0.42" }
 sha2 = "0.10"
+# 口令哈希（argon2id）；只用于账户口令，不参与任何游戏内计算。
+argon2 = { version = "0.5", features = ["std"] }
 # 存档包容器：只写不压（图片本身已是压缩格式），读时支持 deflate 以兼容外部重打包
 zip = { version = "2", default-features = false, features = ["deflate"] }
 sea-orm = { version = "1.1", features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros"] }

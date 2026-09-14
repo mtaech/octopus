@@ -3,6 +3,7 @@
 //! 依赖纪律（#20 ②）：`state`、`rng` 为叶子；`command`/`session` 为编排；
 //! `storage` 为适配层；外部 IO 与 LLM 一律走 `ports`。
 
+pub mod accounts;
 pub mod assets;
 pub mod command;
 pub mod conditions;
@@ -28,8 +29,15 @@ pub mod upcast;
 pub mod upgrade;
 pub mod validate;
 
+pub use accounts::{
+    hash_password, hash_session_token, new_session_token, normalize_username,
+    resolve_display_name, validate_password, validate_username, verify_password, AccountSecret,
+    AdminCounts, DEFAULT_ADMIN_PASSWORD, DEFAULT_ADMIN_USER_ID, DEFAULT_ADMIN_USERNAME,
+    SESSION_TTL_DAYS,
+};
 pub use assets::{
-    collect_asset_refs, content_type_of, pack_bundle, unpack_bundle, AssetStore, StoredAsset,
+    collect_asset_refs, content_type_of, pack_book_bundle, pack_bundle, unpack_book_bundle,
+    unpack_bundle, AssetStore, StoredAsset,
 };
 pub use derived::{check_formula, eval_formula};
 pub use conditions::{
@@ -62,7 +70,7 @@ pub use protocol::{
     ProtocolAdapter, ProtocolMode, ProtocolSpec, KNOWN_INTENTS,
     NARRATIVE_INTENTS, SYSTEM_PREAMBLE, TOOL_PREAMBLE,
 };
-pub use recovery::{plan_rest, rest_deltas, RecoveryTrigger, RestKind};
+pub use recovery::{plan_rest, plan_tick, rest_deltas, tick_deltas, RecoveryTrigger, RestKind, TickKind};
 pub use resolve::{
     degree_thresholds, level_for_margin, modifier_for, resolve_checker, resolve_declarative_check,
     resolve_lua_check, roll_dice, DiceRoll, ModifierProfile, ResolvedCheck,

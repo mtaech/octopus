@@ -41,6 +41,72 @@ impl RecoveryTrigger {
     }
 }
 
+/// 回合 / 场景边界（#12 ④）：\`per_turn\` / \`per_scene\` 的触发时机。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickKind {
+    Turn,
+    Scene,
+}
+
+impl RecoveryTrigger {
+    /// 该触发是否在本次**边界 tick** 中生效（per_turn 只在回合边界、per_scene 只在场景边界）。
+    pub fn active_on_tick(&self, tick: TickKind) -> bool {
+        match self {
+            Self::PerTurn => tick == TickKind::Turn,
+            Self::PerScene => tick == TickKind::Scene,
+            _ => false,
+        }
+    }
+}
+
+/// 计算一次边界 tick 的自然恢复量：返回 (resource_id, delta)，只含真正有变化的项。
+///
+/// 上限与休息共用 \`default_max\`；\`per_turn\` / \`per_scene\` 各只在自己的边界生效，
+/// 所以没声明这两类触发的故事书**不会产生任何增量、也不会多发事件**（与旧行为逐字一致）。
+pub fn plan_tick(world_resources: &Value, actor_resources: &Value, tick: TickKind) -> Vec<(String, i64)> {
+    let Some(defs) = world_resources.as_array() else { return Vec::new() };
+    let mut out = Vec::new();
+    for def in defs {
+        let Some(id) = def.get("id").and_then(|v| v.as_str()) else { continue };
+        let Some(recovery) = def.get("natural_recovery") else { continue };
+        let amount = recovery.get("amount").and_then(|v| v.as_i64()).unwrap_or(0);
+        let trigger = recovery
+            .get("trigger")
+            .and_then(|v| v.as_str())
+            .and_then(RecoveryTrigger::parse);
+        let Some(trigger) = trigger else { continue };
+        if !trigger.active_on_tick(tick) { continue; }
+        // amount <= 0 的声明不产生恢复（0 是「默认不恢复」的常见写法）。
+        if amount <= 0 { continue; }
+        let cur = actor_resources.get(id).and_then(|v| v.as_i64()).unwrap_or(0);
+        let max = def.get("default_max").and_then(|v| v.as_i64()).unwrap_or(i64::MAX);
+        let target = (cur + amount).min(max);
+        if target > cur {
+            out.push((id.to_string(), target - cur));
+        }
+    }
+    out
+}
+
+/// 边界 tick → 状态增量（走 Character 域的 resources.<id>，与休息同一条路径）。
+pub fn tick_deltas(
+    actor_id: &str,
+    world_resources: &Value,
+    actor_resources: &Value,
+    tick: TickKind,
+) -> Vec<StateDelta> {
+    plan_tick(world_resources, actor_resources, tick)
+        .into_iter()
+        .map(|(resource, delta)| StateDelta {
+            domain: DeltaDomain::Character,
+            entity_id: actor_id.to_string(),
+            field: format!("resources.{resource}"),
+            op: DeltaOp::Add,
+            value: Value::from(delta),
+        })
+        .collect()
+}
+
 /// 计算一次休息的恢复量：返回 (resource_id, delta)，只含真正有变化的项。
 pub fn plan_rest(world_resources: &Value, actor_resources: &Value, kind: RestKind) -> Vec<(String, i64)> {
     let Some(defs) = world_resources.as_array() else { return Vec::new() };
@@ -121,6 +187,53 @@ mod tests {
         assert!(!out.iter().any(|(id, _)| id == "res-slot-1"));
         assert!(out.contains(&("res-slot-2".to_string(), 1)));
         assert!(out.contains(&("res-stamina".to_string(), 5)), "不得超过上限");
+    }
+
+    fn world_with_ticks() -> Value {
+        json!([
+            { "id": "res-hp", "default_max": 10, "natural_recovery": { "amount": 3, "trigger": "per_turn" } },
+            { "id": "res-focus", "default_max": 5, "natural_recovery": { "amount": 2, "trigger": "per_scene" } },
+            { "id": "res-slot", "default_max": 2, "natural_recovery": { "amount": 2, "trigger": "per_long_rest" } },
+            { "id": "res-zero", "default_max": 9, "natural_recovery": { "amount": 0, "trigger": "per_turn" } }
+        ])
+    }
+
+    #[test]
+    fn per_turn_tick_only_heals_turn_resources_and_caps() {
+        let actor = json!({ "res-hp": 8, "res-focus": 0, "res-slot": 0, "res-zero": 0 });
+        let out = plan_tick(&world_with_ticks(), &actor, TickKind::Turn);
+        // 8 + 3 = 11 → 夹到 default_max 10，所以只补 2。
+        assert!(out.contains(&("res-hp".to_string(), 2)), "per_turn 补量且不超上限：{out:?}");
+        assert!(!out.iter().any(|(id, _)| id == "res-focus"), "per_scene 不在回合边界生效");
+        assert!(!out.iter().any(|(id, _)| id == "res-slot"), "休息类不在边界生效");
+        assert!(!out.iter().any(|(id, _)| id == "res-zero"), "amount <= 0 不产生恢复");
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn per_scene_tick_only_heals_scene_resources() {
+        let actor = json!({ "res-hp": 0, "res-focus": 0 });
+        let out = plan_tick(&world_with_ticks(), &actor, TickKind::Scene);
+        assert_eq!(out, vec![("res-focus".to_string(), 2)]);
+    }
+
+    #[test]
+    fn tick_at_full_resource_is_a_no_op() {
+        let actor = json!({ "res-hp": 10, "res-focus": 5 });
+        assert!(plan_tick(&world_with_ticks(), &actor, TickKind::Turn).is_empty());
+        assert!(plan_tick(&world_with_ticks(), &actor, TickKind::Scene).is_empty());
+    }
+
+    #[test]
+    fn tick_deltas_use_character_resources_path() {
+        let actor = json!({ "res-hp": 0 });
+        let d = tick_deltas("inst-a", &world_with_ticks(), &actor, TickKind::Turn);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].domain, DeltaDomain::Character);
+        assert_eq!(d[0].entity_id, "inst-a");
+        assert_eq!(d[0].field, "resources.res-hp");
+        assert_eq!(d[0].op, DeltaOp::Add);
+        assert_eq!(d[0].value, Value::from(3));
     }
 
     #[test]

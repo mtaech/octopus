@@ -16,6 +16,9 @@ pub struct Model {
     #[sea_orm(column_type = "Text")]
     pub storybook_json: String,
     pub auto_confirm: bool,
+    /// 归属账户：谁开的档谁看得见（NULL 只可能出现在回填之前的历史行）。
+    #[sea_orm(nullable)]
+    pub owner_id: Option<String>,
     /// 本存档使用的模型（provider id + model id）；NULL 表示用全局角色默认。
     #[sea_orm(nullable)]
     pub model_provider_id: Option<String>,

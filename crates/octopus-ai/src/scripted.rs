@@ -16,6 +16,8 @@ impl AiProvider for ScriptedProvider {
                 attribute: "wit".into(),
                 difficulty: Some(12),
                 actor_id: None,
+                // 判定 C3：脚本化 provider 不发起对抗判定（None = 旧行为逐字不变）。
+                opponent_id: None,
             });
         } else if t.contains("梦") || t.contains("传闻") {
             out.push(Intent::Narrate {
