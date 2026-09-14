@@ -18,7 +18,7 @@ use octopus_types::{
 };
 use serde_json::Value;
 
-use crate::effects::{resolve_effect, EffectResolution};
+use crate::effects::{resolve_effect, EffectResolution, EffectScale};
 use crate::error::EngineError;
 use crate::modifiers::AttrModifier;
 use crate::lua_host::{
@@ -136,6 +136,21 @@ pub(crate) fn check_context(resolved: &ResolvedCheck) -> LuaCheckContext {
         level: Some(resolved.level),
         rolls: resolved.rolls.clone(),
     }
+}
+
+/// 效果快照 → Lua 只读事实（PostResolve 的 `host.resolved_effects`）。
+///
+/// 引擎只导出**它实际算出的东西**：数值型 delta（资源增减，缩放之后）、状态 / 静态修正、
+/// 本次效果自己消耗的骰数，以及本次声明的缩放因子（None = 没声明）。
+/// 消耗扣减**不在这里**——它不是效果本身。
+fn effects_snapshot(effects: &EffectResolution, factor: Option<f64>) -> Value {
+    serde_json::json!({
+        "deltas": effects.deltas,
+        "statuses": effects.statuses,
+        "modifiers": effects.modifiers,
+        "rng_consumed": effects.rng_consumed,
+        "factor": factor,
+    })
 }
 
 /// 判定签名 → Lua 只读快照（**掷骰前**挂载点读它决定「对哪一类判定做什么」）。
@@ -384,18 +399,22 @@ pub(crate) fn run_check(
 /// 执行某挂载点：注册表脚本按序跑（含 `when` 闸门）；技能自身 lua 钩子挂在 PreResolve。
 ///
 /// 返回该挂载点新产生的写请求（顺序 = 脚本执行顺序）。Drain 放在每次挂载点之后，
-/// 调用方才能把「判定修正」挑出来当场应用，而不是等到最后一起丢掉。
+/// 调用方才能把「判定修正 / 效果缩放」挑出来当场应用，而不是等到最后一起丢掉。
+///
+/// `resolved_effects` 只在 PostResolve 传 Some（本次**实际算出的效果**只读快照）；
+/// 其他挂载点传 None，脚本读 `host.resolved_effects` 得到 nil。
 fn run_mount(
     skill: &SkillDef,
     mount: LuaMount,
     ctx: &CommandContext<'_>,
     lua_ctx: &LuaHostContext,
     check: Option<&LuaCheckContext>,
+    resolved_effects: Option<&Value>,
 ) -> Result<Vec<LuaRequest>, EngineError> {
     let Some((host, _)) = ctx.lua else {
         return Ok(Vec::new());
     };
-    let env = MountEnv { gate: ctx.mount_gate, check, event: None };
+    let env = MountEnv { gate: ctx.mount_gate, check, event: None, resolved_effects };
     if let Some(registry) = ctx.registry {
         registry.run_chain_with(host, mount, lua_ctx, &env)?;
     }
@@ -471,6 +490,7 @@ pub fn execute_skill(
         ctx,
         &mount_ctx,
         signature.as_ref(),
+        None,
     )?));
     let difficulty = ctx.difficulty + adjustments.dc;
     mount_ctx.difficulty = Some(difficulty);
@@ -523,40 +543,50 @@ pub fn execute_skill(
 
     // 判定后（CheckPostRoll）：收集 → 掷骰后应用（改 total / margin / 档位 / 覆盖结果）。
     let mut post = CheckAdjustments::default();
-    requests.extend(post.absorb(run_mount(
+    // 效果缩放（GAP-E）：判定后即可声明——与判定修正同一条收集路径（顺序不变）。
+    let mut scale = EffectScale::default();
+    requests.extend(scale.absorb(post.absorb(run_mount(
         skill,
         LuaMount::CheckPostRoll,
         ctx,
         &mount_ctx,
         check_snapshot.as_ref(),
-    )?));
+        None,
+    )?)));
     if let Some(resolved) = check.as_mut() {
         apply_post_roll_adjustments(resolved, post.add, post.dc, check_mode, thresholds, post.force);
         // 快照刷新为**后置修正之后**的值：PreResolve / PostResolve 读到的是最终判定。
         check_snapshot = Some(check_context(resolved));
     }
 
-    requests.extend(run_mount(
+    // 效果缩放的第二个收集点：结算前钩子（含技能自身 lua）也能声明。
+    requests.extend(scale.absorb(run_mount(
         skill,
         LuaMount::PreResolve,
         ctx,
         &mount_ctx,
         check_snapshot.as_ref(),
-    )?);
+        None,
+    )?));
 
     // [2b] 核心效果 + 消耗扣减（效果求值可能掷骰，临时持锁）。
     let empty_status_defs = HashMap::new();
     let status_defs = ctx.status_defs.unwrap_or(&empty_status_defs);
     // 豁免：失败（result = false）才结算效果；其余判定保持「结果交 AI 叙事」的既有语义。
     // 调用方要求命中门时（攻击类入口），一律以判定结果决定是否结算效果。
-    let effect_applies = if effect_requires_success {
-        check.as_ref().map(|c| c.result).unwrap_or(true)
-    } else {
-        match (&check, checker_kind) {
-            (Some(resolved), CheckKind::Save) => !resolved.result,
-            _ => true,
-        }
-    };
+    //
+    // GAP-E：规则包**声明了缩放因子**即表示「这次效果照常结算一次、数值按因子缩放」——
+    // 声明本身就覆盖上面两道门（「豁免成功 = 完全不结算」不再是唯一出路）。
+    // 没有声明时这里逐字不变。
+    let effect_applies = scale.is_declared()
+        || if effect_requires_success {
+            check.as_ref().map(|c| c.result).unwrap_or(true)
+        } else {
+            match (&check, checker_kind) {
+                (Some(resolved), CheckKind::Save) => !resolved.result,
+                _ => true,
+            }
+        };
     let mut effects = match &skill.effect {
         Some(effect) if effect_applies => {
             // 同名状态的叠加策略（#12 ③）：以**施法者当前状态**为基座合并 add / max。
@@ -578,6 +608,11 @@ pub fn execute_skill(
         }
         _ => EffectResolution::default(),
     };
+    // GAP-E：数值型 delta 按声明的因子缩放。**在消耗并入之前**——消耗是本次施法的
+    // 代价，不是效果本身，不该跟着一起减半。没有声明因子时一个字节都不动。
+    scale.apply(&mut effects);
+    // PostResolve 的只读快照：引擎**实际**算出的效果与数值（缩放之后、消耗之前）。
+    let resolved_effects = effects_snapshot(&effects, scale.factor);
     for cost in &skill.cost {
         effects.deltas.push(resource_delta(&actor_id, &cost.resource, -cost.amount));
     }
@@ -588,6 +623,7 @@ pub fn execute_skill(
         ctx,
         &mount_ctx,
         check_snapshot.as_ref(),
+        Some(&resolved_effects),
     )?);
     // Lua 判定器脚本自己也可能写请求：挂载点跑完后兜底收一次，不漏。
     if let Some((host, _)) = ctx.lua {
@@ -666,7 +702,8 @@ pub fn execute_declarative_skill(
 mod tests {
     use super::*;
     use octopus_types::{
-        CheckerDef, EffectDef, ImmediateEffect, LuaMountDef, ResourceCost, SuccessLevel,
+        AttributeModifier, CheckerDef, EffectDef, ImmediateEffect, LuaMountDef, ResourceCost,
+        SuccessLevel,
     };
     use serde_json::json;
 
@@ -845,6 +882,71 @@ mod tests {
             .collect();
         assert_eq!(events, vec!["pre_roll", "skill_lua", "post_resolve"]);
         assert!(out.rng_consumed.is_empty());
+    }
+
+    /// GAP-L 端到端：`host.target` 的只读快照与 `host.actor` 同级完整——
+    /// 规则包脚本按**目标的状态**给本次攻击判定「掷两次取高」，实测生效（RNG 多消耗一颗）。
+    #[test]
+    fn target_status_snapshot_drives_check_mount() {
+        let host = LuaHost::new(99).unwrap();
+        let mut registry = LuaRegistry::new();
+        registry.register(
+            "target-status",
+            LuaMount::CheckPreRoll,
+            "local t = host.target\n\
+             assert(t ~= nil and t.statuses ~= nil)\n\
+             assert(t.attributes.dex == 40 and t.resources.hp == 7 and t.location_id == 'loc-1')\n\
+             assert(t.kind == 'monster' and t.present == true)\n\
+             for i = 1, #t.statuses do\n\
+               if t.statuses[i].id == 'off-guard' then host.modify_check('keep_high') end\n\
+             end",
+        );
+        let a = actor(json!({ "hp": 30 }));
+        let with_status = json!({
+            "instance_id": "inst-mon-1", "template_id": "mon-wolf", "name": "灰狼", "kind": "monster",
+            "attributes": { "dex": 40 }, "resources": { "hp": 7 }, "location_id": "loc-1", "present": true,
+            "statuses": [ { "id": "off-guard", "name": "疏于防备" } ]
+        });
+        let without_status = json!({
+            "instance_id": "inst-mon-1", "template_id": "mon-wolf", "name": "灰狼", "kind": "monster",
+            "attributes": { "dex": 40 }, "resources": { "hp": 7 }, "location_id": "loc-1", "present": true,
+            "statuses": []
+        });
+        let rolls = |target: &Value| -> usize {
+            let rng = Mutex::new(DeterministicRng::new(99));
+            let lua_ctx = LuaHostContext {
+                script_id: "target-status".into(),
+                actor_id: "char-a".into(),
+                actor: a.clone(),
+                target_id: Some("mon-1".into()),
+                target: Some(target.clone()),
+                difficulty: Some(12),
+                ..Default::default()
+            };
+            let mut ctx = CommandContext {
+                actor_id: "char-a",
+                actor: &a,
+                target_id: Some("mon-1"),
+                target: Some(target),
+                difficulty: 12,
+                attribute: Some("str".into()),
+                global_checker: None,
+                rng: &rng,
+                lua: Some((&host, &lua_ctx)),
+                registry: Some(&registry),
+                status_defs: None,
+                profiles: None,
+                attribute_bonuses: None,
+                extra_bonus: 0,
+                effect_requires_success: false,
+                mount_gate: None,
+            };
+            execute_skill(&plain_check_skill(), &mut ctx).unwrap().rng_consumed.len()
+        };
+        // 目标带「疏于防备」→ 脚本声明取高 = 同一骰式掷两次。
+        assert_eq!(rolls(&with_status), 2, "按目标状态声明取高应多掷一颗");
+        // 对照：目标没有该状态 → 单次掷骰。
+        assert_eq!(rolls(&without_status), 1, "没有该状态时行为与不声明挂载点一致");
     }
 
     #[test]
@@ -1472,5 +1574,314 @@ mod tests {
         let (out, _) =
             run_with_mounts(&skill, 7, 12, &[md("expr", "check_post_roll", script)], None);
         assert_eq!(out.check.expect("check").r#mod, 4 + 3, "post_roll 读到 expr 才加值");
+    }
+    // ============================================================
+    // GAP-E：效果缩放原语（「豁免成功伤害减半」不再是重掷近似）
+    // ============================================================
+
+    /// 一条「豁免 + 两段数值效果 + 标记 + 静态修正 + 消耗」的技能——正是旧 Lua 近似
+    /// 够不到的形态：规则包只能重掷 immediate[1] 的骰式，第二段数值与 modifiers 全部丢。
+    fn save_multi_effect_skill() -> SkillDef {
+        SkillDef {
+            id: "sk-save-multi".into(),
+            name: "坠落瓦砾".into(),
+            cost: vec![ResourceCost { resource: "mana".into(), amount: 5 }],
+            check: Some(SkillCheck::Def(CheckerDef {
+                dice: Some("1d20".into()),
+                kind: Some(CheckKind::Save),
+                ..Default::default()
+            })),
+            effect: Some(EffectDef {
+                immediate: Some(vec![
+                    ImmediateEffect::Damage { amount: "1d6".into(), resource: Some("hp".into()) },
+                    ImmediateEffect::ModifyResource { resource: "mana".into(), amount: "2d6".into() },
+                    ImmediateEffect::SetFlag { flag: "buried".into(), value: None },
+                ]),
+                modifiers: Some(vec![AttributeModifier { attribute: "str".into(), value: 2 }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// 跑一次「豁免 + 多段效果」结算。
+    ///
+    /// mounts 是规则包脚本（按声明顺序注册在各自挂载点）。豁免结果由判定前挂载点的
+    /// 通用原语钉死（force_success / force_fail）：骰照掷、结果确定，断言与种子无关。
+    fn run_scale_case(
+        skill: &SkillDef,
+        mounts: &[(LuaMount, &str)],
+        save_succeeds: bool,
+    ) -> (CommandOutcome, Vec<u64>) {
+        let host = LuaHost::new(7).unwrap();
+        let mut registry = LuaRegistry::new();
+        registry.register(
+            "pin-save-result",
+            LuaMount::CheckPreRoll,
+            if save_succeeds {
+                "host.modify_check('force_success')"
+            } else {
+                "host.modify_check('force_fail')"
+            },
+        );
+        for (mount, source) in mounts {
+            registry.register(format!("rule:{}", mount.as_str()), *mount, *source);
+        }
+        let a = actor(json!({ "hp": 30, "mana": 20 }));
+        let lua_ctx = LuaHostContext {
+            script_id: "gap-e".into(),
+            actor_id: "char-a".into(),
+            actor: a.clone(),
+            difficulty: Some(10),
+            ..Default::default()
+        };
+        let rng = Mutex::new(DeterministicRng::new(7));
+        let out = {
+            let mut ctx = CommandContext {
+                actor_id: "char-a",
+                actor: &a,
+                target_id: None,
+                target: None,
+                difficulty: 10,
+                attribute: Some("str".into()),
+                global_checker: None,
+                rng: &rng,
+                lua: Some((&host, &lua_ctx)),
+                registry: Some(&registry),
+                status_defs: None,
+                profiles: None,
+                attribute_bonuses: None,
+                extra_bonus: 0,
+                effect_requires_success: false,
+                mount_gate: None,
+            };
+            execute_skill(skill, &mut ctx).unwrap()
+        };
+        (out, rng.lock().unwrap().consumed.clone())
+    }
+
+    /// GAP-E 核心价值：规则包只声明一个因子，引擎只掷一次效果骰，缩放覆盖全部
+    /// 数值型 delta（两段效果 + modifiers 一并覆盖）——不再有「门 Lua 另掷一份」的近似。
+    #[test]
+    fn declared_scale_shrinks_every_numeric_delta_from_a_single_roll() {
+        // 基线 A：没有因子 + 豁免成功 = 旧语义（效果完全不结算，只剩消耗）。
+        let (untouched, untouched_rng) = run_scale_case(&save_multi_effect_skill(), &[], true);
+        assert_eq!(untouched_rng.len(), 1, "无因子：豁免成功不结算效果 → 只有判定骰");
+        assert_eq!(untouched.deltas().len(), 1, "无因子：只有消耗扣减");
+        assert_eq!(untouched.deltas()[0].field, "resources.mana");
+        assert_eq!(untouched.deltas()[0].value, json!(-5));
+
+        // 基线 B：豁免失败 = 引擎全量结算——这就是「引擎实际算出的那份效果」。
+        let (failed, failed_rng) = run_scale_case(&save_multi_effect_skill(), &[], false);
+        assert_eq!(failed_rng.len(), 4, "豁免失败：1 颗 d20 + 1d6 + 2d6 = 4 颗");
+        assert_eq!(failed.deltas().len(), 4, "两段数值 + 标记 + 消耗");
+        let raw_hp = failed.deltas()[0].value.as_i64().unwrap();
+        let raw_mana = failed.deltas()[1].value.as_i64().unwrap();
+        assert!((-6..=-1).contains(&raw_hp), "1d6 伤害：{raw_hp}");
+        assert!((2..=12).contains(&raw_mana), "2d6 资源变动：{raw_mana}");
+        assert_eq!(failed.deltas()[2].domain, DeltaDomain::Flag);
+        assert_eq!(failed.deltas()[2].value, json!(true));
+        assert_eq!(failed.deltas()[3].value, json!(-5), "消耗 -5");
+
+        // 因子 1：与「豁免失败的全量结算」逐字相同 → 缩放的就是引擎算出的那一份。
+        let (full, full_rng) = run_scale_case(
+            &save_multi_effect_skill(),
+            &[(LuaMount::CheckPostRoll, "host.scale_effect(1)")],
+            true,
+        );
+        assert_eq!(full_rng, failed_rng, "因子不改变掷骰：有因子时恰好「判定骰 + 一次效果骰」");
+        assert_eq!(full.deltas(), failed.deltas(), "因子 1 = 引擎实际算出的效果，逐字相同");
+        assert_eq!(full.effects.modifiers, failed.effects.modifiers);
+        let brief = |o: &CommandOutcome| -> Vec<String> {
+            o.deltas().iter().map(|d| format!("{}={}", d.field, d.value)).collect()
+        };
+        println!("GAP-E 无因子/豁免成功：rng={untouched_rng:?} deltas={:?}", brief(&untouched));
+        println!(
+            "GAP-E 无因子/豁免失败：rng={failed_rng:?} deltas={:?} modifiers={:?}",
+            brief(&failed),
+            failed.effects.modifiers
+        );
+        println!("GAP-E 有因子 1.0（成功）：rng={full_rng:?} deltas={:?}", brief(&full));
+
+        // 因子 0 / 0.5 / 1.5 / 2：骰序不变，两段数值都按因子缩放（向零取整）。
+        for factor in [0.0_f64, 0.5, 1.5, 2.0] {
+            let script = format!("host.scale_effect({factor})");
+            let (out, rng_used) = run_scale_case(
+                &save_multi_effect_skill(),
+                &[(LuaMount::CheckPostRoll, script.as_str())],
+                true,
+            );
+            assert_eq!(rng_used, full_rng, "因子 {factor} 不得改变骰序 / 骰数");
+            assert_eq!(
+                out.deltas()[0].value.as_i64().unwrap(),
+                (raw_hp as f64 * factor).trunc() as i64,
+                "因子 {factor}：第一段数值 delta"
+            );
+            assert_eq!(
+                out.deltas()[1].value.as_i64().unwrap(),
+                (raw_mana as f64 * factor).trunc() as i64,
+                "因子 {factor}：第二段数值 delta（旧 Lua 近似覆盖不到的那一段）"
+            );
+            assert_eq!(out.deltas()[2].domain, DeltaDomain::Flag);
+            assert_eq!(out.deltas()[2].value, json!(true), "标记不受缩放（因子 {factor}）");
+            assert_eq!(out.deltas()[3].value, json!(-5), "消耗不受缩放（因子 {factor}）");
+            assert_eq!(out.effects.modifiers, full.effects.modifiers, "静态修正不受缩放");
+            println!("GAP-E 有因子 {factor}：rng={rng_used:?} deltas={:?}", brief(&out));
+        }
+    }
+
+    /// 收集时机：check_post_roll 与 pre_resolve（含技能自身 lua 钩子）都能声明；
+    /// 同一轮多次声明以最后一条为准（脚本顺序即优先级）。
+    #[test]
+    fn scale_factor_can_be_declared_at_post_roll_or_pre_resolve() {
+        let via_post = run_scale_case(
+            &save_multi_effect_skill(),
+            &[(LuaMount::CheckPostRoll, "host.scale_effect(0.5)")],
+            true,
+        );
+        let via_pre = run_scale_case(
+            &save_multi_effect_skill(),
+            &[(LuaMount::PreResolve, "host.scale_effect(0.5)")],
+            true,
+        );
+        assert_eq!(via_post.0.deltas(), via_pre.0.deltas(), "两个时机的同一因子结果一致");
+        assert_eq!(via_post.1, via_pre.1, "两个时机的骰序一致");
+
+        // 技能自身 lua 钩子（也挂在 PreResolve）同口径。
+        let mut skill = save_multi_effect_skill();
+        skill.lua = Some("host.scale_effect(0.5)".into());
+        let via_skill_lua = run_scale_case(&skill, &[], true);
+        assert_eq!(via_skill_lua.0.deltas(), via_post.0.deltas(), "技能自身 lua 钩子同口径");
+
+        // 多次声明：后一条覆盖前一条。
+        let last_wins = run_scale_case(
+            &save_multi_effect_skill(),
+            &[
+                (LuaMount::CheckPostRoll, "host.scale_effect(0.5)"),
+                (LuaMount::PreResolve, "host.scale_effect(1)"),
+            ],
+            true,
+        );
+        let (full, _) = run_scale_case(&save_multi_effect_skill(), &[], false);
+        assert_eq!(last_wins.0.deltas(), full.deltas(), "PreResolve 的后一条声明覆盖前者");
+    }
+
+    /// 规则包的原样用法：豁免成功才声明因子；失败分支不声明 → 默认全量。
+    /// 全程只掷一次伤害骰。
+    #[test]
+    fn rule_pack_idiom_scales_only_the_success_branch() {
+        let rule = "if host.check_kind == 'save' and host.check_result then host.scale_effect(0.5) end";
+        let (success, success_rng) =
+            run_scale_case(&save_multi_effect_skill(), &[(LuaMount::CheckPostRoll, rule)], true);
+        let (failure, failure_rng) =
+            run_scale_case(&save_multi_effect_skill(), &[(LuaMount::CheckPostRoll, rule)], false);
+
+        // 两边都是「判定骰 + 一次效果骰」：同种子下骰子完全一致（骰序不因分支而变）。
+        assert_eq!(success_rng, failure_rng, "豁免成败不改变骰序");
+        assert_eq!(success_rng.len(), 4);
+        assert_eq!(success.deltas().len(), 4);
+        assert_eq!(failure.deltas().len(), 4);
+        for i in [0usize, 1] {
+            let full = failure.deltas()[i].value.as_i64().unwrap();
+            assert_eq!(
+                success.deltas()[i].value.as_i64().unwrap(),
+                (full as f64 * 0.5).trunc() as i64,
+                "豁免成功那份 = 同一次掷骰的一半（第 {i} 段）"
+            );
+        }
+        // 非数值效果与消耗两边逐字相同。
+        assert_eq!(success.deltas()[2], failure.deltas()[2]);
+        assert_eq!(success.deltas()[3], failure.deltas()[3]);
+    }
+
+    /// 硬要求：没有因子时逐字不变——挂载点事件顺序、骰序、rng_consumed 全部照旧。
+    #[test]
+    fn absent_factor_keeps_mount_and_dice_order_verbatim() {
+        let mut skill = save_multi_effect_skill();
+        skill.lua = Some("host.trigger_event('skill_lua')".into());
+        let mounts: [(LuaMount, &str); 4] = [
+            (LuaMount::CheckPostRoll, "host.trigger_event('post_roll')"),
+            (LuaMount::PreResolve, "host.trigger_event('pre_resolve')"),
+            (LuaMount::PostResolve, "host.trigger_event('post_resolve')"),
+            (LuaMount::CheckPreRoll, "host.trigger_event('pre_roll')"),
+        ];
+        let (out, rng) = run_scale_case(&skill, &mounts, false);
+        let events: Vec<String> = out
+            .requests
+            .iter()
+            .filter_map(|r| match r {
+                LuaRequest::TriggerEvent { event, .. } => Some(event.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            events,
+            vec!["pre_roll", "post_roll", "pre_resolve", "skill_lua", "post_resolve"],
+            "挂载点事件顺序不得因缩放收集而改变"
+        );
+        assert_eq!(rng.len(), 4, "骰序：1 颗 d20 + 1d6 + 2d6");
+        assert_eq!(out.rng_consumed, rng, "rng_consumed = 本次全量消耗");
+        // 同一个种子的「豁免成功 + 无因子」：效果一个都不结算，只掷判定骰。
+        let (ok, ok_rng) = run_scale_case(&save_multi_effect_skill(), &[], true);
+        assert_eq!(ok_rng.len(), 1);
+        assert_eq!(ok_rng, rng[..1].to_vec(), "判定骰是序列里的第一颗");
+        assert_eq!(ok.deltas().len(), 1);
+    }
+
+    /// PostResolve 只读快照：脚本能核对「引擎到底算了什么」（缩放后的实际数值），
+    /// 而且改这张表不影响已经算出的结算产物。
+    #[test]
+    fn post_resolve_reads_back_the_engine_resolved_effect() {
+        let script = "local e = host.resolved_effects; assert(e ~= nil); assert(e.factor == 0.5); assert(e.rng_consumed == 3); assert(#e.deltas == 3); assert(e.deltas[1].field == 'resources.hp'); assert(e.deltas[2].field == 'resources.mana'); host.set_flag('seen-hp', e.deltas[1].value); host.set_flag('seen-mana', e.deltas[2].value); host.set_flag('seen-flag', e.deltas[3].value); host.set_flag('seen-factor', e.factor); e.deltas[1].value = 999";
+        let (out, _) = run_scale_case(
+            &save_multi_effect_skill(),
+            &[
+                (LuaMount::CheckPostRoll, "if host.check_result then host.scale_effect(0.5) end"),
+                (LuaMount::PostResolve, script),
+            ],
+            true,
+        );
+        let flag_value = |flag: &str| -> Option<Value> {
+            out.requests.iter().find_map(|r| match r {
+                LuaRequest::ApplyEffect { effect, .. }
+                    if effect.get("flag").and_then(Value::as_str) == Some(flag) =>
+                {
+                    effect.get("value").cloned()
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(flag_value("seen-hp"), Some(out.deltas()[0].value.clone()), "如实回报伤害数值");
+        assert_eq!(
+            flag_value("seen-mana"),
+            Some(out.deltas()[1].value.clone()),
+            "如实回报第二段数值 delta"
+        );
+        assert_eq!(flag_value("seen-flag"), Some(json!(true)), "非数值效果也如实回报");
+        assert_eq!(flag_value("seen-factor"), Some(json!(0.5)), "声明过的因子可读");
+        // 只读：Lua 侧把快照改成 999，结算产物纹丝不动。
+        assert_ne!(out.deltas()[0].value, json!(999), "快照是导出的事实，不是引擎状态本身");
+        assert!(out.deltas()[0].value.as_i64().unwrap() < 0);
+    }
+
+    /// PostResolve 的只读快照里不含消耗：消耗是本次施法的代价，不是「效果」。
+    #[test]
+    fn resolved_effects_snapshot_excludes_cost() {
+        let script = "local e = host.resolved_effects; assert(#e.deltas == 3); assert(e.rng_consumed == 3); assert(e.factor == nil); host.set_flag('seen-count', #e.deltas)";
+        let (out, _) = run_scale_case(
+            &save_multi_effect_skill(),
+            &[(LuaMount::PostResolve, script)],
+            false,
+        );
+        assert_eq!(out.deltas().len(), 4, "产物里 3 条效果 + 1 条消耗");
+        let seen = out.requests.iter().find_map(|r| match r {
+            LuaRequest::ApplyEffect { effect, .. }
+                if effect.get("flag").and_then(Value::as_str) == Some("seen-count") =>
+            {
+                effect.get("value").cloned()
+            }
+            _ => None,
+        });
+        assert_eq!(seen, Some(json!(3)), "快照只含效果自身，不含消耗");
     }
 }

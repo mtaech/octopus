@@ -5,8 +5,10 @@
 // 与 scripts/import-bestiary.mjs 的图鉴 / 地点 / 地图 / 骨架**合并成一本可直接导入的故事书**。
 //
 // 硬边界（不可越过）：
-//   1. 只用引擎已落地的通用原语：host.modify_check / apply_effect / modify_resource / engine_rng
-//      + 只读 host.get_attribute / has_status / check.* / status.* / definition / actor / target。
+//   1. 只用引擎已落地的通用原语：host.modify_check / scale_effect / apply_effect / modify_resource / engine_rng
+//      + 只读 host.get_attribute / has_status / check.* / status.* / definition / actor / target
+//      + T21 世界事实 host.get_character / get_flag / list_flags / get_encounter / list_encounters
+//      + T22 PostResolve 只读 host.resolved_effects。
 //   2. 不新增任何封闭字段，不改引擎。表达不了的规则**原样报告为缺口**（见 --check 的 gap 列表
 //      与 story_example/lmop-import.md），绝不用「看起来齐全」的假规则糊过去。
 //   3. 图鉴数据**不复制**：只引用 scripts/import-bestiary.mjs 产出的 id（模板 id / XP 值从草稿读）。
@@ -71,6 +73,12 @@ const DECLARABLE_MOUNTS = [
 //   · 清标记：set_flag / clear_flag（闭合 GAP-H；clear_flag 是 set_flag(flag, false) 的具名写法）
 //   · 事件挂载点事实：event_name / event_data（闭合 GAP-F：enemy_defeated / encounter_cleared）
 //   · check_pre_roll 签名：check_kind / check_attribute / check_target 掷骰前即有值（闭合 GAP-D）
+//
+// T21 / T22 新增（本轮规则包开始实际使用）：
+//   · 只读世界事实：get_character / get_flag / list_flags / get_encounter / list_encounters
+//     （闭合 GAP-A；host.target 同时升级为与 host.actor 同级完整，含 statuses —— 闭合 GAP-L）
+//   · 效果缩放 scale_effect（只在 check_post_roll / pre_resolve 存在）+ PostResolve 只读快照
+//     resolved_effects（闭合 GAP-E）
 const HOST_API = [
   'script_id', 'mount', 'event', 'scene_id', 'round', 'difficulty', 'controlled', 'present',
   'storage', 'actor', 'target', 'definition',
@@ -81,8 +89,10 @@ const HOST_API = [
   'check_expr', 'check_level', 'check_kind',
   'get_attribute', 'get_resource', 'has_status', 'relationship',
   'get_attachments', 'get_attachment', 'get_definition', 'list_definitions',
+  'get_character', 'get_flag', 'list_flags', 'get_encounter', 'list_encounters',
+  'resolved_effects',
   'engine_rng', 'request_cost', 'apply_status', 'remove_status', 'trigger_event', 'query_world',
-  'modify_check', 'apply_effect', 'modify_resource', 'set_flag', 'clear_flag', 'log'
+  'modify_check', 'scale_effect', 'apply_effect', 'modify_resource', 'set_flag', 'clear_flag', 'log'
 ]
 
 // Lua 预检禁用 API（lua_lint.rs FORBIDDEN 同口径）。
@@ -160,13 +170,13 @@ const WANDER_TABLES = [
   }
 ]
 
-// 规则包新增的常驻标记（作者 / 导演 / AI 置位；规则脚本靠 when 闸门读它们——Lua 读不到 flag）。
+// 规则包新增的常驻标记（作者 / 导演 / AI 置位；规则脚本用 when 闸门读它们）。
+// T21 之后 Lua 也能读标记（host.get_flag / host.list_flags），本包暂未改用——口径不变。
 const RULE_FLAGS = [
   { key: 'dnd-in-wilderness', label: '野外行进（开启遭遇检定）' },
   { key: 'dnd-night', label: '夜间' },
   { key: 'dnd-sunlight', label: '阳光直射' },
   { key: 'dnd-in-combat', label: '战斗中（战斗轮计数开闸）' },
-  { key: 'dnd-flanked', label: '目标 5 尺内已有盟友（集群战术开闸）' },
   { key: 'dnd-surprised', label: '本场战斗出现了被突袭者' },
   { key: 'dnd-battle-round-1', label: '战斗第 1 轮' },
   { key: 'dnd-battle-round-2', label: '战斗第 2 轮' },
@@ -255,14 +265,17 @@ const RULE_SKILLS = [
   {
     id: 'sk-lmop-rubble-collapse',
     name: '坠落瓦砾',
-    description: 'DC 10 敏捷豁免：失败受 3d6 钝击伤害并倒地，成功则只受一半伤害（减半由规则包 Lua 结算）。',
+    description: 'DC 10 敏捷豁免：失败受 3d6 钝击伤害并倒地，成功则只受一半伤害（dnd-save-half 声明 scale_effect(0.5)，引擎只掷一次效果骰）。',
     category: '陷阱',
     target: 'single',
     attribute: 'dex',
     check: { dice: '1d20', kind: 'save', mode: 'gte', default_dc: 10 },
+    // ⚠️ 「失败才倒地」不写在这里：scale_effect 的声明会**整体打开**引擎的效果门
+    // （成功豁免也照常结算），而缩放只作用于数值型 delta，状态会原样施加。
+    // 所以附加状态放进开放内容 savehalf-rubble.fields.fail_status，由 dnd-save-half
+    // 在失败分支补；成功分支只剩「引擎自己掷出、按 0.5 缩放」的那份伤害。
     effect: {
-      immediate: [{ kind: 'damage', amount: '3d6', resource: 'res-hp' }],
-      status: ['dnd-prone']
+      immediate: [{ kind: 'damage', amount: '3d6', resource: 'res-hp' }]
     }
   },
   {
@@ -319,7 +332,8 @@ const RULE_KINDS = [
     applies_to: ['character'],
     fields: [
       { key: 'creature_id', label: '生物', type: 'ref', ref_kind: 'character' },
-      { key: 'gate_flag', label: '开闸标记', type: 'text' },
+      { key: 'ally_proxy', label: '同伴近似口径', type: 'text' },
+      { key: 'range_proxy', label: '目标附近近似口径', type: 'text' },
       { key: 'note', label: '原文', type: 'textarea' }
     ]
   },
@@ -330,6 +344,7 @@ const RULE_KINDS = [
     applies_to: ['character'],
     fields: [
       { key: 'creature_id', label: '生物', type: 'ref', ref_kind: 'character' },
+      { key: 'target_status', label: '目标状态', type: 'text', hint: '目标带该状态即视为「受其突袭」' },
       { key: 'note', label: '原文', type: 'textarea' }
     ]
   },
@@ -352,6 +367,7 @@ const RULE_KINDS = [
     applies_to: ['skill'],
     fields: [
       { key: 'skill_id', label: '技能', type: 'ref', ref_kind: 'skill' },
+      { key: 'fail_status', label: '失败附加状态', type: 'ref', ref_kind: 'status', hint: '只有豁免失败才施加；成功只减半伤害' },
       { key: 'note', label: '说明', type: 'textarea' }
     ]
   },
@@ -584,14 +600,21 @@ const GAPS = [
 //   evidence   规则包里的落地位置 / 断言
 const GAP_RESOLUTION = {
   'GAP-A-no-cross-entity-read': {
-    status: 'open',
-    now: '仍然存在：没有 get_character / get_encounter / get_flag；host.target 仍只带 id / name / kind。'
-      + '本轮新增的 get_attachment / get_definition 只读**开放内容**（故事书静态数据），不读运行时实体，'
-      + '所以「盟友在目标 5 尺内」这个事实依旧只能用 dnd-flanked 标记近似。'
+    status: 'partial',
+    closed_by: 'host.get_character(id) / host.get_flag / host.list_flags / host.get_encounter / host.list_encounters'
+      + '（host.target 同时升级为与 host.actor 同级完整）',
+    evidence: '读任意实体的能力**真正落地并已用上**：集群战术用 host.list_encounters 找同遭遇同伴、'
+      + 'host.get_character 读同伴 HP；伏击用 host.target.statuses；XP 用 host.get_encounter 兜底回查 template_id。'
+      + '近似口径由开放内容声明（pack-*.fields.ally_proxy / range_proxy），Lua 里没有名单常量。',
+    now: '按「近似提高」登记而不是「已闭合」：这条缺口当初登记的是**集群战术规则**，'
+      + '而「目标 5 尺内」这个事实仍受 GAP-B 限制——只能近似成「同遭遇 + 同 location_id + HP>0」，'
+      + '判定仍不精确。跨实体读取这一**能力**本身已闭合（见 closed_by / evidence），但规则结果不是精确的。',
   },
   'GAP-B-no-positioning': {
     status: 'open',
     now: '仍然存在：引擎没有位置 / 距离 / 区域概念（只有 location_id 这种地点归属）。'
+      + 'GAP-A 近似提高后集群战术能读同伴了，但「5 尺内」只能用「同一场遭遇 + 同一 location_id」近似，'
+      + 'HP>0 也只是「未失能」的近似——近似程度提高，判定仍不精确。'
   },
   'GAP-C-no-open-content-in-lua': {
     status: 'closed',
@@ -606,15 +629,21 @@ const GAP_RESOLUTION = {
       + 'dnd-proficiency 也回到 check_pre_roll 用签名选属性。'
   },
   'GAP-E-effect-roll-not-exposed': {
-    status: 'open',
-    now: '仍然存在：没有 pending_effect / last_effect 快照，读不到本次效果已掷出的伤害；'
-      + 'dnd-save-half 仍旧按 host.definition 的骰式重掷取半（期望值等价，不是同一颗骰）。'
+    status: 'closed',
+    closed_by: 'host.scale_effect(factor)（只在 check_post_roll / pre_resolve）+ PostResolve 只读 host.resolved_effects',
+    evidence: 'dnd-save-half 改为在 check_post_roll 声明 host.scale_effect(0.5)：引擎照常结算一次、'
+      + '只掷一次效果骰，数值型 delta 按 0.5 向零取整（多段效果 / modifiers 一并覆盖），不再由 Lua 重掷同一骰式。'
+      + '引擎校验断言 save_half.engine_scales_own_roll（同种子下 0.5 的结果恰为 1.0 结果的一半）与'
+      + ' save_half.resolved_effects_is_engine_snapshot（PostResolve 读到的 factor / rng_consumed / delta 与提交值一致）。'
+      + '配套：技能的失败附加状态移入开放内容 fail_status，由脚本在失败分支补（缩放不覆盖状态）。'
   },
   'GAP-F-no-defeat-event': {
     status: 'closed',
     closed_by: 'event 挂载点 + host.event_name / host.event_data（enemy_defeated / encounter_cleared）',
     evidence: 'dnd-xp-award 挂在 event 上，按 data.enemy.template_id 逐只发 XP；'
       + '与遭遇来源无关，导演即兴建的遭遇同样覆盖（引擎校验断言 xp.improvised_encounter）。'
+      + 'T21 之后还能用 host.get_encounter 读遭遇快照：事件缺 template_id 时按 instance_id 回查'
+      + '（引擎校验 xp.encounter_snapshot_fallback）——常规路径不变，这是兜底。'
       + '边界：非 strike 击杀（Lua 直接把资源打到 0）不派发该事件，那种路径不发 XP。'
   },
   'GAP-G-encounter-count-static': {
@@ -642,8 +671,11 @@ const GAP_RESOLUTION = {
       + '「模板自带状态」还缺一个声明入口（挂接读得到，但挂接 → 状态的桥没有）。'
   },
   'GAP-L-target-status-unreadable': {
-    status: 'open',
-    now: '仍然存在：host.target 仍不含 statuses / attributes / resources（只有 id / name / kind）。'
+    status: 'closed',
+    closed_by: 'host.target 与 host.actor 同级完整（含 statuses / attributes / resources / location_id）',
+    evidence: 'dnd-ambusher-keep-high 直接读 host.target.statuses 判断目标是否带 dnd-surprised'
+      + '（期望状态 id 来自开放内容 fields.target_status，脚本无状态名常量）；when 闸门不再要求 dnd-surprised 标记。'
+      + '引擎校验断言 ambusher.reads_target_statuses（带状态 → keep_high；不带 → 零请求）。'
   },
   'GAP-M-no-encounter-active-cond': {
     status: 'open',
@@ -738,30 +770,84 @@ function srcSunlightSensitivity() {
   ].join('\n')
 }
 
-/** 集群战术：when 闸门 dnd-flanked 成立 + 该生物**从开放内容读到**有集群战术 → 取高。 */
+/** 集群战术（狼）：目标 5 尺内有未失能的盟友 → 攻击检定优势。
+ *
+ *  T21 之后规则包能读运行时事实了（host.get_character / host.list_encounters），
+ *  不再是「导演置位 dnd-flanked」的纯标记近似。**但仍受 GAP-B 限制**：
+ *  引擎没有位置 / 距离 / 交战关系，所以：
+ *    · 「我方同伴」= 与我同处一场活跃遭遇的其它敌人（遭遇的 enemies 数组即分组），
+ *      HP > 0 是「未失能」能做到的最接近近似（引擎没有失能状态声明）；
+ *    · 「在目标附近」= 目标与我在同一 location_id（缺任一侧时不做判断）。
+ *  仍然表达不了：精确到 5 尺、以及「失能」的完整语义（麻痹 / 震慑 / 昏迷 …）。
+ *  数据来源：开放内容（角色模板的 dnd-pack-tactics 挂接），脚本无生物名单。 */
 function srcPackTactics() {
   return [
     '-- 规则包：集群战术（狼，附录 B 原文）。',
-    '-- 「至少一个未处于失能的盟友在目标 5 尺内」这个事实引擎拿不到（GAP-A / GAP-B），',
-    '-- 由叙事层置位 dnd-flanked；本脚本只负责「有该特性 + 闸门成立 → 取高」。',
     '-- 数据来源：开放内容（角色模板的 dnd-pack-tactics 挂接），脚本无生物名单。',
+    '-- T21：读运行时事实——同一场遭遇的同伴（list_encounters + get_character）。',
+    '-- 仍受 GAP-B（没有位置 / 距离）：同伴按「同一场遭遇」近似，目标按「同一 location_id」近似。',
     "local ids = host.get_attachment('dnd-pack-tactics')",
-    'if type(ids) == "table" and #ids > 0 then',
-    "  host.modify_check('keep_high')",
-    'end'
+    'if type(ids) ~= "table" or #ids == 0 then return end',
+    'local me = host.actor',
+    'local target = host.target',
+    'if type(me) ~= "table" or type(target) ~= "table" then return end',
+    'local my_key = me.id or me.instance_id',
+    'local function alive(inst)',
+    "  local hp = inst and inst.resources and inst.resources['res-hp']",
+    '  return type(hp) == "number" and hp > 0',
+    'end',
+    'local ally_found = false',
+    'for _, enc in ipairs(host.list_encounters()) do',
+    '  local enemies = enc.enemies',
+    '  if type(enemies) == "table" then',
+    '    local mine = false',
+    '    for _, e in ipairs(enemies) do',
+    '      if (e.instance_id or e.id) == my_key then mine = true end',
+    '    end',
+    '    if mine then',
+    '      for _, e in ipairs(enemies) do',
+    '        local key = e.instance_id or e.id',
+    '        if key and key ~= my_key then',
+    '          if alive(host.get_character(key)) then ally_found = true end',
+    '        end',
+    '      end',
+    '    end',
+    '  end',
+    'end',
+    'if not ally_found then return end',
+    '-- 「在目标 5 尺内」的可用近似：双方都知道地点时必须同地点（GAP-B 仍然存在）。',
+    'local my_place = me.location_id',
+    'local target_place = target.location_id',
+    'if my_place and target_place and my_place ~= target_place then return end',
+    "host.modify_check('keep_high')"
   ].join('\n')
 }
 
-/** 伏击：战斗第一轮 + 本场有人被突袭 + **从开放内容读到**有伏击 → 取高。 */
+/** 伏击：战斗第一轮里，**直接读目标的状态**（host.target.statuses，GAP-L 闭合）
+ *  判断「这个目标是否受我突袭」，不再用 dnd-surprised 标记近似。
+ *  期望的状态 id 来自开放内容 dnd-ambusher.fields.target_status（脚本无状态名常量）。 */
 function srcAmbusherAdvantage() {
   return [
     '-- 规则包：伏击（变形怪，附录 B 原文）：战斗开始的第一轮里，',
     '-- 对任何成功受其突袭的生物所发动的攻击检定具有优势。',
-    '-- host.target 读不到目标状态（GAP-L），用 dnd-surprised 标记近似。',
-    '-- 数据来源：开放内容（角色模板的 dnd-ambusher 挂接），脚本无生物名单。',
+    '-- T21：host.target 与 host.actor 同级完整（含 statuses）——直接按目标状态判定（GAP-L 闭合）。',
+    '-- 数据来源：开放内容（角色模板的 dnd-ambusher 挂接 → fields.target_status），脚本无状态名常量。',
     "local ids = host.get_attachment('dnd-ambusher')",
-    'if type(ids) == "table" and #ids > 0 then',
-    "  host.modify_check('keep_high')",
+    'if type(ids) ~= "table" or #ids == 0 then return end',
+    'local target = host.target',
+    'local statuses = target and target.statuses',
+    'if type(statuses) ~= "table" then return end',
+    'for _, def_id in ipairs(ids) do',
+    '  local def = host.get_definition(def_id)',
+    '  local wanted = def and def.fields and def.fields.target_status',
+    '  if wanted and wanted ~= "" then',
+    '    for _, st in ipairs(statuses) do',
+    '      if st.id == wanted or st.name == wanted then',
+    "        host.modify_check('keep_high')",
+    '        return',
+    '      end',
+    '    end',
+    '  end',
     'end'
   ].join('\n')
 }
@@ -811,37 +897,38 @@ function srcProficiency() {
   ].join('\n')
 }
 
-/** 豁免成功伤害减半：掷骰后按 host.definition 的骰式重掷取半，施加到目标。 */
+/** 豁免成功伤害减半（GAP-E 闭合）：声明 host.scale_effect(0.5)，让**引擎自己**
+ *  掷一次效果骰、按 0.5 缩放数值型 delta —— 不再由 Lua 重掷同一骰式。
+ *
+ *  为什么失败分支要补状态：scale_effect 的声明会覆盖「豁免成功 = 不结算」那道门
+ *  （效果照常结算一次），而缩放只作用于数值 delta；状态会原样施加。所以技能里
+ *  只留伤害，附加状态（倒地）由本脚本在失败分支按开放内容补。
+ *
+ *  规则只对**登记在开放内容里**的技能生效（dnd-save-half 定义的 fields.skill_id），
+ *  脚本里没有技能名 / 状态名 / 骰式常量。 */
 function srcSaveHalf() {
   return [
     '-- 规则包：豁免成功伤害减半（模块第 1727 行原文）。',
-    '-- 引擎的豁免语义是「成功 = 效果不结算」，所以减半这一档由规则包在判定后补。',
-    '-- 骰式解析（NdM+K）是规则包自己的算术：引擎不认识「一半」。',
-    '-- 缺口 GAP-E：Lua 读不到本次效果已掷出的伤害，只能重掷同一骰式。',
-    "if host.check_kind == 'save' and host.check_result == true then",
-    '  local definition = host.definition',
-    '  local effect = definition and definition.effect',
-    '  local immediate = effect and effect.immediate',
-    '  local first = immediate and immediate[1]',
-    "  if first and first.kind == 'damage' and first.amount then",
-    '    local expression = tostring(first.amount)',
-    "    local count, sides, tail = string.match(expression, '^(%d+)d(%d+)(.*)$')",
-    '    local total = 0',
-    '    if count then',
-    '      for _ = 1, tonumber(count) do',
-    '        total = total + host.engine_rng(1, tonumber(sides))',
-    '      end',
-    '      total = total + (tonumber(tail) or 0)',
-    '    else',
-    '      total = tonumber(expression) or 0',
-    '    end',
-    '    local half = math.floor(total / 2)',
-    '    if half > 0 then',
-    '      local target = host.target and host.target.id',
-    '      if target then',
-    "        host.apply_effect(target, { kind = 'damage', amount = tostring(half), resource = first.resource or 'res-hp' })",
-    '      end',
-    '    end',
+    '-- T22：scale_effect 只在 check_post_roll / pre_resolve 存在；效果照常由引擎结算一次，',
+    '--       数值型 delta 按因子缩放（向零取整、逐条）——全程只掷一次效果骰。',
+    '-- 数据来源：开放内容 dnd-save-half 定义（fields.skill_id / fields.fail_status）。',
+    "if host.check_kind ~= 'save' then return end",
+    'local definition = host.definition',
+    'local skill_id = definition and definition.id',
+    'local rule = nil',
+    "for _, def in ipairs(host.list_definitions('dnd-save-half')) do",
+    '  local fields = def.fields',
+    '  if fields and fields.skill_id == skill_id then rule = fields end',
+    'end',
+    'if not rule then return end',
+    'if host.check_result == true then',
+    '  -- 豁免成功：引擎按本次实际掷出的效果骰结算一次，数值减半。',
+    '  host.scale_effect(0.5)',
+    'elseif rule.fail_status and rule.fail_status ~= "" then',
+    '  -- 豁免失败：默认全量结算；失败才附加的状态由本脚本补（缩放不覆盖状态）。',
+    '  local target = host.target and (host.target.id or host.target.instance_id)',
+    '  if target then',
+    "    host.apply_status(target, rule.fail_status, 1, 'turns')",
     '  end',
     'end'
   ].join('\n')
@@ -947,6 +1034,18 @@ function srcXpAward() {
     'local data = host.event_data',
     'local enemy = data and data.enemy',
     'local template_id = enemy and enemy.template_id',
+    '-- T21：遭遇快照可读（get_encounter）——事件缺 template_id 时按 instance_id 回查。',
+    '-- 这是**兜底**，不改变常规路径（strike 派发的 data.enemy 本就带 template_id）。',
+    'if (not template_id or template_id == "") and enemy and enemy.instance_id then',
+    '  local enc = data and data.encounter and data.encounter.id',
+    '  local snapshot = enc and host.get_encounter(enc)',
+    '  local list = snapshot and snapshot.enemies',
+    '  if type(list) == "table" then',
+    '    for _, e in ipairs(list) do',
+    '      if e.instance_id == enemy.instance_id and e.template_id then template_id = e.template_id end',
+    '    end',
+    '  end',
+    'end',
     'if not template_id or template_id == "" then return end',
     'local xp = 0',
     "local defs = host.list_definitions('dnd-xp-award')",
@@ -1087,19 +1186,19 @@ function buildRules(draft) {
     mount: 'check_pre_roll',
     source: srcPackTactics(),
     coverage: ['advantage_pack_tactics'],
-    when: { op: 'flag_set', flag: 'dnd-flanked' },
-    note: '集群战术：盟友在目标 5 尺内（dnd-flanked 标记）'
+    // GAP-A 闭合：不再用 when: dnd-flanked 开闸——规则自己读运行时事实（同遭遇同伴 + 同地点）。
+    // 精确「目标 5 尺内」仍做不到（GAP-B），近似口径见 srcPackTactics 注释，不假装准确。
+    note: '集群战术：同遭遇同伴（get_character）+ 同 location_id 近似「目标 5 尺内有盟友」'
   })
   add({
     id: 'dnd-ambusher-keep-high',
     mount: 'check_pre_roll',
     source: srcAmbusherAdvantage(),
     coverage: ['surprise_first_round'],
-    when: {
-      op: 'all_of',
-      children: [{ op: 'flag_set', flag: 'dnd-battle-round-1' }, { op: 'flag_set', flag: 'dnd-surprised' }]
-    },
-    note: '伏击：战斗第一轮对被突袭者的攻击检定优势'
+    // GAP-L 闭合：闸门只留「战斗第一轮」——「这个目标是否受我突袭」由脚本读
+    // host.target.statuses 判定，不再要求 dnd-surprised 全场标记。
+    when: { op: 'flag_set', flag: 'dnd-battle-round-1' },
+    note: '伏击：战斗第一轮，对 host.target.statuses 带受突袭状态的目标攻击检定优势'
   })
   add({
     id: 'dnd-skill-dc',
@@ -1278,9 +1377,11 @@ function buildOpenContent(draft, tables) {
       description: '至少一个未失能的盟友在目标 5 尺内时，攻击检定有优势',
       fields: {
         creature_id: id,
-        gate_flag: 'dnd-flanked',
+        ally_proxy: '同一场活跃遭遇里的其它敌人（HP>0 视为未失能）',
+        range_proxy: '与目标同一 location_id',
         note:
-          '盟友 5 尺内这个事实引擎拿不到（缺口 GAP-A / GAP-B），由叙事层置位 dnd-flanked；'
+          'GAP-A 已闭合：规则用 host.list_encounters + host.get_character 读同遭遇同伴，不再靠 dnd-flanked 标记；'
+          + '但精确「目标 5 尺内」仍做不到（GAP-B：引擎无位置 / 距离），HP>0 只是「未失能」的近似。'
           + '「哪只生物有集群战术」由本定义驱动（Lua 读模板挂接，不烘名单）。'
       }
     })
@@ -1294,8 +1395,10 @@ function buildOpenContent(draft, tables) {
       description: '战斗第一轮对受其突袭的生物的攻击检定有优势',
       fields: {
         creature_id: id,
+        target_status: 'dnd-surprised',
         note:
           '附录 B 原文：战斗开始的第一轮里，该生物对任何成功受其突袭的生物所发动的攻击检定具有优势。'
+          + 'GAP-L 已闭合：Lua 直接读 host.target.statuses 里有没有 target_status 这个状态，不用全场标记近似。'
           + '「哪只生物有伏击」由本定义驱动（Lua 读模板挂接，不烘名单）。'
       }
     })
@@ -1324,8 +1427,11 @@ function buildOpenContent(draft, tables) {
     description: 'DC 10 敏捷豁免：失败 3d6 钝击 + 倒地，成功减半',
     fields: {
       skill_id: 'sk-lmop-rubble-collapse',
+      fail_status: 'dnd-prone',
       note:
-        'lua_mounts:dnd-save-half 在 check_post_roll 按 host.definition 的骰式重掷取半（缺口 GAP-E：读不到本次已掷出的伤害）。'
+        'lua_mounts:dnd-save-half 在 check_post_roll 声明 host.scale_effect(0.5)（GAP-E 已闭合）：'
+        + '引擎照常结算一次、只掷一次效果骰，数值型 delta 按 0.5 向零取整；'
+        + '失败才附加的状态（fail_status）由同一脚本在失败分支补——缩放不覆盖状态。'
     }
   })
 
@@ -1939,13 +2045,13 @@ function runChecks(build) {
     },
     {
       id: 'dnd-pack-tactics',
-      reads: ["host.get_attachment('dnd-pack-tactics')"],
-      forbids: ['mon-wolf']
+      reads: ["host.get_attachment('dnd-pack-tactics')", 'host.list_encounters', 'host.get_character'],
+      forbids: ['mon-wolf', 'dnd-flanked']
     },
     {
       id: 'dnd-ambusher-keep-high',
-      reads: ["host.get_attachment('dnd-ambusher')"],
-      forbids: ['mon-doppelganger']
+      reads: ["host.get_attachment('dnd-ambusher')", 'host.target', 'host.get_definition('],
+      forbids: ['mon-doppelganger', 'dnd-surprised']
     },
     {
       id: 'dnd-save-ends',
@@ -1954,8 +2060,13 @@ function runChecks(build) {
     },
     {
       id: 'dnd-xp-award',
-      reads: ["host.list_definitions('dnd-xp-award')", 'host.event_data'],
+      reads: ["host.list_definitions('dnd-xp-award')", 'host.event_data', 'host.get_encounter'],
       forbids: ['mon-']
+    },
+    {
+      id: 'dnd-save-half',
+      reads: ["host.list_definitions('dnd-save-half')", 'host.scale_effect(0.5)'],
+      forbids: ['savehalf-rubble', 'host.engine_rng']
     }
   ]
   const dataDrivenProblems = []
@@ -2003,6 +2114,63 @@ function runChecks(build) {
       : sunProblems.slice(0, 6).join(' ; ')
   )
 
+  // 9b. GAP-E：豁免减半 = 声明引擎缩放，Lua 不再重掷效果骰
+  const halfSource = srcOf('dnd-save-half')
+  const halfProblems = []
+  if (!halfSource.includes('host.scale_effect(0.5)')) halfProblems.push('没有声明 host.scale_effect(0.5)')
+  if (halfSource.includes('host.engine_rng')) halfProblems.push('仍在 Lua 里重掷效果骰（GAP-E 的旧写法）')
+  if (!halfSource.includes("host.check_kind ~= 'save'")) halfProblems.push('没有先按 check_kind == save 收敛')
+  if (!halfSource.includes('host.check_result == true')) halfProblems.push('没有按豁免结果分支')
+  if (!halfSource.includes("host.list_definitions('dnd-save-half')")) halfProblems.push('规则没有从开放内容取 skill_id / fail_status')
+  const halfDefs = book.definitions.filter(d => d.kind === 'dnd-save-half')
+  if (!halfDefs.length || !halfDefs.every(d => d.fields && d.fields.fail_status)) halfProblems.push('dnd-save-half 定义缺少 fail_status')
+  const rubble = book.skills.find(s => s.id === 'sk-lmop-rubble-collapse')
+  if (rubble && rubble.effect && Array.isArray(rubble.effect.status) && rubble.effect.status.length) {
+    halfProblems.push('技能的失败附加状态仍写在 effect.status（缩放门会连成功豁免也施加）')
+  }
+  expect(
+    halfProblems.length === 0,
+    'save_half.scale_effect',
+    halfProblems.length === 0
+      ? 'dnd-save-half 只声明 scale_effect(0.5)（Lua 无效果骰重掷）；失败附加状态走开放内容 fields.fail_status，技能 effect 不含状态'
+      : halfProblems.slice(0, 6).join(' ; ')
+  )
+
+  // 9c. GAP-L：伏击读 host.target.statuses（不再靠 dnd-surprised 标记）
+  const ambSource = srcOf('dnd-ambusher-keep-high')
+  const ambProblems = []
+  if (!ambSource.includes('host.target')) ambProblems.push('没有读 host.target')
+  if (!ambSource.includes('statuses')) ambProblems.push('没有读目标的 statuses')
+  if (ambSource.includes('dnd-surprised')) ambProblems.push('仍把受突袭状态名烘进 Lua（应读开放内容 fields.target_status）')
+  const ambDefs = book.definitions.filter(d => d.kind === 'dnd-ambusher')
+  if (!ambDefs.length || !ambDefs.every(d => d.fields && d.fields.target_status)) ambProblems.push('伏击定义缺少 target_status')
+  const ambMount = book.lua_mounts.find(m => m.id === 'dnd-ambusher-keep-high')
+  if (JSON.stringify((ambMount && ambMount.when) || {}).includes('dnd-surprised')) ambProblems.push('when 闸门仍要求 dnd-surprised 标记')
+  expect(
+    ambProblems.length === 0,
+    'ambusher.target_status',
+    ambProblems.length === 0
+      ? '伏击读 host.target.statuses，期望状态 id 由开放内容 fields.target_status 给出；闸门只留战斗第一轮'
+      : ambProblems.slice(0, 6).join(' ; ')
+  )
+
+  // 9d. GAP-A：集群战术读运行时事实（近似程度提高，不假装精确）
+  const packSource = srcOf('dnd-pack-tactics')
+  const packProblems = []
+  if (!packSource.includes('host.list_encounters')) packProblems.push('没有读活跃遭遇')
+  if (!packSource.includes('host.get_character')) packProblems.push('没有读同伴实例')
+  if (!packSource.includes('location_id')) packProblems.push('没有用 location_id 做「目标附近」的近似')
+  if (packSource.includes('dnd-flanked')) packProblems.push('仍靠 dnd-flanked 标记')
+  const packDefs = book.definitions.filter(d => d.kind === 'dnd-pack-tactics')
+  if (!packDefs.length || !packDefs.every(d => d.fields && d.fields.range_proxy)) packProblems.push('集群战术定义缺少 range_proxy（近似口径必须写明）')
+  expect(
+    packProblems.length === 0,
+    'pack_tactics.world_facts',
+    packProblems.length === 0
+      ? '集群战术用 host.list_encounters + host.get_character 读同遭遇同伴（HP>0），目标按同一 location_id 近似；5 尺仍做不到（GAP-B）'
+      : packProblems.slice(0, 6).join(' ; ')
+  )
+
   // 10. 规则挂接自洽（开放内容 → Lua 的入口必须真的指得到定义）
   const attachProblems = []
   const defsById = new Map(book.definitions.map(d => [d.id, d]))
@@ -2031,15 +2199,17 @@ function runChecks(build) {
 
   // 11. 缺口登记（证伪职责：清单非空、每条有 rule / stuck_at / need / status）
   const badGaps = GAPS.filter(
-    g => !g.rule || !g.stuck_at || !g.need || !['closed', 'open'].includes(g.status)
-      || (g.status === 'closed' && (!g.closed_by || !g.evidence))
-      || (g.status === 'open' && !g.now)
+    g => !g.rule || !g.stuck_at || !g.need || !['closed', 'partial', 'open'].includes(g.status)
+      || ((g.status === 'closed' || g.status === 'partial') && (!g.closed_by || !g.evidence))
+      || ((g.status === 'partial' || g.status === 'open') && !g.now)
   )
   const closed = GAPS.filter(g => g.status === 'closed')
+  const partial = GAPS.filter(g => g.status === 'partial')
   expect(
     badGaps.length === 0 && GAPS.length > 0,
     'gaps.registered',
-    GAPS.length + ' 条缺口已逐条复核：闭合 ' + closed.length + ' 条 / 仍存在 ' + (GAPS.length - closed.length) + ' 条'
+    GAPS.length + ' 条缺口已逐条复核：闭合 ' + closed.length + ' 条 / 近似提高 ' + partial.length + ' 条 / 仍存在 '
+      + (GAPS.length - closed.length - partial.length) + ' 条'
       + (badGaps.length ? '（缺字段：' + badGaps.map(g => g.id).join(',') + '）' : '')
   )
 
@@ -2104,16 +2274,19 @@ function checkMode(engineBin) {
 
   console.log('')
   const closedCount = GAPS.filter(g => g.status === 'closed').length
+  const partialCount = GAPS.filter(g => g.status === 'partial').length
   console.log(
-    '—— 缺口清单现状：闭合 ' + closedCount + ' 条 / 仍存在 ' + (GAPS.length - closedCount)
+    '—— 缺口清单现状：闭合 ' + closedCount + ' 条 / 近似提高 ' + partialCount + ' 条 / 仍存在 '
+    + (GAPS.length - closedCount - partialCount)
     + ' 条（共 ' + GAPS.length + ' 条；原样报告，不新增封闭字段）——'
   )
   for (const gap of GAPS) {
-    if (gap.status === 'closed') {
-      console.log('· [已闭合] [' + gap.id + '] ' + gap.rule)
+    if (gap.status === 'closed' || gap.status === 'partial') {
+      console.log('· [' + (gap.status === 'closed' ? '已闭合' : '近似提高') + '] [' + gap.id + '] ' + gap.rule)
       console.log('    原缺口：' + gap.stuck_at)
-      console.log('    闭合原语：' + gap.closed_by)
+      console.log('    ' + (gap.status === 'closed' ? '闭合原语' : '提高用到的原语') + '：' + gap.closed_by)
       console.log('    落地：' + gap.evidence)
+      if (gap.now) console.log('    残余 / 复核：' + gap.now)
     } else {
       console.log('· [仍存在] [' + gap.id + '] ' + gap.rule)
       console.log('    卡在：' + gap.stuck_at)

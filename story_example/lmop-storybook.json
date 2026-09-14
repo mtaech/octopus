@@ -4588,7 +4588,7 @@
     {
       "id": "sk-lmop-rubble-collapse",
       "name": "坠落瓦砾",
-      "description": "DC 10 敏捷豁免：失败受 3d6 钝击伤害并倒地，成功则只受一半伤害（减半由规则包 Lua 结算）。",
+      "description": "DC 10 敏捷豁免：失败受 3d6 钝击伤害并倒地，成功则只受一半伤害（dnd-save-half 声明 scale_effect(0.5)，引擎只掷一次效果骰）。",
       "category": "陷阱",
       "target": "single",
       "attribute": "dex",
@@ -4605,9 +4605,6 @@
             "amount": "3d6",
             "resource": "res-hp"
           }
-        ],
-        "status": [
-          "dnd-prone"
         ]
       }
     },
@@ -4816,8 +4813,13 @@
           "ref_kind": "character"
         },
         {
-          "key": "gate_flag",
-          "label": "开闸标记",
+          "key": "ally_proxy",
+          "label": "同伴近似口径",
+          "type": "text"
+        },
+        {
+          "key": "range_proxy",
+          "label": "目标附近近似口径",
           "type": "text"
         },
         {
@@ -4840,6 +4842,12 @@
           "label": "生物",
           "type": "ref",
           "ref_kind": "character"
+        },
+        {
+          "key": "target_status",
+          "label": "目标状态",
+          "type": "text",
+          "hint": "目标带该状态即视为「受其突袭」"
         },
         {
           "key": "note",
@@ -4892,6 +4900,13 @@
           "label": "技能",
           "type": "ref",
           "ref_kind": "skill"
+        },
+        {
+          "key": "fail_status",
+          "label": "失败附加状态",
+          "type": "ref",
+          "ref_kind": "status",
+          "hint": "只有豁免失败才施加；成功只减半伤害"
         },
         {
           "key": "note",
@@ -5005,7 +5020,8 @@
       "description": "战斗第一轮对受其突袭的生物的攻击检定有优势",
       "fields": {
         "creature_id": "mon-doppelganger",
-        "note": "附录 B 原文：战斗开始的第一轮里，该生物对任何成功受其突袭的生物所发动的攻击检定具有优势。「哪只生物有伏击」由本定义驱动（Lua 读模板挂接，不烘名单）。"
+        "target_status": "dnd-surprised",
+        "note": "附录 B 原文：战斗开始的第一轮里，该生物对任何成功受其突袭的生物所发动的攻击检定具有优势。GAP-L 已闭合：Lua 直接读 host.target.statuses 里有没有 target_status 这个状态，不用全场标记近似。「哪只生物有伏击」由本定义驱动（Lua 读模板挂接，不烘名单）。"
       }
     },
     {
@@ -5414,8 +5430,9 @@
       "description": "至少一个未失能的盟友在目标 5 尺内时，攻击检定有优势",
       "fields": {
         "creature_id": "mon-wolf",
-        "gate_flag": "dnd-flanked",
-        "note": "盟友 5 尺内这个事实引擎拿不到（缺口 GAP-A / GAP-B），由叙事层置位 dnd-flanked；「哪只生物有集群战术」由本定义驱动（Lua 读模板挂接，不烘名单）。"
+        "ally_proxy": "同一场活跃遭遇里的其它敌人（HP>0 视为未失能）",
+        "range_proxy": "与目标同一 location_id",
+        "note": "GAP-A 已闭合：规则用 host.list_encounters + host.get_character 读同遭遇同伴，不再靠 dnd-flanked 标记；但精确「目标 5 尺内」仍做不到（GAP-B：引擎无位置 / 距离），HP>0 只是「未失能」的近似。「哪只生物有集群战术」由本定义驱动（Lua 读模板挂接，不烘名单）。"
       }
     },
     {
@@ -5649,7 +5666,8 @@
       "description": "DC 10 敏捷豁免：失败 3d6 钝击 + 倒地，成功减半",
       "fields": {
         "skill_id": "sk-lmop-rubble-collapse",
-        "note": "lua_mounts:dnd-save-half 在 check_post_roll 按 host.definition 的骰式重掷取半（缺口 GAP-E：读不到本次已掷出的伤害）。"
+        "fail_status": "dnd-prone",
+        "note": "lua_mounts:dnd-save-half 在 check_post_roll 声明 host.scale_effect(0.5)（GAP-E 已闭合）：引擎照常结算一次、只掷一次效果骰，数值型 delta 按 0.5 向零取整；失败才附加的状态（fail_status）由同一脚本在失败分支补——缩放不覆盖状态。"
       }
     },
     {
@@ -6249,10 +6267,6 @@
       "label": "战斗中（战斗轮计数开闸）"
     },
     {
-      "key": "dnd-flanked",
-      "label": "目标 5 尺内已有盟友（集群战术开闸）"
-    },
-    {
       "key": "dnd-surprised",
       "label": "本场战斗出现了被突袭者"
     },
@@ -6422,28 +6436,15 @@
     {
       "id": "dnd-pack-tactics",
       "mount": "check_pre_roll",
-      "source": "-- 规则包：集群战术（狼，附录 B 原文）。\n-- 「至少一个未处于失能的盟友在目标 5 尺内」这个事实引擎拿不到（GAP-A / GAP-B），\n-- 由叙事层置位 dnd-flanked；本脚本只负责「有该特性 + 闸门成立 → 取高」。\n-- 数据来源：开放内容（角色模板的 dnd-pack-tactics 挂接），脚本无生物名单。\nlocal ids = host.get_attachment('dnd-pack-tactics')\nif type(ids) == \"table\" and #ids > 0 then\n  host.modify_check('keep_high')\nend",
-      "when": {
-        "op": "flag_set",
-        "flag": "dnd-flanked"
-      }
+      "source": "-- 规则包：集群战术（狼，附录 B 原文）。\n-- 数据来源：开放内容（角色模板的 dnd-pack-tactics 挂接），脚本无生物名单。\n-- T21：读运行时事实——同一场遭遇的同伴（list_encounters + get_character）。\n-- 仍受 GAP-B（没有位置 / 距离）：同伴按「同一场遭遇」近似，目标按「同一 location_id」近似。\nlocal ids = host.get_attachment('dnd-pack-tactics')\nif type(ids) ~= \"table\" or #ids == 0 then return end\nlocal me = host.actor\nlocal target = host.target\nif type(me) ~= \"table\" or type(target) ~= \"table\" then return end\nlocal my_key = me.id or me.instance_id\nlocal function alive(inst)\n  local hp = inst and inst.resources and inst.resources['res-hp']\n  return type(hp) == \"number\" and hp > 0\nend\nlocal ally_found = false\nfor _, enc in ipairs(host.list_encounters()) do\n  local enemies = enc.enemies\n  if type(enemies) == \"table\" then\n    local mine = false\n    for _, e in ipairs(enemies) do\n      if (e.instance_id or e.id) == my_key then mine = true end\n    end\n    if mine then\n      for _, e in ipairs(enemies) do\n        local key = e.instance_id or e.id\n        if key and key ~= my_key then\n          if alive(host.get_character(key)) then ally_found = true end\n        end\n      end\n    end\n  end\nend\nif not ally_found then return end\n-- 「在目标 5 尺内」的可用近似：双方都知道地点时必须同地点（GAP-B 仍然存在）。\nlocal my_place = me.location_id\nlocal target_place = target.location_id\nif my_place and target_place and my_place ~= target_place then return end\nhost.modify_check('keep_high')"
     },
     {
       "id": "dnd-ambusher-keep-high",
       "mount": "check_pre_roll",
-      "source": "-- 规则包：伏击（变形怪，附录 B 原文）：战斗开始的第一轮里，\n-- 对任何成功受其突袭的生物所发动的攻击检定具有优势。\n-- host.target 读不到目标状态（GAP-L），用 dnd-surprised 标记近似。\n-- 数据来源：开放内容（角色模板的 dnd-ambusher 挂接），脚本无生物名单。\nlocal ids = host.get_attachment('dnd-ambusher')\nif type(ids) == \"table\" and #ids > 0 then\n  host.modify_check('keep_high')\nend",
+      "source": "-- 规则包：伏击（变形怪，附录 B 原文）：战斗开始的第一轮里，\n-- 对任何成功受其突袭的生物所发动的攻击检定具有优势。\n-- T21：host.target 与 host.actor 同级完整（含 statuses）——直接按目标状态判定（GAP-L 闭合）。\n-- 数据来源：开放内容（角色模板的 dnd-ambusher 挂接 → fields.target_status），脚本无状态名常量。\nlocal ids = host.get_attachment('dnd-ambusher')\nif type(ids) ~= \"table\" or #ids == 0 then return end\nlocal target = host.target\nlocal statuses = target and target.statuses\nif type(statuses) ~= \"table\" then return end\nfor _, def_id in ipairs(ids) do\n  local def = host.get_definition(def_id)\n  local wanted = def and def.fields and def.fields.target_status\n  if wanted and wanted ~= \"\" then\n    for _, st in ipairs(statuses) do\n      if st.id == wanted or st.name == wanted then\n        host.modify_check('keep_high')\n        return\n      end\n    end\n  end\nend",
       "when": {
-        "op": "all_of",
-        "children": [
-          {
-            "op": "flag_set",
-            "flag": "dnd-battle-round-1"
-          },
-          {
-            "op": "flag_set",
-            "flag": "dnd-surprised"
-          }
-        ]
+        "op": "flag_set",
+        "flag": "dnd-battle-round-1"
       }
     },
     {
@@ -6459,7 +6460,7 @@
     {
       "id": "dnd-save-half",
       "mount": "check_post_roll",
-      "source": "-- 规则包：豁免成功伤害减半（模块第 1727 行原文）。\n-- 引擎的豁免语义是「成功 = 效果不结算」，所以减半这一档由规则包在判定后补。\n-- 骰式解析（NdM+K）是规则包自己的算术：引擎不认识「一半」。\n-- 缺口 GAP-E：Lua 读不到本次效果已掷出的伤害，只能重掷同一骰式。\nif host.check_kind == 'save' and host.check_result == true then\n  local definition = host.definition\n  local effect = definition and definition.effect\n  local immediate = effect and effect.immediate\n  local first = immediate and immediate[1]\n  if first and first.kind == 'damage' and first.amount then\n    local expression = tostring(first.amount)\n    local count, sides, tail = string.match(expression, '^(%d+)d(%d+)(.*)$')\n    local total = 0\n    if count then\n      for _ = 1, tonumber(count) do\n        total = total + host.engine_rng(1, tonumber(sides))\n      end\n      total = total + (tonumber(tail) or 0)\n    else\n      total = tonumber(expression) or 0\n    end\n    local half = math.floor(total / 2)\n    if half > 0 then\n      local target = host.target and host.target.id\n      if target then\n        host.apply_effect(target, { kind = 'damage', amount = tostring(half), resource = first.resource or 'res-hp' })\n      end\n    end\n  end\nend"
+      "source": "-- 规则包：豁免成功伤害减半（模块第 1727 行原文）。\n-- T22：scale_effect 只在 check_post_roll / pre_resolve 存在；效果照常由引擎结算一次，\n--       数值型 delta 按因子缩放（向零取整、逐条）——全程只掷一次效果骰。\n-- 数据来源：开放内容 dnd-save-half 定义（fields.skill_id / fields.fail_status）。\nif host.check_kind ~= 'save' then return end\nlocal definition = host.definition\nlocal skill_id = definition and definition.id\nlocal rule = nil\nfor _, def in ipairs(host.list_definitions('dnd-save-half')) do\n  local fields = def.fields\n  if fields and fields.skill_id == skill_id then rule = fields end\nend\nif not rule then return end\nif host.check_result == true then\n  -- 豁免成功：引擎按本次实际掷出的效果骰结算一次，数值减半。\n  host.scale_effect(0.5)\nelseif rule.fail_status and rule.fail_status ~= \"\" then\n  -- 豁免失败：默认全量结算；失败才附加的状态由本脚本补（缩放不覆盖状态）。\n  local target = host.target and (host.target.id or host.target.instance_id)\n  if target then\n    host.apply_status(target, rule.fail_status, 1, 'turns')\n  end\nend"
     },
     {
       "id": "dnd-consume-inspiration",
@@ -6550,7 +6551,7 @@
     {
       "id": "dnd-xp-award",
       "mount": "event",
-      "source": "-- 规则包：经验值合计（模块第 1987 行「合计角色们克服的每个怪物的经验值」）。\n-- 时机：event 挂载点 + enemy_defeated（data.enemy.template_id / data.killer）。\n-- 数值：开放内容 dnd-xp-award 定义（fields.template_id → fields.xp），脚本无 XP 常量。\nif host.event_name ~= 'enemy_defeated' then return end\nlocal data = host.event_data\nlocal enemy = data and data.enemy\nlocal template_id = enemy and enemy.template_id\nif not template_id or template_id == \"\" then return end\nlocal xp = 0\nlocal defs = host.list_definitions('dnd-xp-award')\nfor _, def in ipairs(defs) do\n  local fields = def.fields\n  if fields and fields.template_id == template_id then xp = tonumber(fields.xp) or 0 end\nend\nif xp > 0 then\n  host.modify_resource(host.actor.id, 'res-xp', xp)\nend"
+      "source": "-- 规则包：经验值合计（模块第 1987 行「合计角色们克服的每个怪物的经验值」）。\n-- 时机：event 挂载点 + enemy_defeated（data.enemy.template_id / data.killer）。\n-- 数值：开放内容 dnd-xp-award 定义（fields.template_id → fields.xp），脚本无 XP 常量。\nif host.event_name ~= 'enemy_defeated' then return end\nlocal data = host.event_data\nlocal enemy = data and data.enemy\nlocal template_id = enemy and enemy.template_id\n-- T21：遭遇快照可读（get_encounter）——事件缺 template_id 时按 instance_id 回查。\n-- 这是**兜底**，不改变常规路径（strike 派发的 data.enemy 本就带 template_id）。\nif (not template_id or template_id == \"\") and enemy and enemy.instance_id then\n  local enc = data and data.encounter and data.encounter.id\n  local snapshot = enc and host.get_encounter(enc)\n  local list = snapshot and snapshot.enemies\n  if type(list) == \"table\" then\n    for _, e in ipairs(list) do\n      if e.instance_id == enemy.instance_id and e.template_id then template_id = e.template_id end\n    end\n  end\nend\nif not template_id or template_id == \"\" then return end\nlocal xp = 0\nlocal defs = host.list_definitions('dnd-xp-award')\nfor _, def in ipairs(defs) do\n  local fields = def.fields\n  if fields and fields.template_id == template_id then xp = tonumber(fields.xp) or 0 end\nend\nif xp > 0 then\n  host.modify_resource(host.actor.id, 'res-xp', xp)\nend"
     }
   ]
 }

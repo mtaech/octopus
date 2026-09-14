@@ -1747,6 +1747,8 @@ impl Session {
     fn with_eval_context<R>(&self, script_id: &str, f: impl FnOnce(&EvalContext<'_>) -> R) -> R {
         let (flags, goals, triggers, actor_attrs, actor_loc, scene_id, encounters) = {
             let st = self.state.lock().expect("state poisoned");
+            // 条件求值里的 Lua 也用同一批只读事实（GAP-A）：跑之前刷新，避免读到旧快照。
+            self.refresh_lua_world_facts(&st);
             let actor_id = st.controlled.first().cloned().unwrap_or_default();
             let actor = st.characters.get(&actor_id);
             (
@@ -4499,10 +4501,37 @@ impl Session {
         self.flush_rng_consumption();
     }
 
+    /// 把只读世界事实（GAP-A：角色实例 / 标记 / 遭遇）注入 Lua 宿主，供脚本按 id 查表。
+    ///
+    /// 引擎**不理解**这些数据的语义，只做搬运：把存档里的就绪事实原样转成 JSON 快照，
+    /// 由 `host.get_character` / `get_flag` / `list_flags` / `get_encounter` /
+    /// `list_encounters` 查表。**只读**：不产生任何 LuaRequest、不改世界状态。
+    ///
+    /// 注册表为空 = 没有任何脚本会读它 → 不构造、不注入（零开销、零行为变化）。
+    /// 与 `LuaHostContext` 无关（那是跨 crate 字面量构造契约），走 `set_world_facts` 独立注入。
+    fn refresh_lua_world_facts(&self, st: &WorldState) {
+        let has_scripts = self
+            .lua_registry
+            .lock()
+            .map(|registry| !registry.is_empty())
+            .unwrap_or(false);
+        if !has_scripts {
+            return;
+        }
+        let facts = serde_json::json!({
+            "characters": serde_json::to_value(&st.characters).unwrap_or(Value::Null),
+            "flags": serde_json::to_value(&st.flags).unwrap_or(Value::Null),
+            "encounters": serde_json::to_value(&st.encounters).unwrap_or(Value::Null),
+        });
+        self.lua.set_world_facts(facts);
+    }
+
     /// 挂载点 `when` 条件求值的只读世界快照。
     fn mount_world(&self, actor_key: &str) -> MountWorld {
         let (flags, goals, triggers, actor_location, actor_attributes, scene_id, encounters) = {
             let st = self.state.lock().expect("state poisoned");
+            // 跑脚本前刷新只读世界事实（GAP-A）：没有挂载点脚本时不构造（零开销）。
+            self.refresh_lua_world_facts(&st);
             let hit = if actor_key.is_empty() {
                 None
             } else {
@@ -4572,7 +4601,7 @@ impl Session {
         }
         self.with_mount_gate(lua_ctx, |gate| {
             let registry = self.lua_registry.lock().expect("lua registry poisoned");
-            let env = MountEnv { gate, check, event: None };
+            let env = MountEnv { gate, check, event: None, resolved_effects: None };
             match registry.run_chain_status(&self.lua, mount, lua_ctx, &env, status) {
                 Ok(_) => Ok(self.lua.drain_requests()),
                 Err(e) => {
@@ -4623,6 +4652,8 @@ impl Session {
 
         let (flags, goals, prog_triggers, actor_id, actor_attrs, actor_loc, scene_id, encounters) = {
             let st = self.state.lock().expect("state poisoned");
+            // 触发点条件里的 Lua 也用同一批只读事实（GAP-A）：跑之前刷新。
+            self.refresh_lua_world_facts(&st);
             let actor_id = st.controlled.first().cloned().unwrap_or_default();
             let actor = st.characters.get(&actor_id);
             (
@@ -4752,6 +4783,7 @@ impl Session {
                 gate,
                 check: None,
                 event: Some(LuaEventContext { name, data }),
+                resolved_effects: None,
             };
             match registry.run_chain_with(&self.lua, LuaMount::Event, lua_ctx, &env) {
                 Ok(_) => Ok(self.lua.drain_requests()),
@@ -4882,6 +4914,9 @@ impl Session {
                 // 判定修正只在判定挂载点（check_pre_roll / check_post_roll）被消费；
                 // 其他时机抛出这类请求没有判定可改，忽略。
                 LuaRequest::ModifyCheck { .. } => {}
+                // 效果缩放在技能结算路径（command::execute_skill）被消费；
+                // 判定意图（Intent::Check）没有效果可缩放，这里忽略。
+                LuaRequest::ScaleEffect { .. } => {}
             }
         }
         if !changes.is_empty() {
@@ -11578,6 +11613,158 @@ return host.storage.cleared_count == 1 and c ~= nil
             session.projection().characters["char-a"]["resources"].get("score").is_none(),
             "没有脚本就没有任何状态变化"
         );
+    }
+
+    /// GAP-A：会话把存档里的角色实例 / 标记 / 活跃遭遇注入 Lua 只读快照，
+    /// 实例键 / 模板 id / 角色名 / instance_id 四种写法都命中同一实例。
+    #[test]
+    fn lua_world_facts_are_injected_from_state() {
+        let sb = json!({
+            "lua_mounts": [{ "id": "probe", "mount": "pre_resolve", "source": "return 1" }]
+        });
+        let mut state = state_with_pc();
+        state.flags.insert("met-isa".to_string(), json!(true));
+        state.characters.insert(
+            "mon-1".to_string(),
+            CharacterInstance {
+                instance_id: "inst-mon-1".into(),
+                template_id: "mon-wolf".into(),
+                name: "灰狼".into(),
+                kind: "monster".into(),
+                attributes: json!({ "dex": 40 }).as_object().unwrap().clone(),
+                resources: json!({ "hp": 7 }).as_object().unwrap().clone(),
+                inventory: Default::default(),
+                location_id: Some("loc-1".into()),
+                present: true,
+                statuses: vec![StatusInstance {
+                    id: "off-guard".into(),
+                    name: "疏于防备".into(),
+                    turns_left: Some(2),
+                    scenes_left: None,
+                }],
+            },
+        );
+        state.encounters.insert(
+            "enc-1".to_string(),
+            json!({
+                "id": "enc-1", "name": "洞穴", "active": true,
+                "enemies": [{ "id": "e1", "name": "灰狼", "hp": 3, "max": 11, "ac": 12 }]
+            }),
+        );
+        let (session, _sink) = session_with_state(sb, state);
+        // 挂载点执行路径会刷新只读世界事实（GAP-A）。
+        let _ = session.mount_world("char-a");
+        let probe = LuaHostContext { script_id: "probe".into(), ..Default::default() };
+        for id in ["mon-1", "mon-wolf", "灰狼", "inst-mon-1"] {
+            let script = format!(
+                "local c = host.get_character('{id}')
+                 return c ~= nil and c.id == 'mon-1' and c.attributes.dex == 40 
+                 and c.resources.hp == 7 and c.statuses[1].id == 'off-guard' 
+                 and c.location_id == 'loc-1' and c.kind == 'monster' and c.present == true"
+            );
+            assert!(session.lua.run_condition(&script, &probe).unwrap(), "id 形态 {id} 应命中");
+        }
+        assert!(session.lua.run_condition("return host.get_flag('met-isa') == true", &probe).unwrap());
+        assert!(session
+            .lua
+            .run_condition("return host.get_encounter('enc-1').enemies[1].hp == 3", &probe)
+            .unwrap());
+        assert!(session
+            .lua
+            .run_condition(
+                "return host.get_character('nobody') == nil and host.get_flag('nope') == nil 
+                 and #host.list_encounters() == 1 and host.list_flags()['met-isa'] == true",
+                &probe
+            )
+            .unwrap());
+    }
+
+    /// 验收 5：没有相关挂载点脚本时不构造、不注入世界事实（零开销、零行为变化）。
+    #[test]
+    fn lua_world_facts_are_not_injected_without_mount_scripts() {
+        let (session, _sink) = session_with(json!({}));
+        // 即便走一次挂载点世界快照构造，注册表为空 → 不注入。
+        let _ = session.mount_world("char-a");
+        let probe = LuaHostContext { script_id: "probe".into(), ..Default::default() };
+        assert!(session
+            .lua
+            .run_condition(
+                "return host.get_character('char-a') == nil and host.get_flag('met-isa') == nil 
+                 and next(host.list_flags()) == nil and #host.list_encounters() == 0",
+                &probe
+            )
+            .unwrap());
+    }
+
+    /// 验收 4：只读世界事实口在挂载点链里不产生任何 LuaRequest、不改世界状态。
+    #[test]
+    fn readonly_world_fact_mount_produces_no_requests_or_state_change() {
+        let sb = json!({
+            "lua_mounts": [{
+                "id": "ro", "mount": "pre_resolve",
+                "source": "local c = host.get_character('char-a'); local f = host.get_flag('k'); local e = host.get_encounter('nope'); local l = host.list_encounters()"
+            }]
+        });
+        let mut state = state_with_pc();
+        state.flags.insert("k".to_string(), json!(1));
+        let (session, _sink) = session_with_state(sb, state);
+        let before = serde_json::to_value(&*session.state.lock().unwrap()).unwrap();
+        let ctx = LuaHostContext {
+            script_id: "ro".into(),
+            actor_id: "char-a".into(),
+            ..Default::default()
+        };
+        let requests = session.run_mount_chain(LuaMount::PreResolve, &ctx, None, None).unwrap();
+        assert!(requests.is_empty(), "只读 API 不得产生任何 LuaRequest");
+        let after = serde_json::to_value(&*session.state.lock().unwrap()).unwrap();
+        assert_eq!(before, after, "只读 API 不得改世界状态");
+    }
+
+    /// GAP-L 端到端（会话级）：规则包在 `check_pre_roll` 按**目标的状态**声明取高，
+    /// 走完整 resolve_skill 管线后实测多掷一颗骰（骰序 / RNG 消耗可观察）。
+    #[test]
+    fn target_status_drives_check_mount_end_to_end() {
+        let sb = json!({
+            "skills": [{ "id": "sk-hit", "name": "攻击", "check": { "dice": "1d20" } }],
+            "world": { "check": { "dice": "1d20", "default_dc": 12 } },
+            "lua_mounts": [{
+                "id": "target-status", "mount": "check_pre_roll",
+                "source": "local t = host.target\nfor i = 1, #(t.statuses or {}) do\n  if t.statuses[i].id == 'off-guard' then host.modify_check('keep_high') end\nend"
+            }]
+        });
+        let monster = |marked: bool| CharacterInstance {
+            instance_id: "inst-mon-1".into(),
+            template_id: "mon-wolf".into(),
+            name: "灰狼".into(),
+            kind: "monster".into(),
+            attributes: json!({ "dex": 40 }).as_object().unwrap().clone(),
+            resources: json!({ "hp": 7 }).as_object().unwrap().clone(),
+            inventory: Default::default(),
+            location_id: None,
+            present: true,
+            statuses: if marked {
+                vec![StatusInstance {
+                    id: "off-guard".into(),
+                    name: "疏于防备".into(),
+                    turns_left: Some(1),
+                    scenes_left: None,
+                }]
+            } else {
+                vec![]
+            },
+        };
+        let rolled = |marked: bool| -> usize {
+            let mut state = state_with_pc();
+            state.characters.insert("mon-1".to_string(), monster(marked));
+            let (session, _sink) = session_with_state(sb.clone(), state);
+            let skill = session.rules.skill("sk-hit").cloned().unwrap();
+            session.resolve_skill(None, &skill, Some("mon-1"), None);
+            session.rng.lock().unwrap().consumed.len()
+        };
+        // 目标带「疏于防备」→ 脚本声明取高 = 同一骰式掷两次。
+        assert_eq!(rolled(true), 2, "按目标状态声明取高应多掷一颗");
+        // 对照：目标没有该状态 → 单次掷骰，行为与不声明挂载点一致。
+        assert_eq!(rolled(false), 1);
     }
 }
 

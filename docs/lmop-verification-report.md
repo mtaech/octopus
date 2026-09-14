@@ -5,10 +5,13 @@
 > 用户原话要求：「开发完成后自己新建一个 凡戴尔的失落矿坑 的故事书验证一下」——本报告走的是**真实 HTTP 产品路径**新建故事书（不是只读 JSON）。
 > 本报告只做记录与取证；发现的不符项**原样登记，未改动 `crates/*/src/` 与 `frontend/src/` 的任何产品代码**。
 >
-> **⚠️ 本文件含两轮验证。第 1 轮（§0–§10，T15/T12 之后的交付物）原样保留在下方，作为历史证据。**
-> **第 2 轮（T17/T18 引擎原语 + T19 规则包升级之后）见文末 §R2。** 第 2 轮由**另一名独立验证者**
+> **⚠️ 本文件含三轮验证。第 1 轮（§0–§10，T15/T12 之后的交付物）原样保留在下方，作为历史证据。**
+> **第 2 轮（T17/T18 引擎原语 + T19 规则包升级之后）见 §R2。** 第 2 轮由**另一名独立验证者**
 > （未参与 T17/T18/T19 实现）重新取证，**不采信任务方自述**；并专门对 T19 修改过的两处第一轮用例做了
 > **变异审计**（§R2-3）。
+> **第 3 轮（T21/T22 引擎原语 + T23 规则包改动之后）见 §R3。** 第 3 轮由**第三名独立验证者**
+> （未参与 T21/T22/T23 实现）重新取证，专门审计四件事：save-half 是否真的不重掷 / 连带修正是否保住行为 /
+> 两处过期注释的断言还有没有牙齿 / 集群战术近似的边界；并逐条复核 14 条 GAP 的第三轮现状（§R3-3 / §R3-4）。
 
 ---
 
@@ -516,6 +519,334 @@ R2-MUT1 PASS: 基线 kill=50/post=0；变异B kill=0；变异C post=50
 **未改动**：`crates/*/src/` 与 `frontend/src/` 的任何产品代码；
 **未改动** T19 改过的那两个用例（`crates/octopus-api/tests/lmop_verification.rs` 的 mtime 仍是 `11:42:19.98`）。
 本轮只**新增**了上面 3 个文件 + 追加本节。第一轮的 §0–§10 未删改一字（除在文首加了一段指向第二轮的导航）。
+
+---
+
+## 第三轮·独立复核（T21 / T22 引擎原语 + T23 规则包）
+
+> 角色：**全新的独立验证者（第三轮）**（未参与 T21 / T22 / T23 的任何实现）。只验证，不修产品代码。
+> inScope：`docs/lmop-verification-report.md` · `scripts/`（只新增） · `crates/octopus-api/tests/`（只新增）。
+> **未修改**前两轮的用例：`lmop_verification.rs` / `lmop_verification_round2.rs` 逐字未动（只读 + 跑 + 变异推理）。
+> 被测交付物：`story_example/lmop-storybook.json`，sha256 `f7b15b723c9f38ab90fdf4487c5dce56931db0fe3d7ae6272d8f738375d29bc2`（T23 重新生成后的版本；与第二轮验的 `b49694ba…` **不是同一版**）。
+> 查询口径：**不采信 T23 自述**；四条专门审计全部独立复现，前两轮用例重跑只为确认「没被改坏」。
+
+### R3-0. 结论摘要
+
+| | 数量 | 说明 |
+|---|---|---|
+| 清单项 **通过** | **19 / 19** | 见 §R3-2 逐条验收表 |
+| **未通过** | **0** | —— |
+| **未覆盖** | **0** | 19 条全部有可复现命令 + 原始输出；另有 3 处**覆盖边界**如实登记（§R3-6） |
+| 四件专门审计 | ①通过 ②通过（含 1 处**改善**）③**注释过期**（断言仍有牙齿，但一条机制描述已失实）④**近似边界 5 类错误结论** |
+| 14 条 GAP 第三轮现状 | **闭合 7 / 近似提高 1 / 仍存在 6** | 独立复核（§R3-4），**数目与 T23 自述一致**，但逐条证据是本轮自己取的 |
+
+**一句话**：第三轮补的 `scale_effect` / `get_character` 等原语**是真的**——我独立复现了「同一颗效果骰被缩放」（32 个种子骰序逐位相同、半值恰为向零取整、引擎产物里 1 条 hp delta 而 Lua 无伤害请求），也独立确认了「多段效果 + modifiers 全部被缩放」这件**重掷做不到**的事。T23 的连带修正**保住了行为**（成功=半伤不倒地、失败=满伤+倒地），并且顺手修掉了一处旧实现的位置错误（附加状态从前落在**施法者**，现在落在**目标**）。
+**但有两处不能替它圆场**：a12 / a12b 的注释与 r2_6 负对照的**失效机制描述已经过期**——前者只是措辞，后者是**事实错误**（减半分支其实发了、引擎也结算了，只是 delta 落在不存在的实体上被静默丢弃）。集群战术的「近似提高」标签是**诚实**的：我实测出 5 类**错误结论**（同伴在别处、同伴失能、无地点、非攻击判定、同伴在另一场遭遇），而且开放内容自己声明的 `range_proxy`（「与目标同一 location_id」）**脚本根本没实现**——它只比了「狼 vs 目标」的地点，从没看同伴在哪。
+
+### R3-1. 环境与复现命令（第三轮）
+
+```bash
+cd /home/huang/Personal/Dev/Code/octopus
+
+# A. 真实 HTTP 路径（真实产品 API：起服务 → 建书/发布/开档/读投影 → 停服务）
+./start.sh backend
+node scripts/lmop-verify-http-round3.mjs      # EXIT=0，13/13 通过
+./start.sh stop                               # 验证结束后停掉（8787 已释放，pgrep octopus-bin 空）
+
+# B. 引擎级端到端（注入式 provider，零联网；本轮新增独立测试文件）
+export CARGO_TARGET_DIR=$PWD/.scratch/engine-test-target
+cargo test -p octopus-api --test lmop_verification_round3 -- --test-threads=4 --nocapture
+#   → 14 passed; 0 failed（连跑 3 轮均 14/14）
+
+# 前两轮的用例：只读不改，原地重跑（确认 T21/T22/T23 没改坏它们）
+cargo test -p octopus-api --test lmop_verification        # 12 passed; 0 failed
+cargo test -p octopus-api --test lmop_verification_round2 # 13 passed; 0 failed
+
+# 交付物侧自检
+node scripts/lmop-rulepack.mjs --check        # EXIT=0，28 项断言 0 失败 + 14 条 GAP（闭合 7 / 近似 1 / 仍存在 6）
+node scripts/import-bestiary.mjs --check      # EXIT=0，28/28
+./scripts/lmop-boundary-check.sh              # EXIT=0（禁词零命中）
+./scripts/lmop-engine-check.sh                # EXIT=0（0 error / 0 lua issue / 规则断言 0 失败）
+```
+
+原始输出留档（本轮）：`/tmp/r3logs/round3-tests.log` · `/tmp/r3logs/prev-rounds.log` · `/tmp/r3logs/audit3a-mutations.log` ·
+`/tmp/r3logs/rulepack-check.log` · `/tmp/r3logs/bestiary-check.log` · `/tmp/r3logs/boundary-check.log` ·
+`/tmp/r3logs/engine-check.log`（HTTP 那次的完整输出见 §R3-2 第 1 条的原始片段）。
+
+### R3-2. 逐条验收表（第三轮 19 条）
+
+| # | 清单项 | 结论 | 证据（命令 / 断言 / 原始片段） |
+|---|---|---|---|
+| **1** | 真实路径建书 + 发布 + 开档（**重新生成后的**故事书） | **通过** | `node scripts/lmop-verify-http-round3.mjs` → EXIT=0，13/13。首行钉死交付物：`sha256 = f7b15b723c9f38ab90fdf4487c5dce56931db0fe3d7ae6272d8f738375d29bc2`。`POST /api/storybooks → 201`（`sb-849c8abbf1a241f4980b5d314e821286`）、`PUT → 200`、`POST /publish → 200 revision=1`、`POST /api/saves → 201 embedded_revision=1`（`sv-7f6d038763344b0cb155a4637681cb7b`）。引擎层每条用例的 `publish_and_open` 走同一条发布门（0 error）。 |
+| **2** | 投影不含 `kind="monster"` 初始实例 | **通过** | HTTP：`character kinds = {"pc":1}`、`keys=inst-pc-lmop-talin`、`encounters=[]`。引擎 `r3_1_2`：`kinds={"pc": 1}`、`characters.len()==1`（31 条图鉴模板一条都不进实例表）。 |
+| **3** | 遭遇克隆：灰烬丧尸 AC 8 / HP 22 / 六维 13,6,16,3,6,5 | **通过** | `r3_3_4_7`：`count=1` → `{"hp":22,"max":22,"ac":8}`；实例 `attributes={"str":13,"dex":6,"con":16,"int":3,"wis":6,"cha":5}`。 |
+| **4** | 玩家攻击：属性来自技能声明、伤害扣实例 hp、发 CheckResult | **通过** | `r3_3_4_7`：先读 `skills[sk-lmop-shortsword].attribute == "dex"`，再断言 `CheckResult.attribute == declared && != "str"`、`kind=Attack`、`expr`/`rolls` 非空；命中回合实例 `res-hp 22→<22` 且与 `EncounterView.enemies[0].hp` 同步。 |
+| **5** | `enemy_strike`：难度 = 玩家派生 AC | **通过** | `r3_5`：`CheckResult.target=14`，14 是测试**自己从故事书算的**（10 + dex16 的 +3 + 皮甲挂接 +1）；`attribute="str"`（丧尸猛击自己的声明）；PC `res-hp 24→<24`。 |
+| **6** | 自目标豁免减半不再静默失效 | **通过** | `r3_audit2`（自目标，成功 =(delta,dice,prone)= `(3,4,false)`／失败 `(7,4,true)`）；前两轮用例重跑仍绿（`a12b`、`r2_6`）。见审计②。 |
+| **7** | 资源经 Add 后仍是 JSON 整数 | **通过** | `r3_3_4_7`：受伤实例 `resources` 的序列化串**不含小数点**且 `res-hp.as_i64()` 为 `Some`（形态证据，不是 `as_i64` 兜底）；`r2_4_and_8` 重跑覆盖 PC 侧。 |
+| **8** | `check_pre_roll` 能读 attribute/kind | **通过** | `r3_8_10_11`：探针挂载点写下 `r3.kind-attribute` / `r3.attr-dex`，且**没有** `r3.kind-nil` / `r3.attr-nil`；`r2_9_and_12` 重跑给出同一结论（`c1_mod=8 c2_mod=0`）。 |
+| **9** | 触发点预置遭遇 + `encounter_cleared` 条件 | **通过** | `r3_9_13`：无遭遇时 `eval_cond(EncounterCleared)==false`；PC 到 `loc-lmop-0b7` 后掷表建遭遇，`enc.location_id=="loc-lmop-0b7"`、`template_ids` 与故事书该触发点预置集合**逐条相等**（不采信引擎摘要）；移开后清剿 → `eval_cond==true`。 |
+| **10** | 对抗判定：掷 vs 掷 与 掷 vs 被动都跑通，`opponent` 非空 | **通过** | `r3_8_10_11`：先建遭遇使对手**在世界上** → 掷 vs 掷 `opponent="灰烬丧尸"`、`dice=2`。掷 vs 被动由 `r2_11` 重跑覆盖（`dice=1`、`opponent` 非空）。 |
+| **11** | 优势 `keep_high` 的 RNG 消耗为 2 | **通过** | `r3_8_10_11`：无激励 `dice=1`；施加 `dnd-inspired` 后同一 dex 检定 `dice=2`。 |
+| **12** | 熟练加值数据驱动（改故事书 definition → 检定总值随之变） | **通过** | 前两轮用例 `r2_13` 重跑：基线 `r#mod=8`，把 `prof-pc-lmop-talin-dex.fields.bonus` 由 `"5"` 改 `"9"`（只改一处）→ `r#mod=12`。交付物自检 `proficiency.data_driven` 同结论。 |
+| **13** | 掷表遭遇可反复 | **通过** | `r3_9_13` 按 active 上升沿计数（连跑 3 轮，归档于 `/tmp/r3logs/round3-tests.log`）：分别命中 `tr-lmop-wander-day-12`=**2**（74 回合）／`day-4`=**2**（38 回合）／`day-1`=**2**（13 回合）；更早的若干次运行还见过 `day-11` / `day-7` 各 2 次——**每轮都出现同一表项的第二次触发**（具体命中哪一行随存档种子变化）。 |
+| **14** | XP 由 `enemy_defeated` 发放（含不在任何掷表行里的模板） | **通过** | 前两轮用例 `r2_15` 重跑：`mon-skeleton`（不在 8 个掷表模板里）即兴遭遇打死 `res-xp 0→50`。交付物自检 `xp.improvised_encounter` / `xp.encounter_snapshot_fallback` 同结论。 |
+| **15** | **GAP-A 新能力**：`get_character` 四形态命中；`get_flag`/`get_encounter` 可用；`host.target` 含 `statuses` | **通过** | `r3_15`（会话级探针）：四形态全命中、`get_character('nobody')==nil`、`list_flags` 是表、`get_flag` 未命中返回 nil、`get_encounter(list[1].id)` 命中且带 `enemies`、`host.target` 的 `statuses/attributes/resources/location_id/kind` 全部可读。**口径注**：本交付物里实例键 `== instance_id`（同一字符串），四形态实为 **3 个不同取值 + 1 个重复**。 |
+| **16** | **GAP-L 生效**：伏击按目标状态给优势（正例 + 反例） | **通过** | `r3_16`（真实脚本 + 真实开放内容）：目标带 `dnd-surprised` → `keep_high=1`；无状态 → 0；别的状态 → 0；袭击者无挂接 → 0。**数据驱动反证**：把 `definitions[ambush-doppelganger].fields.target_status` 改成 `dnd-prone` → `prone=1 / surprised=0`。 |
+| **17** | **GAP-E 生效**：save-half 缩放**引擎那份**效果（同一次掷骰的一半），不是重掷 | **通过** | `r3_audit1_17`：把真实脚本里**唯一**的 `scale_effect(0.5)` 换成 `scale_effect(1.0)`，同种子 32 次——**骰序逐位相同**（每次 4 颗 = 1×d20 + 3×d6），`half == trunc(full×0.5)`，引擎产物 1 条 hp delta、Lua 伤害请求 **0**。对照旧重掷脚本：引擎 0 / Lua 1。 |
+| **18** | 多段效果 / 带 modifiers 的技能：缩放覆盖全部数值 delta（**独立构造**） | **通过** | `r3_18`（自建技能：`cost` + `2d6` 伤害 + `1d4` 改资源 + `1d8` 治疗 + `set_flag` + `modifiers`）：24 个种子下骰序不变（5 颗 = d20 + 2d6 + 1d4 + 1d8），**3 段数值 delta 全部按因子缩放**，标记 / 消耗 / 静态修正逐字不动。反面对照：同一个技能挂上 T23 之前的 Lua 重掷脚本 → 只补出**第一段**伤害，第 2/3 段与 modifiers 全丢。 |
+| **19** | 引擎边界：`crates/octopus-engine/src` 与 `crates/octopus-types/src` 禁词零命中 | **通过** | `./scripts/lmop-boundary-check.sh` EXIT=0（`advantage|proficiency|on_save|save_ends|ConditionalModifier|EncounterTable|extends` 零命中）。**独立宽词表复核**：`disadvantage` / `saving_throw` / `dnd-` 在两个 crate 均 **0 命中**；`scale_effect / get_character / list_encounters / resolved_effects` 有命中但都是**通用原语名**。一处精度更正见 §R3-6。 |
+
+### R3-3. 四件专门审计（独立复现，不采信自述）
+
+审计手段统一为：**从交付物里读出真实脚本原文**（不抄），用**固定种子**跑真实 `command::execute_skill`；
+RNG 与 `LuaHost` **共享同一个句柄**（真实会话就是这么接线的——第一版 harness 里我各建了一个，
+结果旧「重掷」脚本掷的骰不在记账里，被误测成「没掷」，已修正；这条踩坑本身也说明「骰序可比」不是自动成立的）。
+
+#### 审计①：save-half 是否真的不再重掷 —— **成立（不是另掷一份）**
+
+复现：把真实脚本里唯一的 `scale_effect(0.5)` 逐字换成 `scale_effect(1.0)`，其余不动；同种子、同技能、
+同一条 `sk-lmop-rubble-collapse`（豁免结果用 `check_pre_roll` 的 `force_success` 钉死，骰照掷），跑 32 个种子：
+
+```text
+R3-AUDIT1/17 PASS: 32 个种子下骰序逐位相同且 half==trunc(full*0.5)；
+  新机制 引擎 hp delta=1 / Lua 伤害请求=0；旧机制 引擎=0 / Lua=1
+```
+
+| 判据 | 观测 | 含义 |
+|---|---|---|
+| RNG 序列 | 32/32 种子下 `factor=1.0` 与 `factor=0.5` 的 `consumed` **逐位相同**（各 4 颗） | 因子不改变掷骰 |
+| 数值 | `half == (full as f64 * 0.5).trunc()` 全部成立 | 半值 = **同一份**的向零取整 |
+| 出处 | 成功回合引擎产物里恰好 **1 条** `resources.res-hp` delta；Lua `ApplyEffect(damage)` 请求 **0 条** | 减半伤害是**引擎结算产物**，不是 Lua 另补 |
+| 对照（T23 之前的脚本） | 引擎 hp delta **0** 条、Lua 伤害请求 **1** 条 | 旧机制确实是「门 Lua 另掷一份」 |
+
+结论：**T23 的自述在这一条上经得起独立复现**。`scale_effect` 缩放的就是引擎**那次**结算；
+规则包脚本里已无 `engine_rng`（断言 `!real.contains("engine_rng")` 通过）。
+「多段效果 / modifiers 全丢」这个重掷无法回避的问题，由清单 18 独立钉死。
+
+#### 审计②：T23 的连带修正是否保住行为 —— **保住了，而且顺手修了一处位置错误**
+
+连带修正的内容：`scale_effect` 会打开「成功也结算」的门，而缩放只作用于**数值型** delta，
+所以 T23 把 `dnd-prone` 从技能的 `effect.status` 移到开放内容 `savehalf-rubble.fields.fail_status`，
+由脚本在失败分支补。本轮独立复现两条分支：
+
+```text
+R3-AUDIT2  PASS: 成功(delta,dice,prone)=Some((5, 4, false)) 失败(delta,dice,prone)=Some((9, 4, true))
+R3-AUDIT2b PASS: 失败分支 伤害 entity=inst-zombie / 状态 target=inst-zombie status=dnd-prone
+```
+
+（具体 delta 随存档 id 派生的种子变化：上面这段是某一次真实运行的原文，
+连跑归档里还出现 `(3,4,false)/(7,4,true)`、`(5,4,false)/(15,4,true)` 等；
+**区间断言**（成功 1..9 / 失败 3..18）与 `prone` 断言在全部复跑里都成立。）
+
+| 分支 | 契约 | 实测 |
+|---|---|---|
+| 豁免**成功** | 只受一半伤害（1..9）、**不倒地** | `delta∈1..9`、`prone=false`（多次复跑一致） |
+| 豁免**失败** | 满伤（3..18）+ **倒地** | `delta∈3..18`、`prone=true` |
+| 附加状态落点 | —— | 伤害与 `dnd-prone` **都落在目标实例**；引擎旧路径是 `status_delta(actor_id)`（`effects.rs:229`），即**显式非自身目标时状态以前会落在施法者头上**——T23 把它改成落在目标，是**改善**，不是回归 |
+
+时长口径也逐字等价：`dnd-prone` 顶层定义 `duration:1 / unit:turns`，
+`build_status_ref`（旧路径）与 `build_status_instance(status,1,"turns")`（新路径）都得到 `turns_left=1`。
+LMoP 的实际用法是「自己踩瓦砾打自己」，因此**可观测行为没有变化**。
+
+**如实登记一个作者陷阱**（不是缺陷，代码注释也写明了）：`scale_effect` 的语义是
+「**声明** = 这次效果照常结算一次、数值按因子缩放」——`effect_applies = scale.is_declared() || …`。
+所以 `scale_effect(1.0)` **不等于**「没有声明」：它照样把「豁免成功 = 不结算」那道门打开。
+审计③的 M2 变异（把 0.5 改成 1.0）实测在成功分支打出**满伤 3..18**，正是这个语义的直接后果。
+规则作者若想表达「成功就不结算」，不能写 `scale_effect(1)`。
+
+#### 审计③：两处「注释口径过期」 —— 结论分两半
+
+审计标准（照任务要求）：**不是「注释对不对」，而是「把实现改坏，这条断言会不会 FAIL」**。
+手段：把 a12 / a12b 的断言段按字面复刻到固定种子的引擎级用例上，施加 4 组变异
+（`/tmp/r3logs/audit3a-mutations.log`）：
+
+```text
+R3-AUDIT3a: 基线 dice=4 delta=5
+  M1(无声明)      dice=1 delta=0                → 断言 FAIL=true
+  M2(因子1.0)     64 种子失败 41/64（delta 例：[4, 7, 11, 13, 13, 14, 11, 12]）
+  M3(旧重掷脚本)   dice=4 引擎delta=0 Lua补=1   → a12 仍 PASS
+  M4(因子0.25)    64 种子失败 0/64（delta 例：[1, 1, 2, 3, 3, 3, 2, 3]）
+```
+
+##### ③a `crates/octopus-api/tests/lmop_verification.rs` 的 a12 / a12b
+
+过期文本：文件头 `// 验收 12：豁免成功伤害减半（Lua 重掷同一骰式再取半）`（707 行）、
+`assert_eq!(dice, 4, "豁免成功：1 颗 d20 + Lua 重掷 3d6 取半 = 4 颗")`（730 / 774 行）。
+现在成功分支是「引擎掷 1 次 d20 + 1 次 3d6，数值减半」。
+
+**判断：注释过期，不是断言失效；但断言是「机制盲」的，且对「缩放过头」没有牙齿。**
+
+- M1（删掉缩放声明）让 `dice==4` 与 `delta∈1..9` **双双 FAIL** ⇒ 断言仍在抓「减半到底有没有生效」，不是恒真。
+- M2（0.5→1.0，即「把减半改坏成满伤」）被抓住 **41/64** 个种子（`delta>9` 时才 FAIL）——**概率性**，不是必然。
+- M3（把实现换回 T23 之前的 Lua 重掷）**两条断言都 PASS**：重掷路径同样消耗 4 颗骰、同样落在 `1..9`。
+  所以「重掷 3d6 取半」这句注释**没有任何断言在管**——它现在是纯文字，注释改了断言也不会变。
+- M4（0.25）**0/64 被抓**：`delta∈1..4 ⊂ 1..9`，断言对「缩放过头」没有覆盖。
+
+即：**没有替它圆场的余地**——这句注释确实过期了，且断言无法区分「缩放引擎那份」与「另掷一份」；
+但断言本身没有失去牙齿（M1 会让它挂）。覆盖空档由本轮新增的 `r3_audit1_17`（同骰证明）
+与 `r3_18`（多段 / 过度缩放反面）补上。
+
+##### ③b `crates/octopus-api/tests/lmop_verification_round2.rs` 的 r2_6 负对照
+
+过期文本（466–470 行注释、488/516/528/533 行断言消息）：「C 负对照：`target_id = Some("不存在的实体")`
+→ 目标解析不到 → `host.target = nil` → **减半分支静默不发** → delta = 0。这正是修复前的**失效形态**。」
+
+**判断：这是事实错误，不只是口径过期（但断言仍 PASS，且不恒真）。**
+
+```text
+R3-AUDIT3b PASS: 负对照 delta==0 仍成立（断言未恒真：自目标时 delta=-5），
+  但机制已变——引擎结算了 entity_id=r3-不存在的目标 的伤害并静默丢弃，
+  旧注释「host.target 为 nil → 分支不发」不再成立
+```
+
+- 引擎级实测：显式给一个解析不到的目标 + 豁免成功 → 规则脚本**照样声明了缩放**
+  （成功分支根本不读 `host.target`），引擎**结算出 1 条伤害 delta**，`entity_id = "r3-不存在的目标"`。
+- 会话级实测（真实 r2_6-C 形态）：成功回合 `delta == 0`（`apply_delta` 对未知实体直接 `return`，
+  `session.rs:5703`），**但引擎仍掷了 4 颗骰**；投影 `characters.len()==1`（不留幻影实例）。
+- 因此负对照的 `delta==0` **不是因为分支没发**，而是「算完了落在不存在的实体上被丢掉」。
+  它**仍不是恒真**（自目标时 `delta=-5`），也就是说「不可解析目标回落到施法者」这类坏实现仍会被它抓住；
+  但它**已经无法区分**「分支被跳过」与「算了但被丢弃」——R2 赋予它的诊断价值（证明修复前的失效形态）已经没有了。
+- **新观察（低 severity，如实登记）**：显式不可解析目标 + 成功分支，现在会「掷效果骰 → 算出伤害 →
+  静默丢弃」，全程**无日志、无事件、无报错**。失败分支本来就是这个形态（引擎一向如此），
+  成功分支是新开的（因为 `scale_effect` 打开了结算门）。
+
+#### 审计④：集群战术的近似边界 —— 在什么条件下会给出**错误结论**
+
+规则包现在的判据（`dnd-pack-tactics` 脚本原文）：
+`host.get_attachment('dnd-pack-tactics')` 非空 → 在 `host.list_encounters()` 里找**我所在的那场遭遇** →
+同遭遇里除我以外、`host.get_character(key)` 存在且 `resources['res-hp'] > 0` 的条目算「未失能的盟友」→
+若 **我** 与 **目标** 都有 `location_id` 且不同则退出 → 否则 `modify_check('keep_high')`。
+
+```text
+R3-AUDIT4: P0=1 P1(同伴倒)=0 P2(异地)=0 |
+  FP-A(同伴在别处)=1 FP-B(同伴失能)=1 FP-C(无地点)=1 FP-E(属性检定)=1 |
+  FN-A(同伴在别的遭遇)=0 FP-D(无实例)=0
+```
+
+| 场景 | 规则应得 | 实测 | 判定 |
+|---|---|---|---|
+| P0 同遭遇 + 同伴存活 + 狼与目标同地点 | 优势 | `1` | 对 |
+| P1 同伴 HP=0 | 无 | `0` | 对（「未失能」的近似在此成立） |
+| P2 狼与目标不同地点 | 无 | `0` | 对 |
+| FP-D 遭遇条目在、实例查不到 | 无 | `0` | 对 |
+| **FP-A 同伴在** `loc-c`**、狼与目标在** `loc-a` | 无（同伴不在目标 5 尺内） | **`1`** | **错**——脚本**从不检查同伴的 location** |
+| **FP-B 同伴 HP>0 但带** `stunned`**（失能）状态** | 无（「未失能」不成立） | **`1`** | **错**——`HP>0` 只是「未失能」的近似 |
+| **FP-C 狼与目标都没有** `location_id` | 无（无法证明同处） | **`1`** | **错**——地点闸门被整体跳过 |
+| **FP-E 狼做**非攻击**判定（签名 kind=attribute）** | 无（数据卡只说「攻击检定」） | **`1`** | **错**——脚本不看判定签名，也没有 `when` 闸门 |
+| **FN-A 同伴与目标同地点，但在**另一场遭遇** | 有 | **`0`** | **错**（漏判） |
+
+**这决定 GAP-A 该算「近似提高」而不是「已闭合」**：跨实体读取这个**能力**确实闭合了
+（清单 15/16 + 上面的 P0），但**规则结论不精确**，而且不止是 GAP-B 的锅：
+开放内容自己声明的 `range_proxy` 写的是「与目标同一 location_id」，**脚本从没实现这一步**——
+它比的是「狼 vs 目标」的地点。这是一处**声明与实现不一致**，比单纯「没有 5 尺」更具体。
+另有 FP-E：脚本注册在 `check_pre_roll` 且 `when=null`，对**任何**判定都跑，数据卡写的是「攻击检定」。
+
+### R3-4. 14 条 GAP 的第三轮现状（独立复核，不是照抄 T23 自述）
+
+复核方法：每条先看**引擎/类型里有没有那个原语**（带行号），再看**规则包真的用上了没有**
+（运行时用例 / 交付物自检 / 读源码），最后给出本轮的标签。T23 自报「闭合 7 / 近似提高 1 / 仍存在 6」——
+
+**独立结论：数目一致**；下面每条的“卡在哪”是本轮自己取的证，不是抄自述。
+
+| GAP | 主题 | 第三轮现状 | 独立证据 |
+|---|---|---|---|
+| **A** | Lua 读不到其它实体（集群战术 / 任何「对手或盟友」类规则） | **近似提高**（能力闭合，规则结论不精确） | 原语在场：`lua_host.rs` 的 `get_character / get_flag / list_flags / get_encounter / list_encounters`（`find_character_snapshot` 四形态；`active_encounters` 只列 active），会话侧由 `session.rs::refresh_lua_world_facts` 在跑脚本前注入。运行时反证：清单 15（会话级四形态/标记/遭遇/目标快照全命中）＋清单 16（伏击按目标状态）。**仍不精确的证据**：审计④ 的 FP-A/FP-B/FP-C/FP-E/FN-A。 |
+| **B** | 无位置 / 距离 / 区域概念 | **仍存在** | `distance`（词边界 grep）在 `crates/octopus-engine/src` **0 命中**；位置仍只有 `location_id` 归属。集群战术只能近似，且（审计④ FP-A）连「同伴同地点」这一步都没实现。 |
+| **C** | 挂接 / 开放内容不进 Lua | **已闭合** | 原语：`get_attachments / get_attachment(kind) / get_definition(id) / list_definitions(kind)`。运行时反证：前两轮 `r2_13` 重跑（只改 definition 的 `bonus 5→9` → `r#mod 8→12`）；交付物自检 `open_content.data_driven`（7 条规则全部运行时读开放内容）。 |
+| **D** | `check_pre_roll` 拿不到判定签名 | **已闭合** | `LuaCheckContext` 含 `attribute/kind/resolved/expr`；清单 8 的探针在掷骰前读到 `kind=attribute / attribute=dex` 且无 nil 标记。 |
+| **E** | 效果骰值不暴露（豁免减半的数值等价） | **已闭合** | 原语 `host.scale_effect(factor)`（只在 `check_post_roll / pre_resolve` 注册，写错时机当场报错）＋ `PostResolve` 只读 `host.resolved_effects`。独立反证：审计①（32 种子同骰、半值恰为向零取整、引擎产物而非 Lua 补）＋清单 18（多段/modifiers 全覆盖）。 |
+| **F** | 无「敌人被击败」事件 | **已闭合（边界不变）** | `enemy_defeated` 逐只发 XP，与遭遇来源无关；前两轮 `r2_15` 重跑（不在掷表行的 `mon-skeleton` 也拿 50 XP）。**边界（如实登记）**：只在 `strike_enemy` 路径派发，Lua 直接把资源打到 0 不发 XP（本轮仍只做代码复核）。 |
+| **G** | 预置遭遇数量是静态整数 | **仍存在** | `EncounterPresetEnemy.count: Option<u32>`（`octopus-types/src/lib.rs:878-883`）。运行时旁证：清单 13 的遭遇 `note = "规则包预置遭遇 · 原表 1d8+2 → 固定 3"`（每行固定成骰式**下界**）。 |
+| **H** | 没有清标记原语 | **已闭合** | `ImmediateEffect::SetFlag` 带 `value`；Lua 侧 `set_flag(flag[,value]) / clear_flag(flag)`。运行时反证：清单 13 依赖行标记被清掉才可能出现第二次上升沿。 |
+| **I** | 无先攻 / 轮次 / 行动经济 | **仍存在** | `initiative` 在 engine 唯一命中是 `validate.rs:2948` 的测试数据字符串。突袭仍只落状态 + `dnd-battle-round-N` 标记。 |
+| **J** | 对抗的「掷 vs 被动」入口 | **仍存在（引擎能力已具备，规则包未改用）** | `CondExpr` 变体（`types:118-137`）仍只有 `AttributeGe`（只看 actor 自己），没有「掷骰 vs 对手被动」入口；`Intent::Check.opponent_id` 两种对抗都真跑通（清单 10 + `r2_11` 重跑）。 |
+| **K** | 模板级状态无声明入口 | **仍存在** | `octopus-api/src/lib.rs:520 / 591` 建实例时 `statuses: vec![]`；character 模板没有初始状态声明。 |
+| **L** | `host.target` 读不到目标状态 | **已闭合** | `CHARACTER_SNAPSHOT_KEYS` 让 `host.target` 与 `host.actor` 同级（`statuses/attributes/resources/inventory/location_id/present`）；清单 16 的正例/反例 + 数据驱动反证（改 `fields.target_status` → 期望值翻转）。 |
+| **M** | 没有 `encounter_active` 条件 | **仍存在** | `encounter_active / EncounterActive` 在 `crates/*/src` **0 命中**；`CondExpr` 仍只有 `EncounterCleared`。战斗轮计数继续靠 `dnd-in-combat` 标记开闸。 |
+| **N** | 触发点一次性（`repeatable` 未实现） | **已闭合** | 24 个掷表触发点全部 `repeatable:true` + `dnd-wander-reset` 在 `encounter_cleared` 清标记。运行时反证：清单 13 三轮各观察到**同一表项第二次触发**（day-12 / day-4 / day-1，更早运行还见过 day-11 / day-7）。 |
+
+**汇总**：闭合 **7**（C / D / E / F / H / L / N）／近似提高 **1**（A）／仍存在 **6**（B / G / I / J / K / M）。
+与 T23 自述数目一致；第二轮是「闭合 5 / 仍存在 9」，本轮新增闭合 **E / L**，并把 **A** 从「仍存在」改判为「近似提高」。
+
+### R3-5. 这套设计成立性的第三轮判断
+
+**第三轮被推翻的证伪（设计假设其实是对的，只是实现落后）**
+
+| 前两轮仍成立的证伪 | 第三轮 |
+|---|---|
+| 「豁免减半可以用既有原语精确表达」被证伪（GAP-E，只能重掷） | **推翻该证伪**：`scale_effect` 让引擎只掷一次、按因子缩放，且覆盖多段效果与 modifiers。这不是「期望值等价」，是**同一颗骰**（审计①）。 |
+| 「Lua 读不到其它实体」（GAP-A 能力面） | **推翻该证伪的能力面**：`get_character / get_flag / get_encounter / list_encounters` + 完整的 `host.target` 快照都到位并被规则包真的用上（清单 15/16）。**但规则结论面仍被证伪**（审计④）。 |
+| 「`host.target` 读不到目标状态」（GAP-L） | **推翻**：伏击直接按 `host.target.statuses` 判定，期望状态 id 还来自开放内容。 |
+
+**第三轮仍成立的证伪 / 未知**
+
+- **「集群战术能得出正确结论」仍被证伪**：5 类错误结论（审计④），其中 FP-A（不看同伴 location）是**声明与实现不一致**，
+  不只是「引擎没有 5 尺」；FP-E（非攻击判定也给优势）是**规则包自己写宽了**。
+- **「引擎有位置概念」仍被证伪**（GAP-B，`distance` 0 命中）。
+- **「预置遭遇能表达数据卡数量」仍被证伪**（GAP-G，`count: Option<u32>`）。
+- **仍然存在的结构性缺口**：轮次经济（I）、`CondExpr` 的被动对手入口（J）、模板初始状态（K）、`encounter_active`（M）。
+  这四条与第一轮登记时**一字未变**，且都不是「读不到东西」，而是**引擎刻意没有的概念**——属于边界选择，不是原语欠账。
+- **本轮新登记的未知 / 风险**（都不是验收缺陷，但值得记）：
+  1. `scale_effect` 把「要不要结算」和「结算多少」绑在一个原语上，**因子 1.0 也会开门**（审计②的陷阱）。
+  2. 开放内容声明的 `range_proxy` 与脚本实现不一致（审计④ FP-A）。
+  3. 伏击 / 集群战术都**不看判定签名**，对非攻击判定也生效（审计④ FP-E；对比 `dnd-sunlight-sensitivity` 是按签名收敛的）。
+  4. r2_6 负对照的**机制描述失实**，其诊断价值已消失（审计③b）。
+  5. `enemy_defeated` 只在 strike 路径发 XP（边界，与第二轮相同）。
+
+**结论（第三轮）**：第一轮说「路是对的，但原语集不够」，第二轮说「边界明显变宽」，第三轮可以更明确地说：
+**「读事实」这一类缺口已经补齐**——跨实体、目标快照、效果数值三样都能读了，而且不是文档层面，是运行时实测。
+剩下的 6 条仍存在里，**4 条（I/J/K/M）是引擎没有那种概念**，**2 条（B/G）是引擎没有那种结构**；
+真正还没解决的不是「引擎能力」，而是**规则包自己的精确度**（审计④）与**几处固化的近似口径**（负对照、注释、range_proxy）。
+另需注意：本轮四条专门审计里，**两条落在「登记/注释跟不上实现」**（审计③）——这不是实现错，是**验证资产会过期**，
+下一轮若要继续用这些负对照，得先把它们的机制描述改成当前事实。
+
+### R3-6. 未通过 / 未覆盖项清单（不得隐瞒）
+
+**未通过：无（0 项）。未覆盖：无（0 项）。**
+
+必须声明的 **3 处覆盖边界** 与 **1 处精度更正**：
+
+1. **HTTP 侧「既有数据没少」的可见范围有限**：`GET /api/saves` 是**按所有者**过滤的，
+   本次用新注册的验证账户跑，跑前该账户看到的存档是 0 个——所以「既有 1 个存档」这条我没法从这个账户证实，
+   只能证实：故事书清单（可公共读）跑前 1 本（`sb-ffa1d260083048a68f1e63a2e9a219c3`，用户的）、跑后 2 本，
+   **没有任何既有 id 消失**；且脚本只发 `POST/PUT/GET`，**没有发过任何 `DELETE`**。
+2. **GAP-F 的非 strike 击杀路径**仍只有代码复核（`enemy_defeated` 派发点在 strike 结算体内），**没有**构造运行时反例（与第二轮相同）。
+3. **`scale_effect` 的开门语义**是在引擎级 `execute_skill` 上用真实技能验证的，**没有**再造一个第二种 save 技能的完整会话用例。
+4. **精度更正（不是缺陷）**：第二轮写「`lmop / mon-` 的命中全部位于 `#[cfg(test)]` 模块内」。
+   本轮逐行核对：`crates/octopus-engine/src/session.rs` 有 **4 处** 落在产品代码里的命中，
+   但它们**全部是注释**（`1925 / 4947 / 5412 / 5450` 行的说明文字，含故事书名 “LMoP”）；
+   这些行在 HEAD 就存在，不是 T21/T22/T23 引入的。禁词表（`advantage|proficiency|on_save|save_ends|ConditionalModifier|EncounterTable|extends`）
+   与宽词表（`disadvantage|saving_throw|dnd-`）仍是 **0 命中**，「产品代码零规则集语义」这一实质结论不变。
+
+**副作用（如实上报，未删除、未修改任何既有条目）**：本轮在真实 `octopus.db` 里**新增**了
+1 个验证账户、1 本故事书、1 个存档——id 见 §R3-7，便于事后清理。
+既有的用户故事书 `sb-ffa1d260083048a68f1e63a2e9a219c3`（凡戴尔的失落矿坑）**未改动**；
+`octopus/octopus` 口令仍不可用（401），所以走了真实注册端点（与第二轮同一条真实路径）。
+
+### R3-7. 本轮新增 / 改动文件 + 新增验证数据 id
+
+| 文件 | 作用 |
+|---|---|
+| `docs/lmop-verification-report.md` | 本报告（§0–§10 与 §R2 **原样保留**，仅追加 §R3 + 文首导航补一行） |
+| `crates/octopus-api/tests/lmop_verification_round3.rs` | **新增**：14 条独立引擎级用例（清单 1–18 + 四件审计，含自建多段效果技能与变异组） |
+| `scripts/lmop-verify-http-round3.mjs` | **新增**：真实 HTTP 路径第三轮验证（13 项断言） |
+
+**未改动**：`crates/*/src/` 与 `frontend/src/` 的任何产品代码；
+**未改动**前两轮的用例（`lmop_verification.rs` / `lmop_verification_round2.rs` 逐字未动，只读 + 跑 + 变异推理）；
+**未改动** `story_example/lmop-storybook.json`（只读；所有变异都施加在内存副本上）。
+
+**新增验证数据（真实 octopus.db，便于清理）**：
+
+```text
+账户    verify3-mu0r3x4o   (user-9d319dff1234451c80551f7b5f0e03cb)
+故事书  sb-849c8abbf1a241f4980b5d314e821286   凡戴尔的失落矿坑（第三轮验证 2026-09-14T04:36:53）
+存档    sv-7f6d038763344b0cb155a4637681cb7b   embedded_revision=1
+（既有，未改动：sb-ffa1d260083048a68f1e63a2e9a219c3）
+```
+
+
+
 
 
 

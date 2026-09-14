@@ -88,7 +88,8 @@ Lua 定义「什么时候做」**。本规则包不改引擎、不新增任何�
 * `kinds[]` / `definitions[]`：规则包追加 **11 种 / 64 条**开放内容；整本故事书
   **13 种 / 88 条**（草稿自带 2 种 / 23 条 + 皮甲 1 条）。
   （原文写的「11 种 / 55 条」是 T15 的错数，本轮按实测改正：T15 时就是 13 / 56。）
-* `flags[]`：37 个（草稿 4 + 规则包常驻 9 + 掷表行 24）。
+* `flags[]`：36 个（草稿 4 + 规则包常驻 8 + 掷表行 24）。本轮删掉不再使用的 `dnd-flanked`
+  （集群战术改为读运行时事实，见 GAP-A）。
 * `skeleton`：三猪小径（`sc-lmop-0b7`）下 **24 个掷表触发点**，每个带
   `repeatable: true` + `condition: flag_set` + `encounter` 预置。
 
@@ -100,17 +101,17 @@ Lua 定义「什么时候做」**。本规则包不改引擎、不新增任何�
 | 激励用掉即消失 `dnd-consume-inspiration` | `check_post_roll` | — | `remove_status` |
 | 劣势 · 灰烬呛咳 `dnd-status-keep-low` | `check_pre_roll` | — | `has_status` + `modify_check('keep_low')` |
 | 劣势 · 日照敏感 `dnd-sunlight-sensitivity` | `check_pre_roll` | `flag_set dnd-sunlight` | `get_attachment` + **判定签名**（`check_kind` / `check_attribute`）+ `modify_check('keep_low')` |
-| 优势 · 集群战术 `dnd-pack-tactics` | `check_pre_roll` | `flag_set dnd-flanked` | `get_attachment` + `modify_check('keep_high')` |
-| 优势 · 伏击（第 1 轮） `dnd-ambusher-keep-high` | `check_pre_roll` | `all_of[第1轮, 被突袭]` | `get_attachment` + `modify_check('keep_high')` |
+| 优势 · 集群战术 `dnd-pack-tactics` | `check_pre_roll` | —（脚本内自判） | `get_attachment` + `list_encounters` + `get_character` + `modify_check('keep_high')` |
+| 优势 · 伏击（第 1 轮） `dnd-ambusher-keep-high` | `check_pre_roll` | `flag_set 第1轮` | `get_attachment` + `get_definition` + **`host.target.statuses`** + `modify_check('keep_high')` |
 | 技能声明的豁免 DC `dnd-skill-dc` | `check_pre_roll` | — | `definition.check.default_dc` + `host.difficulty` + `modify_check('dc', Δ)` |
 | 熟练加值 `dnd-proficiency` | `check_pre_roll` | — | `get_attachment('dnd-proficiency')` + `get_definition(id).fields` + `check_attribute` + `modify_check('add', N)` |
-| 豁免成功伤害减半 `dnd-save-half` | `check_post_roll` | — | `check_result` + `engine_rng` + `apply_effect(damage)` |
+| 豁免成功伤害减半 `dnd-save-half` | `check_post_roll` | — | `check_result` + **`scale_effect(0.5)`**（引擎照常结算一次、只掷一次效果骰）+ 失败分支 `apply_status`（状态 id 来自开放内容 `fail_status`） |
 | 突袭 `dnd-surprise` | `check_post_roll` | — | `apply_status` + `apply_effect(set_flag)` |
 | 战斗第一轮 `dnd-battle-round` | `turn_end` | `flag_set dnd-in-combat` | `storage` + `clear_flag` × 3 + `apply_effect(set_flag)` |
 | 重复豁免 `dnd-save-ends` | `status_tick` | — | `list_definitions('dnd-save-ends')` + `status_id` + `get_attribute` + `engine_rng` + `remove_status` |
 | 掷表遭遇 `dnd-wander-day` / `-night` | `turn_end` | 地点 / 野外标记 + 昼夜 | `engine_rng(1,20)` → `engine_rng(1,12)` → `set_flag` |
 | 掷表标记复位 `dnd-wander-reset` | `event` | —（脚本内按 `event_name` 分支） | `event_name` / `event_data` + `clear_flag` |
-| XP 合计 `dnd-xp-award` | `event` | —（脚本内按 `event_name` 分支） | `event_data.enemy.template_id` + `list_definitions('dnd-xp-award')` + `modify_resource('res-xp')` |
+| XP 合计 `dnd-xp-award` | `event` | —（脚本内按 `event_name` 分支） | `event_data.enemy.template_id` + **`get_encounter`（缺 template_id 时按 instance_id 回查）** + `list_definitions('dnd-xp-award')` + `modify_resource('res-xp')` |
 
 ### 本轮新用上的引擎原语（T17 / T18）
 
@@ -121,6 +122,17 @@ Lua 定义「什么时候做」**。本规则包不改引擎、不新增任何�
 | `host.set_flag(flag[, value])` / `host.clear_flag(flag)` | 战斗轮次、掷表行标记复位 | GAP-H |
 | `TriggerDef.repeatable`（边沿语义：条件由假变真） | 24 个掷表触发点 | GAP-N |
 | `event` 挂载点 + `host.event_name` / `host.event_data` | XP（`enemy_defeated`）、掷表复位（`encounter_cleared`） | GAP-F |
+
+### 本轮新用上的引擎原语（T21 / T22）
+
+| 原语 | 用在哪 | 闭合 / 提高了什么 |
+|---|---|---|
+| `host.get_character(id)`（实例键 / 模板 id / 角色名 / instance_id 四种写法） | 集群战术读同伴实例（HP） | GAP-A（跨实体读取这一**能力**已闭合） |
+| `host.list_encounters()` / `host.get_encounter(id)` | 集群战术找同遭遇同伴；XP 按 `instance_id` 回查 `template_id` | GAP-A / GAP-F 佐证 |
+| `host.get_flag(name)` / `host.list_flags()` | 本轮规则包**未改口径**（`when` 闸门照旧），能力已可用 | — |
+| `host.target` 与 `host.actor` 同级完整（含 `statuses`） | 伏击直接读目标状态 | GAP-L |
+| `host.scale_effect(factor)`（只在 `check_post_roll` / `pre_resolve`） | 豁免成功伤害减半 | GAP-E |
+| `host.resolved_effects`（PostResolve 只读） | 引擎校验核对「缩放的就是引擎那份」 | GAP-E 证据 |
 
 「优势 / 劣势」仍是**规则包自己的词汇**：引擎只认识 `keep_high` / `keep_low`，
 脚本里包一层别名由规则包负责（[规则集走 Lua](../docs/rules-via-lua.md) §4 ②）。
@@ -157,7 +169,8 @@ turn_end + when(at_location 三猪小径 ∨ dnd-in-wilderness) + 昼夜
 
 ### 导演 / AI 需要置位的标记
 
-规则包读不到 flag（Lua 没有读标记的口子），**闸门全靠 `when: flag_set`**。上场前按剧情置位：
+规则脚本用 `when: flag_set` 闸门读标记（T21 之后 Lua 也能用 `host.get_flag` 直接读，本包未改口径）。
+上场前按剧情置位：
 
 | 标记 | 何时置位 |
 |---|---|
@@ -165,19 +178,18 @@ turn_end + when(at_location 三猪小径 ∨ dnd-in-wilderness) + 昼夜
 | `dnd-night` | 夜里（决定查白昼表还是黑夜表） |
 | `dnd-sunlight` | 阳光直射（日照敏感生物在场时） |
 | `dnd-in-combat` | 战斗开始（战斗轮次计数开闸） |
-| `dnd-flanked` | 有怪物满足「盟友在目标 5 尺内」 |
 
-### 表达不了的缺口（**逐条复核：已闭合 / 仍存在**）
+### 表达不了的缺口（**逐条复核：已闭合 / 近似提高 / 仍存在**）
 
 `--check` 结尾会打印完整清单（每条：哪条规则 / 卡在哪个原语 / 需要什么 / 本轮复核结论）。
-**14 条缺口：闭合 5 条（C / D / F / H / N），仍存在 9 条（A / B / E / G / I / J / K / L / M）。**
+**14 条缺口：闭合 7 条（C / D / E / F / H / L / N）· 近似提高 1 条（A）· 仍存在 6 条（B / G / I / J / K / M）。**
 
 0. **先记一条「引擎实况 + 规则包补法」**：`use_skill` 路径的难度只取 `world.check.default_dc`，
    **技能的 `check.default_dc` 不参与**（只在 `Intent::Check` / `strike` 兜底里读）。
    所以「DC 10 敏捷豁免」这条规则由 `dnd-skill-dc` 用 `modify_check('dc', want - host.difficulty)` 补上——
    不是缺口，但**照抄技能声明是没用的**，必须在 Lua 里翻一次。
 
-#### 已闭合（5 条）
+#### 已闭合（7 条）
 
 | GAP | 主题 | 闭合原语 | 规则包落地 | 谁在断言 |
 |---|---|---|---|---|
@@ -186,26 +198,34 @@ turn_end + when(at_location 三猪小径 ∨ dnd-in-wilderness) + 昼夜
 | **F** | 没有「敌人被击败」事件 | `event` 挂载点 + `host.event_name` / `host.event_data`（`enemy_defeated` / `encounter_cleared`） | `dnd-xp-award` 按 `data.enemy.template_id` **逐只**发 XP；与遭遇来源无关 | `--check: encounter_table.chain`；引擎 `xp.improvised_encounter` |
 | **H** | 没有清标记原语 | `host.set_flag(flag[, value])` / `host.clear_flag(flag)` | `dnd-battle-round` 每轮清 1..3 再置当前轮；`dnd-wander-reset` 在 `encounter_cleared` 时清行标记 | `--check: encounter_table.chain` |
 | **N** | 触发点一次性（`repeatable` 未实现） | `TriggerDef.repeatable`（**边沿**语义：条件由假变真） | 24 个掷表触发点全部标 `repeatable: true`，配合 H 的复位形成「结束 → 清标记 → 再触发」循环 | `--check: encounter_table.chain`；引擎 `encounter_table.refires` |
+| **E** | 效果掷骰值不暴露 | `host.scale_effect(factor)`（`check_post_roll` / `pre_resolve`）+ PostResolve 只读 `host.resolved_effects` | `dnd-save-half` 改为声明 `scale_effect(0.5)`：引擎照常结算一次、只掷一次效果骰，数值按 0.5 向零取整；Lua 不再重掷。技能的失败附加状态移入开放内容 `fail_status`，由脚本失败分支补 | `--check: save_half.scale_effect`；引擎 `save_half.engine_scales_own_roll` / `save_half.resolved_effects_is_engine_snapshot` |
+| **L** | `host.target` 读不到目标状态 | `host.target` 升级为与 `host.actor` 同级完整（含 `statuses`） | `dnd-ambusher-keep-high` 直接读 `host.target.statuses` 判定「是否受我突袭」；`when` 闸门只留战斗第一轮 | `--check: ambusher.target_status`；引擎 `ambusher.reads_target_statuses` |
 
 **C + F 的边界（如实登记）**：
-* C 闭合的是「规则要用的**数据**进 Lua」。`get_attachment` / `get_definition` 只读**故事书静态数据**，
-  不等于「读运行时实体」——那仍是 GAP-A。
+* C 闭合的是「规则要用的**数据**进 Lua」。`get_attachment` / `get_definition` 只读**故事书静态数据**；
+  「读运行时实体」由 T21 的 `get_character` / `*_encounter` 补上，但那条路只到 GAP-A（近似提高），见下。
 * F 闭合的是「引擎派发击败事实」。**非 strike 击杀**（Lua 直接把怪物资源打到 0）不派发
-  `enemy_defeated`，那条路径不发 XP。
+  `enemy_defeated`，那条路径不发 XP。T21 之后 `get_encounter` 只多了一条「事件缺 `template_id` 时回查」的兜底。
 
-#### 仍然存在（9 条，卡在什么原语上）
+#### 近似提高（1 条）
+
+| GAP | 主题 | 现在的近似口径 | 仍然缺什么 |
+|---|---|---|---|
+| A | Lua 读不到其它实体 | **能力已闭合**：`get_character` / `list_encounters` / `get_encounter` / `get_flag` / `list_flags` 都已可用，集群战术已改用它们读同伴。「我方同伴」= 同一场活跃遭遇的其它敌人（HP>0 当「未失能」）；「在目标附近」= 同一 `location_id` | **规则结果仍不精确**：精确到 5 尺做不到（GAP-B），「失能」也只有 HP>0 这一种近似——所以按「近似提高」登记，不按「已闭合」报 |
+
+为什么 A 不按「已闭合」报：本条缺口当初登记的规则是**集群战术**，不是一个孤立的能力。
+跨实体读取本身确实落地了，但那条规则仍受 GAP-B 限制；**宁可少报闭合，也不夸大**。
+
+#### 仍然存在（6 条，卡在什么原语上）
 
 | GAP | 主题 | 卡在哪个原语 / 缺什么 |
 |---|---|---|
-| A | Lua 读不到其它实体 | 没有 `get_character` / `get_encounter` / `get_flag`；`host.target` 仍只有 id / name / kind。集群战术的「盟友在目标 5 尺内」只能继续用 `dnd-flanked` 标记近似 |
-| B | 没有位置 / 距离 / 区域 | 引擎只有 `location_id` 这种地点归属，没有 5 尺 / 交战关系 |
-| E | 效果掷骰值不暴露 | 没有 `pending_effect` / `last_effect`；`dnd-save-half` 只能按 `host.definition` 的骰式**重掷**取半（期望值等价，不是同一颗骰） |
+| B | 没有位置 / 距离 / 区域 | 引擎只有 `location_id` 这种地点归属，没有 5 尺 / 交战关系；集群战术只能用「同遭遇 + 同地点」近似 |
 | G | 预置遭遇数量是静态整数 | `EncounterPresetEnemy.count` 没有骰式落点；「1d8+2 只蚊蝠」只能固定成骰式下界 |
 | I | 没有先攻 / 轮次 / 行动经济 | 「在战斗第一轮失去其回合」只有状态 + 标记，靠叙事层落实 |
-| J | 没有「掷骰 vs 对手被动」入口 | `CondExpr::AttributeGe` 只看 actor 自己的属性；规则脚本读不到对手被动值 |
+| J | 没有「掷骰 vs 对手被动」入口 | `CondExpr::AttributeGe` 只看 actor 自己的属性；`get_character` 能读属性，但判定上下文里拿不到「对手是谁」，也没有对抗入口 |
 | K | 模板级状态无声明入口 | character 模板没有初始状态声明，建实例时 `statuses` 恒为空；挂接读得到，但「挂接 → 状态」的桥没有 |
-| L | `host.target` 读不到目标状态 | 仍只有 id / name / kind，没有 statuses / attributes / resources |
-| M | 没有 `encounter_active` 条件 | `CondExpr` 仍只有 `encounter_cleared`；战斗轮计数继续靠 `dnd-in-combat` 标记开闸 |
+| M | 没有 `encounter_active` 条件 | `CondExpr` 仍只有 `encounter_cleared`；战斗轮计数继续靠 `dnd-in-combat` 标记开闸（Lua 能读遭遇，但 `when` 闸门走 `CondExpr`） |
 
 ### 运行期证据（真实引擎）
 
@@ -229,6 +249,16 @@ turn_end + when(at_location 三猪小径 ∨ dnd-in-wilderness) + 昼夜
     xp.improvised_encounter       即兴遭遇（encounter=enc-improvised）击败灰烬丧尸 → res-xp +50；
                                   scene / encounter_cleared 事件零请求；再击败一只 → 再 +50
     bestiary.xp_matches           31 条模板的 dnd-xp-award 定义与图鉴 statblock.xp 逐条相等
+    save_half.engine_scales_own_roll            同种子下因子 1.0 → delta -11（ctx.rng 4 颗），
+                                  规则包 scale_effect(0.5) → delta -5 = trunc(-11×0.5)，ctx.rng 逐位相同
+    save_half.resolved_effects_is_engine_snapshot  PostResolve 读到 factor=0.5 / rng_consumed=3 /
+                                  delta field=resources.res-hp value=-4，与提交值逐字一致
+    pack_tactics.reads_world_facts 同遭遇有存活同伴 → keep_high；同伴 HP=0 / 目标在别处 /
+                                  我不在任何遭遇 / 无挂接 → 零请求
+    ambusher.reads_target_statuses target.statuses 含受突袭 → keep_high；无状态 / 别的状态 /
+                                  无伏击挂接 → 零请求
+    xp.encounter_snapshot_fallback 事件缺 template_id、只有 instance_id → get_encounter 回查 → res-xp +50；
+                                  快照里查不到 → 不发
 
 ### 既有引擎 E2E 用例的口径更新（经授权）
 
@@ -245,6 +275,16 @@ turn_end + when(at_location 三猪小径 ∨ dnd-in-wilderness) + 昼夜
 
 全套回归：`cargo test -p octopus-api --test lmop_verification` → **12 passed**（含 `a11_a13` 的
 `r#mod = 8`，即 dex 3 + 数据驱动的熟练 5，证明 GAP-C 在真实 session 里生效）。
+
+**本轮（T21 / T22）复核**：`dnd-save-half` 换成 `scale_effect` 之后，这两个测试文件
+**逐字未动**——`a12` / `a12b` / `r2_6` 断言的是「豁免成功伤害落在 1..9、骰数 4、失败 3..18」，
+新口径下仍然成立（引擎掷一次 3d6 + d20 = 4 颗，成功取半 = 1..9）。实测：
+`lmop_verification` 12 passed / `lmop_verification_round2` 13 passed。
+
+⚠️ 但有两处**注释口径已过期**（断言仍然有效，本轮按「本来就通过就不动」原则未改）：
+`a12` / `a12b` 里「Lua 重掷 3d6 取半」的措辞，以及 `r2_6` 负对照「`host.target` 为 nil 时减半分支静默失效」——
+新口径下成功豁免由**引擎**结算后再缩放，目标解析不到时引擎把 delta 落在不存在的实体上被 `apply_delta` 丢弃，
+delta 仍为 0。第三轮审计请据此核对。
 
 ## 地点 / 地图 / 骨架
 
@@ -275,7 +315,7 @@ turn_end + when(at_location 三猪小径 ∨ dnd-in-wilderness) + 昼夜
 **与附录 B 逐项交叉核对**（28 条可解析条目全部一致）、地点树无环、锚点归一化且在所属地点子树内、
 骨架场景引用有效、两次构建逐字节一致（确定性）。
 
-`lmop-rulepack.mjs --check`（25 项断言）覆盖：十条能力覆盖矩阵（规则 + 开放内容两侧都要有）、开局 PC（六维 /
+`lmop-rulepack.mjs --check`（28 项断言）覆盖：十条能力覆盖矩阵（规则 + 开放内容两侧都要有）、开局 PC（六维 /
 `res-hp` / 技能 / 常驻地）、**撤回字段 deep-scan**（`advantage` / `disadvantage` / `on_save` /
 `ConditionalModifier` / `save_ends` / `crit` / `EncounterTable` / `extends` 在整本故事书里零命中）、
 `lua_mounts` 静态预检（挂载点白名单 / 禁用 API / `host.*` 存在性 / 撤回词）、图鉴数据未被复制或改动
@@ -284,7 +324,8 @@ turn_end + when(at_location 三猪小径 ∨ dnd-in-wilderness) + 昼夜
 **日照敏感按签名**、**规则挂接全部指向同 kind 的定义**、缺口清单逐条带 status、两次构建逐字节一致。
 
 加 `--engine <bin>` 时，同一支真实引擎校验器再跑：`validate_storybook` 错误 0 +
-`lint_storybook` 问题 0（警告 24 条为既有图鉴告警）+ 5 条运行时规则断言（加值数据驱动 / 判定签名 /
-同表项反复触发 / 即兴遭遇发 XP / XP 与图鉴逐条相等）。
+`lint_storybook` 问题 0（警告 24 条为既有图鉴告警）+ **10 条**运行时规则断言（加值数据驱动 / 判定签名 /
+同表项反复触发 / 即兴遭遇发 XP / XP 与图鉴逐条相等 / **缩放就是引擎那份骰** / **`resolved_effects` 核对** /
+**集群战术读运行时事实** / **伏击读目标状态** / **XP 遭遇快照回查**）。
 
 附录 B 共 **31 节 = 30 张独立数据卡 + 毒牙**（青年绿龙的别名条目）。

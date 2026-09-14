@@ -26,12 +26,18 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::process::ExitCode;
+use std::sync::Mutex;
 
 use octopus_engine::conditions::evaluate_skeleton_full;
-use octopus_engine::lua_host::{CheckModifier, LuaCheckContext, LuaEventContext, LuaHostContext, LuaMount, MountEnv};
+use octopus_engine::lua_host::{
+    CheckModifier, LuaCheckContext, LuaEventContext, LuaHostContext, LuaMount, LuaRegistry, MountEnv,
+};
 use octopus_engine::lua_lint::lint_storybook;
-use octopus_engine::{validate_storybook_result, EvalContext, LuaHost, LuaRequest};
-use octopus_types::{CheckKind, IssueSeverity};
+use octopus_engine::rng::DeterministicRng;
+use octopus_engine::{
+    execute_skill, validate_storybook_result, CommandContext, CommandOutcome, EvalContext, LuaHost, LuaRequest,
+};
+use octopus_types::{CheckKind, IssueSeverity, SkillDef};
 use serde_json::{json, Map, Value};
 
 struct Assertions {
@@ -192,6 +198,12 @@ fn run_rule_assertions(sb: &Value, a: &mut Assertions) {
     encounter_table_refires(sb, a);
     xp_improvised_encounter(sb, a);
     bestiary_xp_matches(sb, a);
+    // T21 / T22 新增原语（GAP-A / GAP-E / GAP-L）
+    save_half_engine_scales_own_roll(sb, a);
+    save_half_resolved_effects_is_engine_snapshot(sb, a);
+    pack_tactics_reads_world_facts(sb, a);
+    ambusher_reads_target_statuses(sb, a);
+    xp_encounter_snapshot_fallback(sb, a);
 }
 
 /// 验收 1：熟练加值数据驱动。
@@ -605,5 +617,348 @@ fn bestiary_xp_matches(sb: &Value, a: &mut Assertions) {
         } else {
             mismatches.join(" ; ")
         },
+    );
+}
+
+
+// ============================================================
+// T21 / T22 原语的真实引擎验收（GAP-A / GAP-E / GAP-L）
+// ============================================================
+
+/// 把挂载点写请求里的 set_flag 收成 map（探针用它回传只读事实）。
+fn flag_writes(requests: &[LuaRequest]) -> BTreeMap<String, Value> {
+    let mut out = BTreeMap::new();
+    for req in requests {
+        if let LuaRequest::ApplyEffect { effect, .. } = req {
+            if effect.get("kind").and_then(Value::as_str) == Some("set_flag") {
+                if let Some(flag) = effect.get("flag").and_then(Value::as_str) {
+                    out.insert(
+                        flag.to_string(),
+                        effect.get("value").cloned().unwrap_or(Value::Bool(true)),
+                    );
+                }
+            }
+        }
+    }
+    out
+}
+
+/// res-xp 的增量（没有就是 None）。
+fn xp_gain(requests: &[LuaRequest]) -> Option<i64> {
+    requests.iter().find_map(|r| match r {
+        LuaRequest::ModifyResource { resource, amount, .. } if resource == "res-xp" => Some(*amount),
+        _ => None,
+    })
+}
+
+fn save_case_skill(sb: &Value) -> Option<SkillDef> {
+    sb.get("skills")
+        .and_then(Value::as_array)
+        .and_then(|arr| {
+            arr.iter()
+                .find(|s| s.get("id").and_then(Value::as_str) == Some("sk-lmop-rubble-collapse"))
+        })
+        .cloned()
+        .and_then(|v| serde_json::from_value::<SkillDef>(v).ok())
+}
+
+fn sample_actor() -> Value {
+    json!({
+        "instance_id": "inst-save",
+        "template_id": "pc-lmop-talin",
+        "name": "塔林·银溪",
+        "kind": "pc",
+        "attributes": { "str": 10, "dex": 16, "con": 14, "int": 12, "wis": 13, "cha": 11 },
+        "resources": { "res-hp": 24 },
+        "statuses": [],
+        "location_id": "loc-lmop-0b7"
+    })
+}
+
+/// 跑一次真实的 `execute_skill`：规则包的脚本挂在 check_post_roll，PostResolve 挂一支探针
+/// 把 `host.resolved_effects` 写成标记回传；豁免结果用 check_pre_roll 的通用原语钉死
+/// （骰照掷、结果确定 → 与种子无关）。返回结算产物 + ctx.rng 的真实消耗序列。
+fn run_save_case(sb: &Value, skill: &SkillDef, seed: u64, half_rule: &str) -> (CommandOutcome, Vec<u64>) {
+    let host = host_with(sb, seed);
+    let mut registry = LuaRegistry::new();
+    registry.register("pin-save-success", LuaMount::CheckPreRoll, "host.modify_check('force_success')");
+    registry.register("rule:save-half", LuaMount::CheckPostRoll, half_rule);
+    registry.register(
+        "audit:resolved-effects",
+        LuaMount::PostResolve,
+        r#"local e = host.resolved_effects
+if e == nil then host.set_flag('audit-missing', true) return end
+host.set_flag('audit-factor', tostring(e.factor))
+host.set_flag('audit-rng', tostring(e.rng_consumed))
+host.set_flag('audit-deltas', tostring(#e.deltas))
+local first = e.deltas[1]
+if first then
+  host.set_flag('audit-field', tostring(first.field))
+  host.set_flag('audit-value', tostring(first.value))
+end"#,
+    );
+    let actor = sample_actor();
+    let lua_ctx = LuaHostContext {
+        script_id: "lmop-check:save-half".into(),
+        actor_id: "inst-save".into(),
+        actor: actor.clone(),
+        target_id: Some("inst-save".into()),
+        target: Some(actor.clone()),
+        skill: serde_json::to_value(skill).ok(),
+        difficulty: Some(10),
+        ..Default::default()
+    };
+    let rng = Mutex::new(DeterministicRng::new(seed));
+    let out = {
+        let mut ctx = CommandContext {
+            actor_id: "inst-save",
+            actor: &actor,
+            target_id: Some("inst-save"),
+            target: Some(&actor),
+            difficulty: 10,
+            attribute: None,
+            global_checker: None,
+            rng: &rng,
+            lua: Some((&host, &lua_ctx)),
+            registry: Some(&registry),
+            status_defs: None,
+            profiles: None,
+            attribute_bonuses: None,
+            extra_bonus: 0,
+            effect_requires_success: false,
+            mount_gate: None,
+        };
+        execute_skill(skill, &mut ctx).expect("execute_skill 失败")
+    };
+    let consumed = rng.lock().unwrap().consumed.clone();
+    (out, consumed)
+}
+
+/// GAP-E：规则包只声明一个因子，引擎只掷一次效果骰；同一颗骰在 0.5 下恰好是 1.0 的一半。
+fn save_half_engine_scales_own_roll(sb: &Value, a: &mut Assertions) {
+    let name = "save_half.engine_scales_own_roll";
+    let rule = mount_source(sb, "dnd-save-half");
+    let Some(skill) = save_case_skill(sb) else {
+        a.check(name, false, "找不到 / 解析不了技能 sk-lmop-rubble-collapse");
+        return;
+    };
+    // 同一种子、同一条技能，只换缩放因子：1.0 = 引擎全量结算（基线），规则包真实脚本 = 0.5。
+    let (full, full_rng) = run_save_case(sb, &skill, 7, "host.scale_effect(1)");
+    let (half, half_rng) = run_save_case(sb, &skill, 7, &rule);
+    let full_v = full.deltas().first().and_then(|d| d.value.as_i64());
+    let half_v = half.deltas().first().and_then(|d| d.value.as_i64());
+    let expect_half = full_v.map(|v| (v as f64 * 0.5).trunc() as i64);
+    let full_audit = flag_writes(&full.requests);
+    let half_audit = flag_writes(&half.requests);
+    let ok = full_rng == half_rng
+        && full_rng.len() == 4
+        && full.deltas().len() == 1
+        && half.deltas().len() == 1
+        && full_v.is_some()
+        && half_v == expect_half
+        && half_audit.get("audit-factor").and_then(Value::as_str) == Some("0.5")
+        && half_audit.get("audit-rng").and_then(Value::as_str) == Some("3")
+        && full_audit.get("audit-missing").is_none();
+    a.check(
+        name,
+        ok,
+        format!(
+            "同种子：因子 1.0 → delta {full_v:?}（ctx.rng {full_rng:?}）；规则包脚本 scale_effect(0.5) → delta {half_v:?}（ctx.rng {half_rng:?}）；             half == trunc(full×0.5)={}；引擎快照 factor={:?} rng_consumed={:?}（3 = 一次 3d6，Lua 未重掷）",
+            half_v == expect_half,
+            half_audit.get("audit-factor"),
+            half_audit.get("audit-rng"),
+        ),
+    );
+}
+
+/// GAP-E 核对：PostResolve 读到的 host.resolved_effects 就是引擎实际算出的那一份
+/// （factor / 效果骰数 / delta 字段与值都与提交值逐字一致）。
+fn save_half_resolved_effects_is_engine_snapshot(sb: &Value, a: &mut Assertions) {
+    let name = "save_half.resolved_effects_is_engine_snapshot";
+    let rule = mount_source(sb, "dnd-save-half");
+    let Some(skill) = save_case_skill(sb) else {
+        a.check(name, false, "找不到 / 解析不了技能 sk-lmop-rubble-collapse");
+        return;
+    };
+    let (half, half_rng) = run_save_case(sb, &skill, 11, &rule);
+    let audit = flag_writes(&half.requests);
+    let committed = half.deltas().first().map(|d| d.value.to_string());
+    let audited = audit.get("audit-value").and_then(Value::as_str).map(str::to_string);
+    let ok = half_rng.len() == 4
+        && audit.get("audit-factor").and_then(Value::as_str) == Some("0.5")
+        && audit.get("audit-rng").and_then(Value::as_str) == Some("3")
+        && audit.get("audit-deltas").and_then(Value::as_str) == Some("1")
+        && audit.get("audit-field").and_then(Value::as_str) == Some("resources.res-hp")
+        && audited.is_some()
+        && audited == committed;
+    a.check(
+        name,
+        ok,
+        format!(
+            "PostResolve 读 host.resolved_effects：factor={:?} rng_consumed={:?} #deltas={:?} field={:?} value={:?}；             与提交的 delta {committed:?} 逐字一致={}",
+            audit.get("audit-factor"),
+            audit.get("audit-rng"),
+            audit.get("audit-deltas"),
+            audit.get("audit-field"),
+            audit.get("audit-value"),
+            audited == committed,
+        ),
+    );
+}
+
+/// GAP-A：集群战术读运行时事实（list_encounters + get_character + location_id）。
+/// 正例 / 三个反例（同伴倒下 / 目标不在一处 / 我不在任何遭遇）。
+fn pack_tactics_reads_world_facts(sb: &Value, a: &mut Assertions) {
+    let name = "pack_tactics.reads_world_facts";
+    let source = mount_source(sb, "dnd-pack-tactics");
+
+    let wolf = |key: &str, hp: i64, place: &str| {
+        json!({
+            "instance_id": key, "template_id": "mon-wolf", "name": "狼", "kind": "monster",
+            "attributes": {}, "resources": { "res-hp": hp }, "statuses": [], "location_id": place
+        })
+    };
+    let pc = |place: &str| {
+        json!({
+            "instance_id": "inst-pc", "template_id": "pc-lmop-talin", "name": "塔林", "kind": "pc",
+            "attributes": {}, "resources": { "res-hp": 24 }, "statuses": [], "location_id": place
+        })
+    };
+    let facts = |ally_hp: i64, with_encounter: bool, wolf_place: &str| {
+        let encounters = if with_encounter {
+            json!({ "enc-1": { "id": "enc-1", "name": "野外遭遇", "active": true, "enemies": [
+                { "id": "e1", "instance_id": "inst-wolf-1", "template_id": "mon-wolf", "hp": 11 },
+                { "id": "e2", "instance_id": "inst-wolf-2", "template_id": "mon-wolf", "hp": ally_hp }
+            ] } })
+        } else {
+            json!({ "enc-1": { "id": "enc-1", "name": "野外遭遇", "active": true, "enemies": [
+                { "id": "e2", "instance_id": "inst-wolf-2", "template_id": "mon-wolf", "hp": ally_hp }
+            ] } })
+        };
+        json!({
+            "characters": {
+                "inst-wolf-1": wolf("inst-wolf-1", 11, wolf_place),
+                "inst-wolf-2": wolf("inst-wolf-2", ally_hp, wolf_place)
+            },
+            "flags": {},
+            "encounters": encounters
+        })
+    };
+
+    let run_pack = |facts_value: Value, actor_template: &str, target_place: &str| -> usize {
+        let host = host_with(sb, 5);
+        host.set_world_facts(facts_value);
+        let actor = if actor_template == "mon-wolf" {
+            wolf("inst-wolf-1", 11, "loc-lmop-0b7")
+        } else {
+            json!({ "instance_id": "inst-wolf-1", "template_id": actor_template, "name": "旁观者", "kind": "pc",
+                    "attributes": {}, "resources": { "res-hp": 24 }, "statuses": [], "location_id": "loc-lmop-0b7" })
+        };
+        let ctx = LuaHostContext {
+            script_id: "lmop-check:pack".into(),
+            actor_id: "inst-wolf-1".into(),
+            actor,
+            target_id: Some("inst-pc".into()),
+            target: Some(pc(target_place)),
+            ..Default::default()
+        };
+        modifies(&run(&host, &source, LuaMount::CheckPreRoll, &ctx, &MountEnv::default()))
+            .iter()
+            .filter(|(m, _)| *m == CheckModifier::KeepHigh)
+            .count()
+    };
+
+    let positive = run_pack(facts(11, true, "loc-lmop-0b7"), "mon-wolf", "loc-lmop-0b7");
+    let ally_down = run_pack(facts(0, true, "loc-lmop-0b7"), "mon-wolf", "loc-lmop-0b7");
+    let apart = run_pack(facts(11, true, "loc-lmop-0b7"), "mon-wolf", "loc-elsewhere");
+    let no_encounter = run_pack(facts(11, false, "loc-lmop-0b7"), "mon-wolf", "loc-lmop-0b7");
+    let no_trait = run_pack(facts(11, true, "loc-lmop-0b7"), "pc-lmop-talin", "loc-lmop-0b7");
+    let ok = positive == 1 && ally_down == 0 && apart == 0 && no_encounter == 0 && no_trait == 0;
+    a.check(
+        name,
+        ok,
+        format!(
+            "同遭遇有存活同伴 → keep_high={positive}（期望 1）；同伴 HP=0 → {ally_down}；目标在别处 → {apart}；             我不在任何遭遇 → {no_encounter}；无集群战术挂接 → {no_trait}（反例均期望 0）。             注：这是「同遭遇 + 同 location_id」近似，5 尺仍做不到（GAP-B）"
+        ),
+    );
+}
+
+/// GAP-L：伏击直接读 host.target.statuses（不再靠 dnd-surprised 全场标记）。
+fn ambusher_reads_target_statuses(sb: &Value, a: &mut Assertions) {
+    let name = "ambusher.reads_target_statuses";
+    let source = mount_source(sb, "dnd-ambusher-keep-high");
+    let run_amb = |actor_template: &str, statuses: Value| -> usize {
+        let host = host_with(sb, 5);
+        let actor = json!({ "instance_id": "inst-amb", "template_id": actor_template, "name": "袭击者",
+            "kind": "monster", "attributes": {}, "resources": { "res-hp": 22 }, "statuses": [] });
+        let target = json!({ "instance_id": "inst-pc", "template_id": "pc-lmop-talin", "name": "塔林",
+            "kind": "pc", "attributes": {}, "resources": { "res-hp": 24 }, "statuses": statuses });
+        let ctx = LuaHostContext {
+            script_id: "lmop-check:ambush".into(),
+            actor_id: "inst-amb".into(),
+            actor,
+            target_id: Some("inst-pc".into()),
+            target: Some(target),
+            ..Default::default()
+        };
+        modifies(&run(&host, &source, LuaMount::CheckPreRoll, &ctx, &MountEnv::default()))
+            .iter()
+            .filter(|(m, _)| *m == CheckModifier::KeepHigh)
+            .count()
+    };
+    let with_status = run_amb("mon-doppelganger", json!([{ "id": "dnd-surprised", "name": "受突袭" }]));
+    let without = run_amb("mon-doppelganger", json!([]));
+    let other_status = run_amb("mon-doppelganger", json!([{ "id": "dnd-prone", "name": "倒地" }]));
+    let no_trait = run_amb("mon-wolf", json!([{ "id": "dnd-surprised", "name": "受突袭" }]));
+    let ok = with_status == 1 && without == 0 && other_status == 0 && no_trait == 0;
+    a.check(
+        name,
+        ok,
+        format!(
+            "target.statuses 含受突袭 → keep_high={with_status}（期望 1）；无状态 → {without}；别的状态 → {other_status}；             袭击者无伏击挂接 → {no_trait}（反例均期望 0）。期望状态 id 来自开放内容 fields.target_status"
+        ),
+    );
+}
+
+/// GAP-F 佐证：事件缺 template_id 时，用 host.get_encounter 按 instance_id 从遭遇快照回查。
+fn xp_encounter_snapshot_fallback(sb: &Value, a: &mut Assertions) {
+    let name = "xp.encounter_snapshot_fallback";
+    let source = mount_source(sb, "dnd-xp-award");
+    let zombie = character(sb, "mon-ash-zombie");
+    let expected = zombie.pointer("/statblock/xp").and_then(Value::as_i64).unwrap_or(0);
+    let host = host_with(sb, 13);
+    host.set_world_facts(json!({
+        "characters": {}, "flags": {},
+        "encounters": { "enc-2": { "id": "enc-2", "name": "洞穴", "active": true, "enemies": [
+            { "id": "e1", "instance_id": "inst-z", "template_id": "mon-ash-zombie", "hp": 0 }
+        ] } }
+    }));
+    let pc = character(sb, "pc-lmop-talin");
+    let ctx = LuaHostContext {
+        script_id: "lmop-check:xp-fallback".into(),
+        actor_id: "inst-pc-lmop-talin".into(),
+        actor: pc,
+        ..Default::default()
+    };
+    // 事件里**没有** template_id，只有 instance_id。
+    let data = json!({
+        "enemy": { "id": "e1", "name": "灰烬丧尸", "instance_id": "inst-z" },
+        "encounter": { "id": "enc-2", "name": "洞穴", "scene_id": "sc-x", "location_id": "loc-x" }
+    });
+    let env = MountEnv {
+        event: Some(LuaEventContext { name: "enemy_defeated", data: Some(&data) }),
+        ..Default::default()
+    };
+    let gain = xp_gain(&run(&host, &source, LuaMount::Event, &ctx, &env));
+    // 负对照：遭遇快照里没有这只 instance_id → 不发。
+    host.set_world_facts(json!({ "characters": {}, "flags": {}, "encounters": {} }));
+    let miss = xp_gain(&run(&host, &source, LuaMount::Event, &ctx, &env));
+    let ok = gain == Some(expected) && expected > 0 && miss.is_none();
+    a.check(
+        name,
+        ok,
+        format!(
+            "enemy_defeated 缺 template_id、只有 instance_id → get_encounter('enc-2') 回查 mon-ash-zombie → res-xp +{gain:?}             （图鉴 statblock.xp={expected}）；快照里查不到 → {miss:?}（期望不发）。常规路径仍走 data.enemy.template_id"
+        ),
     );
 }

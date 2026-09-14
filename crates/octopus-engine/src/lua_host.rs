@@ -25,6 +25,22 @@ use crate::rng::DeterministicRng;
 const HOOK_STEP: u32 = 1000;
 /// 脚本私有存储区在 Lua 注册表中的键。
 const STORAGE_REGISTRY_KEY: &str = "__octopus_script_storage";
+/// 角色只读快照下发给脚本的键（GAP-L）：`host.actor` 与 `host.target` 同级完整。
+///
+/// 引擎不知道这些键的语义，只是把角色实例（`CharacterInstance`）的既有字段原样转过去；
+/// 缺字段（如没有 location_id）就不下发，脚本读到 nil。
+const CHARACTER_SNAPSHOT_KEYS: &[&str] = &[
+    "instance_id",
+    "template_id",
+    "name",
+    "kind",
+    "attributes",
+    "resources",
+    "inventory",
+    "statuses",
+    "location_id",
+    "present",
+];
 
 /// 沙箱资源预算。
 #[derive(Debug, Clone, Copy)]
@@ -247,6 +263,12 @@ pub struct MountEnv<'a> {
     /// 只在 Lua Event 挂载点下发；其他挂载点为 None（脚本读 `host.event_name` /
     /// `host.event_data` 得到 nil——旧脚本看不到新字段，也不会因此报错）。
     pub event: Option<LuaEventContext<'a>>,
+    /// 本次结算**实际算出的效果**只读快照（host.resolved_effects）。
+    ///
+    /// 只在效果结算之后、PostResolve 挂载点下发（command::execute_skill）；其他挂载点
+    /// 为 None，脚本读到 nil——旧脚本看不到新字段，也不会因此报错。引擎只导出事实
+    ///（deltas / statuses / modifiers / rng_consumed / factor），不解释用法。
+    pub resolved_effects: Option<&'a Value>,
 }
 
 /// 一次事件派发的**通用**上下文：引擎只把「发生了什么（名字）」与「相关事实（任意 JSON）」
@@ -278,6 +300,12 @@ pub enum LuaRequest {
     ApplyEffect { target: String, effect: Value },
     /// 加减任意目标的资源（可正可负；target 为空 = 当前 actor）。
     ModifyResource { target: String, resource: String, amount: i64 },
+    /// 效果缩放（通用原语）：声明「本次结算的**数值型** delta（资源增减）按此因子缩放」。
+    ///
+    /// 引擎不认识「豁免 / 减半 / 抗性 / 易伤」——只有一个因子；要不要缩放、缩放多少
+    /// 由规则包 Lua 决定。只在判定之后、效果结算之前被消费（check_post_roll /
+    /// pre_resolve），这两处正是效果结算的上游时机。
+    ScaleEffect { factor: f64 },
 }
 
 /// 归一化判定输出（#12）：脚本只能给最终值 total 与差值 margin，档位由引擎分。
@@ -327,6 +355,12 @@ pub struct LuaHost {
     /// 「当前角色模板 → 挂接 → definition」把原始数据交给脚本。缺省 Null = 无快照
     /// （编辑器试跑等独立入口），脚本读到 nil / 空表。
     read_data: Arc<Mutex<Value>>,
+    /// 只读世界事实快照（GAP-A）：角色实例 / 世界标记 / 活跃遭遇。
+    ///
+    /// 与 `read_data`（冻结的开放内容）分开：这些事实随回合变化，由会话组合根在**跑脚本前**
+    /// 用 `set_world_facts` 刷新。引擎**不理解**其语义，只按 id / 名字做查表搬运；
+    /// 缺省 Null = 没有快照（单测 / 编辑器试跑），脚本读到 nil / 空表，行为与不注入时一致。
+    world_data: Arc<Mutex<Value>>,
 }
 
 impl LuaHost {
@@ -378,6 +412,7 @@ impl LuaHost {
             instr,
             limits,
             read_data: Arc::new(Mutex::new(Value::Null)),
+            world_data: Arc::new(Mutex::new(Value::Null)),
         })
     }
 
@@ -391,6 +426,17 @@ impl LuaHost {
     /// 没调用过的宿主（编辑器试跑 / 单测）读到 nil，行为与不注入时一致。
     pub fn set_read_data(&self, data: Value) {
         if let Ok(mut slot) = self.read_data.lock() {
+            *slot = data;
+        }
+    }
+
+    /// 注入只读世界事实快照（GAP-A）：角色实例 / 世界标记 / 活跃遭遇。
+    ///
+    /// 与 `set_read_data`（冻结的开放内容）分开：这些事实随回合变化，由会话组合根在**跑脚本前**
+    /// 刷新。引擎不理解数据语义，只按 id / 名字把存档里的就绪事实原样交给脚本查表；
+    /// 没调用过的宿主（编辑器试跑 / 单测 / 没有相关挂载点脚本的存档）读到 nil / 空表。
+    pub fn set_world_facts(&self, data: Value) {
+        if let Ok(mut slot) = self.world_data.lock() {
             *slot = data;
         }
     }
@@ -649,9 +695,9 @@ impl LuaHost {
         };
         let actor_ref = lua.create_table().map_err(lua_err)?;
         actor_ref.set("id", actor_id).map_err(lua_err)?;
-        for key in ["instance_id", "template_id", "name", "kind", "attributes", "resources", "statuses"] {
-            if let Some(v) = ctx.actor.get(key) {
-                actor_ref.set(key, json_to_lua(lua, v)?).map_err(lua_err)?;
+        for key in CHARACTER_SNAPSHOT_KEYS {
+            if let Some(v) = ctx.actor.get(*key) {
+                actor_ref.set(*key, json_to_lua(lua, v)?).map_err(lua_err)?;
             }
         }
         host.set("actor", actor_ref).map_err(lua_err)?;
@@ -698,6 +744,95 @@ impl LuaHost {
                     })
                     .unwrap_or(false);
                 Ok(found)
+            })
+            .map_err(lua_err)?,
+        )
+        .map_err(lua_err)?;
+
+        // ---------- 只读世界事实（GAP-A）：任意实体 / 标记 / 遭遇 ----------
+        //
+        // 引擎**不理解**这些数据的语义：它只把存档里的事实按 id / 名字做查表搬运，
+        // 不判断「谁和谁是一伙」「哪个遭遇算赢」——那是规则包 Lua 的事。
+        // 快照没注入 / 查不到时返回 nil / 空表，不抛错（旧存档、编辑器试跑行为一致）。
+        let world_data = self.world_data.clone();
+        host.set(
+            "get_character",
+            lua.create_function(move |lua, id: String| {
+                let data = world_data
+                    .lock()
+                    .map_err(|_| mlua::Error::RuntimeError("world data poisoned".into()))?;
+                match find_character_snapshot(&data, &id) {
+                    Some((key, inst)) => {
+                        // 快照带存档寻址键（id），供 apply_status(target, ...) 等写请求使用——
+                        // 与 host.actor.id 同一口径，脚本不必自己拼实例键。
+                        let mut obj = inst.as_object().cloned().unwrap_or_default();
+                        obj.insert("id".to_string(), Value::String(key.to_string()));
+                        json_to_lua(lua, &Value::Object(obj))
+                    }
+                    None => Ok(LuaValue::Nil),
+                }
+            })
+            .map_err(lua_err)?,
+        )
+        .map_err(lua_err)?;
+
+        let world_data = self.world_data.clone();
+        host.set(
+            "get_flag",
+            lua.create_function(move |lua, name: String| {
+                let data = world_data
+                    .lock()
+                    .map_err(|_| mlua::Error::RuntimeError("world data poisoned".into()))?;
+                match data.get("flags").and_then(|flags| flags.get(name.trim())) {
+                    Some(v) => json_to_lua(lua, v),
+                    None => Ok(LuaValue::Nil),
+                }
+            })
+            .map_err(lua_err)?,
+        )
+        .map_err(lua_err)?;
+
+        let world_data = self.world_data.clone();
+        host.set(
+            "list_flags",
+            lua.create_function(move |lua, ()| {
+                let data = world_data
+                    .lock()
+                    .map_err(|_| mlua::Error::RuntimeError("world data poisoned".into()))?;
+                let flags = data
+                    .get("flags")
+                    .cloned()
+                    .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+                json_to_lua(lua, &flags)
+            })
+            .map_err(lua_err)?,
+        )
+        .map_err(lua_err)?;
+
+        let world_data = self.world_data.clone();
+        host.set(
+            "get_encounter",
+            lua.create_function(move |lua, id: String| {
+                let data = world_data
+                    .lock()
+                    .map_err(|_| mlua::Error::RuntimeError("world data poisoned".into()))?;
+                match find_encounter(&data, id.trim()) {
+                    Some(enc) => json_to_lua(lua, enc),
+                    None => Ok(LuaValue::Nil),
+                }
+            })
+            .map_err(lua_err)?,
+        )
+        .map_err(lua_err)?;
+
+        let world_data = self.world_data.clone();
+        host.set(
+            "list_encounters",
+            lua.create_function(move |lua, ()| {
+                let data = world_data
+                    .lock()
+                    .map_err(|_| mlua::Error::RuntimeError("world data poisoned".into()))?;
+                json_to_lua(lua, &Value::Array(active_encounters(&data)))
             })
             .map_err(lua_err)?,
         )
@@ -798,9 +933,9 @@ impl LuaHost {
             if let Some(id) = target_id {
                 target_ref.set("id", id).map_err(lua_err)?;
             }
-            for key in ["instance_id", "template_id", "name", "kind"] {
-                if let Some(v) = target.get(key) {
-                    target_ref.set(key, json_to_lua(lua, v)?).map_err(lua_err)?;
+            for key in CHARACTER_SNAPSHOT_KEYS {
+                if let Some(v) = target.get(*key) {
+                    target_ref.set(*key, json_to_lua(lua, v)?).map_err(lua_err)?;
                 }
             }
             host.set("target", target_ref).map_err(lua_err)?;
@@ -859,6 +994,13 @@ impl LuaHost {
                 }
             }
             host.set("check", t).map_err(lua_err)?;
+        }
+
+        // 效果快照（PostResolve 可读）：引擎**实际**算出的效果与数值（缩放之后），
+        // 让规则包能核对「引擎到底算了什么」，而不是自己另掷一份近似。
+        // 只在效果结算之后下发；其他挂载点是 nil（旧脚本看不到，也不会因此报错）。
+        if let Some(effects) = mount_env.resolved_effects {
+            host.set("resolved_effects", json_to_lua(lua, effects)?).map_err(lua_err)?;
         }
 
         let relationships = ctx.relationships.clone();
@@ -968,6 +1110,21 @@ impl LuaHost {
             })?;
             Ok(LuaRequest::ModifyCheck { mode: parsed, amount: amount.unwrap_or(0) })
         });
+
+        // 效果缩放（通用原语）：声明「本次结算的数值型 delta 按此因子缩放」。
+        // 与判定修正不同，它**只在会被消费的两个时机**注册（check_post_roll / pre_resolve）：
+        // 写错时机即当场报错（调用一个不存在的函数），不会静默丢请求。
+        if matches!(mount, LuaMount::CheckPostRoll | LuaMount::PreResolve) {
+            push_try!("scale_effect", |factor: f64| {
+                if !factor.is_finite() {
+                    return Err(format!("缩放因子必须是有限数：{factor}"));
+                }
+                if factor < 0.0 {
+                    return Err(format!("缩放因子不能为负：{factor}（0 = 完全抵消，1 = 不变）"));
+                }
+                Ok(LuaRequest::ScaleEffect { factor })
+            });
+        }
 
         // 施加即时效果：形状按 ImmediateEffect 校验，结算走同一条 resolve_effect 路径。
         push_try!("apply_effect", |(target, effect): (String, LuaValue)| {
@@ -1209,6 +1366,73 @@ fn definitions_of(data: &Value, kind: Option<&str>) -> Vec<Value> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// 只读角色快照（GAP-A）里的角色查找：与引擎 `Session::find_character` 同口径——
+/// 实例键（存档寻址键）/ 模板 id / 角色名 / instance_id 四种写法都能命中。
+///
+/// 另兼容把提示词里的「名字(id)」整串当 id 回填的形式（与 `actor_id_candidates` 同一处理）。
+/// 查不到 / id 为空返回 None（脚本读到 nil），不抛错。
+fn find_character_snapshot<'a>(data: &'a Value, id: &str) -> Option<(&'a str, &'a Value)> {
+    let id = id.trim();
+    if id.is_empty() {
+        return None;
+    }
+    let chars = data.get("characters").and_then(Value::as_object)?;
+    for cand in id_candidates(id) {
+        for (key, c) in chars {
+            let hit = key.as_str() == cand
+                || c.get("template_id").and_then(Value::as_str) == Some(cand)
+                || c.get("name").and_then(Value::as_str) == Some(cand)
+                || c.get("instance_id").and_then(Value::as_str) == Some(cand);
+            if hit {
+                return Some((key.as_str(), c));
+            }
+        }
+    }
+    None
+}
+
+/// id 原串 + 其中「名字(id)」括号内的 id（与 `Session::actor_id_candidates` 同口径）。
+fn id_candidates(id: &str) -> Vec<&str> {
+    let mut out = vec![id];
+    for (open, close) in [('(', ')'), ('（', '）')] {
+        let Some(start) = id.rfind(open) else { continue };
+        let after = start + open.len_utf8();
+        let Some(rel) = id[after..].find(close) else { continue };
+        let inner = id[after..after + rel].trim();
+        if !inner.is_empty() && inner != id {
+            out.push(inner);
+        }
+    }
+    out
+}
+
+/// 活跃遭遇（`active` 缺省为真，与引擎其它处的口径一致）。
+///
+/// 顺序 = 存档 BTreeMap 顺序：确定性、可重放。没有快照 / 没有遭遇 → 空表。
+fn active_encounters(data: &Value) -> Vec<Value> {
+    data.get("encounters")
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.values()
+                .filter(|e| e.get("active").and_then(Value::as_bool).unwrap_or(true))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 按 id 找一场**活跃**遭遇：先按存档寻址键，再按遭遇自身的 `id` 字段；查不到返回 None。
+fn find_encounter<'a>(data: &'a Value, id: &str) -> Option<&'a Value> {
+    if id.is_empty() {
+        return None;
+    }
+    let is_active = |e: &Value| e.get("active").and_then(Value::as_bool).unwrap_or(true);
+    let encs = data.get("encounters").and_then(Value::as_object)?;
+    encs.get(id)
+        .filter(|e| is_active(e))
+        .or_else(|| encs.values().find(|e| e.get("id").and_then(Value::as_str) == Some(id) && is_active(e)))
 }
 
 /// serde_json::Value → Lua 值（对象为 string key 表，数组为 1 基表）。
@@ -1634,12 +1858,12 @@ mod tests {
         assert_eq!(events(&host), vec!["always".to_string()]);
 
         let gate_false = |_: &CondExpr| false;
-        let env = MountEnv { gate: Some(&gate_false), check: None, event: None };
+        let env = MountEnv { gate: Some(&gate_false), check: None, event: None, resolved_effects: None };
         assert_eq!(registry.run_chain_with(&host, LuaMount::Event, &c, &env).unwrap(), 1);
         assert_eq!(events(&host), vec!["always".to_string()]);
 
         let gate_true = |_: &CondExpr| true;
-        let env = MountEnv { gate: Some(&gate_true), check: None, event: None };
+        let env = MountEnv { gate: Some(&gate_true), check: None, event: None, resolved_effects: None };
         assert_eq!(registry.run_chain_with(&host, LuaMount::Event, &c, &env).unwrap(), 2);
         assert_eq!(events(&host), vec!["always".to_string(), "gated".to_string()]);
     }
@@ -1724,7 +1948,7 @@ mod tests {
             .run_condition("return host.check == nil and host.check_result == nil", &c)
             .unwrap());
         // 判定后：脚本能读到判定结果（分档语义由 Lua 自己决定）。
-        let env = MountEnv { gate: None, check: Some(&check), event: None };
+        let env = MountEnv { gate: None, check: Some(&check), event: None, resolved_effects: None };
         host.run_hook_with(
             "assert(host.check.total == 12); assert(host.check.margin == -3);              assert(host.check.result == false); assert(host.check_level == 'barely');              assert(host.check_kind == 'save'); assert(host.check.rolls[1] == 9);              host.modify_resource('char-a', 'mana', host.check.total)",
             LuaMount::CheckPostRoll,
@@ -1863,4 +2087,213 @@ mod tests {
         // 空 flag 当场报错（不静默丢请求）。
         assert!(host.run_hook("host.set_flag('  ')", LuaMount::Event, &c).is_err());
     }
+
+    /// GAP-A：只读世界事实口——按任意 id 形态读角色实例（与引擎 find_character 同口径）。
+    ///
+    /// 引擎不认识 kind / 状态 / 遭遇的语义，只做查表搬运；查不到返回 nil，不抛错。
+    #[test]
+    fn world_fact_read_api_resolves_any_character_id_form() {
+        let host = LuaHost::new(1).unwrap();
+        host.set_world_facts(json!({
+            "characters": {
+                "char-a": {
+                    "instance_id": "inst-char-a", "template_id": "pc-mira", "name": "米拉", "kind": "pc",
+                    "attributes": { "str": 70 }, "resources": { "hp": 30 },
+                    "statuses": [ { "id": "bless", "name": "祝福" } ],
+                    "location_id": "loc-1", "present": true
+                }
+            },
+            "flags": { "met-isa": true },
+            "encounters": {}
+        }));
+        let c = ctx(json!({}));
+        // 四种 id 写法（实例键 / 模板 id / 角色名 / instance_id）都能命中同一实例。
+        for id in ["char-a", "pc-mira", "米拉", "inst-char-a"] {
+            let script = format!(
+                "local c = host.get_character('{id}')\n\
+                 return c ~= nil and c.id == 'char-a' and c.attributes.str == 70 \n\
+                 and c.resources.hp == 30 and c.statuses[1].id == 'bless' \n\
+                 and c.location_id == 'loc-1' and c.kind == 'pc' and c.present == true"
+            );
+            assert!(host.run_condition(&script, &c).unwrap(), "id 形态 {id} 应命中同一实例");
+        }
+        // 提示词里常见的「名字(id)」整串回填也能命中。
+        assert!(host
+            .run_condition("return host.get_character('米拉(char-a)').template_id == 'pc-mira'", &c)
+            .unwrap());
+        // 查不到 / id 为空 → nil（不抛错）。
+        assert!(host.run_condition("return host.get_character('nobody') == nil", &c).unwrap());
+        assert!(host.run_condition("return host.get_character('') == nil", &c).unwrap());
+    }
+
+    /// GAP-A：标记与活跃遭遇的只读口；查不到返回 nil / 空表，不抛错。
+    #[test]
+    fn world_fact_read_api_exposes_flags_and_active_encounters() {
+        let host = LuaHost::new(1).unwrap();
+        host.set_world_facts(json!({
+            "characters": {},
+            "flags": { "met-isa": true, "gate-open": false, "count": 3 },
+            "encounters": {
+                "enc-1": { "id": "enc-1", "name": "洞穴", "active": true,
+                    "enemies": [ { "id": "e1", "name": "灰狼", "hp": 3, "max": 11, "ac": 12 } ] },
+                "enc-old": { "id": "enc-old", "name": "旧账", "active": false, "enemies": [] }
+            }
+        }));
+        let c = ctx(json!({}));
+        assert!(host.run_condition("return host.get_flag('met-isa') == true", &c).unwrap());
+        // false 是合法值，不是「查不到」：必须原样返回，不能变成 nil。
+        assert!(host.run_condition("return host.get_flag('gate-open') == false", &c).unwrap());
+        assert!(host.run_condition("return host.get_flag('count') == 3", &c).unwrap());
+        assert!(host.run_condition("return host.get_flag('missing') == nil", &c).unwrap());
+        assert!(host
+            .run_condition("local f = host.list_flags(); return f['met-isa'] == true and f.count == 3", &c)
+            .unwrap());
+        // 只列活跃遭遇（含敌人与 hp）；已结束的遭遇按 id 也查不到。
+        assert!(host
+            .run_condition(
+                "local l = host.list_encounters(); return #l == 1 and l[1].id == 'enc-1' and l[1].enemies[1].hp == 3",
+                &c
+            )
+            .unwrap());
+        assert!(host.run_condition("return host.get_encounter('enc-1').name == '洞穴'", &c).unwrap());
+        assert!(host.run_condition("return host.get_encounter('enc-old') == nil", &c).unwrap());
+        assert!(host.run_condition("return host.get_encounter('missing') == nil", &c).unwrap());
+
+        // 没有注入快照的宿主（编辑器试跑 / 无相关脚本）：nil / 空表，不报错。
+        let bare = LuaHost::new(1).unwrap();
+        assert!(bare
+            .run_condition(
+                "return host.get_character('x') == nil and host.get_flag('x') == nil \n\
+                 and next(host.list_flags()) == nil and host.get_encounter('x') == nil \n\
+                 and #host.list_encounters() == 0",
+                &c
+            )
+            .unwrap());
+    }
+
+    /// 只读性：这些 API 只查表，不产生任何 LuaRequest、不改世界状态。
+    #[test]
+    fn world_fact_read_api_produces_no_requests() {
+        let host = LuaHost::new(1).unwrap();
+        host.set_world_facts(json!({
+            "characters": { "char-a": { "name": "米拉", "statuses": [] } },
+            "flags": { "k": 1 },
+            "encounters": { "enc-1": { "id": "enc-1", "active": true, "enemies": [] } }
+        }));
+        let c = ctx(json!({}));
+        host.run_hook(
+            "local a = host.get_character('char-a'); local b = host.get_character('missing'); \n\
+             local f = host.get_flag('k'); local l = host.list_flags(); \n\
+             local e = host.get_encounter('enc-1'); local es = host.list_encounters()",
+            LuaMount::PreResolve,
+            &c,
+        )
+        .unwrap();
+        assert!(host.drain_requests().is_empty(), "只读 API 不得产生任何 LuaRequest");
+    }
+
+    /// GAP-L：host.target 的只读快照与 host.actor 同级完整（状态 / 属性 / 资源 / 位置 / 种类 / 在场）。
+    #[test]
+    fn actor_and_target_snapshots_carry_the_same_facts() {
+        let host = LuaHost::new(1).unwrap();
+        let snapshot = |name: &str| {
+            json!({
+                "instance_id": format!("inst-{name}"),
+                "template_id": format!("tmpl-{name}"),
+                "name": name,
+                "kind": "pc",
+                "attributes": { "dex": 40 },
+                "resources": { "hp": 7 },
+                "statuses": [ { "id": "off-guard", "name": "疏于防备" } ],
+                "location_id": "loc-1",
+                "present": true
+            })
+        };
+        let mut c = ctx(snapshot("米拉"));
+        c.target = Some(snapshot("目标"));
+        assert!(host
+            .run_condition(
+                "local function ok(c) return c ~= nil and c.attributes.dex == 40 and c.resources.hp == 7 \n\
+                 and c.statuses[1].id == 'off-guard' and c.location_id == 'loc-1' \n\
+                 and c.kind == 'pc' and c.present == true end \n\
+                 return ok(host.actor) and ok(host.target)\n\
+                 and host.actor.id == 'inst-米拉' and host.target.id == 'inst-目标'",
+                &c
+            )
+            .unwrap());
+    }
+
+    // ---------- GAP-E：效果缩放原语 + PostResolve 只读快照 ----------
+
+    /// scale_effect 只在**会消费它**的两个时机注册（check_post_roll / pre_resolve）：
+    /// 写错时机即当场报错（不是静默丢请求）。因子必须是有限非负数。
+    #[test]
+    fn scale_effect_is_registered_only_where_it_is_consumed() {
+        let host = LuaHost::new(1).unwrap();
+        let c = ctx(json!({}));
+        for mount in [LuaMount::CheckPostRoll, LuaMount::PreResolve] {
+            host.run_hook("host.scale_effect(0.5)", mount, &c).unwrap();
+            assert_eq!(
+                host.drain_requests(),
+                vec![LuaRequest::ScaleEffect { factor: 0.5 }],
+                "{mount:?} 应收到缩放声明"
+            );
+        }
+        // 其他时机没有这个 API：调用即报错，作者立刻看到时机写错了。
+        for mount in [LuaMount::CheckPreRoll, LuaMount::PostResolve, LuaMount::Event] {
+            let err = host.run_hook("host.scale_effect(0.5)", mount, &c).unwrap_err();
+            assert!(err.to_string().contains("scale_effect"), "{mount:?} 应报错，实际：{err}");
+            assert!(host.drain_requests().is_empty(), "{mount:?} 不该产生请求");
+        }
+        // 因子校验：负 / NaN / 无穷 一律当场报错（引擎不接受说不清的因子）。
+        for bad in ["host.scale_effect(-1)", "host.scale_effect(0/0)", "host.scale_effect(1/0)"] {
+            let err = host.run_hook(bad, LuaMount::CheckPostRoll, &c).unwrap_err();
+            assert!(err.to_string().contains("缩放因子"), "{bad} → {err}");
+        }
+        assert!(host.drain_requests().is_empty(), "非法因子不得留下请求");
+    }
+
+    /// resolved_effects 是 PostResolve 专属的只读事实：其他时机读它是 nil（旧脚本零影响）。
+    #[test]
+    fn resolved_effects_is_exposed_only_to_post_resolve() {
+        let host = LuaHost::new(1).unwrap();
+        let c = ctx(json!({}));
+        assert!(host.run_condition("return host.resolved_effects == nil", &c).unwrap());
+        for mount in [LuaMount::CheckPostRoll, LuaMount::PreResolve, LuaMount::Event] {
+            host.run_hook("assert(host.resolved_effects == nil)", mount, &c).unwrap();
+        }
+        let snapshot = json!({
+            "deltas": [
+                { "domain": "character", "entity_id": "char-b", "field": "resources.hp",
+                  "op": "add", "value": -3 }
+            ],
+            "statuses": [],
+            "modifiers": [],
+            "rng_consumed": 1,
+            "factor": 0.5
+        });
+        let env = MountEnv { resolved_effects: Some(&snapshot), ..Default::default() };
+        host.run_hook_with(
+            "assert(host.resolved_effects.deltas[1].value == -3); 
+             assert(host.resolved_effects.deltas[1].field == 'resources.hp'); 
+             assert(host.resolved_effects.factor == 0.5); 
+             assert(host.resolved_effects.rng_consumed == 1)",
+            LuaMount::PostResolve,
+            &c,
+            &env,
+        )
+        .unwrap();
+        assert!(host.drain_requests().is_empty(), "只读快照不得产生请求");
+        // 没有声明因子时 factor 下发 nil（脚本据此区分「没缩放」与「因子 0」）。
+        let no_factor = json!({ "deltas": [], "statuses": [], "modifiers": [], "rng_consumed": 0, "factor": null });
+        let env = MountEnv { resolved_effects: Some(&no_factor), ..Default::default() };
+        host.run_hook_with(
+            "assert(host.resolved_effects.factor == nil)",
+            LuaMount::PostResolve,
+            &c,
+            &env,
+        )
+        .unwrap();
+    }
 }
+
