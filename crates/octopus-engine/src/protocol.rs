@@ -132,6 +132,7 @@ pub const KNOWN_INTENTS: &[&str] = &[
     "adjust",
     "status",
     "summary",
+    "end_turn",
     "finish_turn",
 ];
 
@@ -181,6 +182,11 @@ const INTENT_CATALOG: &[(&str, &str, &str)] = &[
     ("adjust", "adjust {character_id, resource, amount}", "调整资源（导演）"),
     ("status", "status {character_id, status_id, remove?}", "施加 / 移除状态（导演）"),
     ("summary", "summary {text}", "本回合微摘要（派生记忆，不进叙事）"),
+    (
+        "end_turn",
+        "end_turn {}",
+        "结束当前行动者的时序回合（战斗中推进到下一个行动者；不改变叙事）",
+    ),
     ("finish_turn", "finish_turn {}", "回合收束"),
 ];
 
@@ -215,6 +221,7 @@ pub fn intent_kind(intent: &Intent) -> &'static str {
         Intent::Encounter { .. } => "encounter",
         Intent::Status { .. } => "status",
         Intent::Summary { .. } => "summary",
+        Intent::EndTurn => "end_turn",
         Intent::FinishTurn => "finish_turn",
     }
 }
@@ -389,6 +396,11 @@ const INTENT_TOOLS: &[(&str, &str, &[(&str, &str, bool)])] = &[
         &[("character_id", "string", true), ("status_id", "string", true), ("remove", "boolean", false)],
     ),
     ("summary", "本回合微摘要（派生记忆，不进叙事）", &[("text", "string", true)]),
+    (
+        "end_turn",
+        "结束当前行动者的时序回合（战斗中推进到下一个行动者；不改变叙事）",
+        &[],
+    ),
     ("finish_turn", "回合收束（本轮不再产生意图）", &[]),
 ];
 

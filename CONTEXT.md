@@ -343,3 +343,23 @@ _Avoid_: 技能（本项目的「技能」专指可用能力，见「技能」�
 具体规则体系对可判定数值槽的称呼（D&D 六维）。本项目对应的通用概念是**属性维度**；「属性」只在讨论具体规则体系时使用。
 _Avoid_: 属性维度（本项目通用术语，见「属性维度」条）
 
+**回合边界 (Turn Boundary)**:
+玩家一次输入产生的结算单位，也是持续状态 tick 与恢复时机的触发点。**与「时序回合」不是一回事**：前者是「一次输入」，后者是战斗中「某个角色的第几次行动」。
+_实现_: 全局 `round` 计数 + `tick_statuses_turn` / `tick_statuses_scene` 与 `turn_end` / `scene_end` 挂载点。
+_Avoid_: 轮次（易与战斗轮混淆）
+
+**时序 (Turn Order)**:
+战斗 / 冲突场景中决定「谁先行动、每个角色能行动几次」的通用容器——顺序 + 行动预算 + 当前指针；由故事书声明（`world.turn`），引擎只负责轮转与校验。
+_实现_: `WorldState.turn`（`TurnState`）+ `DeltaDomain::Turn` 的 delta；顺序来源 `none | initiative | fixed`；未声明 = 时序整体关闭（旧故事书行为逐字不变）。Lua 只读口 `host.turn`。
+_Avoid_: 先攻系统（那只是 `order: initiative` 的一种取值）、回合制（暗示必须有回合）
+
+**行动预算 (Action Budget)**:
+时序中分配给某个角色一个回合内的可消耗计数（如 action / bonus / reaction / movement）；**名字与数量由故事书声明**，引擎只做「够不够、扣多少」，不认识任何规则集语义。
+_实现_: `world.turn.budgets` + `SkillDef.budget`（与 `cost` 对称）+ `world.turn.intent_budget` 的缺省口径；不足时驳回 `insufficient_budget`。缺省**不扣**——作者必须显式声明谁消耗它。
+_Avoid_: 行动点（暗示单一数值）、AP
+
+**失去回合 (Lost Turn)**:
+角色在若干时序回合内被禁止行动（突袭 / 昏迷 / 定身等）——由规则包在挂载点调用引擎原语把该角色的预算清零或跳过；引擎提供原语，**不判断何时该失去**（它不认识「突袭」）。
+_实现_: `host.skip_turn(actor, n)` / `host.set_budget(actor, id, n)` → `TurnState.skip`；被跳过或被清空预算的机械意图驳回 `not_your_turn` / `insufficient_budget`。
+_Avoid_: 眩晕（那是状态，不是时序后果）
+

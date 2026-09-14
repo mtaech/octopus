@@ -83,6 +83,7 @@ pub fn eval_cond(cond: &CondExpr, ctx: &EvalContext<'_>) -> Result<bool, EngineE
                 && r.get("value").and_then(as_number).unwrap_or(0.0) >= *value
         }),
         CondExpr::EncounterCleared {} => encounters_cleared(ctx),
+        CondExpr::EncounterActive {} => encounters_active(ctx),
         CondExpr::Lua { script } => {
             let (host, lua_ctx) = ctx
                 .lua
@@ -132,6 +133,43 @@ fn encounters_cleared(ctx: &EvalContext<'_>) -> bool {
         }
     }
     seen
+}
+
+/// encounter_active（#GAP-I 顺带关掉 GAP-M）：当前场景**存在未结束且未全灭**的遭遇。
+///
+/// 与 `encounters_cleared` 互补但**不能取反**：场景里一场遭遇都没有时两者都不成立
+///（「清剿」还没开始，「在战斗中」也不成立），所以必须是独立的原子谓词。
+fn encounters_active(ctx: &EvalContext<'_>) -> bool {
+    for enc in ctx.encounters {
+        let scene = enc
+            .get("scene_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let belongs = match (scene, ctx.scene_id) {
+            (Some(s), Some(cur)) => s == cur,
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        if !belongs {
+            continue;
+        }
+        // 已结束的遭遇不算「在战斗中」（导演可显式收尾）。
+        if !enc.get("active").and_then(Value::as_bool).unwrap_or(true) {
+            continue;
+        }
+        let all_down = enc
+            .get("enemies")
+            .and_then(Value::as_array)
+            .is_some_and(|list| {
+                list.iter()
+                    .all(|e| e.get("hp").and_then(Value::as_i64).unwrap_or(0) <= 0)
+            });
+        if !all_down {
+            return true;
+        }
+    }
+    false
 }
 
 fn parse_cond(value: Option<&Value>) -> Option<CondExpr> {

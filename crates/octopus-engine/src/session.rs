@@ -199,6 +199,151 @@ pub struct SessionRules {
     /// 资源边界（#12 ③）：资源 id → (min, max)。只含**声明过** \`default_max\` / \`min\` 的资源，
     /// 未声明的资源不参与夹取（对旧故事书零影响）。构造时算一次，热路径不解析 JSON。
     resource_bounds: std::collections::HashMap<String, (Option<i64>, Option<i64>)>,
+    /// 时序声明（#GAP-I，解析自 `world.turn`）：None = 未声明 → 时序整体关闭（旧行为逐字不变）。
+    turn: Option<TurnRules>,
+}
+
+/// 时序声明（#GAP-I）。刻意**不进 octopus-types**：与 `world.resources` 同口径——
+/// 引擎从原始 JSON 读它、发布门校验它，但它不是引擎对外承诺的数据契约。
+#[derive(Debug, Clone, Default)]
+pub struct TurnRules {
+    /// 顺序来源：none（只做预算）/ initiative（掷骰）/ fixed（查表）。
+    pub order: TurnOrderKind,
+    /// 先攻骰式（缺省 1d20）。
+    pub initiative_dice: String,
+    /// 先攻加值取哪个属性维度（走既有 modifier 口径）。
+    pub initiative_attribute: Option<String>,
+    /// 模板 id → 固定先攻值（order = fixed，或个别单位特例）。
+    pub initiative_fixed: std::collections::HashMap<String, i64>,
+    /// 声明的预算（id, 每回合额度），保持声明顺序。
+    pub budgets: Vec<(String, i64)>,
+    /// true = 每轮重置全员预算；false（缺省）= 轮到自己时重置自己的。
+    pub reset_per_round: bool,
+    /// 机械意图类型 → 缺省消耗的预算 id（作者显式声明；缺省 = 不扣）。
+    pub intent_budget: std::collections::HashMap<String, String>,
+}
+
+/// 顺序来源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TurnOrderKind {
+    /// 不定顺序（只按玩家回合做预算限制）。
+    #[default]
+    None,
+    /// 掷先攻排序。
+    Initiative,
+    /// 查 `initiative.fixed` 表排序（不掷骰、不消耗 RNG）。
+    Fixed,
+}
+
+impl TurnRules {
+    /// 是否真的启用时序（声明了顺序来源或预算）。整块声明但两者皆空 = 等于没声明。
+    pub fn enabled(&self) -> bool {
+        self.order != TurnOrderKind::None || !self.budgets.is_empty()
+    }
+}
+
+/// 解析 `world.turn`；缺省 / 非对象 → None（时序整体关闭）。
+///
+/// 形状非法的条目在这里**静默丢弃**（发布门 validate 负责报错）：运行期不 panic，
+/// 也不因为一条坏声明就让整个回合失败。
+fn turn_rules_of(storybook: &Value) -> Option<TurnRules> {
+    let t = storybook.pointer("/world/turn")?;
+    if !t.is_object() {
+        return None;
+    }
+    let order = match t.get("order").and_then(Value::as_str).map(str::trim) {
+        Some("initiative") => TurnOrderKind::Initiative,
+        Some("fixed") => TurnOrderKind::Fixed,
+        _ => TurnOrderKind::None,
+    };
+    let init = t.get("initiative");
+    let initiative_dice = init
+        .and_then(|i| i.get("dice"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("1d20")
+        .to_string();
+    let initiative_attribute = init
+        .and_then(|i| i.get("attribute"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let mut initiative_fixed = std::collections::HashMap::new();
+    if let Some(map) = init.and_then(|i| i.get("fixed")).and_then(Value::as_object) {
+        for (k, v) in map {
+            if let Some(n) = v.as_i64() {
+                initiative_fixed.insert(k.clone(), n);
+            }
+        }
+    }
+    let mut budgets: Vec<(String, i64)> = Vec::new();
+    if let Some(arr) = t.get("budgets").and_then(Value::as_array) {
+        for b in arr {
+            let Some(id) = b
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let Some(amount) = b.get("amount").and_then(Value::as_i64) else { continue };
+            if amount <= 0 || budgets.iter().any(|(x, _)| x == id) {
+                continue;
+            }
+            budgets.push((id.to_string(), amount));
+        }
+    }
+    let reset_per_round =
+        t.get("reset").and_then(Value::as_str).map(str::trim) == Some("per_round");
+    let mut intent_budget = std::collections::HashMap::new();
+    if let Some(map) = t.get("intent_budget").and_then(Value::as_object) {
+        for (k, v) in map {
+            if let Some(id) = v.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                intent_budget.insert(k.clone(), id.to_string());
+            }
+        }
+    }
+    Some(TurnRules {
+        order,
+        initiative_dice,
+        initiative_attribute,
+        initiative_fixed,
+        budgets,
+        reset_per_round,
+        intent_budget,
+    })
+}
+
+/// 一条时序 delta（#GAP-I）：`DeltaDomain::Turn` + 约定字段名（见该枚举的文档）。
+fn turn_delta(field: &str, op: DeltaOp, value: Value) -> StateDelta {
+    StateDelta {
+        domain: DeltaDomain::Turn,
+        entity_id: String::new(),
+        field: field.to_string(),
+        op,
+        value,
+    }
+}
+
+/// 机械意图的类型名：时序闸门只约束这些（会发生规则结算 / 改变世界状态）。
+///
+/// 叙事意图（narrate / speak / emote / think）**任何回合都能发**——否则「失去回合」
+/// 会连台词都说不出来，那不是规则语义，是 bug。导演类意图（quest / encounter / adjust…）
+/// 也不受约束：它们是人替 GM 推进剧情，不属于某个角色的行动经济。
+fn mechanical_intent_kind(intent: &Intent) -> Option<&'static str> {
+    match intent {
+        Intent::Check { .. } => Some("check"),
+        Intent::Move { .. } => Some("move"),
+        Intent::UseSkill { .. } => Some("use_skill"),
+        Intent::UseItem { .. } => Some("use_item"),
+        Intent::Interact { .. } => Some("interact"),
+        Intent::Strike { .. } => Some("strike"),
+        Intent::EnemyStrike { .. } => Some("enemy_strike"),
+        _ => None,
+    }
 }
 
 /// 解析故事书声明的资源边界（\`world.resources[].default_max\` / \`min\`）。
@@ -281,7 +426,8 @@ impl SessionRules {
         }
         let attribute_bonuses = crate::modifiers::attribute_modifiers(&storybook);
         let resource_bounds = resource_bounds_of(&storybook);
-        Self { storybook, skills, status_defs, profiles, attribute_bonuses, resource_bounds }
+        let turn = turn_rules_of(&storybook);
+        Self { storybook, skills, status_defs, profiles, attribute_bonuses, resource_bounds, turn }
     }
 
     /// 角色模板 → 属性修正（挂接定义 + 已装备物品）。
@@ -301,6 +447,11 @@ impl SessionRules {
         &self,
     ) -> &std::collections::HashMap<String, (Option<i64>, Option<i64>)> {
         &self.resource_bounds
+    }
+
+    /// 时序声明（`world.turn`）；None = 未声明。
+    pub fn turn(&self) -> Option<&TurnRules> {
+        self.turn.as_ref()
     }
 
     pub fn skill(&self, id: &str) -> Option<&SkillDef> {
@@ -1456,6 +1607,397 @@ impl Session {
         Ok(changes)
     }
 
+    // ---------- 时序与行动经济（#GAP-I） ----------
+
+    /// 生效的时序声明：声明了 \`world.turn\` 且真的启用（有顺序来源或预算）。
+    fn turn_rules(&self) -> Option<&TurnRules> {
+        self.rules.turn().filter(|r| r.enabled())
+    }
+
+    /// Lua 只读时序快照（#GAP-I）：脚本的 \`host.turn\`。不在时序中时 None（读到 nil）。
+    ///
+    /// 只给事实（轮次 / 顺序 / 当前行动者 / 剩余预算），**不给任何规则集语义**——
+    /// 「谁被突袭」「什么时候该失去回合」由规则包 Lua 自己判断。
+    fn turn_snapshot(&self) -> Option<Value> {
+        let st = self.state.lock().ok()?;
+        if st.turn.order.is_empty() {
+            return None;
+        }
+        let current = st.turn.order.get(st.turn.index).cloned();
+        let budgets = current
+            .as_ref()
+            .and_then(|k| st.turn.budgets.get(k))
+            .map(|m| serde_json::json!(m))
+            .unwrap_or_else(|| serde_json::json!({}));
+        Some(serde_json::json!({
+            "round": st.turn.round,
+            "order": st.turn.order,
+            "index": st.turn.index,
+            "current": current,
+            "budgets": budgets,
+            "combat": self.combat_active(&st),
+        }))
+    }
+
+    /// 当前场景是否有**未结束且未全灭**的遭遇——时序的激活判据。
+    ///
+    /// 与 \`CondExpr::EncounterActive\` 同一口径（两处必须同时改）：场景归属看 \`scene_id\`，
+    /// 已结束（active=false）或敌人全灭都不算「在战斗中」。
+    fn combat_active(&self, st: &WorldState) -> bool {
+        st.encounters.values().any(|enc| {
+            let belongs = match enc.get("scene_id").and_then(Value::as_str) {
+                Some(s) => s == st.scene_id,
+                None => true,
+            };
+            if !belongs {
+                return false;
+            }
+            if !enc.get("active").and_then(Value::as_bool).unwrap_or(true) {
+                return false;
+            }
+            !enc
+                .get("enemies")
+                .and_then(Value::as_array)
+                .is_some_and(|l| {
+                    l.iter()
+                        .all(|e| e.get("hp").and_then(Value::as_i64).unwrap_or(0) <= 0)
+                })
+        })
+    }
+
+    /// 时序激活 / 退出（#GAP-I）：在「遭遇刚建好」与「回合末」两处调用。
+    ///
+    /// 未声明 \`world.turn\` 时完全静默——旧故事书的行为逐字不变。
+    fn sync_turn_combat(&self) {
+        let Some(rules) = self.turn_rules().cloned() else { return };
+        let (active, has_order) = {
+            let st = self.state.lock().expect("state poisoned");
+            (self.combat_active(&st), !st.turn.order.is_empty())
+        };
+        if active && !has_order {
+            self.begin_combat(&rules);
+        } else if !active && has_order {
+            // 战斗结束：清空顺序即退出时序（预算残留无害，下次开战重建）。
+            self.emit_simple(PlayEvent::StateUpdate(StateUpdatePayload {
+                changes: vec![turn_delta("turn/order", DeltaOp::Set, serde_json::json!([]))],
+            }));
+        }
+    }
+
+    /// 开始一场战斗的时序：排定先攻顺序、建立全员预算（#GAP-I）。
+    ///
+    /// 先攻掷骰走 engine RNG → 自动落 \`rng_consume\`，重放时骰序连续；
+    /// 同分按实例键排序，「同一日志 → 同一顺序」是确定性的。
+    fn begin_combat(&self, rules: &TurnRules) {
+        // 参战者 = 在场的角色实例 + 当前场景遭遇里还活着的敌人实例。
+        let (participants, global_checker) = {
+            let st = self.state.lock().expect("state poisoned");
+            let mut keys: Vec<String> = st
+                .characters
+                .iter()
+                .filter(|(_, c)| c.present)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for enc in st.encounters.values() {
+                let belongs = match enc.get("scene_id").and_then(Value::as_str) {
+                    Some(s) => s == st.scene_id,
+                    None => true,
+                };
+                if !belongs || !enc.get("active").and_then(Value::as_bool).unwrap_or(true) {
+                    continue;
+                }
+                if let Some(list) = enc.get("enemies").and_then(Value::as_array) {
+                    for e in list {
+                        if e.get("hp").and_then(Value::as_i64).unwrap_or(0) <= 0 {
+                            continue;
+                        }
+                        if let Some(k) = e.get("instance_id").and_then(Value::as_str) {
+                            if !keys.iter().any(|x| x == k) {
+                                keys.push(k.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            let info: Vec<(String, String, f64)> = keys
+                .iter()
+                .map(|k| {
+                    let c = st.characters.get(k);
+                    let template = c.map(|c| c.template_id.clone()).unwrap_or_default();
+                    let value = rules
+                        .initiative_attribute
+                        .as_ref()
+                        .and_then(|a| c.and_then(|c| c.attributes.get(a)))
+                        .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64)))
+                        .unwrap_or(0.0);
+                    (k.clone(), template, value)
+                })
+                .collect();
+            (info, self.rules.global_checker())
+        };
+        let mut scored: Vec<(String, i64)> = Vec::new();
+        for (key, template_id, attr_value) in participants {
+            let score = if let Some(fixed) = rules.initiative_fixed.get(&template_id) {
+                *fixed
+            } else if rules.order == TurnOrderKind::Initiative {
+                let rolled = {
+                    let mut rng = self.rng.lock().expect("rng poisoned");
+                    crate::resolve::roll_dice(&rules.initiative_dice, &mut rng)
+                        .map(|d| d.total)
+                        .unwrap_or(0)
+                };
+                let modifier = match (&rules.initiative_attribute, global_checker.as_ref()) {
+                    (Some(attr), Some(checker)) => {
+                        let profile =
+                            self.rules.profiles().get(attr).cloned().unwrap_or_default();
+                        crate::resolve::modifier_for(checker, attr, attr_value, profile)
+                    }
+                    _ => 0,
+                };
+                rolled + modifier
+            } else {
+                0
+            };
+            scored.push((key, score));
+        }
+        scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let order: Vec<String> = scored.into_iter().map(|(k, _)| k).collect();
+        let names: Vec<String> = {
+            let st = self.state.lock().expect("state poisoned");
+            order
+                .iter()
+                .map(|k| {
+                    st.characters
+                        .get(k)
+                        .map(|c| c.name.clone())
+                        .unwrap_or_else(|| k.clone())
+                })
+                .collect()
+        };
+        let mut changes = vec![
+            turn_delta("turn/order", DeltaOp::Set, serde_json::json!(order)),
+            turn_delta("turn/index", DeltaOp::Set, serde_json::json!(0)),
+            turn_delta("turn/round", DeltaOp::Set, serde_json::json!(1)),
+        ];
+        for key in &order {
+            for (id, amount) in &rules.budgets {
+                changes.push(turn_delta(
+                    &format!("turn/budget.{key}.{id}"),
+                    DeltaOp::Set,
+                    serde_json::json!(amount),
+                ));
+            }
+        }
+        self.emit_simple(PlayEvent::StateUpdate(StateUpdatePayload { changes }));
+        self.emit_simple(PlayEvent::System(SystemPayload {
+            level: SystemLevel::Info,
+            code: Some("turn_order".into()),
+            text: format!("战斗开始，先攻顺序：{}", names.join(" → ")),
+        }));
+    }
+
+    /// 一次机械意图要花掉哪些预算（#GAP-I）。
+    ///
+    /// 口径（**缺省不扣**，作者必须显式）：技能声明的 \`budget\` 优先（use_skill / use_item /
+    /// 带 skill_id 的 strike）；否则查 \`world.turn.intent_budget\`（amount 视为 1）；都没有 = 不消耗。
+    fn turn_costs(&self, rules: &TurnRules, intent: &Intent) -> Vec<(String, i64)> {
+        let mut out: Vec<(String, i64)> = Vec::new();
+        // 物品技能与技能同口径：物品引用的第一个技能声明什么就扣什么（不 leak、不复制语义）。
+        let skill_id: Option<String> = match intent {
+            Intent::UseSkill { skill_id, .. } => Some(skill_id.clone()),
+            Intent::UseItem { item_id, .. } => self.rules.item_skill_ids(item_id).into_iter().next(),
+            Intent::Strike { skill_id, .. } => skill_id.clone(),
+            _ => None,
+        };
+        if let Some(sid) = skill_id.as_deref() {
+            if let Some(skill) = self.rules.skill(sid) {
+                for b in &skill.budget {
+                    if b.amount > 0 {
+                        out.push((b.budget.clone(), b.amount));
+                    }
+                }
+            }
+        }
+        if out.is_empty() {
+            if let Some(kind) = mechanical_intent_kind(intent) {
+                if let Some(bid) = rules.intent_budget.get(kind) {
+                    out.push((bid.clone(), 1));
+                }
+            }
+        }
+        // 同一预算声明多次 → 合并，避免重复检查 / 重复扣。
+        let mut merged: Vec<(String, i64)> = Vec::new();
+        for (id, amount) in out {
+            match merged.iter_mut().find(|(x, _)| *x == id) {
+                Some(slot) => slot.1 += amount,
+                None => merged.push((id, amount)),
+            }
+        }
+        merged
+    }
+
+    /// 时序闸门（#GAP-I）：机械意图必须来自当前行动者，且预算足够；通过则**就地扣除**预算。
+    ///
+    /// 未声明 \`world.turn\` / 不在战斗中 / 非机械意图 → 恒放行（旧行为逐字不变）。
+    /// 「宣告即消耗」与规则书一致：即使随后被别的闸门（冷却 / 资源）驳回，这次行动也已经花掉了。
+    fn turn_gate(
+        &self,
+        intent: &Intent,
+        actor: Option<&ActorRef>,
+    ) -> Result<(), (RejectionCode, String)> {
+        let Some(rules) = self.turn_rules().cloned() else { return Ok(()) };
+        if mechanical_intent_kind(intent).is_none() {
+            return Ok(());
+        }
+        let actor_id = actor.map(|a| a.id.clone()).unwrap_or_default();
+        let (active, current, cur_name, skipped, budgets) = {
+            let st = self.state.lock().expect("state poisoned");
+            let current = st.turn.order.get(st.turn.index).cloned();
+            let name_of = |k: &str| {
+                st.characters
+                    .get(k)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| k.to_string())
+            };
+            let cur_name = current.as_deref().map(name_of).unwrap_or_default();
+            let skipped = current
+                .as_ref()
+                .map(|k| st.turn.skip.get(k).copied().unwrap_or(0) > 0)
+                .unwrap_or(false);
+            let budgets = current
+                .as_ref()
+                .and_then(|k| st.turn.budgets.get(k).cloned())
+                .unwrap_or_default();
+            (self.combat_active(&st), current, cur_name, skipped, budgets)
+        };
+        // 不在战斗中 / 还没排顺序 → 不约束（时序尚未建立）。
+        if !active {
+            return Ok(());
+        }
+        let Some(current) = current else { return Ok(()) };
+        let actor_key = {
+            let st = self.state.lock().expect("state poisoned");
+            Self::find_character(&st.characters, &actor_id)
+                .map(|(k, _)| k.clone())
+                .unwrap_or(actor_id)
+        };
+        if actor_key.is_empty() {
+            // 归不到具体角色（意图没署名、也没有受控角色）：无法判定归属 → 保持旧行为放行，
+            // 绝不因为「认不出是谁」就驳回一条本来合法的意图。
+            return Ok(());
+        }
+        if actor_key != current {
+            return Err((
+                RejectionCode::NotYourTurn,
+                format!("现在不是你的时序回合（当前行动者：{cur_name}）"),
+            ));
+        }
+        if skipped {
+            return Err((
+                RejectionCode::NotYourTurn,
+                "你本轮失去了自己的时序回合".to_string(),
+            ));
+        }
+        let costs = self.turn_costs(&rules, intent);
+        for (id, amount) in &costs {
+            let left = budgets.get(id).copied().unwrap_or(0);
+            if left < *amount {
+                return Err((
+                    RejectionCode::InsufficientBudget,
+                    format!("行动预算「{id}」不足（剩余 {left}，需要 {amount}）"),
+                ));
+            }
+        }
+        if !costs.is_empty() {
+            let changes: Vec<StateDelta> = costs
+                .iter()
+                .map(|(id, amount)| {
+                    turn_delta(
+                        &format!("turn/budget.{actor_key}.{id}"),
+                        DeltaOp::Add,
+                        serde_json::json!(-*amount),
+                    )
+                })
+                .collect();
+            self.emit_simple(PlayEvent::StateUpdate(StateUpdatePayload { changes }));
+        }
+        Ok(())
+    }
+
+    /// 结束当前行动者的时序回合（#GAP-I）：跳过计数递减、指针推进、按声明重置预算。
+    fn end_turn(&self) {
+        let Some(rules) = self.turn_rules().cloned() else { return };
+        let changes = {
+            let st = self.state.lock().expect("state poisoned");
+            if !self.combat_active(&st) || st.turn.order.is_empty() {
+                return;
+            }
+            let n = st.turn.order.len();
+            let mut index = st.turn.index;
+            let mut round = st.turn.round.max(1);
+            let mut skip_now = st.turn.skip.clone();
+            let mut changes: Vec<StateDelta> = Vec::new();
+            // 找下一个没被跳过的人；跳过者本轮消耗一次 skip 计数。
+            // guard 兜底：全员都被跳过时最多绕两圈就停下，绝不死循环。
+            let mut guard = 0usize;
+            loop {
+                guard += 1;
+                if guard > n * 3 + 8 {
+                    break;
+                }
+                index += 1;
+                if index >= n {
+                    index = 0;
+                    round += 1;
+                }
+                let key = st.turn.order[index].clone();
+                match skip_now.get(&key).copied().unwrap_or(0) {
+                    0 => break,
+                    left => {
+                        let next = left - 1;
+                        if next == 0 {
+                            skip_now.remove(&key);
+                            changes.push(turn_delta(
+                                &format!("turn/skip.{key}"),
+                                DeltaOp::Remove,
+                                Value::Null,
+                            ));
+                        } else {
+                            skip_now.insert(key.clone(), next);
+                            changes.push(turn_delta(
+                                &format!("turn/skip.{key}"),
+                                DeltaOp::Set,
+                                serde_json::json!(next),
+                            ));
+                        }
+                    }
+                }
+            }
+            changes.push(turn_delta("turn/index", DeltaOp::Set, serde_json::json!(index)));
+            changes.push(turn_delta("turn/round", DeltaOp::Set, serde_json::json!(round)));
+            // 预算重置：缺省「轮到自己时重置自己的」；reset = per_round 则每轮重置全员。
+            let keys: Vec<String> = if rules.reset_per_round {
+                st.turn.order.clone()
+            } else {
+                vec![st.turn.order[index].clone()]
+            };
+            for key in keys {
+                for (id, amount) in &rules.budgets {
+                    changes.push(turn_delta(
+                        &format!("turn/budget.{key}.{id}"),
+                        DeltaOp::Set,
+                        serde_json::json!(amount),
+                    ));
+                }
+            }
+            changes
+        };
+        if changes.is_empty() {
+            return;
+        }
+        self.emit_simple(PlayEvent::StateUpdate(StateUpdatePayload { changes }));
+    }
+
     // ---------- 回合管线（#03） ----------
 
     pub async fn run_round(
@@ -1691,7 +2233,10 @@ impl Session {
                     _ => story_fallback.clone(),
                 });
                 let rejections_before = self.rejection_count.load(Ordering::SeqCst);
-                if let Intent::Strike { enemy_id, skill_id } = intent {
+                // 时序闸门（#GAP-I）：机械意图的归属与预算。放在最前，被驳回也进回喂。
+                if let Err((code, message)) = self.turn_gate(&intent, actor.as_ref()) {
+                    self.reject(message, code);
+                } else if let Intent::Strike { enemy_id, skill_id } = intent {
                     struck = true;
                     let mut choice = text_choice.clone();
                     if skill_id.is_some() {
@@ -1799,6 +2344,8 @@ impl Session {
     /// `true`，可重复触发落 `{fired, active}`——后者带上了「上一次条件值」，边沿检测
     /// 才能在重放（同一条日志 → 同一份进度）下得出同一个结论。
     fn evaluate_turn_end(&self) {
+        // 时序激活 / 退出（#GAP-I）：放在最前，保证即使骨架没有任何进展也会同步。
+        self.sync_turn_combat();
         let skeleton = self.rules.skeleton().cloned().unwrap_or(Value::Null);
         match self.with_eval_context("turn_end", |ctx| evaluate_skeleton_full(&skeleton, ctx)) {
             Ok(out) => {
@@ -2004,6 +2551,8 @@ impl Session {
             Some(story_actor()),
             None,
         );
+        // 遭遇建好即进入时序（#GAP-I）：排先攻、建预算。未声明 world.turn 时静默。
+        self.sync_turn_combat();
     }
 
     /// 触发点被标记 fired 之后自动建遭遇（地图 P5 §6.3）。
@@ -2519,6 +3068,8 @@ impl Session {
             scene_id,
             round: self.round.load(Ordering::SeqCst),
             difficulty: Some(difficulty),
+            // 时序只读快照（#GAP-I）：规则包在挂载点读 host.turn 判断「何时该失去回合」。
+            turn: self.turn_snapshot(),
             relationships: vec![],
             present: vec![],
             controlled: String::new(),
@@ -2852,6 +3403,8 @@ impl Session {
             scene_id,
             round: self.round.load(Ordering::SeqCst),
             difficulty: Some(difficulty),
+            // 时序只读快照（#GAP-I）：规则包在挂载点读 host.turn 判断「何时该失去回合」。
+            turn: self.turn_snapshot(),
             relationships: vec![],
             present: vec![],
             controlled: String::new(),
@@ -4015,6 +4568,10 @@ impl Session {
             Intent::UseItem { item_id, target_id } => {
                 self.handle_use_item(&item_id, target_id.as_deref(), actor);
             }
+            Intent::EndTurn => {
+                // 时序回合结束（#GAP-I）：推进指针、重置预算。非时序状态下是 no-op。
+                self.end_turn();
+            }
             Intent::FinishTurn => {}
         }
         // 其余意图只落叙事 / 状态，不需要模型据新信息续写。
@@ -4182,6 +4739,8 @@ impl Session {
             scene_id,
             round: self.round.load(Ordering::SeqCst),
             difficulty: Some(difficulty),
+            // 时序只读快照（#GAP-I）：规则包在挂载点读 host.turn 判断「何时该失去回合」。
+            turn: self.turn_snapshot(),
             relationships: vec![],
             present: vec![],
             controlled: String::new(),
@@ -4395,6 +4954,8 @@ impl Session {
             actor,
             scene_id,
             round: self.round.load(Ordering::SeqCst),
+            // 时序快照（#GAP-I）：turn_end 是规则包判断「何时失去回合」的主要时机。
+            turn: self.turn_snapshot(),
             relationships: self.rules.relationships(),
             ..Default::default()
         }
@@ -4676,6 +5237,7 @@ impl Session {
             script_id: format!("trigger:{event}"),
             actor: Value::Object(actor_obj),
             round: self.round.load(Ordering::SeqCst),
+            turn: self.turn_snapshot(),
             relationships: relationships.clone(),
             ..Default::default()
         };
@@ -4745,6 +5307,8 @@ impl Session {
             actor: Value::Null,
             scene_id,
             round: self.round.load(Ordering::SeqCst),
+            // 时序快照（#GAP-I）：突袭等战斗开局逻辑在事件挂载点里读它。
+            turn: self.turn_snapshot(),
             ..Default::default()
         };
         // 走统一入口：注册表锁只在链执行期间持有（写请求在锁释放后落状态），
@@ -4910,6 +5474,41 @@ impl Session {
                         op: DeltaOp::Add,
                         value: Value::from(*amount),
                     });
+                }
+                // 时序原语（#GAP-I）：让目标跳过 N 个时序回合（突袭 / 定身… 由规则包判断）。
+                LuaRequest::SkipTurn { target, turns } => {
+                    let entity = self.resolve_lua_target(target, default_actor);
+                    if entity.is_empty() || *turns == 0 {
+                        continue;
+                    }
+                    // 与既有跳过数**累加**：两条脚本各跳 1 回合 = 跳 2 回合，不互相覆盖。
+                    let base = self
+                        .state
+                        .lock()
+                        .expect("state poisoned")
+                        .turn
+                        .skip
+                        .get(&entity)
+                        .copied()
+                        .unwrap_or(0);
+                    changes.push(turn_delta(
+                        &format!("turn/skip.{entity}"),
+                        DeltaOp::Set,
+                        serde_json::json!(base.saturating_add(*turns)),
+                    ));
+                }
+                // 时序原语（#GAP-I）：改某个预算槽（0 = 本轮不能再花这个预算）。
+                LuaRequest::SetBudget { target, budget, amount } => {
+                    let entity = self.resolve_lua_target(target, default_actor);
+                    let budget = budget.trim();
+                    if entity.is_empty() || budget.is_empty() {
+                        continue;
+                    }
+                    changes.push(turn_delta(
+                        &format!("turn/budget.{entity}.{budget}"),
+                        DeltaOp::Set,
+                        serde_json::json!((*amount).max(0)),
+                    ));
                 }
                 // 判定修正只在判定挂载点（check_pre_roll / check_post_roll）被消费；
                 // 其他时机抛出这类请求没有判定可改，忽略。
@@ -5795,6 +6394,76 @@ fn apply_delta(state: &mut WorldState, d: &StateDelta) {
                 state.meta = meta;
             }
         }
+        // 时序域（#GAP-I）：field 约定见 DeltaDomain::Turn 的文档。
+        DeltaDomain::Turn => match d.field.as_str() {
+            "turn/round" => {
+                if let Some(v) = d.value.as_u64() {
+                    state.turn.round = v as u32;
+                }
+            }
+            "turn/index" => {
+                if let Some(v) = d.value.as_u64() {
+                    state.turn.index = v as usize;
+                }
+            }
+            "turn/order" => {
+                if let Ok(v) = serde_json::from_value::<Vec<String>>(d.value.clone()) {
+                    state.turn.order = v;
+                    // 顺序变短后指针可能越界：夹回合法下標，绝不让它指向不存在的人。
+                    if state.turn.index >= state.turn.order.len() {
+                        state.turn.index = 0;
+                    }
+                }
+            }
+            other => {
+                if let Some(rest) = other.strip_prefix("turn/budget.") {
+                    // rest = "<实例键>.<预算id>"：预算 id 不含点（发布门校验），
+                    // 所以从**最后一个点**切分永远切在真正的分隔符上。
+                    if let Some((key, id)) = rest.rsplit_once('.') {
+                        match d.op {
+                            DeltaOp::Remove => {
+                                if let Some(m) = state.turn.budgets.get_mut(key) {
+                                    m.remove(id);
+                                }
+                            }
+                            DeltaOp::Add => {
+                                if let Some(v) = d.value.as_i64() {
+                                    let slot = state
+                                        .turn
+                                        .budgets
+                                        .entry(key.to_string())
+                                        .or_default()
+                                        .entry(id.to_string())
+                                        .or_insert(0);
+                                    *slot = slot.saturating_add(v);
+                                }
+                            }
+                            DeltaOp::Set => {
+                                if let Some(v) = d.value.as_i64() {
+                                    state
+                                        .turn
+                                        .budgets
+                                        .entry(key.to_string())
+                                        .or_default()
+                                        .insert(id.to_string(), v);
+                                }
+                            }
+                        }
+                    }
+                } else if let Some(key) = other.strip_prefix("turn/skip.") {
+                    match d.op {
+                        DeltaOp::Remove => {
+                            state.turn.skip.remove(key);
+                        }
+                        _ => {
+                            if let Some(v) = d.value.as_u64() {
+                                state.turn.skip.insert(key.to_string(), v as u32);
+                            }
+                        }
+                    }
+                }
+            }
+        },
         // v1 游玩页没有地点 / 关系 / 资源面板，保持 no-op。
         DeltaDomain::Location | DeltaDomain::Relationship | DeltaDomain::Resource => {}
     }
@@ -5902,6 +6571,7 @@ mod tests {
         WorldState {
             encounters: Default::default(),
             cooldowns: Default::default(),
+            turn: Default::default(),
             seq: 0,
             scene_id: "sc-1".into(),
             scene_title: "场景".into(),
@@ -10391,6 +11061,187 @@ mod tests {
         })
     }
 
+
+    // ---------- 时序与行动经济（#GAP-I） ----------
+
+    /// 未声明 world.turn → 时序整体关闭：不排先攻、闸门恒放行（旧行为逐字不变）。
+    #[tokio::test]
+    async fn turn_layer_is_inert_without_world_turn_declaration() {
+        let (session, _sink) = session_with(json!({ "world": {} }));
+        let _enc = create_encounter(&session, vec![temp_spec("灰狼", 11, 12)]).await;
+        assert!(
+            session.state.lock().unwrap().turn.order.is_empty(),
+            "未声明 world.turn 就不该排先攻"
+        );
+        let check = Intent::Check { attribute: "str".into(), difficulty: None, actor_id: None, opponent_id: None };
+        assert!(session.turn_gate(&check, None).is_ok(), "时序关闭时任何机械意图都放行");
+    }
+
+    /// 声明 world.turn + 建遭遇 → 排定先攻顺序与全员预算，且**随命令日志重放**。
+    #[tokio::test]
+    async fn turn_order_is_rolled_on_encounter_and_survives_replay() {
+        let sb = json!({
+            "characters": [{
+                "id": "mon-goblin", "name": "地精", "kind": "monster",
+                "attributes": { "dex": 14 }, "resources": { "hp": 7 }
+            }],
+            "world": {
+                "check": { "dice": "1d20" },
+                "turn": {
+                    "order": "initiative",
+                    "initiative": { "dice": "1d20", "attribute": "dex" },
+                    "budgets": [{ "id": "action", "amount": 1 }],
+                    "intent_budget": { "check": "action" }
+                }
+            }
+        });
+        let (session, _sink) = session_with_state(sb.clone(), state_with_pc());
+        let _enc = create_encounter(&session, vec![goblin_spec(2)]).await;
+        let (order, round, budgets) = {
+            let st = session.state.lock().unwrap();
+            (st.turn.order.clone(), st.turn.round, st.turn.budgets.clone())
+        };
+        assert_eq!(round, 1, "战斗开始即第 1 轮");
+        assert_eq!(order.len(), 3, "受控角色 + 2 只地精都该排进顺序：{order:?}");
+        assert_eq!(
+            order.iter().filter(|k| k.contains("mon-goblin")).count(),
+            2,
+            "两只地精实例都要在序里：{order:?}"
+        );
+        assert!(order.iter().all(|k| budgets.get(k).and_then(|m| m.get("action")).copied() == Some(1)),
+            "全员预算都该按声明建好：{budgets:?}");
+
+        let persisted = persisted_of(&session);
+        let (restarted, _s2) = session_with_state(sb, state_with_pc());
+        restarted.replay(&persisted);
+        assert_eq!(restarted.state.lock().unwrap().turn.order, order, "先攻顺序必须随日志重放");
+        assert_eq!(restarted.state.lock().unwrap().turn.round, round);
+    }
+
+    /// 固定先攻（fixed）：怪物先手，受控角色发机械意图被 not_your_turn 驳回。
+    #[tokio::test]
+    async fn fixed_initiative_rejects_actor_whose_turn_it_is_not() {
+        let sb = json!({
+            "characters": [{
+                "id": "mon-goblin", "name": "地精", "kind": "monster",
+                "attributes": { "dex": 14 }, "resources": { "hp": 7 }
+            }],
+            "world": {
+                "check": { "dice": "1d20" },
+                "turn": {
+                    "order": "fixed",
+                    "initiative": { "fixed": { "mon-goblin": 100 } },
+                    "budgets": [{ "id": "action", "amount": 1 }],
+                    "intent_budget": { "check": "action" }
+                }
+            }
+        });
+        let (session, _sink) = session_with_state(sb, state_with_pc());
+        let _enc = create_encounter(&session, vec![goblin_spec(1)]).await;
+        let order = session.state.lock().unwrap().turn.order.clone();
+        assert!(order[0].contains("mon-goblin"), "固定先攻 100 的怪物应当排第一：{order:?}");
+        assert_eq!(order.len(), 2, "怪物 + 受控角色：{order:?}");
+
+        let mila = ActorRef { id: "char-a".into(), name: "米拉".into() };
+        let check = Intent::Check { attribute: "str".into(), difficulty: None, actor_id: None, opponent_id: None };
+        let err = session.turn_gate(&check, Some(&mila)).expect_err("现在不是米拉的回合");
+        assert_eq!(err.0, RejectionCode::NotYourTurn, "{err:?}");
+
+        // end_turn 推进到下一个行动者：米拉拿到自己的回合，预算被重置。
+        session.end_turn();
+        {
+            let st = session.state.lock().unwrap();
+            assert_eq!(st.turn.order[st.turn.index], "char-a", "应当轮到米拉");
+        }
+        assert!(session.turn_gate(&check, Some(&mila)).is_ok(), "轮到米拉后应当放行");
+        assert_eq!(
+            session.state.lock().unwrap().turn.budgets["char-a"]["action"],
+            0,
+            "宣告即消耗：放行后 action 应当扣到 0"
+        );
+        let err2 = session.turn_gate(&check, Some(&mila)).expect_err("预算已耗尽");
+        assert_eq!(err2.0, RejectionCode::InsufficientBudget, "{err2:?}");
+    }
+
+    /// 「失去回合」（#GAP-I）：skip_turn 让目标跳过 N 个时序回合，其机械意图被驳回；
+    /// 跳过计数在下一次推进时被消耗，之后恢复行动。
+    #[tokio::test]
+    async fn skip_turn_makes_the_actor_lose_its_turn() {
+        let sb = json!({
+            "world": {
+                "check": { "dice": "1d20" },
+                "turn": {
+                    "order": "none",
+                    "budgets": [{ "id": "action", "amount": 1 }],
+                    "intent_budget": { "check": "action" }
+                }
+            }
+        });
+        let (session, _sink) = session_with_state(sb, state_with_pc());
+        let _enc = create_encounter(&session, vec![temp_spec("灰狼", 11, 12)]).await;
+        let key = session.state.lock().unwrap().turn.order[0].clone();
+        // 规则包原语（引擎不认识「突袭」，只认识「跳过几个回合」）。
+        session.apply_lua_requests(&[LuaRequest::SkipTurn { target: key.clone(), turns: 1 }], &key);
+        assert_eq!(session.state.lock().unwrap().turn.skip.get(&key).copied(), Some(1));
+
+        let me = ActorRef { id: key.clone(), name: "米拉".into() };
+        let check = Intent::Check { attribute: "str".into(), difficulty: None, actor_id: None, opponent_id: None };
+        let err = session.turn_gate(&check, Some(&me)).expect_err("本轮失去了回合");
+        assert_eq!(err.0, RejectionCode::NotYourTurn, "{err:?}");
+
+        session.end_turn();
+        assert_eq!(
+            session.state.lock().unwrap().turn.skip.get(&key).copied(),
+            None,
+            "跳过计数应当在推进时被消耗掉"
+        );
+        assert!(session.turn_gate(&check, Some(&me)).is_ok(), "下一轮恢复行动");
+    }
+
+    /// encounter_active（#GAP-I 顺带关掉 GAP-M）：有未结束遭遇才成立，且**不能**由
+    /// encounter_cleared 取反得到（没有遭遇时两者都不成立）。
+    #[tokio::test]
+    async fn encounter_active_condition_tracks_live_encounters() {
+        let (session, _sink) = session_with(json!({ "world": {} }));
+        let active = CondExpr::EncounterActive {};
+        let cleared = CondExpr::EncounterCleared {};
+        let eval = |c: &CondExpr, s: &Arc<Session>| {
+            s.with_eval_context("test", |ctx| eval_cond(c, ctx).unwrap_or(false))
+        };
+        assert!(!eval(&active, &session), "没有遭遇时 encounter_active 不成立");
+        assert!(!eval(&cleared, &session), "没有遭遇时 encounter_cleared 也不成立");
+        let _enc = create_encounter(&session, vec![temp_spec("灰狼", 11, 12)]).await;
+        assert!(eval(&active, &session), "有未结束的遭遇时成立");
+        assert!(!eval(&cleared, &session), "还有敌人活着 → 尚未清空");
+    }
+
+    /// Lua 只读口：`host.turn` 给事实（轮次 / 当前行动者 / 预算），不给规则语义。
+    #[tokio::test]
+    async fn lua_host_turn_exposes_readonly_facts() {
+        let sb = json!({
+            "world": {
+                "check": { "dice": "1d20" },
+                "turn": {
+                    "order": "none",
+                    "budgets": [{ "id": "action", "amount": 2 }],
+                    "intent_budget": { "check": "action" }
+                }
+            }
+        });
+        let (session, _sink) = session_with_state(sb, state_with_pc());
+        assert!(session.turn_snapshot().is_none(), "非战斗中读 host.turn 应当是 nil");
+        let _enc = create_encounter(&session, vec![temp_spec("灰狼", 11, 12)]).await;
+        let snap = session.turn_snapshot().expect("战斗中应当有 host.turn");
+        assert_eq!(snap.get("round").and_then(Value::as_u64), Some(1));
+        assert!(snap.get("current").and_then(Value::as_str).is_some(), "当前行动者要可见");
+        assert_eq!(
+            snap.pointer("/budgets/action").and_then(Value::as_i64),
+            Some(2),
+            "预算事实要交给规则包：{snap}"
+        );
+        assert_eq!(snap.get("combat").and_then(Value::as_bool), Some(true));
+    }
+
     fn goblin_spec(count: u32) -> octopus_types::EnemySpec {
         octopus_types::EnemySpec {
             name: "地精".into(),
@@ -11006,7 +11857,7 @@ mod tests {
     async fn lmop_draft_bestiary_creates_real_instances() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../story_example/lmop-storybook.draft.json"
+            "/../../story_example/dnd/lmop-storybook.draft.json"
         );
         let Ok(raw) = std::fs::read_to_string(path) else {
             eprintln!("跳过：找不到 LMoP 草稿 {path}");

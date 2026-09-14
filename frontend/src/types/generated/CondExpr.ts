@@ -3,4 +3,4 @@
 /**
  * 条件表达式（#13）：结构化 JSON 表达式树 + Lua 兜底（与 #12「声明式核心 + Lua 钩子」同构）。
  */
-export type CondExpr = { "op": "all_of", children: Array<CondExpr>, } | { "op": "any_of", children: Array<CondExpr>, } | { "op": "not", child: CondExpr, } | { "op": "trigger_fired", trigger_id: string, } | { "op": "flag_set", flag: string, } | { "op": "at_location", location_id: string, } | { "op": "attribute_ge", attribute: string, value: number, } | { "op": "relationship_ge", from: string, to: string, type: string, value: number, } | { "op": "encounter_cleared", } | { "op": "lua", script: string, };
+export type CondExpr = { "op": "all_of", children: Array<CondExpr>, } | { "op": "any_of", children: Array<CondExpr>, } | { "op": "not", child: CondExpr, } | { "op": "trigger_fired", trigger_id: string, } | { "op": "flag_set", flag: string, } | { "op": "at_location", location_id: string, } | { "op": "attribute_ge", attribute: string, value: number, } | { "op": "relationship_ge", from: string, to: string, type: string, value: number, } | { "op": "encounter_cleared", } | { "op": "encounter_active", } | { "op": "lua", script: string, };

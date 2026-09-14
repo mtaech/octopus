@@ -3,6 +3,7 @@ import type { EncounterView } from "./EncounterView";
 import type { ProjectionMeta } from "./ProjectionMeta";
 import type { QuestView } from "./QuestView";
 import type { SkeletonProgress } from "./SkeletonProgress";
+import type { TurnView } from "./TurnView";
 
 export type WorldProjection = { seq: bigint, scene_id: string, scene_title: string, characters: Record<string, unknown>, controlled: Array<string>, flags: Record<string, unknown>, progress: SkeletonProgress, 
 /**
@@ -12,4 +13,8 @@ quests: Array<QuestView>,
 /**
  * 结构化遭遇（导演创建）。
  */
-encounters: Array<EncounterView>, locations: Array<unknown>, meta: ProjectionMeta, };
+encounters: Array<EncounterView>, 
+/**
+ * 时序（#GAP-I）：不在时序中时为 None，前端与提示词据此显示「轮到谁」。
+ */
+turn?: TurnView | null, locations: Array<unknown>, meta: ProjectionMeta, };

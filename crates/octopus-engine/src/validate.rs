@@ -1458,6 +1458,158 @@ pub fn validate_storybook(sb: &Value) -> Vec<ValidationIssue> {
             }
         }
     }
+
+    // 6d-2. world.turn（时序 #GAP-I）：顺序来源 / 先攻属性 / 预算声明 / 悬空预算引用。
+    //
+    // 缺省不声明 = 时序整体关闭（旧故事书零影响）；一旦声明就必须自洽——运行期对坏声明
+    // 一律**静默丢弃**（不让一个回合失败），所以发布门是唯一的报错点。
+    if let Some(turn) = sb.pointer("/world/turn").filter(|v| v.is_object()) {
+        let target = Some("world.turn".to_string());
+        let order = turn.get("order").and_then(Value::as_str).unwrap_or("none").trim();
+        if !["none", "initiative", "fixed"].contains(&order) {
+            issues.push(ValidationIssue {
+                severity: IssueSeverity::Error,
+                code: "invalid_turn_order".to_string(),
+                target: target.clone(),
+                message: format!(
+                    "world.turn.order 只能是 none / initiative / fixed，实际「{order}」"
+                ),
+                related_refs: None,
+            });
+        }
+        // 先攻属性必须是已声明的属性维度（与 world.check 的 attributes 同口径、同错误码）。
+        // 这里就地收集维度键：world.turn 的自洽性检查自成一段，不依赖别处的局部变量。
+        let dim_keys: HashSet<String> = sb
+            .get("attribute_dimensions")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|d| d.get("key").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(attr) = turn
+            .pointer("/initiative/attribute")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if !dim_keys.contains(attr) {
+                issues.push(ValidationIssue {
+                    severity: IssueSeverity::Error,
+                    code: "unknown_check_attribute".to_string(),
+                    target: Some("world.turn.initiative".to_string()),
+                    message: format!(
+                        "attribute '{attr}' is not declared in attribute_dimensions"
+                    ),
+                    related_refs: Some(vec![attr.to_string()]),
+                });
+            }
+        }
+        // 预算 id：非空 / 唯一 / 不含点（点被 delta 字段名当分隔符）/ 额度为正。
+        let mut budget_ids: Vec<String> = Vec::new();
+        if let Some(list) = turn.get("budgets").and_then(Value::as_array) {
+            for (i, b) in list.iter().enumerate() {
+                let id = b
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .unwrap_or("");
+                if id.is_empty() {
+                    issues.push(ValidationIssue {
+                        severity: IssueSeverity::Error,
+                        code: "empty_budget_id".to_string(),
+                        target: target.clone(),
+                        message: format!("world.turn.budgets[{i}] 缺 id"),
+                        related_refs: None,
+                    });
+                    continue;
+                }
+                if id.contains('.') {
+                    issues.push(ValidationIssue {
+                        severity: IssueSeverity::Error,
+                        code: "invalid_budget_id".to_string(),
+                        target: target.clone(),
+                        message: format!("预算 id「{id}」不能含「.」（delta 字段名以点分隔）"),
+                        related_refs: None,
+                    });
+                }
+                if budget_ids.iter().any(|x| x == id) {
+                    issues.push(ValidationIssue {
+                        severity: IssueSeverity::Error,
+                        code: "duplicate_budget_id".to_string(),
+                        target: target.clone(),
+                        message: format!("重复的预算 id「{id}」"),
+                        related_refs: Some(vec![id.to_string()]),
+                    });
+                } else {
+                    budget_ids.push(id.to_string());
+                }
+                if b.get("amount").and_then(Value::as_i64).unwrap_or(0) <= 0 {
+                    issues.push(ValidationIssue {
+                        severity: IssueSeverity::Error,
+                        code: "invalid_budget_amount".to_string(),
+                        target: target.clone(),
+                        message: format!("预算「{id}」的 amount 必须是正整数"),
+                        related_refs: None,
+                    });
+                }
+            }
+        }
+        // 悬空引用：intent_budget 的值与 skill.budget 的 budget 都必须是已声明的预算 id。
+        if let Some(map) = turn.get("intent_budget").and_then(Value::as_object) {
+            for (intent, v) in map {
+                let id = v.as_str().map(str::trim).unwrap_or("");
+                if !budget_ids.iter().any(|x| x == id) {
+                    issues.push(ValidationIssue {
+                        severity: IssueSeverity::Error,
+                        code: "dangling_budget_ref".to_string(),
+                        target: Some(format!("world.turn.intent_budget.{intent}")),
+                        message: format!("引用了未声明的行动预算「{id}」"),
+                        related_refs: Some(vec![id.to_string()]),
+                    });
+                }
+            }
+        }
+        let mut skill_uses_budget = false;
+        if let Some(skills) = sb.get("skills").and_then(Value::as_array) {
+            for s in skills {
+                let sid = s.get("id").and_then(Value::as_str).unwrap_or("");
+                let Some(list) = s.get("budget").and_then(Value::as_array) else { continue };
+                for b in list {
+                    skill_uses_budget = true;
+                    let id = b
+                        .get("budget")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .unwrap_or("");
+                    if !budget_ids.iter().any(|x| x == id) {
+                        issues.push(ValidationIssue {
+                            severity: IssueSeverity::Error,
+                            code: "dangling_budget_ref".to_string(),
+                            target: Some(format!("skill:{sid}.budget")),
+                            message: format!("技能「{sid}」引用了未声明的行动预算「{id}」"),
+                            related_refs: Some(vec![id.to_string()]),
+                        });
+                    }
+                }
+            }
+        }
+        // 声明了预算却没有任何消耗口径 → 警告（不是错误：只约束顺序也说得通）。
+        if !budget_ids.is_empty()
+            && turn.get("intent_budget").is_none()
+            && !skill_uses_budget
+        {
+            issues.push(ValidationIssue {
+                severity: IssueSeverity::Warning,
+                code: "budget_without_cost".to_string(),
+                target: target.clone(),
+                message: "声明了行动预算，但 intent_budget 与任何 skill.budget 都没说谁消耗它——预算将永远不减少".to_string(),
+                related_refs: None,
+            });
+        }
+    }
     if let Some(chars) = sb.get("characters").and_then(|v| v.as_array()) {
         for c in chars {
             let cid = c.get("id").and_then(|v| v.as_str()).unwrap_or("");
@@ -3310,6 +3462,91 @@ mod tests {
         assert!(!validate_storybook(&plain)
             .iter()
             .any(|i| i.code.starts_with("invalid_lua_mount") || i.code.contains("lua_mount")));
+    }
+
+    /// 时序声明（#GAP-I）：world.turn 的自洽性由发布门把关——运行期对坏声明一律静默丢弃，
+    /// 所以这里是唯一的报错点。
+    #[test]
+    fn world_turn_declaration_is_validated() {
+        let codes = |sb: &Value| -> Vec<String> {
+            validate_storybook(sb).into_iter().map(|i| i.code).collect()
+        };
+        let mut sb = crate::seed::seed_storybooks()[0].json.clone();
+        // 缺省不声明 → 与旧故事书一样，一条时序相关报错都不该有。
+        assert!(
+            !codes(&sb)
+                .iter()
+                .any(|c| c.contains("turn") || c.contains("budget")),
+            "未声明 world.turn 时不该有任何时序相关报错"
+        );
+
+        // 有属性维度就用它，没有就跳过「先攻属性」那一段（种子数据可能没有六维）。
+        let attr = sb
+            .get("attribute_dimensions")
+            .and_then(Value::as_array)
+            .and_then(|a| a.first())
+            .and_then(|d| d.get("key"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+
+        sb["world"]["turn"] = json!({
+            "order": "initiative",
+            "initiative": { "dice": "1d20", "attribute": attr.clone() },
+            "budgets": [{ "id": "action", "amount": 1 }],
+            "intent_budget": { "strike": "action" }
+        });
+        let c = codes(&sb);
+        assert!(!c.contains(&"invalid_turn_order".to_string()), "合法声明不该报错：{c:?}");
+        assert!(!c.contains(&"dangling_budget_ref".to_string()), "合法引用不该报错：{c:?}");
+
+        // 非法 order
+        sb["world"]["turn"]["order"] = json!("roll");
+        assert!(codes(&sb).contains(&"invalid_turn_order".to_string()));
+        sb["world"]["turn"]["order"] = json!("initiative");
+
+        // 悬空预算引用（intent_budget 与 skill.budget 两条路）
+        sb["world"]["turn"]["intent_budget"] = json!({ "strike": "bonus" });
+        assert!(codes(&sb).contains(&"dangling_budget_ref".to_string()));
+        sb["world"]["turn"]["intent_budget"] = json!({ "strike": "action" });
+        // 种子故事书可能没有技能：补一条探针技能来测「skill.budget 悬空引用」这条路。
+        {
+            if !sb.get("skills").is_some_and(Value::is_array) {
+                sb["skills"] = json!([]);
+            }
+            let skills = sb["skills"].as_array_mut().unwrap();
+            if skills.is_empty() {
+                skills.push(json!({ "id": "sk-probe", "name": "探针" }));
+            }
+            skills[0]["budget"] = json!([{ "budget": "bonus", "amount": 1 }]);
+        }
+        assert!(codes(&sb).contains(&"dangling_budget_ref".to_string()));
+        sb["skills"][0].as_object_mut().unwrap().remove("budget");
+
+        // 重复 id + 非正额度
+        sb["world"]["turn"]["budgets"] =
+            json!([{ "id": "action", "amount": 1 }, { "id": "action", "amount": 0 }]);
+        let c = codes(&sb);
+        assert!(c.contains(&"duplicate_budget_id".to_string()), "{c:?}");
+        assert!(c.contains(&"invalid_budget_amount".to_string()), "{c:?}");
+        sb["world"]["turn"]["budgets"] = json!([{ "id": "action", "amount": 1 }]);
+
+        // 未声明的先攻属性
+        if let Some(attr) = &attr {
+            sb["world"]["turn"]["initiative"]["attribute"] = json!("luck");
+            assert!(codes(&sb).contains(&"unknown_check_attribute".to_string()));
+            sb["world"]["turn"]["initiative"]["attribute"] = json!(attr);
+        }
+
+        // 声明了预算却没人消耗它 → 警告（不是错误）。
+        sb["world"]["turn"] = json!({ "budgets": [{ "id": "action", "amount": 1 }] });
+        let issues = validate_storybook(&sb);
+        let warn = issues.iter().find(|i| i.code == "budget_without_cost");
+        assert!(
+            warn.is_some(),
+            "应当给「预算没人消耗」的警告：{:?}",
+            issues.iter().map(|i| i.code.clone()).collect::<Vec<_>>()
+        );
+        assert!(matches!(warn.unwrap().severity, IssueSeverity::Warning));
     }
 
     /// 时机原语（L4）：`status_tick` / `turn_end` / `scene_end` 是合法挂载点名；

@@ -310,6 +310,16 @@ pub enum LuaRequest {
     /// 未命中，也照常结算效果」——证据是因子 1.0 与「不声明」行为并不相同。
     /// 只想开门、不想缩放时用 [`LuaRequest::ForceEffect`]。
     ScaleEffect { factor: f64 },
+    /// 失去回合（时序通用原语，#GAP-I）：让目标跳过接下来 N 个时序回合。
+    ///
+    /// 引擎不认识「突袭 / 眩晕 / 定身」——它只认识「这个人接下来 N 个回合不能行动」；
+    /// 何时该跳过由规则包 Lua 决定（在 event / turn_end 等挂载点读 host.turn 后自行判断）。
+    SkipTurn { target: String, turns: u32 },
+    /// 改行动预算（时序通用原语，#GAP-I）：把目标的某个预算设成给定值（0 = 本轮不能再花）。
+    ///
+    /// 与 `SkipTurn` 的关系：`skip_turn` 跳整个回合，`set_budget` 只动一个预算槽
+    ///（如「本轮不能再用附赠动作」）。两者都不含规则集语义。
+    SetBudget { target: String, budget: String, amount: i64 },
     /// 打开效果门（通用原语）：声明「即使判定成功 / 未命中，也照常结算效果一次」。
     ///
     /// 与 [`LuaRequest::ScaleEffect`] **正交**：它不改变任何数值（缩放是 ScaleEffect
@@ -341,15 +351,29 @@ pub struct LuaHostContext {
     pub target: Option<Value>,
     /// 当前技能 / 物品声明式定义（可选）。
     pub skill: Option<Value>,
+    /// 当前场景 id。
+    ///
+    /// 注意位置：协议插件的 `protocol.preamble` **拿不到它**（系统层必须逐回合稳定，
+    /// 见 `protocol::preamble_context`）；它只进 `parse` / `normalize` 的上下文。
     pub scene_id: String,
+    /// 当前回合号。与 `scene_id` 同口径：不进协议插件的 `preamble` 上下文。
     pub round: u32,
+    /// 时序只读快照（#GAP-I）：`{round, order, index, current, budgets, combat}`。
+    /// 不在时序中时为 None → 脚本读 `host.turn` 得到 nil（与 `host.event_name` 同口径）。
+    pub turn: Option<Value>,
     /// 本次判定的难度（供 Lua 判定脚本读取）。
     pub difficulty: Option<i64>,
     /// 与当前角色相关的有向关系边。
     pub relationships: Vec<Value>,
     /// 在场角色 id 列表（协议插件的只读快照，对齐提示词的「在场角色」名单）。
+    ///
+    /// 与 `scene_id` 同口径：只进 `parse` / `normalize`，不进 `preamble`——
+    /// 在场名单逐回合会变，拼进系统层会让「系统层 + 全部历史」每回合按原价重算。
+    /// 需要「按在场角色改变可用动作」时用工具白名单（`declarative.intents`）。
     pub present: Vec<String>,
     /// 受控角色（提示词里的「名字(id)」形态）；协议插件只读。
+    ///
+    /// 与 `present` 同口径：不进 `preamble` 上下文（同上）。
     pub controlled: String,
 }
 
@@ -682,6 +706,11 @@ impl LuaHost {
         }
         host.set("present", present).map_err(lua_err)?;
         host.set("storage", self.script_storage(&ctx.script_id)?).map_err(lua_err)?;
+
+        // 时序只读快照（#GAP-I）：不在时序中时为 nil。
+        if let Some(turn) = &ctx.turn {
+            host.set("turn", json_to_lua(lua, turn)?).map_err(lua_err)?;
+        }
 
         // 事件上下文（Event 挂载点）：事件名 + 只读事实快照。
         // 引擎只负责把「发生了什么」与相关事实原样交给脚本，不解释 data 的内容。
@@ -1152,6 +1181,22 @@ impl LuaHost {
                 .map_err(|e| format!("即时效果形状非法（kind / amount / resource）：{e}"))?;
             Ok(LuaRequest::ApplyEffect { target, effect: value })
         });
+
+        // ---- 时序原语（#GAP-I）----
+        // 引擎不认识「突袭 / 眩晕 / 定身」：只认识「跳过 N 个时序回合」与「把某预算改成多少」。
+        // 何时该这么做、对谁做，全由规则包 Lua 读 host.turn 后自行判断。
+        push!("skip_turn", |(target, turns): (String, Option<i64>)| LuaRequest::SkipTurn {
+            target,
+            turns: turns.unwrap_or(1).clamp(0, 100) as u32,
+        });
+        push!(
+            "set_budget",
+            |(target, budget, amount): (String, String, i64)| LuaRequest::SetBudget {
+                target,
+                budget,
+                amount,
+            }
+        );
 
         // 加减资源：可正可负、可指定目标（不受「当前 actor 消耗」限制）。
         push!("modify_resource", |(target, resource, amount): (String, String, i64)| {
@@ -1735,6 +1780,14 @@ mod tests {
         assert_eq!(LuaMount::Protocol.as_str(), "protocol");
     }
 
+    /// 协议挂载点只读：不得写世界、不得产生 LuaRequest。
+    ///
+    /// 这里用 `preamble` 验证的是「host 会把调用方给的上下文交给脚本」——是 host 的管道
+    /// 测试，不是协议契约。**运行期** `protocol.preamble` 拿到的上下文由
+    /// `protocol::preamble_context()` 构造，逐回合字段（场景 / 回合号 / 在场 / 受控）一律
+    /// 为空：系统层必须逐回合逐字不变，否则「系统层 + 全部历史」每回合按原价重算
+    /// （AGENTS.md 上下文缓存不变量）。契约由发布门 `protocol::check_preamble_stability`
+    /// 与 `protocol::tests::lua_protocol_preamble_sees_no_per_turn_fields` 把住。
     #[test]
     fn protocol_mount_is_read_only_and_exposes_context() {
         let host = LuaHost::new(1).unwrap();

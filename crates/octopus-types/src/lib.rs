@@ -133,6 +133,9 @@ pub enum CondExpr {
     /// 当前场景的遭遇已清空（地图 P5 §6.5）：该场景的遭遇全部结束，或敌人全灭。
     /// 让「清剿」有自然判据，不必绕道 flag_set 让导演记得设标记。
     EncounterCleared {},
+    /// 当前场景存在未结束的遭遇（#GAP-I 顺带关掉 GAP-M）：时序层「在战斗中」的判据。
+    /// 与 `EncounterCleared` 互补——后者取反得不到「有遭遇」，所以要独立原子谓词。
+    EncounterActive {},
     Lua { script: String },
 }
 
@@ -142,6 +145,42 @@ pub enum CondExpr {
 pub struct ResourceCost {
     pub resource: String,
     pub amount: i64,
+}
+
+/// 技能的行动预算消耗（时序 #GAP-I）：与 `ResourceCost` 对称——一个扣资源，一个扣时序预算。
+///
+/// `budget` 引用 `world.turn.budgets` 声明的预算 id；未声明消耗的机械意图按
+/// `world.turn.intent_budget` 的缺省口径处理（缺省 = 不扣，作者必须显式）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+#[ts(export)]
+pub struct BudgetCost {
+    pub budget: String,
+    pub amount: i64,
+}
+
+/// 时序投影（提示词 / 前端只读）：引擎公开的时序事实。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TurnView {
+    /// 战斗轮（1 起）；与「玩家输入次数」的 `round` 不是一回事。
+    pub round: u32,
+    /// 先攻顺序（显示名，按行动先后）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub order: Vec<String>,
+    /// 当前行动者的显示名；不在时序中时为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<String>,
+    /// 当前行动者的剩余预算（只含声明过的预算）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub budgets: Vec<BudgetView>,
+}
+
+/// 一条剩余预算（时序投影用）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct BudgetView {
+    pub id: String,
+    pub left: i64,
 }
 
 /// 技能冷却（#01）。
@@ -288,6 +327,9 @@ pub struct SkillDef {
     pub category: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cost: Vec<ResourceCost>,
+    /// 行动预算消耗（时序 #GAP-I）：与 `cost` 对称。缺省 = 按 `world.turn.intent_budget` 口径。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub budget: Vec<BudgetCost>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cooldown: Option<Cooldown>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -384,6 +426,9 @@ pub enum DeltaDomain {
     Relationship,
     Resource,
     Flag,
+    /// 时序域（#GAP-I）：value = 该字段的新值，field 见 session 的 turn delta 约定
+    ///（`turn/active` · `turn/round` · `turn/index` · `turn/order` · `turn/budget.<实例键>.<预算id>` · `turn/skip.<实例键>`）。
+    Turn,
     /// 全量状态检查点（#14 新原点 / 升级基座）：value = 序列化的世界状态。
     /// 唯一用途是让「日志被归档后的重放」与「故事书换版后的重放」有确定基线；
     /// 历史日志里的旧 delta 仍照常逐条应用。
@@ -826,6 +871,11 @@ pub enum Intent {
     /// 派生数据：引擎**不产生叙事事件、不改世界状态**，只写派生表 round_summaries；
     /// 重放忽略它，删掉也能从回合重建（最坏退化为空）。提示词里属可选但鼓励。
     Summary { text: String },
+    /// 结束当前行动者的时序回合（#GAP-I）：引擎推进指针、按 reset 重置预算。
+    ///
+    /// **与 `FinishTurn` 不是一回事**：`FinishTurn` 是 AI 工具循环的终止信号（不算意图、
+    /// 不进日志），本意图是**世界状态变更**——它落 delta、改变「轮到谁」。
+    EndTurn,
     FinishTurn,
 }
 
@@ -891,6 +941,10 @@ pub enum RejectionCode {
     ActorNotControlled,
     TargetInvalid,
     InsufficientResource,
+    /// 行动预算不足（时序 #GAP-I）：与 InsufficientResource 同构——一个缺资源，一个缺行动。
+    InsufficientBudget,
+    /// 不是你的时序回合（或本轮被跳过）：机械意图只能由当前行动者发出。
+    NotYourTurn,
     CooldownActive,
     /// 使用物品时未持有该物品（#01 物品栏）。
     ItemNotOwned,
@@ -905,6 +959,8 @@ impl RejectionCode {
             Self::ActorNotControlled => "actor_not_controlled",
             Self::TargetInvalid => "target_invalid",
             Self::InsufficientResource => "insufficient_resource",
+            Self::InsufficientBudget => "insufficient_budget",
+            Self::NotYourTurn => "not_your_turn",
             Self::CooldownActive => "cooldown_active",
             Self::ItemNotOwned => "item_not_owned",
             Self::RuleViolation => "rule_violation",
@@ -1076,6 +1132,9 @@ pub struct WorldProjection {
     pub quests: Vec<QuestView>,
     /// 结构化遭遇（导演创建）。
     pub encounters: Vec<EncounterView>,
+    /// 时序（#GAP-I）：不在时序中时为 None，前端与提示词据此显示「轮到谁」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<TurnView>,
     #[ts(type = "Array<unknown>")]
     pub locations: Vec<Value>,
     pub meta: ProjectionMeta,

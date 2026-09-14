@@ -637,6 +637,7 @@ fn build_state(save: &SaveDetail) -> WorldState {
         locations,
         meta,
         cooldowns: BTreeMap::new(),
+        turn: Default::default(),
         rng_seed: fnv1a(&save.item.id),
         // 新档 RNG 从 0 起；快照 / 检查点会在重放时覆盖它（#06 ②）。
         rng_position: 0,
@@ -905,6 +906,8 @@ async fn run_lua(Json(req): Json<Value>) -> Result<Json<Value>, ApiError> {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
+        // 编辑器试跑没有会话 / 世界状态：时序快照恒为 None（脚本读到 host.turn = nil）。
+        turn: None,
     };
     let outcome: Result<Value, String> = match mode {
         "condition" => host
@@ -5460,6 +5463,7 @@ mod lua_run_tests {
                 auto_confirm: false,
             },
             cooldowns: Default::default(),
+        turn: Default::default(),
             rng_seed: 7,
             rng_position: 0,
         };

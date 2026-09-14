@@ -3,4 +3,4 @@
 /**
  * 六种驳回码（#04 校验阶段）+ 玩家取消。
  */
-export type RejectionCode = "actor_not_found" | "actor_not_controlled" | "target_invalid" | "insufficient_resource" | "cooldown_active" | "item_not_owned" | "rule_violation" | "cancelled";
+export type RejectionCode = "actor_not_found" | "actor_not_controlled" | "target_invalid" | "insufficient_resource" | "insufficient_budget" | "not_your_turn" | "cooldown_active" | "item_not_owned" | "rule_violation" | "cancelled";

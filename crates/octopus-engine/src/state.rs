@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 
 use octopus_types::{
-    CharacterInstance, EncounterView, ProjectionMeta, QuestView, Seq, SkeletonProgress,
-    StatusInstance, WorldProjection,
+    BudgetView, CharacterInstance, EncounterView, ProjectionMeta, QuestView, Seq, SkeletonProgress,
+    StatusInstance, TurnView, WorldProjection,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -40,6 +40,28 @@ pub struct WorldState {
     /// 与「快照 + 其后命令」两条路径的骰序一致。旧快照 / 检查点缺省为 0。
     #[serde(default)]
     pub rng_position: u64,
+    /// 时序运行时状态（#GAP-I）；`order` 为空即「不在时序中」。随命令日志重放。
+    #[serde(default)]
+    pub turn: TurnState,
+}
+
+/// 时序运行时状态（#GAP-I）：顺序 + 指针 + 每角色剩余预算 + 跳过次数。
+///
+/// **只由 \`DeltaDomain::Turn\` 的 delta 变更**（\`apply_delta\` 是唯一变更路径），随命令日志重放；
+/// 旧存档 / 旧快照缺省为空。**「是否在时序中」是派生态**——「故事书声明了 world.turn」
+/// 且「当前场景有未结束的遭遇」，不额外存一个可能与遭遇不同步的 active 字段。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TurnState {
+    /// 时序轮（1 起）：与「玩家输入次数」的全局 round 不是一回事。
+    pub round: u32,
+    /// 先攻顺序（角色实例键，按行动先后）。
+    pub order: Vec<String>,
+    /// 当前行动者在 \`order\` 中的下标。
+    pub index: usize,
+    /// 实例键 → 预算 id → 剩余。
+    pub budgets: BTreeMap<String, BTreeMap<String, i64>>,
+    /// 实例键 → 还要跳过的时序回合数（「失去回合」的载体）。
+    pub skip: BTreeMap<String, u32>,
 }
 
 impl WorldState {
@@ -88,9 +110,41 @@ impl WorldState {
             progress: self.progress.clone(),
             quests,
             encounters,
+            turn: self.turn_view(),
             locations: self.locations.clone(),
             meta: self.meta.clone(),
         }
+    }
+
+    /// 时序投影（#GAP-I）：没有顺序（不在时序中）时 None。
+    ///
+    /// 显示名优先取实例的 name；实例已不在表里（旧日志 / 实例被清理）时回落实例键本身，
+    /// 绝不因为一个查不到的键丢掉整段时序信息。
+    pub fn turn_view(&self) -> Option<TurnView> {
+        if self.turn.order.is_empty() {
+            return None;
+        }
+        let name_of = |k: &String| {
+            self.characters
+                .get(k)
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| k.clone())
+        };
+        let current_key = self.turn.order.get(self.turn.index);
+        let budgets = current_key
+            .and_then(|k| self.turn.budgets.get(k))
+            .map(|m| {
+                m.iter()
+                    .map(|(id, left)| BudgetView { id: id.clone(), left: *left })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(TurnView {
+            round: self.turn.round,
+            order: self.turn.order.iter().map(name_of).collect(),
+            current: current_key.map(name_of),
+            budgets,
+        })
     }
 
     /// 插入 / 替换一个**完整角色实例**（图鉴 M2）：怪物克隆走 delta 的唯一变更路径。
