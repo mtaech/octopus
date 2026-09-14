@@ -11,7 +11,8 @@ const defs = computed(() => {
   const d = store.detail
   return d ? d.storybook.world.resources : []
 })
-const panelActors = computed(() => store.presentChars)
+/** 在场角色**不含怪物**：怪物只在遭遇卡片 / 地图面板里出现（图鉴 §5.3）。 */
+const panelActors = computed(() => store.presentChars.filter(c => c.kind !== 'monster'))
 function onSwitch(id: string) { void store.switchTo(id) }
 </script>
 

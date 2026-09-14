@@ -1,9 +1,10 @@
 <script setup lang="ts">
-// CharacterPanel —— A「人物」tab：高质感游戏人物卡（RPG Character Card）
-// 优雅大气布局：左侧名册 + 右侧游戏人物卡（宽幅立绘框 + 身份操作 + 舒展叙事档案 + 6列对齐属性网格 + 资源槽）
+// CharacterPanel —— A「角色库」tab：玩家角色 / NPC / 怪物同住一处的模板面板。
+// 布局：左侧名册（按 kind 筛选）+ 右侧角色卡（立绘 + 身份 + 属性网格 + 资源槽）。
+// kind='monster' 时改为怪物数据卡：statblock 展示字段 + 攻击技能绑定（图鉴 M1 / 地图 P1）。
 import { computed, ref, onUnmounted } from 'vue'
 import { useEditorStore } from '../../stores/editor'
-import type { AttributeDimension, CharacterDef, Definition, FieldDef, ItemDef, KindDef, SheetSection, SkillDef, StatusDef, AssetRef } from '@/types'
+import type { AttributeDimension, CharacterDef, Definition, FieldDef, ItemDef, KindDef, MonsterStatblock, SheetSection, SkillDef, StatusDef, AssetRef } from '@/types'
 import { uid } from '@/types'
 import { entityKey, useWorkbenchSelection } from './selection'
 import WorkbenchLayout, { type WorkbenchItem } from './WorkbenchLayout.vue'
@@ -31,6 +32,9 @@ import { assetUrl, toast, uploadAsset } from '@/api'
 import { importStFile } from '@/lib/st-import'
 import { computeDerived } from '@/lib/derived'
 import FieldText from '../fields/FieldText.vue'
+import FieldArea from '../fields/FieldArea.vue'
+import FieldNum from '../fields/FieldNum.vue'
+import FieldGrid from '../fields/FieldGrid.vue'
 import { nameTintClass, initial } from '@/pages/play/utils'
 import {
   IconCrown,
@@ -58,6 +62,7 @@ import {
   IconLayoutGrid,
   IconPencil,
   IconArrowsMaximize,
+  IconMapPin,
   IconMessageChatbot,
   IconNotes,
   IconEyeOff,
@@ -72,6 +77,32 @@ const selected = useWorkbenchSelection('characters')
 function select(id: string): void { selected.value = id }
 
 const chars = computed<CharacterDef[]>(() => d.value?.characters ?? [])
+
+// ---------------- 角色库：kind 筛选（玩家角色 / NPC / 怪物） ----------------
+type KindKey = 'pc' | 'npc' | 'monster'
+const KIND_TABS: { key: 'all' | KindKey; label: string }[] = [
+  { key: 'all', label: '全部' },
+  { key: 'pc', label: '玩家角色' },
+  { key: 'npc', label: 'NPC' },
+  { key: 'monster', label: '怪物' },
+]
+/** 名册徽标文案 */
+const KIND_BADGE: Record<KindKey, string> = { pc: '👑 PC', npc: 'NPC', monster: '☠ 怪物' }
+const kindFilter = ref<'all' | KindKey>('all')
+/** 归一 kind：字段缺失按 pc（历史行为，旧故事书不受影响） */
+function kindOf(c: CharacterDef): KindKey {
+  return c.kind === 'monster' ? 'monster' : c.kind === 'npc' ? 'npc' : 'pc'
+}
+const kindCounts = computed<Record<'all' | KindKey, number>>(() => ({
+  all: chars.value.length,
+  pc: chars.value.filter(c => kindOf(c) === 'pc').length,
+  npc: chars.value.filter(c => kindOf(c) === 'npc').length,
+  monster: chars.value.filter(c => kindOf(c) === 'monster').length,
+}))
+/** 当前筛选下的角色（名册与右栏都只看这一份） */
+const visibleChars = computed<CharacterDef[]>(() =>
+  kindFilter.value === 'all' ? chars.value : chars.value.filter(c => kindOf(c) === kindFilter.value),
+)
 const dims = computed<AttributeDimension[]>(() => d.value?.attribute_dimensions ?? [])
 const numDims = computed(() => dims.value.filter(dim => dim.type === 'number'))
 const otherDims = computed(() => dims.value.filter(dim => dim.type !== 'number'))
@@ -270,34 +301,46 @@ function derivedPreview(key: string): { text: string; tone: string } {
   return { text: (dv.signed && dv.value >= 0 ? '+' : '') + dv.value, tone: 'text-primary' }
 }
 
-const items = computed<WorkbenchItem[]>(() => chars.value.map(c => ({
-  id: entityKey(c),
-  title: c.name,
-  sub: c.id,
-  badge: c.kind === 'pc' ? 'PC' : 'NPC',
-  tone: c.kind === 'pc' ? 'ok' : 'default',
-})))
+const items = computed<WorkbenchItem[]>(() => visibleChars.value.map(c => {
+  const k = kindOf(c)
+  return {
+    id: entityKey(c),
+    title: c.name,
+    sub: c.id,
+    badge: KIND_BADGE[k],
+    tone: k === 'pc' ? 'ok' : k === 'monster' ? 'warn' : 'default',
+  } as WorkbenchItem
+}))
 
-const current = computed(() => chars.value.find(c => entityKey(c) === selected.value) ?? null)
+const current = computed(() => visibleChars.value.find(c => entityKey(c) === selected.value) ?? null)
+const currentKind = computed<KindKey | null>(() => (current.value ? kindOf(current.value) : null))
+/** 怪物：隐藏扮演向区块，改显示数据卡 */
+const isMonster = computed(() => currentKind.value === 'monster')
 
 /** 首个受控主角（开档默认主角） */
 const firstPcId = computed(() => chars.value.find(c => c.kind === 'pc')?.id ?? '')
 
+/** 新增角色：kind 跟随当前筛选（「全部」时首个角色为 PC，其余为 NPC） */
 function addCharacter(): void {
   const arr = d.value?.characters
   if (!arr) return
+  const k: KindKey = kindFilter.value !== 'all'
+    ? kindFilter.value
+    : (chars.value.some(c => kindOf(c) === 'pc') ? 'npc' : 'pc')
   const c: CharacterDef = {
     id: uid('char'),
-    name: '新角色',
-    kind: chars.value.length === 0 ? 'pc' : 'npc',
+    name: k === 'monster' ? '新怪物' : '新角色',
+    kind: k,
     background: '',
     personality: '',
     attributes: {},
     resources: {},
     skills: [],
+    ...(k === 'monster' ? { statblock: {} } : {}),
   }
   arr.unshift(c)
   selected.value = entityKey(c)
+  if (kindFilter.value !== 'all' && kindFilter.value !== k) kindFilter.value = k
 }
 
 function removeCharacter(c: CharacterDef): void {
@@ -305,6 +348,41 @@ function removeCharacter(c: CharacterDef): void {
   if (!arr) return
   const i = arr.indexOf(c)
   if (i >= 0) arr.splice(i, 1)
+}
+
+// ---------------- 怪物数据卡（图鉴 M1）：展示型字段 + 攻击技能绑定 ----------------
+/** 写 statblock 展示字段：留空即删，保持 JSON 干净 */
+function setStatField(c: CharacterDef, key: keyof MonsterStatblock, v: string): void {
+  if (!c.statblock) c.statblock = {}
+  if (v === '') delete c.statblock[key]
+  else if (key === 'xp') c.statblock.xp = Number(v) || undefined
+  else c.statblock[key] = v
+}
+/** 技能库里判定种类为「攻击」的技能（check.kind === 'attack'）——数据卡只从这里挑 */
+const attackSkills = computed<SkillDef[]>(() =>
+  availableSkills.value.filter(s => typeof s.check === 'object' && s.check?.kind === 'attack'),
+)
+function isSkillBound(c: CharacterDef, sid: string): boolean { return (c.skills ?? []).includes(sid) }
+/** 攻击技能绑定开关：直接落进角色的 skills[]（引擎按它结算攻击） */
+function toggleSkillBinding(c: CharacterDef, sid: string): void {
+  const list = c.skills ?? []
+  c.skills = list.includes(sid) ? list.filter(x => x !== sid) : [...list, sid]
+}
+const boundAttackCount = computed(() =>
+  (current.value?.skills ?? []).filter(sid => attackSkills.value.some(s => s.id === sid)).length,
+)
+/** 怪物 AC 实时预览：派生值里的 ac（缺失回落 12，与引擎同口径） */
+const acPreview = computed(() => derivedValues.value.find(x => x.key === 'ac') ?? null)
+
+// ---------------- 常驻地 / 出没地（地图 P1）：引用地点 ----------------
+const locationOptions = computed(() =>
+  (d.value?.world.locations ?? []).map(l => ({ value: l.id, label: l.name + ' · ' + l.id })),
+)
+/** reka Select 不接受空串，用哨兵占位 */
+const NO_LOCATION = '__no_location__'
+function setLocation(c: CharacterDef, v: string): void {
+  if (v && v !== NO_LOCATION) c.location_id = v
+  else delete c.location_id
 }
 
 // ---- SillyTavern 角色卡导入（PNG 内嵌 JSON / V2 JSON）+ 内嵌角色书词条 ----
@@ -569,7 +647,7 @@ function onDeleteClick(c: CharacterDef): void {
   if (deleteTimer) clearTimeout(deleteTimer)
   confirmingDeleteId.value = null
   removeCharacter(c)
-  toast('ok', `已删除人物「${c.name}」`)
+  toast('ok', `已删除角色「${c.name}」`)
 }
 
 onUnmounted(() => { if (deleteTimer) clearTimeout(deleteTimer) })
@@ -642,26 +720,44 @@ function gaugeClass(val: number, baseline = 10): string {
 
 <template>
   <WorkbenchLayout
-    title="人物"
-    hint="运行时实例化为角色实例；属性值消费全局属性维度，支持在场引用与判定。"
+    title="角色库"
+    hint="角色模板集合：玩家角色 / NPC / 怪物同住一处。属性消费全局维度；kind=monster 改显示数据卡与攻击技能。"
     :count="items.length"
     :items="items"
     :selected="selected"
-    add-label="人物"
-    search-placeholder="搜索角色姓名、ID、特质…"
-    empty-hint="还没有人物模板。点右上「人物」新增，或从 SillyTavern 角色卡导入。"
+    add-label="角色"
+    search-placeholder="搜索角色姓名、ID…"
+    empty-hint="还没有角色模板。用右上「新增」创建，或从 SillyTavern 角色卡导入。"
     custom-actions
     @update:selected="select"
     @add="addCharacter"
   >
+    <!-- 左栏：按 kind 筛选（玩家角色 / NPC / 怪物） -->
+    <template #railFilter>
+      <button
+        v-for="t in KIND_TABS"
+        :key="t.key"
+        type="button"
+        class="inline-flex cursor-pointer items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] transition-colors"
+        :class="kindFilter === t.key
+          ? 'border-primary/50 bg-primary/10 font-semibold text-primary'
+          : 'border-border text-muted-foreground hover:bg-muted/60'"
+        :title="'只显示「' + t.label + '」的角色'"
+        @click="kindFilter = t.key"
+      >
+        <span>{{ t.label }}</span>
+        <span class="font-mono text-[10px] opacity-70">{{ kindCounts[t.key] }}</span>
+      </button>
+    </template>
+
     <template #railActions>
       <Button variant="outline" size="sm" class="h-7 gap-1 px-2 text-xs" :disabled="stImporting" title="导入 SillyTavern 角色卡（PNG / V2 JSON）" @click="pickStFile">
         <IconFileImport class="size-3.5" />
         {{ stImporting ? '导入中…' : '导入' }}
       </Button>
-      <Button size="sm" class="h-7 gap-1 px-2 text-xs" @click="addCharacter">
+      <Button size="sm" class="h-7 gap-1 px-2 text-xs" title="按当前筛选分类新增角色" @click="addCharacter">
         <IconPlus class="size-3.5" />
-        人物
+        新增
       </Button>
       <input ref="stFileInput" type="file" accept=".png,.json,application/json,image/png" class="hidden" @change="onStFile" />
     </template>
@@ -713,9 +809,11 @@ function gaugeClass(val: number, baseline = 10): string {
           class="shrink-0 px-1.5 py-0 text-[9.5px] font-mono font-bold"
           :class="charByKey(item.id)?.kind === 'pc'
             ? 'border-primary/40 bg-primary/15 text-primary shadow-2xs'
-            : 'border-border/70 bg-muted/60 text-muted-foreground'"
+            : charByKey(item.id)?.kind === 'monster'
+              ? 'border-warning/50 bg-warning/10 text-warning'
+              : 'border-border/70 bg-muted/60 text-muted-foreground'"
         >
-          {{ charByKey(item.id)?.kind === 'pc' ? '👑 PC' : 'NPC' }}
+          {{ charByKey(item.id)?.kind === 'pc' ? '👑 PC' : charByKey(item.id)?.kind === 'monster' ? '☠ 怪物' : 'NPC' }}
         </Badge>
       </button>
     </template>
@@ -724,9 +822,11 @@ function gaugeClass(val: number, baseline = 10): string {
     <template v-if="current">
       <div
         class="relative mx-auto w-full max-w-5xl rounded-2xl border transition-all duration-300 shadow-md backdrop-blur-sm overflow-hidden"
-        :class="current.kind === 'pc'
+        :class="currentKind === 'pc'
           ? 'border-primary/50 bg-gradient-to-b from-primary/10 via-card/95 to-card ring-1 ring-primary/20 shadow-primary/5'
-          : 'border-border/80 bg-gradient-to-b from-muted/30 via-card/95 to-card shadow-sm'"
+          : currentKind === 'monster'
+            ? 'border-warning/50 bg-gradient-to-b from-warning/10 via-card/95 to-card ring-1 ring-warning/20 shadow-warning/5'
+            : 'border-border/80 bg-gradient-to-b from-muted/30 via-card/95 to-card shadow-sm'"
       >
         <!-- 卡片顶层控制栏：阵营切换 + 角色操作 -->
         <div class="flex flex-wrap items-center justify-between gap-3 border-b border-border/70 bg-card/60 px-5 py-3 backdrop-blur-xs">
@@ -736,34 +836,51 @@ function gaugeClass(val: number, baseline = 10): string {
               <button
                 type="button"
                 class="inline-flex cursor-pointer items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-bold transition-all"
-                :class="current.kind === 'pc'
+                :class="currentKind === 'pc'
                   ? 'bg-primary text-primary-foreground shadow-xs'
                   : 'text-muted-foreground hover:text-foreground'"
+                title="玩家角色：开档后可被选为受控主角"
                 @click="current.kind = 'pc'"
               >
                 <IconCrown class="size-3.5" />
-                <span>PC 主角</span>
+                <span>玩家角色</span>
               </button>
               <button
                 type="button"
                 class="inline-flex cursor-pointer items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-bold transition-all"
-                :class="current.kind !== 'pc'
+                :class="currentKind === 'npc'
                   ? 'bg-secondary text-secondary-foreground shadow-xs'
                   : 'text-muted-foreground hover:text-foreground'"
+                title="NPC：场景里可交互的故事角色"
                 @click="current.kind = 'npc'"
               >
                 <IconUsers class="size-3.5" />
-                <span>NPC 角色</span>
+                <span>NPC</span>
+              </button>
+              <button
+                type="button"
+                class="inline-flex cursor-pointer items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-bold transition-all"
+                :class="currentKind === 'monster'
+                  ? 'bg-warning text-warning-foreground shadow-xs'
+                  : 'text-muted-foreground hover:text-foreground'"
+                title="怪物：遭遇里的敌方单位，只承载结算数据与数据卡"
+                @click="current.kind = 'monster'"
+              >
+                <IconSwords class="size-3.5" />
+                <span>怪物</span>
               </button>
             </div>
 
             <Badge
-              v-if="current.kind === 'pc'"
+              v-if="currentKind === 'pc'"
               variant="outline"
               class="border-primary/30 bg-primary/10 text-[11px] font-medium text-primary hidden sm:inline-flex"
             >
               {{ current.id === firstPcId ? '默认开档主角' : '受控角色候选' }}
             </Badge>
+            <span v-else-if="currentKind === 'monster'" class="text-xs text-warning/90 hidden sm:inline">
+              怪物 · 遭遇中的敌方单位（不参与对话扮演）
+            </span>
             <span v-else class="text-xs text-muted-foreground/75 hidden sm:inline">
               故事角色 · 场景中可交互
             </span>
@@ -872,13 +989,38 @@ function gaugeClass(val: number, baseline = 10): string {
                 <!-- 唯一 ID 与 关系链提示 -->
                 <div class="flex flex-wrap items-center gap-2 pt-1 text-xs text-muted-foreground">
                   <span class="font-mono text-xs font-semibold">内部标识:</span>
-                  <input
-                    v-model="current.id"
-                    type="text"
-                    placeholder="唯一引用 ID"
-                    class="h-7 w-44 rounded-md border border-border/60 bg-muted/30 font-mono text-xs text-foreground px-2 focus:border-primary focus:bg-background focus:outline-none transition-colors"
-                  />
-                  <span class="text-xs text-muted-foreground/70 hidden sm:inline">（场景在场人物 / 关系网连线引用）</span>
+                  <span class="inline-flex items-center gap-1 rounded-md border border-dashed border-border bg-muted/25 px-2 py-1 transition-colors focus-within:border-solid focus-within:border-primary hover:border-solid hover:border-primary/60 hover:bg-muted/50">
+                    <input
+                      v-model="current.id"
+                      type="text"
+                      placeholder="唯一引用 ID"
+                      title="点击可修改 ID"
+                      class="h-5 w-40 bg-transparent font-mono text-xs text-foreground placeholder:text-muted-foreground/40 focus:outline-none"
+                    />
+                    <IconPencil class="size-3 shrink-0 text-muted-foreground/60" />
+                  </span>
+                  <span class="text-xs text-muted-foreground/70 hidden sm:inline">（场景在场名单 / 关系网连线引用）</span>
+                </div>
+
+                <!-- 常驻地 / 出没地（地图 P1）：引用 world.locations -->
+                <div class="flex flex-wrap items-center gap-2 pt-1 text-xs text-muted-foreground">
+                  <IconMapPin class="size-3.5 shrink-0 text-muted-foreground/60" />
+                  <span class="font-semibold">{{ isMonster ? '出没地' : '常驻地' }}</span>
+                  <Select
+                    :model-value="current.location_id ?? NO_LOCATION"
+                    @update:model-value="setLocation(current, String($event ?? ''))"
+                  >
+                    <SelectTrigger class="h-7 w-52 text-xs" :title="isMonster ? '怪物常出没的地点（遭遇继承它）' : 'NPC / PC 的常驻地点：场景按位置算在场'">
+                      <SelectValue placeholder="（未指定地点）" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectGroup>
+                        <SelectItem :value="NO_LOCATION" class="text-muted-foreground">（未指定）</SelectItem>
+                        <SelectItem v-for="o in locationOptions" :key="o.value" :value="o.value">{{ o.label }}</SelectItem>
+                      </SelectGroup>
+                    </SelectContent>
+                  </Select>
+                  <span v-if="!locationOptions.length" class="text-[11px] text-muted-foreground/60">世界还没有地点，去「世界」新增</span>
                 </div>
               </div>
 
@@ -903,8 +1045,98 @@ function gaugeClass(val: number, baseline = 10): string {
             </div>
           </div>
 
-          <!-- 叙事档案区域：背景渊源与性格特质（可放大到弹窗里写） -->
-          <div class="grid grid-cols-1 gap-3 pt-1 md:grid-cols-2">
+          <!-- 怪物数据卡（图鉴 M1）：kind='monster' 用数据卡替代扮演向区块 -->
+          <section v-if="isMonster" class="rounded-xl border border-warning/40 bg-warning/5 p-4 shadow-2xs">
+            <div class="mb-3 flex flex-wrap items-center gap-2">
+              <IconSwords class="size-4 shrink-0 text-warning" />
+              <span class="font-serif text-base font-bold text-foreground">怪物数据卡</span>
+              <Badge variant="outline" class="border-warning/40 bg-warning/10 px-1.5 font-mono text-[10.5px] text-warning">statblock</Badge>
+              <span
+                class="inline-flex items-center gap-1 rounded-md border border-border/70 bg-muted/40 px-2 py-0.5 font-mono text-[11px] text-foreground/90"
+                title="派生值 AC：由属性维度 + 修正来源实时算出；缺失时引擎回落 12"
+              >
+                <IconShield class="size-3.5 text-primary/70" />
+                AC {{ acPreview?.value ?? 12 }}
+              </span>
+              <span class="text-[11px] text-muted-foreground/70">展示型字段：引擎不读，也不进提示词</span>
+            </div>
+            <FieldGrid dense>
+              <FieldText
+                label="生物类型 / 阵营"
+                :model-value="current.statblock?.creatureType ?? ''"
+                placeholder="如「中型 不死生物，中立邪恶」"
+                @update:model-value="setStatField(current, 'creatureType', $event)"
+              />
+              <FieldText
+                label="挑战等级 CR"
+                :model-value="current.statblock?.challenge ?? ''"
+                placeholder="如 1/4"
+                @update:model-value="setStatField(current, 'challenge', $event)"
+              />
+              <FieldNum
+                label="经验值 XP"
+                :min="0"
+                :model-value="current.statblock?.xp ?? 0"
+                hint="仅展示（XP 合计由 Lua 在击败事件里做）"
+                @update:model-value="setStatField(current, 'xp', String($event))"
+              />
+              <FieldArea
+                label="特性 / 感官 / 免疫"
+                :rows="3"
+                :model-value="current.statblock?.traits ?? ''"
+                placeholder="如「伤害免疫：毒素；感官：黑暗视觉 18m；语言：理解通用语但不能说」"
+                @update:model-value="setStatField(current, 'traits', $event)"
+              />
+              <FieldArea
+                label="攻击动作描述"
+                :rows="3"
+                :model-value="current.statblock?.actionsNote ?? ''"
+                placeholder="攻击动作的文字描述（真正结算走下方「攻击技能」）"
+                @update:model-value="setStatField(current, 'actionsNote', $event)"
+              />
+            </FieldGrid>
+
+            <!-- 攻击技能绑定：只列 check.kind = 'attack' 的技能 -->
+            <div class="mt-4 border-t border-warning/25 pt-3">
+              <div class="mb-2 flex flex-wrap items-center gap-2">
+                <IconTarget class="size-4 shrink-0 text-warning" />
+                <span class="text-xs font-bold text-foreground">攻击技能</span>
+                <Badge variant="outline" class="px-1.5 font-mono text-[10.5px] text-muted-foreground">
+                  {{ boundAttackCount }} / {{ attackSkills.length }}
+                </Badge>
+                <span class="text-[11px] text-muted-foreground/70">绑定后引擎按这些技能结算怪物攻击（判定种类 check.kind = attack）</span>
+              </div>
+              <div
+                v-if="!attackSkills.length"
+                class="rounded-lg border border-dashed border-border/80 bg-muted/20 p-3 text-[11.5px] text-muted-foreground"
+              >
+                技能库里还没有攻击类技能。
+                <button type="button" class="ml-1 cursor-pointer font-bold text-primary underline underline-offset-2" @click="editor.activeTab = 'skills'">
+                  前往「技能」配置 check.kind = attack
+                </button>
+              </div>
+              <div v-else class="flex flex-wrap gap-1.5">
+                <button
+                  v-for="s in attackSkills"
+                  :key="s.id"
+                  type="button"
+                  class="inline-flex cursor-pointer items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11.5px] transition-colors"
+                  :class="isSkillBound(current, s.id)
+                    ? 'border-warning/60 bg-warning/15 font-semibold text-warning'
+                    : 'border-border text-muted-foreground hover:bg-muted/60'"
+                  :title="isSkillBound(current, s.id) ? '点击解绑' : '点击绑定为怪物的攻击技能'"
+                  @click="toggleSkillBinding(current, s.id)"
+                >
+                  <IconSwords class="size-3" />
+                  {{ s.name }}
+                  <span class="font-mono text-[10px] opacity-70">{{ isSkillBound(current, s.id) ? '已绑定' : '+ 绑定' }}</span>
+                </button>
+              </div>
+            </div>
+          </section>
+
+          <!-- 叙事档案区域：背景渊源与性格特质（扮演向；怪物隐藏） -->
+          <div v-if="!isMonster" class="grid grid-cols-1 gap-3 pt-1 md:grid-cols-2">
             <div class="flex flex-col gap-2 rounded-xl border border-border/70 bg-card/60 p-3.5 shadow-2xs transition-colors hover:border-border">
               <div class="flex items-center gap-1.5">
                 <IconBook2 class="size-4 shrink-0 text-primary" />
@@ -944,7 +1176,7 @@ function gaugeClass(val: number, baseline = 10): string {
 
           <!-- 对话示例（发给 AI 的风格样板）与作者注释（只给人看） -->
           <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
-            <div class="flex flex-col gap-2 rounded-xl border border-border/70 bg-card/60 p-3.5 shadow-2xs transition-colors hover:border-border">
+            <div v-if="!isMonster" class="flex flex-col gap-2 rounded-xl border border-border/70 bg-card/60 p-3.5 shadow-2xs transition-colors hover:border-border">
               <div class="flex items-center gap-1.5">
                 <IconMessageChatbot class="size-4 shrink-0 text-primary" />
                 <span class="text-xs font-bold text-foreground">对话示例</span>
@@ -962,7 +1194,10 @@ function gaugeClass(val: number, baseline = 10): string {
               ></textarea>
             </div>
 
-            <div class="flex flex-col gap-2 rounded-xl border border-dashed border-border/70 bg-muted/20 p-3.5 shadow-2xs transition-colors hover:border-border">
+            <div
+              class="flex flex-col gap-2 rounded-xl border border-dashed border-border/70 bg-muted/20 p-3.5 shadow-2xs transition-colors hover:border-border"
+              :class="isMonster && 'md:col-span-2'"
+            >
               <div class="flex items-center gap-1.5">
                 <IconNotes class="size-4 shrink-0 text-muted-foreground" />
                 <span class="text-xs font-bold text-foreground">作者注释</span>
@@ -981,8 +1216,8 @@ function gaugeClass(val: number, baseline = 10): string {
             </div>
           </div>
 
-          <!-- 好卡自检（借鉴 SillyTavern 角色卡指南） -->
-          <div class="flex flex-wrap items-center gap-x-4 gap-y-1.5 rounded-xl border border-border/60 bg-muted/20 px-3.5 py-2.5">
+          <!-- 好卡自检（借鉴 SillyTavern 角色卡指南）：衡量扮演向字段，怪物不适用 -->
+          <div v-if="!isMonster" class="flex flex-wrap items-center gap-x-4 gap-y-1.5 rounded-xl border border-border/60 bg-muted/20 px-3.5 py-2.5">
             <span class="flex items-center gap-1.5 text-[11px] font-bold text-muted-foreground">
               <IconCircleCheck class="size-3.5" :class="writingScore === writingChecks.length ? 'text-primary' : 'text-warning'" />
               好卡自检 {{ writingScore }}/{{ writingChecks.length }}
@@ -1035,7 +1270,7 @@ function gaugeClass(val: number, baseline = 10): string {
               <div class="flex items-center gap-3">
                 <button
                   type="button"
-                  class="inline-flex cursor-pointer items-center gap-1 text-xs text-muted-foreground hover:text-primary transition-colors"
+                  class="inline-flex cursor-pointer items-center gap-1 border-b border-dashed border-border/70 text-xs text-muted-foreground transition-colors hover:border-primary/60 hover:text-primary"
                   title="声明卡面分区：分区的标题与内容由故事书声明"
                   @click="sheetOpen = true"
                 >
@@ -1044,7 +1279,7 @@ function gaugeClass(val: number, baseline = 10): string {
                 </button>
                 <button
                   type="button"
-                  class="inline-flex cursor-pointer items-center gap-1 text-xs text-muted-foreground hover:text-primary transition-colors"
+                  class="inline-flex cursor-pointer items-center gap-1 border-b border-dashed border-border/70 text-xs text-muted-foreground transition-colors hover:border-primary/60 hover:text-primary"
                   title="声明派生值：由属性维度 + 修正来源算出的调整值 / 豁免 / AC / 法术DC"
                   @click="derivedOpen = true"
                 >
@@ -1053,7 +1288,7 @@ function gaugeClass(val: number, baseline = 10): string {
                 </button>
                 <button
                   type="button"
-                  class="inline-flex cursor-pointer items-center gap-1 text-xs text-muted-foreground hover:text-primary transition-colors"
+                  class="inline-flex cursor-pointer items-center gap-1 border-b border-dashed border-border/70 text-xs text-muted-foreground transition-colors hover:border-primary/60 hover:text-primary"
                   title="去「维度设置」管理全局属性"
                   @click="editor.activeTab = 'dimensions'"
                 >
@@ -1556,8 +1791,8 @@ function gaugeClass(val: number, baseline = 10): string {
             </div>
           </div>
 
-          <!-- 每日准备法术（#4）：从已掌握技能里挑选；长休后重挑 -->
-          <div v-if="(current.skills?.length ?? 0)" class="pt-3 border-t border-border/70">
+          <!-- 每日准备法术（#4）：从已掌握技能里挑选；长休后重挑（扮演向，怪物隐藏） -->
+          <div v-if="!isMonster && (current.skills?.length ?? 0)" class="pt-3 border-t border-border/70">
             <div class="mb-3 flex items-center gap-2">
               <IconBook2 class="size-4 text-primary" />
               <span class="font-serif text-base font-bold text-foreground">每日准备</span>
@@ -1593,7 +1828,7 @@ function gaugeClass(val: number, baseline = 10): string {
               <div class="flex items-center gap-2">
                 <button
                   type="button"
-                  class="inline-flex cursor-pointer items-center gap-1 text-xs text-muted-foreground hover:text-primary transition-colors"
+                  class="inline-flex cursor-pointer items-center gap-1 border-b border-dashed border-border/70 text-xs text-muted-foreground transition-colors hover:border-primary/60 hover:text-primary"
                   title="去「技能与物品」管理故事书全局技能定义"
                   @click="editor.activeTab = 'skills'"
                 >
@@ -1858,7 +2093,7 @@ function gaugeClass(val: number, baseline = 10): string {
     </template>
 
     <div v-else class="py-12 text-center text-xs text-muted-foreground/60">
-      从左侧名册选择一位角色开始编辑，或点击「新增人物」。
+      从左侧名册选择一位角色开始编辑，或点击右上「新增」创建。
     </div>
 
     <!-- 隐藏式文件输入，用于立绘上传 -->
@@ -2054,7 +2289,7 @@ function gaugeClass(val: number, baseline = 10): string {
             <!-- 左侧：前往全局技能库编辑 -->
             <button
               type="button"
-              class="inline-flex cursor-pointer items-center gap-1 text-xs text-muted-foreground hover:text-primary transition-colors"
+              class="inline-flex cursor-pointer items-center gap-1 border-b border-dashed border-border/70 text-xs text-muted-foreground transition-colors hover:border-primary/60 hover:text-primary"
               @click="editor.activeTab = 'skills'; closeSkillDetail()"
             >
               <span>在技能库中编辑定义</span>

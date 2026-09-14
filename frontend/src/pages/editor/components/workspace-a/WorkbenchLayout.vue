@@ -93,6 +93,9 @@ const toneCls = (t?: string) =>
             </slot>
           </div>
         </div>
+        <div v-if="$slots.railFilter" class="mt-2 flex flex-wrap items-center gap-1">
+          <slot name="railFilter" />
+        </div>
         <div class="relative mt-2">
           <IconSearch class="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground/60" />
           <Input v-model="q" :placeholder="searchPlaceholder" class="h-7 pl-7 text-xs" />

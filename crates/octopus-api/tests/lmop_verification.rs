@@ -230,7 +230,47 @@ async fn a1_a2_publish_and_open_has_no_monster_instances() {
     // 交付物形状
     assert_eq!(sb["characters"].as_array().unwrap().iter().filter(|c| c["kind"] == "monster").count(), 31);
     assert_eq!(sb["characters"].as_array().unwrap().iter().filter(|c| c["kind"] == "pc").count(), 1);
-    assert_eq!(sb["lua_mounts"].as_array().unwrap().len(), 38);
+    // 【口径变更（GAP-F / GAP-H / GAP-N 闭合）】原期望 38 = 12 条规则 + 2 条掷表 + **24 条按掷表行回补的 XP**。
+    // 旧形态的 24 条 XP 规则挂在 turn_end + when: all_of[行标记, encounter_cleared]，是「没有敌人被击败事件」
+    // （GAP-F）逼出来的近似链路。闭合后重排为 16 条 = 12 规则 + 2 掷表 + 1 条掷表复位（event / encounter_cleared
+    // → clear_flag，配合 repeatable 的边沿语义，GAP-N + GAP-H）+ 1 条 XP（event / enemy_defeated，逐只发放）。
+    // 这里不只数个数：关键挂载点必须**在场且挂在正确的时机**——数量对但挂错地方同样应当失败。
+    let mounts = sb["lua_mounts"].as_array().unwrap();
+    assert_eq!(
+        mounts.len(),
+        16,
+        "规则包挂载点数量（GAP-F 闭合后 24 条按行回补的 XP 合并为 1 条 event 规则）"
+    );
+    let mount_of = |id: &str| {
+        mounts
+            .iter()
+            .find(|m| m["id"] == id)
+            .unwrap_or_else(|| panic!("缺少关键挂载点 {id}"))
+    };
+    let xp_mount = mount_of("dnd-xp-award");
+    assert_eq!(xp_mount["mount"], "event", "XP 必须挂在 event 上（enemy_defeated 逐只发）");
+    assert!(
+        xp_mount["source"].as_str().unwrap().contains("enemy_defeated"),
+        "XP 规则必须按 enemy_defeated 开闸，实际源码：{}",
+        xp_mount["source"]
+    );
+    let reset_mount = mount_of("dnd-wander-reset");
+    assert_eq!(
+        reset_mount["mount"], "event",
+        "掷表标记复位必须挂在 event 上（encounter_cleared 时 clear_flag）"
+    );
+    assert!(
+        reset_mount["source"].as_str().unwrap().contains("clear_flag"),
+        "掷表复位规则必须清标记（GAP-H），实际源码：{}",
+        reset_mount["source"]
+    );
+    assert!(
+        !mounts.iter().any(|m| {
+            let id = m["id"].as_str().unwrap_or("");
+            id.starts_with("dnd-xp-day") || id.starts_with("dnd-xp-night")
+        }),
+        "旧的「按掷表行回补 XP」规则应已全部移除"
+    );
     assert_eq!(sb["world"]["locations"].as_array().unwrap().len(), 88);
     assert_eq!(sb["world"]["maps"].as_array().unwrap().len(), 7);
     assert_eq!(sb["skeleton"].as_array().unwrap().len(), 4);
@@ -781,46 +821,67 @@ async fn a8_trigger_preset_encounter_spawns() {
 }
 
 // ============================================================
-// 验收 9 / 14：encounter_cleared 判据 + XP 累加（数据卡口径）
+// 验收 9 / 14：encounter_cleared 判据 + XP 逐只发放（数据卡口径）
 // ============================================================
-fn flag_of(condition: &Value) -> Option<String> {
-    match condition.get("op").and_then(Value::as_str) {
-        Some("flag_set") => condition.get("flag").and_then(Value::as_str).map(str::to_string),
-        Some("all_of") | Some("any_of") => {
-            condition.get("children").and_then(Value::as_array).and_then(|cs| cs.iter().find_map(flag_of))
-        }
-        _ => None,
-    }
+// 说明：旧口径的辅助函数 flag_of / expected_xp_for_flag（「按掷表行标记推算整场 XP」）
+// 随 GAP-F 闭合一并移除——XP 不再由标记回补，而是由 enemy_defeated 逐只发放。
+
+/// 数据卡 XP（按模板 id）。
+fn xp_of_template(sb: &Value, template_id: &str) -> i64 {
+    sb["characters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == template_id)
+        .and_then(|c| c["statblock"]["xp"].as_i64())
+        .unwrap_or(0)
 }
 
-fn expected_xp_for_flag(sb: &Value, flag: &str) -> Option<i64> {
-    let mut total = 0i64;
-    let mut found = false;
-    for chapter in sb["skeleton"].as_array()? {
-        for scene in chapter["scenes"].as_array()? {
-            for tr in scene["triggers"].as_array().unwrap_or(&vec![]) {
-                if flag_of(&tr["condition"]).as_deref() != Some(flag) {
-                    continue;
-                }
-                found = true;
-                for e in tr["encounter"]["enemies"].as_array().unwrap_or(&vec![]) {
-                    let tid = e["template_id"].as_str().unwrap_or("");
-                    let count = e["count"].as_i64().unwrap_or(1);
-                    let xp = sb["characters"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .find(|c| c["id"] == tid)
-                        .and_then(|c| c["statblock"]["xp"].as_i64())
-                        .unwrap_or(0);
-                    total += xp * count;
-                }
+fn xp_of_pc(session: &Session) -> i64 {
+    num(&session.projection().characters["inst-pc-lmop-talin"]["resources"]["res-xp"])
+}
+
+/// 当前所有遭遇里**还活着**的敌人：(instance_id, template_id)。
+fn live_enemies(session: &Session) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for e in &session.projection().encounters {
+        let ev = serde_json::to_value(e).unwrap();
+        for en in ev["enemies"].as_array().unwrap() {
+            if en["hp"].as_i64().unwrap_or(0) > 0 {
+                out.push((
+                    en["instance_id"].as_str().unwrap().to_string(),
+                    en["template_id"].as_str().unwrap_or("").to_string(),
+                ));
             }
         }
     }
-    found.then_some(total)
+    out
 }
 
+// ============================================================
+// 验收 9 / 14：encounter_cleared 判据 + XP 逐只发放（数据卡口径）
+// ============================================================
+//
+// 【口径变更（GAP-F 闭合）——旧期望为什么过期】
+// 原缺口 GAP-F「没有『敌人被击败』事件」把 XP 逼成一条**回补**链路：
+//   when: all_of[掷表行标记, encounter_cleared] → 清空遭遇后一次性 modify_resource。
+// 于是旧断言是「清空遭遇**之后**的那一回合，XP 增量 == 该掷表行对应的 xp×数量」。
+// 这条口径有两个被独立验证报告点名的洞：① 只有掷表链路能回补，**导演即兴建的遭遇拿不到 XP**；
+// ② 遭遇里混入非预置敌人（AI 加的、后续回合刷的）时，行标记口径与实际击杀不符。
+//
+// GAP-F 闭合后：XP 在 **enemy_defeated**（strike 击杀）时按 data.enemy.template_id **逐只**发放，
+// 清空遭遇不再补发（增量 = 0）。本用例因此改为断言新口径，并**额外钉死**旧口径的反面：
+//   · 每杀一只 → XP 增量恰好等于该模板 statblock.xp（逐只、按数据卡）；
+//   · 整场清剿的总增量 == 遭遇内每只敌人的数据卡 XP 之和（合计口径不变）；
+//   · 清空之后再跑一回合 → 增量为 0（不再补发，也不会重复发）；
+//   · 行标记在 encounter_cleared 时被 clear_flag 复位（GAP-N 的边沿复位，旧口径依赖它保持为真）。
+//
+// 【这条断言在什么情况下会失败】（仍然有牙齿）
+//   1. XP 少发一只、或金额与数据卡不符；
+//   2. 补刀（对已倒下的敌人再攻击）重复发 XP；
+//   3. 清空后又补发一笔（旧回补链路残留）；
+//   4. 敌人倒下了却没发 XP（enemy_defeated 链路断掉）；
+//   5. 行标记没有在遭遇结束时复位（GAP-N 会退回「整局只出一次」）。
 #[tokio::test]
 async fn a9_a14_encounter_cleared_and_xp_award() {
     let sb = lmop();
@@ -847,32 +908,65 @@ async fn a9_a14_encounter_cleared_and_xp_award() {
     h.provider.push(vec![Intent::Move { destination_id: "loc-lmop-040".into(), character_id: None }]);
     run(&session, "离开三猪小径").await;
 
-    // 3) 清空全部遭遇（按实例键逐只打）
-    let mut cleared_round = None;
-    for _ in 0..400 {
-        let proj = session.projection();
-        let mut live: Vec<String> = vec![];
-        for e in &proj.encounters {
-            let ev = serde_json::to_value(e).unwrap();
-            for en in ev["enemies"].as_array().unwrap() {
-                if en["hp"].as_i64().unwrap_or(0) > 0 {
-                    live.push(en["instance_id"].as_str().unwrap().to_string());
-                }
+    // 3) 逐只击杀：每次击杀的 XP 增量必须恰好 == 该敌人模板的数据卡 XP
+    let xp_before_clear = xp_of_pc(&session);
+    let mut xp_running = xp_before_clear;
+    let mut expected_total = 0i64;
+    for e in &session.projection().encounters {
+        let ev = serde_json::to_value(e).unwrap();
+        for en in ev["enemies"].as_array().unwrap() {
+            expected_total += xp_of_template(&sb, en["template_id"].as_str().unwrap_or(""));
+        }
+    }
+    assert!(expected_total > 0, "掷表遭遇的模板必须在数据卡里有 XP（否则本用例没有意义）");
+
+    let mut guard = 0;
+    while let Some((instance_id, template_id)) = live_enemies(&session).into_iter().next() {
+        guard += 1;
+        assert!(guard < 200, "清剿超过 200 回合仍未结束（疑似敌人打不死）");
+        let expected_kill = xp_of_template(&sb, &template_id);
+        let mut awarded = false;
+        for _ in 0..60 {
+            h.provider.push(vec![Intent::Strike {
+                enemy_id: instance_id.clone(),
+                skill_id: Some("sk-lmop-shortsword".into()),
+            }]);
+            run(&session, "攻击").await;
+            let after = xp_of_pc(&session);
+            if after != xp_running {
+                assert_eq!(
+                    after - xp_running, expected_kill,
+                    "击败 {} 必须恰好发该模板的数据卡 XP（{}）",
+                    template_id, expected_kill
+                );
+                xp_running = after;
+                awarded = true;
+                break;
+            }
+            if !live_enemies(&session).iter().any(|(id, _)| id == &instance_id) {
+                panic!("{} 已倒下却没有发 XP（enemy_defeated 链路断了）", template_id);
             }
         }
-        if live.is_empty() && !proj.encounters.is_empty() {
-            break;
-        }
-        let intents: Vec<Intent> = live
-            .into_iter()
-            .map(|id| Intent::Strike { enemy_id: id, skill_id: Some("sk-lmop-shortsword".into()) })
-            .collect();
-        h.provider.push(intents);
-        cleared_round = Some(run(&session, "清剿").await);
+        assert!(awarded, "{} 连续 60 次攻击都没被打倒（或从未发 XP）", template_id);
     }
-    let cleared_round = cleared_round.expect("应清空遭遇");
+    assert!(live_enemies(&session).is_empty(), "清剿结束后不应还有活着的敌人");
 
-    // 4) encounter_cleared 判据（清空后为真）
+    // 4) 合计口径不变 + 清空后**不再补发**（旧回补链路已废弃）
+    let xp_after_clear = xp_of_pc(&session);
+    assert_eq!(
+        xp_after_clear - xp_before_clear,
+        expected_total,
+        "整场清剿的 XP 增量必须等于遭遇内每只敌人的数据卡 XP 之和（逐只发放）"
+    );
+    h.provider.push(vec![Intent::Narrate { content: "结算经验".into(), actor_id: None }]);
+    run(&session, "结算经验").await;
+    assert_eq!(
+        xp_of_pc(&session) - xp_after_clear,
+        0,
+        "清空遭遇后不得再补发 XP（新口径：XP 在击倒那一刻到账）"
+    );
+
+    // 5) encounter_cleared 判据（清空后为真）——与旧用例一致
     {
         let proj = session.projection();
         let flags: BTreeMap<String, Value> = BTreeMap::new();
@@ -900,32 +994,37 @@ async fn a9_a14_encounter_cleared_and_xp_award() {
         );
     }
 
-    // 5) 数据卡口径的期望 XP
-    let flags_before: Vec<String> = session
+    // 6) 掷表行标记的复位（GAP-N / GAP-H）：遭遇结束后 clear_flag，标记必须落回假，
+    //    触发点的 active 也必须是 false——否则同一表项整局只出一次（旧行为）。
+    let still_true: Vec<String> = session
         .projection()
         .flags
-        .keys()
-        .filter(|k| k.starts_with("dnd-wander-"))
-        .cloned()
+        .iter()
+        .filter(|(k, v)| k.starts_with("dnd-wander-") && v.as_bool() == Some(true))
+        .map(|(k, _)| k.clone())
         .collect();
-    assert!(!flags_before.is_empty(), "掷表必须置位至少一个行标记");
-    let mut expected = 0i64;
-    for f in &flags_before {
-        expected += expected_xp_for_flag(&sb, f).unwrap_or_else(|| panic!("找不到标记 {f} 的触发点"));
-    }
-    let xp_before = num(&session.projection().characters["inst-pc-lmop-talin"]["resources"]["res-xp"]);
-
-    h.provider.push(vec![Intent::Narrate { content: "结算经验".into(), actor_id: None }]);
-    run(&session, "结算经验").await;
-    let xp_after = num(&session.projection().characters["inst-pc-lmop-talin"]["resources"]["res-xp"]);
-
-    assert_eq!(
-        xp_after - xp_before,
-        expected,
-        "XP 增量必须等于数据卡口径（标记 {flags_before:?} 对应的 xp×数量）"
+    assert!(
+        still_true.is_empty(),
+        "遭遇清空后所有掷表行标记都应为 false（实际仍为真：{still_true:?}）"
     );
-    assert!(expected > 0);
+    let still_active: Vec<String> = session
+        .projection()
+        .progress
+        .triggers
+        .iter()
+        .filter(|(k, v)| {
+            k.starts_with("tr-lmop-wander-") && v.get("active").and_then(Value::as_bool) == Some(true)
+        })
+        .map(|(k, _)| k.clone())
+        .collect();
+    assert!(
+        still_active.is_empty(),
+        "行标记复位后触发点的 active 必须为 false（实际：{still_active:?}）"
+    );
+
     println!(
-        "A9/A14 PASS: cleared_round={cleared_round} flags={flags_before:?} expected_xp={expected} xp={xp_before}->{xp_after}"
+        "A9/A14 PASS: xp {} -> {}（期望合计 {}，逐只按数据卡）；行标记已复位",
+        xp_before_clear, xp_after_clear, expected_total
     );
 }
+

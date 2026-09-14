@@ -5,7 +5,7 @@
 import { ref, computed } from 'vue'
 import type { CharacterInstance, ResourceDef } from '@/types'
 import { usePlayStore } from '../stores/play'
-import { nameTintClass, initial, portraitOf } from '../utils'
+import { kindLabel, nameTintClass, initial, portraitOf } from '../utils'
 import { assetUrl } from '@/api'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
@@ -40,7 +40,7 @@ const pct = (r: { value: number; max?: number }) => {
   if (r.max == null || r.max <= 0) return '0%'
   return Math.max(0, Math.min(100, (r.value / r.max) * 100)) + '%'
 }
-const kindLabel = computed(() => (props.actor.kind === 'pc' ? 'PC' : 'NPC'))
+const actorKind = computed(() => kindLabel(props.actor.kind))
 
 /** 资源条：按资源语义映射主题语义色（实色即可，条高仅 1.5px），与全局调色一致 */
 function resBarClass(id: string) {
@@ -85,7 +85,7 @@ function resBarClass(id: string) {
         <span class="flex flex-wrap items-center gap-1.5">
           <span class="truncate text-[13.5px] font-extrabold">{{ actor.name }}</span>
           <Badge v-if="controlled" variant="default" class="h-4 px-1.5 text-[9.5px] font-extrabold bg-primary text-primary-foreground shadow-2xs">你</Badge>
-          <span class="font-mono text-[9.5px] font-semibold text-muted-foreground/70 uppercase">{{ kindLabel }}</span>
+          <span class="font-mono text-[9.5px] font-semibold text-muted-foreground/70 uppercase">{{ actorKind }}</span>
         </span>
         <span class="mt-0.5 flex flex-wrap items-center gap-1">
           <template v-if="actor.statuses.length">

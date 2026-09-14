@@ -49,6 +49,31 @@ export interface LocationDef {
   image?: AssetRef
 }
 
+/** 地图锚点（地图 P1）：一个地点在一张底图上的位置。
+ *  锚点属于地图而不是地点——碎星酒馆在世界图上是一个点，在城镇图上是一个门面。 */
+export interface MapPin {
+  /** 指向 world.locations[].id；必须存在（校验挡发布） */
+  location_id: string
+  /** **归一化**坐标 0..1（相对底图）：换分辨率 / 换底图不破版 */
+  x: number
+  y: number
+  /** 覆盖地点名：同一地点在不同地图上叫法可以不同 */
+  label?: string
+}
+
+/** 地图（地图 P1）：地点之上的**可视层**——一张底图 + 若干地点锚点。
+ *  地图不是地点，是地点的投影；引擎不读，纯展示。 */
+export interface MapDef {
+  id: string
+  name: string
+  /** 地图也可层级：世界图 > 区域图 > 地牢图；不得成环 */
+  parent_id?: string
+  /** 底图（复用资产不可变存储） */
+  image?: AssetRef
+  /** 地点锚点 */
+  pins?: MapPin[]
+}
+
 export interface ResourceDef {
   id: string
   name: string
@@ -82,6 +107,11 @@ export interface CheckerDef {
   kind?: CheckKind
   /** 被动判定基数（缺省 10；D&D 被动察觉 = 10 + 加值） */
   passive_base?: number
+  /** 判定属性维度 key（判定 C1）：技能未声明时用它，再缺省回落 'str'。
+   *  必须命中 attribute_dimensions 的 key，否则校验报 Error。 */
+  attribute?: string | null
+  /** 对抗判定时对手所用的属性维度 key（判定 C1）；缺省同 attribute */
+  opposed_attribute?: string | null
 }
 
 export type CondExpr =
@@ -93,6 +123,7 @@ export type CondExpr =
   | { op: 'at_location'; location_id: string }
   | { op: 'attribute_ge'; attribute: string; value: number }
   | { op: 'relationship_ge'; from: string; to: string; type: string; value: number }
+  | { op: 'encounter_cleared' }
   | { op: 'lua'; script: string }
 
 /** 目标 goal（#13 ①）：场景/章节完成判据 */
@@ -104,7 +135,7 @@ export interface GoalDef {
   condition?: CondExpr | null
 }
 
-/** 剧情触发点 trigger（#13 ②）：条件触发的剧情节点，触发后提示 AI 演绎，不改世界状态 */
+/** 剧情触发点 trigger（#13 ②）：条件触发的剧情节点，触发后提示 AI 演绎。 */
 export interface TriggerDef {
   id: string
   title: string
@@ -113,6 +144,28 @@ export interface TriggerDef {
   /** 触发后给主线 AI 的提示 */
   hint: string
   repeatable?: boolean
+  /** 触发时预置的遭遇（地图 P5 §6.3）：作者声明，不再靠 AI 即兴 spawn */
+  encounter?: EncounterPreset
+}
+
+/** 触发点预置的遭遇（地图 P5 §6.3）。引擎在触发点被标记 fired 后按它自动建遭遇，
+ *  走 Intent::Encounter 的同一条路径（图鉴实例克隆 + 地点继承）。
+ *  掷表遭遇不靠新类型：表由 Lua 掷骰 + set_flag 表达。 */
+export interface EncounterPreset {
+  /** 遭遇名；缺省回落触发点标题 */
+  name?: string
+  note?: string
+  /** 遭遇地点；缺省继承触发时所在场景的 location_id */
+  location_id?: string
+  /** 引用的图鉴条目（kind = 'monster'）与展开数量 */
+  enemies: EncounterPresetEnemy[]
+}
+
+/** 预置遭遇里的一条怪物模板引用 */
+export interface EncounterPresetEnemy {
+  template_id: string
+  /** 展开数量（缺省 1） */
+  count?: number
 }
 
 export interface SceneDef {
@@ -133,11 +186,34 @@ export interface ChapterDef {
   scenes: SceneDef[]
 }
 
-/** 人物模板（#01 characters）—— 运行时实例化后成为角色实例 */
+/** 怪物数据卡（图鉴 M1）：kind='monster' 条目的**展示型**字段。
+ *  与 notes 同性质——给人看，不是给引擎算的：引擎永不读取，也不注入提示词。
+ *  真正要结算的数值走封闭原语（六维→attributes · AC→derived · HP→resources.hp ·
+ *  攻击→skills[] · 状态→statuses）。 */
+export interface MonsterStatblock {
+  /** 生物类型与阵营，如「中型 不死生物，中立邪恶」 */
+  creatureType?: string
+  /** 数据卡正文：特性 / 感官 / 语言 / 伤害免疫 / 状态免疫等自由文本 */
+  traits?: string
+  /** 挑战等级，如 "1/4" */
+  challenge?: string
+  /** 经验值（仅展示：XP 合计由 Lua 在「击败」事件里做，引擎不读） */
+  xp?: number
+  /** 攻击动作的文字描述（真正结算走 skills；这里只给玩家看） */
+  actionsNote?: string
+}
+
+/** 人物模板（#01 characters）—— 运行时实例化后成为角色实例。
+ *  kind='monster' 是人物模板的受限变种（图鉴 M1）：只承载引擎要结算的数据，
+ *  不承载人格档案，不参与对话扮演；展示型数据卡在 statblock。 */
 export interface CharacterDef {
   id: string
   name: string
-  kind?: 'pc' | 'npc'
+  kind?: 'pc' | 'npc' | 'monster'
+  /** 常驻地 / 出没地（地图 P1）：build_state 灌进实例，switch_scene 按它算在场 */
+  location_id?: string
+  /** 怪物数据卡（图鉴 M1）：kind='monster' 的展示型块，引擎永不读取 */
+  statblock?: MonsterStatblock
   background: string
   personality: string
   /** 属性值：key = 全局属性维度 key */
@@ -204,6 +280,9 @@ export interface SkillDef {
   target?: string
   /** 技能级判定器：引用全局或用技能自声明（#12 双作用域） */
   check?: string | CheckerDef
+  /** 判定属性维度 key（判定 C1）：声明后本技能用它掷骰（如匕首用 dex）。
+   *  优先级：技能 → 判定器 → 全局 → 'str'；必须命中 attribute_dimensions。 */
+  attribute?: string | null
   effect?: EffectDef
   /** Lua 钩子源码（#02：声明式核心 + Lua 兜底） */
   lua?: string
@@ -388,6 +467,8 @@ export interface StorybookWorld {
   resources: ResourceDef[]
   /** 全局判定器（#12 world.rules.check 落在世界区） */
   check?: CheckerDef | null
+  /** 地图（地图 P1）：地点的可视投影；引擎不读，纯视图 */
+  maps?: MapDef[]
 }
 
 /** 故事书 = 模板唯一事实来源（#01） */
@@ -661,7 +742,8 @@ export interface CharacterInstance {
   instance_id: string
   template_id: string
   name: string
-  kind: 'pc' | 'npc'
+  /** 'monster' = 遭遇克隆出来的怪物实例（图鉴 M2）；模板见 CharacterDef.kind */
+  kind: 'pc' | 'npc' | 'monster'
   attributes: Record<string, number | string>
   resources: Record<string, number>
   /** 物品栏（#01）：item id → 数量 */
@@ -687,14 +769,36 @@ export interface EnemyView {
   max: number
   /** 防御值：攻击判定的难度就是它 */
   ac: number
+  /** 背后的怪物实例键（图鉴 M1）；缺省 = 临时敌人（AI 现编 / 旧日志）。
+   *  存在时 hp / ac 是该实例的投影；不存在时条目自身是权威（旧行为）。 */
+  instance_id?: string | null
+  /** 图鉴模板 id（图鉴 M1）：指向 kind='monster' 的人物模板 */
+  template_id?: string | null
+  /** 遭遇创建时快照的场景 id（地图 P5） */
+  scene_id?: string | null
+  /** 遭遇发生地点（地图 P5）：怪物实例继承它，地图按它归位 */
+  location_id?: string | null
+  /** 可用攻击（图鉴 M2 数据卡摘要）：名字 + 伤害骰，供提示词与缺省攻击技能。
+   *  缺省为空 = 临时敌人 / 旧日志（AI 现编的敌人没有图鉴攻击） */
+  attacks?: { skill_id: string; name: string; damage: string }[]
 }
 
+/** 结构化遭遇（导演创建 / 触发点预置）。叙事与空间锚（scene / location / goal /
+ *  template_ids）都是**创建时的快照**：运行时事件必须可重放，不做查询时推导。 */
 export interface EncounterView {
   id: string
   name: string
   enemies: EnemyView[]
   note?: string | null
   active: boolean
+  /** 创建时的场景（地图 P5 §6.4） */
+  scene_id?: string | null
+  /** 创建时的地点（缺省继承场景） */
+  location_id?: string | null
+  /** 关联目标 id（可选）：任务面板据它显示「清剿中」 */
+  goal_id?: string | null
+  /** 涉及的图鉴模板 id（去重、按创建顺序） */
+  template_ids?: string[]
 }
 
 export interface QuestView {
@@ -705,6 +809,9 @@ export interface QuestView {
   source: 'skeleton' | 'gm' | string
   hidden: boolean
   primary: boolean
+  /** 所属场景的地点（地图 P5 §6.2）：投影时从场景推导，不落库；
+   *  导演运行时新增的任务不属于任何场景 → 缺省 */
+  location_id?: string | null
 }
 
 export interface WorldProjection {
@@ -1004,6 +1111,20 @@ export interface Listener<T> {
 export function uid(prefix = 'id'): string {
   return prefix + '-' + Math.random().toString(36).slice(2, 8) + Date.now().toString(36).slice(-4)
 }
+
+// ---- 账户与登录（多账户；系统侧「账号」，区别于领域里的「玩家」） ----
+export type { Account } from './generated/Account'
+export type { LoginRequest } from './generated/LoginRequest'
+export type { LoginResponse } from './generated/LoginResponse'
+export type { RegisterRequest } from './generated/RegisterRequest'
+export type { ChangePasswordRequest } from './generated/ChangePasswordRequest'
+
+// ---- 管理后台（只有管理员可达） ----
+export type { AdminOverview } from './generated/AdminOverview'
+export type { AdminUserRow } from './generated/AdminUserRow'
+export type { AdminCreateUserRequest } from './generated/AdminCreateUserRequest'
+export type { AdminUpdateUserRequest } from './generated/AdminUpdateUserRequest'
+export type { AdminResetPasswordRequest } from './generated/AdminResetPasswordRequest'
 
 export type { SavePackage } from './generated/SavePackage'
 export type { PlaytestRequest } from './generated/PlaytestRequest'

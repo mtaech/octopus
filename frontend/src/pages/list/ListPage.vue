@@ -10,12 +10,13 @@
 // 呈现层：shadcn-vue + Tailwind 语义类（Material 3 · 靛蓝主题）。
 // 封面为纯 CSS 确定性生成（见 StorybookCover），不引入图片资产。
 // ============================================================
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { toast, createStorybookDraft, saveDraft, uploadAsset } from '@/api'
 import { importStFile } from '@/lib/st-import'
 import { confirm } from '@/lib/confirm'
+import { downloadBlob } from '@/lib/download'
 import { useListStore } from './stores/list'
 import NewGameDialog from './components/NewGameDialog.vue'
 import { relativeTime } from './utils/relativeTime'
@@ -23,7 +24,9 @@ import StorybookCard from './components/StorybookCard.vue'
 import StorybookCover from '@/components/StorybookCover.vue'
 import SaveCard from './components/SaveCard.vue'
 import SettingsDialog from './components/SettingsDialog.vue'
+import AccountMenu from '@/components/AccountMenu.vue'
 import ThemeToggle from '@/components/ThemeToggle.vue'
+import { isAdmin } from '@/lib/auth'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Card } from '@/components/ui/card'
@@ -37,6 +40,9 @@ import {
   IconCheck,
   IconChevronRight,
   IconDiamondFilled,
+  IconDownload,
+  IconFileImport,
+  IconFileZip,
   IconListCheck,
   IconPlayerPlayFilled,
   IconPlus,
@@ -45,13 +51,15 @@ import {
   IconSparkles,
   IconTrash,
   IconUpload,
-  IconFileImport,
 } from '@tabler/icons-vue'
 
 const router = useRouter()
 const store = useListStore()
 // storeToRefs 保响应性；recentSave 为派生计算（最近存档）
-const { storybooks, publishedStorybooks, saves, loading, loaded, error, recentSave } = storeToRefs(store)
+const { storybooks, knownStorybooks, publishedStorybooks, saves, loading, loaded, error, recentSave } = storeToRefs(store)
+
+// 全局设置里是 API Key 与全局模型：只有管理员能改，非管理员不显示入口（后端也会 403）。
+const admin = computed(() => isAdmin())
 
 // ---- 新建游戏弹窗状态 ----
 const dialogOpen = ref(false)
@@ -71,7 +79,8 @@ const selectedSaveIds = ref<string[]>([])
  * 故事书已下架时自然回落为 CSS 生成封面。
  */
 function coverOf(storybookId: string) {
-  return storybooks.value.find(b => b.id === storybookId)?.cover ?? null
+  // 用合并表：我可能在玩别人的已发布故事书，只看书架会查不到封面。
+  return knownStorybooks.value.get(storybookId)?.cover ?? null
 }
 
 // ---- 隐藏文件输入（导入） ----
@@ -175,6 +184,45 @@ async function onStImportChange(evt: Event) {
     toast('error', e instanceof Error ? e.message : String(e))
   } finally {
     stImporting.value = false
+  }
+}
+
+// ---- 故事书包导入 / 导出（自包含 zip：storybook.json + assets/，草稿与已发布版次都带） ----
+const bookFileInput = ref<HTMLInputElement | null>(null)
+const bookImporting = ref(false)
+function triggerBookImport() { bookFileInput.value?.click() }
+
+async function onBookImportChange(evt: Event) {
+  const input = evt.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = '' // 允许重复选择同一文件
+  if (!file) return
+  bookImporting.value = true
+  try {
+    const { doc, issues } = await store.importBookFromFile(file)
+    const title = doc.draft?.meta?.title ?? doc.id
+    const errors = issues.filter(i => i.severity === 'error').length
+    // 发布快照校验不过时后端会退化为草稿导入：说清楚为什么，别让用户以为导出丢了发布态
+    toast('ok', errors
+      ? `已导入「${title}」为草稿（原发布版次有 ${errors} 个错误级问题）`
+      : `已导入「${title}」`)
+    activeTab.value = 'books'
+  } catch (e) {
+    toast('error', e instanceof Error ? e.message : String(e))
+  } finally {
+    bookImporting.value = false
+  }
+}
+
+/** 导出故事书：整本打包（草稿 + 已发布版次 + 全部图片）后走浏览器下载 */
+async function onExportStorybook(id: string) {
+  const sb = storybooks.value.find(s => s.id === id)
+  try {
+    const { filename, blob } = await store.exportBook(id)
+    downloadBlob(filename, blob)
+    toast('ok', `已导出「${sb?.title ?? id}」`)
+  } catch (e) {
+    toast('error', e instanceof Error ? e.message : String(e))
   }
 }
 
@@ -292,10 +340,18 @@ async function onDeleteSelectedSaves() {
         <span class="hidden text-xs text-muted-foreground sm:inline">通用 AI RPG · 你自己的故事书</span>
         <div class="flex-1"></div>
         <ThemeToggle />
-        <Button variant="ghost" size="sm" class="gap-1.5 text-xs text-muted-foreground hover:text-foreground" title="设置 · AI Provider 与模型配置" @click="settingsOpen = true">
+        <Button
+          v-if="admin"
+          variant="ghost"
+          size="sm"
+          class="gap-1.5 text-xs text-muted-foreground hover:text-foreground"
+          title="设置 · AI Provider 与模型配置（仅管理员）"
+          @click="settingsOpen = true"
+        >
           <IconSettings class="size-4" />
           <span class="hidden sm:inline">设置</span>
         </Button>
+        <AccountMenu />
       </div>
     </header>
 
@@ -315,7 +371,7 @@ async function onDeleteSelectedSaves() {
       </div>
 
       <!-- 全页空态 -->
-      <Empty v-else-if="storybooks.length === 0" class="animate-in fade-in duration-500 rounded-2xl border border-dashed border-border/80 bg-card/40 py-16 backdrop-blur-sm motion-reduce:animate-none">
+      <Empty v-else-if="storybooks.length === 0 && publishedStorybooks.length === 0" class="animate-in fade-in duration-500 rounded-2xl border border-dashed border-border/80 bg-card/40 py-16 backdrop-blur-sm motion-reduce:animate-none">
         <EmptyMedia variant="icon" :class="error ? 'bg-warning/10 text-warning' : 'bg-primary/10 text-primary'">
           <IconAlertTriangleFilled v-if="error" aria-hidden="true" />
           <IconBook2 v-else aria-hidden="true" />
@@ -334,6 +390,10 @@ async function onDeleteSelectedSaves() {
           <Button size="lg" class="shadow-md shadow-primary/20" @click="goCreateNew">
             <IconPlus data-icon="inline-start" />
             创作新故事书
+          </Button>
+          <Button size="lg" variant="outline" :disabled="bookImporting" @click="triggerBookImport">
+            <IconFileZip data-icon="inline-start" />
+            导入故事书
           </Button>
           <Button size="lg" variant="outline" :disabled="stImporting" @click="triggerStImport">
             <IconFileImport data-icon="inline-start" />
@@ -467,6 +527,21 @@ async function onDeleteSelectedSaves() {
               <button
                 type="button"
                 class="group/row flex flex-1 cursor-pointer items-center gap-3 px-4 py-3 text-left transition-colors hover:bg-muted/60 focus-visible:ring-2 focus-visible:ring-ring/60 focus-visible:outline-none focus-visible:ring-inset disabled:pointer-events-none disabled:opacity-50"
+                :disabled="bookImporting"
+                @click="triggerBookImport"
+              >
+                <span class="flex size-9 flex-none items-center justify-center rounded-xl border border-primary/25 bg-primary/12 text-primary transition-all duration-300 group-hover/row:bg-primary group-hover/row:text-primary-foreground motion-reduce:transition-none">
+                  <IconFileZip aria-hidden="true" class="size-4" />
+                </span>
+                <span class="min-w-0 flex-1">
+                  <span class="block truncate text-sm font-semibold text-foreground">导入故事书</span>
+                  <span class="block truncate text-xs text-muted-foreground">{{ bookImporting ? '导入中…' : '.octopus-book.zip 整本设定与图片' }}</span>
+                </span>
+                <IconChevronRight aria-hidden="true" class="size-4 flex-none text-muted-foreground/50 transition-transform duration-300 group-hover/row:translate-x-0.5 group-hover/row:text-primary motion-reduce:transition-none" />
+              </button>
+              <button
+                type="button"
+                class="group/row flex flex-1 cursor-pointer items-center gap-3 px-4 py-3 text-left transition-colors hover:bg-muted/60 focus-visible:ring-2 focus-visible:ring-ring/60 focus-visible:outline-none focus-visible:ring-inset disabled:pointer-events-none disabled:opacity-50"
                 :disabled="stImporting"
                 @click="triggerStImport"
               >
@@ -507,7 +582,10 @@ async function onDeleteSelectedSaves() {
                   创作新故事书
                 </Button>
               </div>
-          <div class="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+          <div v-if="!storybooks.length" class="rounded-xl border border-dashed border-border/70 bg-card/40 px-4 py-6 text-center text-xs leading-relaxed text-muted-foreground">
+            你还没有自己的故事书。可以先从「开始新故事」挑一本已发布的故事书开局，或点上方「创作新故事书」写一本。
+          </div>
+          <div v-else class="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
             <StorybookCard
               v-for="(sb, i) in storybooks"
               :key="sb.id"
@@ -516,6 +594,7 @@ async function onDeleteSelectedSaves() {
               :style="{ animationDelay: `${i * 45}ms` }"
               @new-game="openNewGame($event)"
               @edit="goEditor($event)"
+              @export="onExportStorybook($event)"
               @delete="onDeleteStorybook($event)"
             />
           </div>
@@ -598,6 +677,7 @@ async function onDeleteSelectedSaves() {
     </main>
 
     <input ref="fileInput" type="file" accept=".zip,.octopus.zip,.json,.octopus.json" class="hidden" @change="onImportChange" />
+        <input ref="bookFileInput" type="file" accept=".zip,.octopus-book.zip" class="hidden" @change="onBookImportChange" />
         <input ref="stFileInput" type="file" accept=".png,.json,application/json,image/png" class="hidden" @change="onStImportChange" />
 
     <SettingsDialog v-model:open="settingsOpen" />

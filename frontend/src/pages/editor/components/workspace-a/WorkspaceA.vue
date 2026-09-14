@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // A 表单工作台 —— 两级导航：#22 模块树
-// 一级 = 领域分组（设定 / 剧情 / 人物 / 内容 / 关系 / 扩展）；
+// 一级 = 领域分组（设定 / 剧情 / 角色库 / 内容 / 关系 / 扩展）；
 // 二级 = 组内分类。editor.activeTab 仍是「分类」级 key，
 // 校验定位（navigateToIssue）与各面板的选中态寻址都不受影响。
 import { computed, type Component } from 'vue'
@@ -38,8 +38,8 @@ const GROUPS: TabGroup[] = [
   { key: 'story', label: '剧情', icon: IconListTree, leaves: [
     { key: 'skeleton', label: '骨架', icon: IconListTree, comp: 'skeleton' }
   ] },
-  { key: 'character', label: '人物', icon: IconUser, leaves: [
-    { key: 'characters', label: '人物', icon: IconUser, comp: 'characters' }
+  { key: 'character', label: '角色库', icon: IconUser, leaves: [
+    { key: 'characters', label: '角色库', icon: IconUser, comp: 'characters' }
   ] },
   { key: 'content', label: '内容', icon: IconSparkles, leaves: [
     { key: 'skills', label: '技能', icon: IconSparkles, comp: 'skills' },
@@ -77,7 +77,7 @@ const countOf = (key: string): number => {
   const d = editor.draft
   if (!d) return 0
   switch (key) {
-    case 'world': return d.world.locations.length + d.world.resources.length
+    case 'world': return d.world.locations.length + d.world.resources.length + (d.world.maps?.length ?? 0)
     case 'lore': return (d.lore ?? []).length
     case 'narrative': return (d.narrative?.sections ?? []).length
     case 'protocol': {

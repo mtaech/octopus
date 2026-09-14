@@ -12,6 +12,8 @@
 | `bestiary-lmop-appendix-b.json` | 官方 5e 图鉴文件（MM/DMG）中附录 B 用到的条目子集，**逐字段原样**抽取 |
 | `lmop-storybook.draft.json` | 输出：可导入的故事书草稿（**没有规则、没有 PC**） |
 | `../scripts/lmop-rulepack.mjs` | 规则包生成器（D&D 规则走 Lua + 开放内容），含 `--check` 自断言 |
+| `../scripts/lmop-engine-check/` | **真实引擎校验器**（独立 crate，只 path 依赖 `crates/`）：发布门 + 运行时规则断言 |
+| `../scripts/lmop-engine-check.sh` | 上面那支校验器的构建 + 运行包装（产物落 `.scratch/`） |
 | `lmop-storybook.json` | 输出：**可导入的完整故事书** = 草稿 + 规则包 + 开局 PC |
 | `lmop.json` / `凡戴尔的失落矿坑.md` / `lmop2md.js` | 既有素材（未改动） |
 
@@ -77,15 +79,18 @@ Lua 定义「什么时候做」**。本规则包不改引擎、不新增任何�
 
 ### 交付形态
 
-* `lmop-storybook.json.lua_mounts`：**38 条**具名挂载点脚本（12 条规则 + 2 条掷表 + 24 条 XP 回补）。
+* `lmop-storybook.json.lua_mounts`：**16 条**具名挂载点脚本（12 条规则 + 2 条掷表 + 1 条掷表复位 + 1 条 XP）。
 * `characters[]`：`pc-lmop-talin`（塔林·银溪，kind=`pc`）——没有受控角色就没法试玩。
   六维 10/16/14/12/13/11 · `res-hp` 24 · `res-insp` 1 · 常驻地 `loc-lmop-040`（凡达林）·
-  技能 隐匿 / 察觉 / 短剑 / 消耗激励。
+  技能 隐匿 / 察觉 / 短剑 / 消耗激励。角色模板上的 `attachments` 是**开放内容 → Lua 的唯一入口**。
 * `statuses[]`：激励 · 灰烬呛咳 · 受突袭 · 倒地 · 中毒。
 * `skills[]`：6 条（PC 的四条 + 坠落瓦砾 / 灰烬喷发两条豁免类技能）。
-* `kinds[]` / `definitions[]`：11 种 / 55 条开放内容（熟练加值、日照敏感、集群战术、伏击、重复豁免、
-  豁免减半、遭遇表、XP 合计、伤害类型、战斗轮次）。
-* `skeleton`：三猪小径（`sc-lmop-0b7`）下 24 个掷表触发点，每个带 `condition: flag_set` + `encounter` 预置。
+* `kinds[]` / `definitions[]`：规则包追加 **11 种 / 64 条**开放内容；整本故事书
+  **13 种 / 88 条**（草稿自带 2 种 / 23 条 + 皮甲 1 条）。
+  （原文写的「11 种 / 55 条」是 T15 的错数，本轮按实测改正：T15 时就是 13 / 56。）
+* `flags[]`：37 个（草稿 4 + 规则包常驻 9 + 掷表行 24）。
+* `skeleton`：三猪小径（`sc-lmop-0b7`）下 **24 个掷表触发点**，每个带
+  `repeatable: true` + `condition: flag_set` + `encounter` 预置。
 
 ### 逐条规则 → 引擎原语
 
@@ -94,19 +99,30 @@ Lua 定义「什么时候做」**。本规则包不改引擎、不新增任何�
 | 优势 · 激励 `dnd-status-keep-high` | `check_pre_roll` | — | `has_status` + `modify_check('keep_high')` |
 | 激励用掉即消失 `dnd-consume-inspiration` | `check_post_roll` | — | `remove_status` |
 | 劣势 · 灰烬呛咳 `dnd-status-keep-low` | `check_pre_roll` | — | `has_status` + `modify_check('keep_low')` |
-| 劣势 · 日照敏感 `dnd-sunlight-sensitivity` | `check_pre_roll` | `flag_set dnd-sunlight` | `modify_check('keep_low')`（只在攻击检定） |
-| 优势 · 集群战术 `dnd-pack-tactics` | `check_pre_roll` | `flag_set dnd-flanked` | `modify_check('keep_high')` |
-| 优势 · 伏击（第 1 轮） `dnd-ambusher-keep-high` | `check_pre_roll` | `all_of[第1轮, 被突袭]` | `modify_check('keep_high')` |
+| 劣势 · 日照敏感 `dnd-sunlight-sensitivity` | `check_pre_roll` | `flag_set dnd-sunlight` | `get_attachment` + **判定签名**（`check_kind` / `check_attribute`）+ `modify_check('keep_low')` |
+| 优势 · 集群战术 `dnd-pack-tactics` | `check_pre_roll` | `flag_set dnd-flanked` | `get_attachment` + `modify_check('keep_high')` |
+| 优势 · 伏击（第 1 轮） `dnd-ambusher-keep-high` | `check_pre_roll` | `all_of[第1轮, 被突袭]` | `get_attachment` + `modify_check('keep_high')` |
 | 技能声明的豁免 DC `dnd-skill-dc` | `check_pre_roll` | — | `definition.check.default_dc` + `host.difficulty` + `modify_check('dc', Δ)` |
-| 熟练加值 `dnd-proficiency` | `check_post_roll` | — | `check_attribute` / `check_kind` + `modify_check('add', N)` |
+| 熟练加值 `dnd-proficiency` | `check_pre_roll` | — | `get_attachment('dnd-proficiency')` + `get_definition(id).fields` + `check_attribute` + `modify_check('add', N)` |
 | 豁免成功伤害减半 `dnd-save-half` | `check_post_roll` | — | `check_result` + `engine_rng` + `apply_effect(damage)` |
 | 突袭 `dnd-surprise` | `check_post_roll` | — | `apply_status` + `apply_effect(set_flag)` |
-| 战斗第一轮 `dnd-battle-round` | `turn_end` | `flag_set dnd-in-combat` | `storage` + `apply_effect(set_flag)` |
-| 重复豁免 `dnd-save-ends` | `status_tick` | — | `status_id` + `get_attribute` + `engine_rng` + `remove_status` |
+| 战斗第一轮 `dnd-battle-round` | `turn_end` | `flag_set dnd-in-combat` | `storage` + `clear_flag` × 3 + `apply_effect(set_flag)` |
+| 重复豁免 `dnd-save-ends` | `status_tick` | — | `list_definitions('dnd-save-ends')` + `status_id` + `get_attribute` + `engine_rng` + `remove_status` |
 | 掷表遭遇 `dnd-wander-day` / `-night` | `turn_end` | 地点 / 野外标记 + 昼夜 | `engine_rng(1,20)` → `engine_rng(1,12)` → `set_flag` |
-| XP 合计 `dnd-xp-<表>-<d12>` × 24 | `turn_end` | `all_of[表行标记, encounter_cleared]` | `storage` 幂等 + `modify_resource('res-xp')` |
+| 掷表标记复位 `dnd-wander-reset` | `event` | —（脚本内按 `event_name` 分支） | `event_name` / `event_data` + `clear_flag` |
+| XP 合计 `dnd-xp-award` | `event` | —（脚本内按 `event_name` 分支） | `event_data.enemy.template_id` + `list_definitions('dnd-xp-award')` + `modify_resource('res-xp')` |
 
-「优势 / 劣势」是**规则包自己的词汇**：引擎只认识 `keep_high` / `keep_low`，
+### 本轮新用上的引擎原语（T17 / T18）
+
+| 原语 | 用在哪 | 闭合的缺口 |
+|---|---|---|
+| `host.get_attachments()` / `get_attachment(kind)` / `get_definition(id)` / `list_definitions(kind)` | 熟练加值、日照敏感、集群战术、伏击、重复豁免、XP 数值 | GAP-C |
+| `check_pre_roll` 的判定签名（`check_attribute` / `check_kind` / `check_target`） | 日照敏感（攻击骰 ∨ 感知检定）、熟练加值 | GAP-D |
+| `host.set_flag(flag[, value])` / `host.clear_flag(flag)` | 战斗轮次、掷表行标记复位 | GAP-H |
+| `TriggerDef.repeatable`（边沿语义：条件由假变真） | 24 个掷表触发点 | GAP-N |
+| `event` 挂载点 + `host.event_name` / `host.event_data` | XP（`enemy_defeated`）、掷表复位（`encounter_cleared`） | GAP-F |
+
+「优势 / 劣势」仍是**规则包自己的词汇**：引擎只认识 `keep_high` / `keep_low`，
 脚本里包一层别名由规则包负责（[规则集走 Lua](../docs/rules-via-lua.md) §4 ②）。
 
 ### 掷表遭遇的完整链路（无新增字段）
@@ -115,13 +131,29 @@ Lua 定义「什么时候做」**。本规则包不改引擎、不新增任何�
 turn_end + when(at_location 三猪小径 ∨ dnd-in-wilderness) + 昼夜
   → Lua: engine_rng(1,20)  ≥17 触发
   → Lua: engine_rng(1,12)  查表
-  → Lua: apply_effect(actor, { kind = 'set_flag', flag = 'dnd-wander-day-N' })
-  → 触发点 condition: { op: 'flag_set', flag = 'dnd-wander-day-N' } + encounter 预置
-  → 回合末 evaluate_turn_end → spawn_trigger_encounters → 建遭遇（图鉴实例克隆）
-  → 清空后：dnd-xp-table-N 在 when: encounter_cleared 时 modify_resource('res-xp')
+  → Lua: host.set_flag('dnd-wander-day-N')
+  → 触发点 condition: { op: 'flag_set', flag: 'dnd-wander-day-N' } + repeatable: true + encounter 预置
+  → 回合末 evaluate_turn_end（evaluate_skeleton_full）
+       · 条件由假变真（边沿）才触发 → spawn_trigger_encounters → 建遭遇（图鉴实例克隆）
+  → 遭遇结束：event 'encounter_cleared' → dnd-wander-reset 按遭遇名反查 → host.clear_flag(行标记)
+       · 标记落回假 → 该行下一次被掷中就是一次新边沿 → **同一表项可反复出**
+  → 击败敌人：event 'enemy_defeated' → dnd-xp-award 按 data.enemy.template_id → modify_resource('res-xp')
+       · 与遭遇从哪来无关：掷表建的、导演即兴建的都发
 ```
 
 表项来自模块第 1225 / 1235 行的白昼 / 黑夜两张 d12 表（蚊蝠 / 食人魔 / 地精 / 大地精 / 兽人 / 狼 / 枭熊 / 食尸鬼）。
+
+复位靠**遭遇名**精确反查：预置遭遇名带 d12 行号且在表项间唯一（如
+`野外遭遇（白昼） d12=3：食人魔`），所以多场掷表遭遇同时进行时只复位真正结束的那一场。
+遭遇未结束期间同一行再次被掷中不会产生边沿（不重复堆同名遭遇，刻意如此）。
+
+### XP 的口径与边界
+
+* 时机：`enemy_defeated`（strike 击杀路径派发），`data.enemy.template_id` → 开放内容
+  `xp-<模板 id>` 定义的 `fields.xp`；数值逐条来自 T8 图鉴 `statblock.xp`（`--check` 与引擎校验都断言相等）。
+* 覆盖：逐只结算，**不再依赖掷表行标记**，所以导演 / AI 即兴建的遭遇一样拿得到 XP。
+* 边界（原样登记）：非 strike 击杀（Lua 直接把怪物资源打到 0）**不派发** `enemy_defeated`，
+  那种路径拿不到 XP——奖励只挂在引擎认得的「击败」事实上。
 
 ### 导演 / AI 需要置位的标记
 
@@ -135,60 +167,91 @@ turn_end + when(at_location 三猪小径 ∨ dnd-in-wilderness) + 昼夜
 | `dnd-in-combat` | 战斗开始（战斗轮次计数开闸） |
 | `dnd-flanked` | 有怪物满足「盟友在目标 5 尺内」 |
 
-### 表达不了的缺口（**原样报告，未新增封闭字段**）
+### 表达不了的缺口（**逐条复核：已闭合 / 仍存在**）
 
-`--check` 结尾会打印完整清单（每条：哪条规则 / 卡在哪个原语 / 需要什么）。摘要：
+`--check` 结尾会打印完整清单（每条：哪条规则 / 卡在哪个原语 / 需要什么 / 本轮复核结论）。
+**14 条缺口：闭合 5 条（C / D / F / H / N），仍存在 9 条（A / B / E / G / I / J / K / L / M）。**
 
 0. **先记一条「引擎实况 + 规则包补法」**：`use_skill` 路径的难度只取 `world.check.default_dc`，
    **技能的 `check.default_dc` 不参与**（只在 `Intent::Check` / `strike` 兜底里读）。
    所以「DC 10 敏捷豁免」这条规则由 `dnd-skill-dc` 用 `modify_check('dc', want - host.difficulty)` 补上——
    不是缺口，但**照抄技能声明是没用的**，必须在 Lua 里翻一次。
 
-1. **Lua 读不到其它实体**：没有 `get_character` / `get_encounter` / 读 flag；`host.target` 只有 id/name/kind。
-   → 集群战术、伏击的「对受突袭者」、XP 的遭遇内容都只能用标记近似。
-2. **`check_pre_roll` 没有判定签名**：`check_kind` / `check_attribute` 只在掷骰后才有值，
-   而「取高/取低」只有掷骰前有意义 → 日照敏感的「感知（察觉）检定」那一半表达不了（攻击那一半靠 `host.definition` 绕过）。
-3. **效果掷骰值不暴露**：豁免减半只能按 `host.definition` 的骰式**重掷**再取半——期望值对，不是同一颗骰。
-4. **没有「敌人被击败」事件 / 遭遇快照**：XP 只能用 `when: encounter_cleared` + 掷表行标记回补；
-   导演即兴建的遭遇拿不到 XP。
-5. **预置遭遇数量是静态整数**：表里的「1d8+2 只蚊蝠」只能固定成骰式下界（写进 trigger `hint` 与 preset `note`）。
-6. **没有清标记原语、触发点一次性（`repeatable` 未实现）**：24 行表项整局各触发一次。
-7. **没有先攻 / 轮次 / 行动经济**：突袭的「战斗第一轮失去其回合」只有状态 + 标记，靠叙事层落实。
-8. **挂接定义不进 Lua**：`docs/rules-via-lua.md` §7 的 `host.attachment_bonus` 引擎里没有；
-   开放内容只能给人看，规则要用的数据在**生成期烘进 Lua 表**（`lmop-rulepack.mjs` 的 `RULEPACK` 常量）。
-9. **模板级状态无声明入口**：`build_state` 建实例时 `statuses` 恒为空，怪物固有特性做不成自带状态。
+#### 已闭合（5 条）
 
-### 运行期证据
+| GAP | 主题 | 闭合原语 | 规则包落地 | 谁在断言 |
+|---|---|---|---|---|
+| **C** | 挂接 / 开放内容不进 Lua | `host.get_attachments()` / `get_attachment(kind)` / `get_definition(id)` / `list_definitions(kind)` | 熟练加值 / 日照敏感 / 集群战术 / 伏击 / 重复豁免 / XP 数值全部改成**运行时读开放内容**；角色模板的 `attachments` 是唯一入口 | `--check: open_content.data_driven / attachments.resolve`；引擎 `proficiency.data_driven / bestiary.xp_matches` |
+| **D** | `check_pre_roll` 没有判定签名 | 掷骰前下发 `check_attribute` / `check_kind` / `check_target` | 日照敏感按签名区分「攻击骰」与「依赖视力的感知（wis）检定」；熟练加值回到掷骰前用签名选属性 | `--check: sunlight.by_signature`；引擎 `sunlight.by_signature` |
+| **F** | 没有「敌人被击败」事件 | `event` 挂载点 + `host.event_name` / `host.event_data`（`enemy_defeated` / `encounter_cleared`） | `dnd-xp-award` 按 `data.enemy.template_id` **逐只**发 XP；与遭遇来源无关 | `--check: encounter_table.chain`；引擎 `xp.improvised_encounter` |
+| **H** | 没有清标记原语 | `host.set_flag(flag[, value])` / `host.clear_flag(flag)` | `dnd-battle-round` 每轮清 1..3 再置当前轮；`dnd-wander-reset` 在 `encounter_cleared` 时清行标记 | `--check: encounter_table.chain` |
+| **N** | 触发点一次性（`repeatable` 未实现） | `TriggerDef.repeatable`（**边沿**语义：条件由假变真） | 24 个掷表触发点全部标 `repeatable: true`，配合 H 的复位形成「结束 → 清标记 → 再触发」循环 | `--check: encounter_table.chain`；引擎 `encounter_table.refires` |
 
-`--check` 只做静态断言（含真实引擎 `--engine` 钩子）。规则**真的生效**另由一次性 Rust 校验器证明：
-`LuaRegistry::from_storybook(&sb)` + `LuaHost::new(seed)` + `run_chain_with/run_chain_status`
-（`octopus_engine::lua_host` 全是 pub API），断言 19 项：
+**C + F 的边界（如实登记）**：
+* C 闭合的是「规则要用的**数据**进 Lua」。`get_attachment` / `get_definition` 只读**故事书静态数据**，
+  不等于「读运行时实体」——那仍是 GAP-A。
+* F 闭合的是「引擎派发击败事实」。**非 strike 击杀**（Lua 直接把怪物资源打到 0）不派发
+  `enemy_defeated`，那条路径不发 XP。
 
-    registry.loads_all       38 条 lua_mounts 全部装载（when 也全部解析）
-    rule.status_keep_high    激励 → ModifyCheck keep_high；无状态 → 零请求
-    rule.status_keep_low     灰烬呛咳 → ModifyCheck keep_low
-    rule.sunlight_keep_low   阳光+攻击 → 取低；阳光+属性检定 / 无阳光 → 零请求
-    rule.pack_tactics_*      dnd-flanked 成立 → 取高；闸门不成立 → 零请求
-    rule.ambusher_*          第 1 轮 + 被突袭 → 取高
-    rule.skill_dc            技能声明 DC 10 / 当前 12 → dc -2；已相等或攻击技能 → 不加
-    rule.proficiency_add     dex 属性检定 → add 5；攻击 / 未熟练属性 → 不加
-    rule.save_half           豁免成功 → 3d6 重掷取半 = 数字串，消耗 3 颗骰；失败 → 不补
-    rule.consume_inspiration 掷骰后 RemoveStatus 激励
-    rule.surprise            隐匿失败 → ApplyStatus 受突袭 + set_flag
-    rule.repeat_save         体质 +10 对 DC 10 连续 5 次全移除；不在表里的状态 → 零请求
-    rule.battle_round        第 1/2/3 轮各置一次标记，第 4 轮起不再置位
-    rule.wander_table        300 回合触发 48 次，12 个 d12 行全部出现；黑夜闸门走另一张表
-    rule.xp_award            蚊蝠 25×3 = 75 → modify_resource；重复触发零请求（幂等）
-    rule.xp_award.waits_for_clear  遭遇未清空 → 不发 XP
+#### 仍然存在（9 条，卡在什么原语上）
 
-如需固化进仓库，把上面这套调用搬进 `crates/octopus-engine/tests/` 即可（属 crates/，超出本任务 inScope）。
+| GAP | 主题 | 卡在哪个原语 / 缺什么 |
+|---|---|---|
+| A | Lua 读不到其它实体 | 没有 `get_character` / `get_encounter` / `get_flag`；`host.target` 仍只有 id / name / kind。集群战术的「盟友在目标 5 尺内」只能继续用 `dnd-flanked` 标记近似 |
+| B | 没有位置 / 距离 / 区域 | 引擎只有 `location_id` 这种地点归属，没有 5 尺 / 交战关系 |
+| E | 效果掷骰值不暴露 | 没有 `pending_effect` / `last_effect`；`dnd-save-half` 只能按 `host.definition` 的骰式**重掷**取半（期望值等价，不是同一颗骰） |
+| G | 预置遭遇数量是静态整数 | `EncounterPresetEnemy.count` 没有骰式落点；「1d8+2 只蚊蝠」只能固定成骰式下界 |
+| I | 没有先攻 / 轮次 / 行动经济 | 「在战斗第一轮失去其回合」只有状态 + 标记，靠叙事层落实 |
+| J | 没有「掷骰 vs 对手被动」入口 | `CondExpr::AttributeGe` 只看 actor 自己的属性；规则脚本读不到对手被动值 |
+| K | 模板级状态无声明入口 | character 模板没有初始状态声明，建实例时 `statuses` 恒为空；挂接读得到，但「挂接 → 状态」的桥没有 |
+| L | `host.target` 读不到目标状态 | 仍只有 id / name / kind，没有 statuses / attributes / resources |
+| M | 没有 `encounter_active` 条件 | `CondExpr` 仍只有 `encounter_cleared`；战斗轮计数继续靠 `dnd-in-combat` 标记开闸 |
+
+### 运行期证据（真实引擎）
+
+`--check` 本身做静态断言（形状 / 引用 / 数据驱动 / 重复性 / 确定性）。
+规则**真的生效**由独立校验器 `scripts/lmop-engine-check`（只 path 依赖 `crates/`，不改引擎）证明：
+发布门 `validate_storybook_result` + `lint_storybook`，运行期用 `LuaHost` + `conditions::evaluate_skeleton_full`
+跑规则包里**实际的 Lua 源码**：
+
+    ./scripts/lmop-engine-check.sh
+    # 或：CARGO_TARGET_DIR=$PWD/.scratch/lmop-engine-check-target \
+    #       cargo build --manifest-path scripts/lmop-engine-check/Cargo.toml
+    #     node scripts/lmop-rulepack.mjs --check --engine <上面的 debug/lmop-engine-check>
+
+断言（2026 实测全绿）：
+
+    publish_gate                  validate_storybook 错误 0 / lua_lint 问题 0
+    proficiency.data_driven       definition bonus=5 → Lua add 5；把 bonus 改成 9（只改故事书数据）→ add 9
+    sunlight.by_signature         str+attack → keep_low；wis+attribute → keep_low；str+attribute / con+save → 零请求；狼 → 零请求
+    encounter_table.refires       400 回合模拟：12 个触发点被边沿触发，单点最多 12 次；
+                                  反证组（去掉 repeatable / 复位）单点最多 1 次
+    xp.improvised_encounter       即兴遭遇（encounter=enc-improvised）击败灰烬丧尸 → res-xp +50；
+                                  scene / encounter_cleared 事件零请求；再击败一只 → 再 +50
+    bestiary.xp_matches           31 条模板的 dnd-xp-award 定义与图鉴 statblock.xp 逐条相等
+
+### 既有引擎 E2E 用例的口径更新（经授权）
+
+`crates/octopus-api/tests/lmop_verification.rs` 里两条用例钉的是**旧口径**，GAP-F / GAP-H / GAP-N
+闭合后按新语义改写（经协调方授权只改这一个测试文件）：
+
+| 用例 | 旧期望 | 新期望（更严，不是放宽） |
+|---|---|---|
+| `a1_a2`（挂载点形状） | `lua_mounts.len() == 38`（12 规则 + 2 掷表 + 24 条按行回补 XP） | `== 16`，且**断言关键挂载点在场并挂在正确时机**：`dnd-xp-award` 必须 mount=`event` 且源码含 `enemy_defeated`；`dnd-wander-reset` 必须 mount=`event` 且源码含 `clear_flag`；旧的 `dnd-xp-day*/night*` 规则必须已移除 |
+| `a9_a14`（XP） | 清空遭遇后一回合 XP 增量 == 掷表行 xp×数量 | **逐只**击杀时 XP 增量 == 该模板 `statblock.xp`；整场清剿增量 == 遭遇内每只敌人数据卡 XP 之和；清空后再跑一回合增量 **恰好为 0**（不再补发）；行标记与触发点 `active` 必须已复位为 false |
+
+新用例的失败条件（仍有牙齿）：少发 / 多发 / 补刀重复发 / 金额与数据卡不符 / 清空后补发 /
+行标记未复位 —— 任意一条都会 FAIL。旧缺口语义以注释形式保留在用例里（可追溯）。
+
+全套回归：`cargo test -p octopus-api --test lmop_verification` → **12 passed**（含 `a11_a13` 的
+`r#mod = 8`，即 dex 3 + 数据驱动的熟练 5，证明 GAP-C 在真实 session 里生效）。
 
 ## 地点 / 地图 / 骨架
 
 * 地点：`world.locations[]` 的 `parent_id` 树，id 形如 `loc-lmop-<5etools section id>`（可回溯）。
   根地点 10 个（凡达林、克拉摩窝点、三猪小径、兔莓与阿加莎的巢穴、古枭井、雷树废墟、飞龙突岩、克拉摩堡、回声洞、地精伏击），
   子地点为镇内场所与「第 N 区」（如 `回声洞 > 第 5 区`），共 88 个。
-* 骨架：4 章（四个部分）× 88 场，场景 `location_id` 指向地点；草稿里 `goals` / `triggers` 留空待作者填写，规则包在「三猪小径」（`sc-lmop-0b7`）追加 24 个掷表触发点（每个带 `condition: flag_set` + `encounter` 预置）。
+* 骨架：4 章（四个部分）× 88 场，场景 `location_id` 指向地点；草稿里 `goals` / `triggers` 留空待作者填写，规则包在「三猪小径」（`sc-lmop-0b7`）追加 24 个掷表触发点（每个带 `repeatable: true` + `condition: flag_set` + `encounter` 预置）。
 * 地图：`world.maps[]` 7 张（剑湾 / 克拉摩窝点 / 凡达林 / 红标帮窝点 / 雷树废墟 / 克拉摩堡 / 回声洞），
   锚点 `pins` 坐标为**归一化 0..1**。
 
@@ -204,18 +267,24 @@ turn_end + when(at_location 三猪小径 ∨ dnd-in-wilderness) + 昼夜
 
     node scripts/import-bestiary.mjs --check
     node scripts/lmop-rulepack.mjs --check
-    node scripts/lmop-rulepack.mjs --check --engine <引擎校验器>
+    ./scripts/lmop-engine-check.sh                      # 真实引擎：发布门 + 运行时规则断言
+    node scripts/lmop-rulepack.mjs --check --engine .scratch/lmop-engine-check-target/debug/lmop-engine-check
 
 覆盖：条目数与解析命中、kind / statblock / 资源声明、`derived.ac` 与数据卡逐条相等、
 攻击技能的 check 形状与伤害效果、变体挂接且全稿无 `extends`、
 **与附录 B 逐项交叉核对**（28 条可解析条目全部一致）、地点树无环、锚点归一化且在所属地点子树内、
 骨架场景引用有效、两次构建逐字节一致（确定性）。
 
-`lmop-rulepack.mjs --check` 覆盖：十条能力覆盖矩阵（规则 + 开放内容两侧都要有）、开局 PC（六维 / `res-hp` /
-技能 / 常驻地）、**撤回字段 deep-scan**（`advantage` / `disadvantage` / `on_save` / `ConditionalModifier` /
-`save_ends` / `crit` / `EncounterTable` / `extends` 在整本故事书里零命中）、`lua_mounts` 静态预检
-（挂载点白名单 / 禁用 API / `host.*` 存在性 / 撤回词）、图鉴数据未被复制或改动、掷表链路端到端形状
-（Lua → flag → 触发点 → 预置遭遇 → XP）、开放内容引用自洽、缺口清单非空、两次构建逐字节一致。
-加 `--engine <bin>` 时再跑一次真实引擎的 `validate_storybook` + `lint_storybook`（0 error / 0 lua issue）。
+`lmop-rulepack.mjs --check`（25 项断言）覆盖：十条能力覆盖矩阵（规则 + 开放内容两侧都要有）、开局 PC（六维 /
+`res-hp` / 技能 / 常驻地）、**撤回字段 deep-scan**（`advantage` / `disadvantage` / `on_save` /
+`ConditionalModifier` / `save_ends` / `crit` / `EncounterTable` / `extends` 在整本故事书里零命中）、
+`lua_mounts` 静态预检（挂载点白名单 / 禁用 API / `host.*` 存在性 / 撤回词）、图鉴数据未被复制或改动
+（规则挂接只允许**追加**规则包自己的 kind）、掷表链路端到端形状（Lua → set_flag → repeatable 触发点 →
+预置遭遇 → `clear_flag` 复位）、开放内容引用自洽、**数据驱动**（6 条规则的 Lua 里没有标识 / 数值常量）、
+**日照敏感按签名**、**规则挂接全部指向同 kind 的定义**、缺口清单逐条带 status、两次构建逐字节一致。
+
+加 `--engine <bin>` 时，同一支真实引擎校验器再跑：`validate_storybook` 错误 0 +
+`lint_storybook` 问题 0（警告 24 条为既有图鉴告警）+ 5 条运行时规则断言（加值数据驱动 / 判定签名 /
+同表项反复触发 / 即兴遭遇发 XP / XP 与图鉴逐条相等）。
 
 附录 B 共 **31 节 = 30 张独立数据卡 + 毒牙**（青年绿龙的别名条目）。

@@ -1427,13 +1427,14 @@
             {
               "id": "tr-lmop-wander-day-1",
               "title": "野外遭遇（白昼） d12=1：蚊蝠",
-              "hint": "规则包掷表：d20 ≥ 17 触发，d12=1 → 蚊蝠（原表数量 1d8+2，本规则包固定 3）。",
+              "hint": "规则包掷表：d20 ≥ 17 触发，d12=1 → 蚊蝠（原表数量 1d8+2，本规则包固定 3）。可重复：行标记在遭遇结束时复位（dnd-wander-reset）。",
+              "repeatable": true,
               "condition": {
                 "op": "flag_set",
                 "flag": "dnd-wander-day-1"
               },
               "encounter": {
-                "name": "野外遭遇（白昼）：蚊蝠",
+                "name": "野外遭遇（白昼） d12=1：蚊蝠",
                 "note": "规则包预置遭遇 · 原表 1d8+2 → 固定 3",
                 "location_id": "loc-lmop-0b7",
                 "enemies": [
@@ -1447,13 +1448,14 @@
             {
               "id": "tr-lmop-wander-day-2",
               "title": "野外遭遇（白昼） d12=2：蚊蝠",
-              "hint": "规则包掷表：d20 ≥ 17 触发，d12=2 → 蚊蝠（原表数量 1d8+2，本规则包固定 3）。",
+              "hint": "规则包掷表：d20 ≥ 17 触发，d12=2 → 蚊蝠（原表数量 1d8+2，本规则包固定 3）。可重复：行标记在遭遇结束时复位（dnd-wander-reset）。",
+              "repeatable": true,
               "condition": {
                 "op": "flag_set",
                 "flag": "dnd-wander-day-2"
               },
               "encounter": {
-                "name": "野外遭遇（白昼）：蚊蝠",
+                "name": "野外遭遇（白昼） d12=2：蚊蝠",
                 "note": "规则包预置遭遇 · 原表 1d8+2 → 固定 3",
                 "location_id": "loc-lmop-0b7",
                 "enemies": [
@@ -1467,13 +1469,14 @@
             {
               "id": "tr-lmop-wander-day-3",
               "title": "野外遭遇（白昼） d12=3：食人魔",
-              "hint": "规则包掷表：d20 ≥ 17 触发，d12=3 → 食人魔（原表数量 1，本规则包固定 1）。",
+              "hint": "规则包掷表：d20 ≥ 17 触发，d12=3 → 食人魔（原表数量 1，本规则包固定 1）。可重复：行标记在遭遇结束时复位（dnd-wander-reset）。",
+              "repeatable": true,
               "condition": {
                 "op": "flag_set",
                 "flag": "dnd-wander-day-3"
               },
               "encounter": {
-                "name": "野外遭遇（白昼）：食人魔",
+                "name": "野外遭遇（白昼） d12=3：食人魔",
                 "note": "规则包预置遭遇 · 原表 1 → 固定 1",
                 "location_id": "loc-lmop-0b7",
                 "enemies": [
@@ -1487,13 +1490,14 @@
             {
               "id": "tr-lmop-wander-day-4",
               "title": "野外遭遇（白昼） d12=4：食人魔",
-              "hint": "规则包掷表：d20 ≥ 17 触发，d12=4 → 食人魔（原表数量 1，本规则包固定 1）。",
+              "hint": "规则包掷表：d20 ≥ 17 触发，d12=4 → 食人魔（原表数量 1，本规则包固定 1）。可重复：行标记在遭遇结束时复位（dnd-wander-reset）。",
+              "repeatable": true,
               "condition": {
                 "op": "flag_set",
                 "flag": "dnd-wander-day-4"
               },
               "encounter": {
-                "name": "野外遭遇（白昼）：食人魔",
+                "name": "野外遭遇（白昼） d12=4：食人魔",
                 "note": "规则包预置遭遇 · 原表 1 → 固定 1",
                 "location_id": "loc-lmop-0b7",
                 "enemies": [
@@ -1507,13 +1511,14 @@
             {
               "id": "tr-lmop-wander-day-5",
               "title": "野外遭遇（白昼） d12=5：地精",
-              "hint": "规则包掷表：d20 ≥ 17 触发，d12=5 → 地精（原表数量 1d6+3，本规则包固定 4）。",
+              "hint": "规则包掷表：d20 ≥ 17 触发，d12=5 → 地精（原表数量 1d6+3，本规则包固定 4）。可重复：行标记在遭遇结束时复位（dnd-wander-reset）。",
+              "repeatable": true,
               "condition": {
                 "op": "flag_set",
                 "flag": "dnd-wander-day-5"
               },
               "encounter": {
-                "name": "野外遭遇（白昼）：地精",
+                "name": "野外遭遇（白昼） d12=5：地精",
                 "note": "规则包预置遭遇 · 原表 1d6+3 → 固定 4",
                 "location_id": "loc-lmop-0b7",
                 "enemies": [
@@ -1527,13 +1532,14 @@
             {
               "id": "tr-lmop-wander-day-6",
               "title": "野外遭遇（白昼） d12=6：地精",
-              "hint": "规则包掷表：d20 ≥ 17 触发，d12=6 → 地精（原表数量 1d6+3，本规则包固定 4）。",
+              "hint": "规则包掷表：d20 ≥ 17 触发，d12=6 → 地精（原表数量 1d6+3，本规则包固定 4）。可重复：行标记在遭遇结束时复位（dnd-wander-reset）。",
+              "repeatable": true,
               "condition": {
                 "op": "flag_set",
                 "flag": "dnd-wander-day-6"
               },
               "encounter": {
-                "name": "野外遭遇（白昼）：地精",
+                "name": "野外遭遇（白昼） d12=6：地精",
                 "note": "规则包预置遭遇 · 原表 1d6+3 → 固定 4",
                 "location_id": "loc-lmop-0b7",
                 "enemies": [
@@ -1547,13 +1553,14 @@
             {
               "id": "tr-lmop-wander-day-7",
               "title": "野外遭遇（白昼） d12=7：大地精",
-              "hint": "规则包掷表：d20 ≥ 17 触发，d12=7 → 大地精（原表数量 1d4+2，本规则包固定 3）。",
+              "hint": "规则包掷表：d20 ≥ 17 触发，d12=7 → 大地精（原表数量 1d4+2，本规则包固定 3）。可重复：行标记在遭遇结束时复位（dnd-wander-reset）。",
+              "repeatable": true,
               "condition": {
                 "op": "flag_set",
                 "flag": "dnd-wander-day-7"
               },
               "encounter": {
-                "name": "野外遭遇（白昼）：大地精",
+                "name": "野外遭遇（白昼） d12=7：大地精",
                 "note": "规则包预置遭遇 · 原表 1d4+2 → 固定 3",
                 "location_id": "loc-lmop-0b7",
                 "enemies": [
@@ -1567,13 +1574,14 @@
             {
               "id": "tr-lmop-wander-day-8",
               "title": "野外遭遇（白昼） d12=8：大地精",
-              "hint": "规则包掷表：d20 ≥ 17 触发，d12=8 → 大地精（原表数量 1d4+2，本规则包固定 3）。",
+              "hint": "规则包掷表：d20 ≥ 17 触发，d12=8 → 大地精（原表数量 1d4+2，本规则包固定 3）。可重复：行标记在遭遇结束时复位（dnd-wander-reset）。",
+              "repeatable": true,
               "condition": {
                 "op": "flag_set",
                 "flag": "dnd-wander-day-8"
               },
               "encounter": {
-                "name": "野外遭遇（白昼）：大地精",
+                "name": "野外遭遇（白昼） d12=8：大地精",
                 "note": "规则包预置遭遇 · 原表 1d4+2 → 固定 3",
                 "location_id": "loc-lmop-0b7",
                 "enemies": [
@@ -1587,13 +1595,14 @@
             {
               "id": "tr-lmop-wander-day-9",
               "title": "野外遭遇（白昼） d12=9：兽人",
-              "hint": "规则包掷表：d20 ≥ 17 触发，d12=9 → 兽人（原表数量 1d4+2，本规则包固定 3）。",
+              "hint": "规则包掷表：d20 ≥ 17 触发，d12=9 → 兽人（原表数量 1d4+2，本规则包固定 3）。可重复：行标记在遭遇结束时复位（dnd-wander-reset）。",
+              "repeatable": true,
               "condition": {
                 "op": "flag_set",
                 "flag": "dnd-wander-day-9"
               },
               "encounter": {
-                "name": "野外遭遇（白昼）：兽人",
+                "name": "野外遭遇（白昼） d12=9：兽人",
                 "note": "规则包预置遭遇 · 原表 1d4+2 → 固定 3",
                 "location_id": "loc-lmop-0b7",
                 "enemies": [
@@ -1607,13 +1616,14 @@
             {
               "id": "tr-lmop-wander-day-10",
               "title": "野外遭遇（白昼） d12=10：兽人",
-              "hint": "规则包掷表：d20 ≥ 17 触发，d12=10 → 兽人（原表数量 1d4+2，本规则包固定 3）。",
+              "hint": "规则包掷表：d20 ≥ 17 触发，d12=10 → 兽人（原表数量 1d4+2，本规则包固定 3）。可重复：行标记在遭遇结束时复位（dnd-wander-reset）。",
+              "repeatable": true,
               "condition": {
                 "op": "flag_set",
                 "flag": "dnd-wander-day-10"
               },
               "encounter": {
-                "name": "野外遭遇（白昼）：兽人",
+                "name": "野外遭遇（白昼） d12=10：兽人",
                 "note": "规则包预置遭遇 · 原表 1d4+2 → 固定 3",
                 "location_id": "loc-lmop-0b7",
                 "enemies": [
@@ -1627,13 +1637,14 @@
             {
               "id": "tr-lmop-wander-day-11",
               "title": "野外遭遇（白昼） d12=11：狼",
-              "hint": "规则包掷表：d20 ≥ 17 触发，d12=11 → 狼（原表数量 1d4+2，本规则包固定 3）。",
+              "hint": "规则包掷表：d20 ≥ 17 触发，d12=11 → 狼（原表数量 1d4+2，本规则包固定 3）。可重复：行标记在遭遇结束时复位（dnd-wander-reset）。",
+              "repeatable": true,
               "condition": {
                 "op": "flag_set",
                 "flag": "dnd-wander-day-11"
               },
               "encounter": {
-                "name": "野外遭遇（白昼）：狼",
+                "name": "野外遭遇（白昼） d12=11：狼",
                 "note": "规则包预置遭遇 · 原表 1d4+2 → 固定 3",
                 "location_id": "loc-lmop-0b7",
                 "enemies": [
@@ -1647,13 +1658,14 @@
             {
               "id": "tr-lmop-wander-day-12",
               "title": "野外遭遇（白昼） d12=12：枭熊",
-              "hint": "规则包掷表：d20 ≥ 17 触发，d12=12 → 枭熊（原表数量 1，本规则包固定 1）。",
+              "hint": "规则包掷表：d20 ≥ 17 触发，d12=12 → 枭熊（原表数量 1，本规则包固定 1）。可重复：行标记在遭遇结束时复位（dnd-wander-reset）。",
+              "repeatable": true,
               "condition": {
                 "op": "flag_set",
                 "flag": "dnd-wander-day-12"
               },
               "encounter": {
-                "name": "野外遭遇（白昼）：枭熊",
+                "name": "野外遭遇（白昼） d12=12：枭熊",
                 "note": "规则包预置遭遇 · 原表 1 → 固定 1",
                 "location_id": "loc-lmop-0b7",
                 "enemies": [
@@ -1667,13 +1679,14 @@
             {
               "id": "tr-lmop-wander-night-1",
               "title": "野外遭遇（黑夜） d12=1：蚊蝠",
-              "hint": "规则包掷表：d20 ≥ 17 触发，d12=1 → 蚊蝠（原表数量 1d8+2，本规则包固定 3）。",
+              "hint": "规则包掷表：d20 ≥ 17 触发，d12=1 → 蚊蝠（原表数量 1d8+2，本规则包固定 3）。可重复：行标记在遭遇结束时复位（dnd-wander-reset）。",
+              "repeatable": true,
               "condition": {
                 "op": "flag_set",
                 "flag": "dnd-wander-night-1"
               },
               "encounter": {
-                "name": "野外遭遇（黑夜）：蚊蝠",
+                "name": "野外遭遇（黑夜） d12=1：蚊蝠",
                 "note": "规则包预置遭遇 · 原表 1d8+2 → 固定 3",
                 "location_id": "loc-lmop-0b7",
                 "enemies": [
@@ -1687,13 +1700,14 @@
             {
               "id": "tr-lmop-wander-night-2",
               "title": "野外遭遇（黑夜） d12=2：蚊蝠",
-              "hint": "规则包掷表：d20 ≥ 17 触发，d12=2 → 蚊蝠（原表数量 1d8+2，本规则包固定 3）。",
+              "hint": "规则包掷表：d20 ≥ 17 触发，d12=2 → 蚊蝠（原表数量 1d8+2，本规则包固定 3）。可重复：行标记在遭遇结束时复位（dnd-wander-reset）。",
+              "repeatable": true,
               "condition": {
                 "op": "flag_set",
                 "flag": "dnd-wander-night-2"
               },
               "encounter": {
-                "name": "野外遭遇（黑夜）：蚊蝠",
+                "name": "野外遭遇（黑夜） d12=2：蚊蝠",
                 "note": "规则包预置遭遇 · 原表 1d8+2 → 固定 3",
                 "location_id": "loc-lmop-0b7",
                 "enemies": [
@@ -1707,13 +1721,14 @@
             {
               "id": "tr-lmop-wander-night-3",
               "title": "野外遭遇（黑夜） d12=3：蚊蝠",
-              "hint": "规则包掷表：d20 ≥ 17 触发，d12=3 → 蚊蝠（原表数量 1d8+2，本规则包固定 3）。",
+              "hint": "规则包掷表：d20 ≥ 17 触发，d12=3 → 蚊蝠（原表数量 1d8+2，本规则包固定 3）。可重复：行标记在遭遇结束时复位（dnd-wander-reset）。",
+              "repeatable": true,
               "condition": {
                 "op": "flag_set",
                 "flag": "dnd-wander-night-3"
               },
               "encounter": {
-                "name": "野外遭遇（黑夜）：蚊蝠",
+                "name": "野外遭遇（黑夜） d12=3：蚊蝠",
                 "note": "规则包预置遭遇 · 原表 1d8+2 → 固定 3",
                 "location_id": "loc-lmop-0b7",
                 "enemies": [
@@ -1727,13 +1742,14 @@
             {
               "id": "tr-lmop-wander-night-4",
               "title": "野外遭遇（黑夜） d12=4：食尸鬼",
-              "hint": "规则包掷表：d20 ≥ 17 触发，d12=4 → 食尸鬼（原表数量 1d4+1，本规则包固定 2）。",
+              "hint": "规则包掷表：d20 ≥ 17 触发，d12=4 → 食尸鬼（原表数量 1d4+1，本规则包固定 2）。可重复：行标记在遭遇结束时复位（dnd-wander-reset）。",
+              "repeatable": true,
               "condition": {
                 "op": "flag_set",
                 "flag": "dnd-wander-night-4"
               },
               "encounter": {
-                "name": "野外遭遇（黑夜）：食尸鬼",
+                "name": "野外遭遇（黑夜） d12=4：食尸鬼",
                 "note": "规则包预置遭遇 · 原表 1d4+1 → 固定 2",
                 "location_id": "loc-lmop-0b7",
                 "enemies": [
@@ -1747,13 +1763,14 @@
             {
               "id": "tr-lmop-wander-night-5",
               "title": "野外遭遇（黑夜） d12=5：地精",
-              "hint": "规则包掷表：d20 ≥ 17 触发，d12=5 → 地精（原表数量 1d6+3，本规则包固定 4）。",
+              "hint": "规则包掷表：d20 ≥ 17 触发，d12=5 → 地精（原表数量 1d6+3，本规则包固定 4）。可重复：行标记在遭遇结束时复位（dnd-wander-reset）。",
+              "repeatable": true,
               "condition": {
                 "op": "flag_set",
                 "flag": "dnd-wander-night-5"
               },
               "encounter": {
-                "name": "野外遭遇（黑夜）：地精",
+                "name": "野外遭遇（黑夜） d12=5：地精",
                 "note": "规则包预置遭遇 · 原表 1d6+3 → 固定 4",
                 "location_id": "loc-lmop-0b7",
                 "enemies": [
@@ -1767,13 +1784,14 @@
             {
               "id": "tr-lmop-wander-night-6",
               "title": "野外遭遇（黑夜） d12=6：大地精",
-              "hint": "规则包掷表：d20 ≥ 17 触发，d12=6 → 大地精（原表数量 1d4+2，本规则包固定 3）。",
+              "hint": "规则包掷表：d20 ≥ 17 触发，d12=6 → 大地精（原表数量 1d4+2，本规则包固定 3）。可重复：行标记在遭遇结束时复位（dnd-wander-reset）。",
+              "repeatable": true,
               "condition": {
                 "op": "flag_set",
                 "flag": "dnd-wander-night-6"
               },
               "encounter": {
-                "name": "野外遭遇（黑夜）：大地精",
+                "name": "野外遭遇（黑夜） d12=6：大地精",
                 "note": "规则包预置遭遇 · 原表 1d4+2 → 固定 3",
                 "location_id": "loc-lmop-0b7",
                 "enemies": [
@@ -1787,13 +1805,14 @@
             {
               "id": "tr-lmop-wander-night-7",
               "title": "野外遭遇（黑夜） d12=7：兽人",
-              "hint": "规则包掷表：d20 ≥ 17 触发，d12=7 → 兽人（原表数量 1d4+2，本规则包固定 3）。",
+              "hint": "规则包掷表：d20 ≥ 17 触发，d12=7 → 兽人（原表数量 1d4+2，本规则包固定 3）。可重复：行标记在遭遇结束时复位（dnd-wander-reset）。",
+              "repeatable": true,
               "condition": {
                 "op": "flag_set",
                 "flag": "dnd-wander-night-7"
               },
               "encounter": {
-                "name": "野外遭遇（黑夜）：兽人",
+                "name": "野外遭遇（黑夜） d12=7：兽人",
                 "note": "规则包预置遭遇 · 原表 1d4+2 → 固定 3",
                 "location_id": "loc-lmop-0b7",
                 "enemies": [
@@ -1807,13 +1826,14 @@
             {
               "id": "tr-lmop-wander-night-8",
               "title": "野外遭遇（黑夜） d12=8：兽人",
-              "hint": "规则包掷表：d20 ≥ 17 触发，d12=8 → 兽人（原表数量 1d4+2，本规则包固定 3）。",
+              "hint": "规则包掷表：d20 ≥ 17 触发，d12=8 → 兽人（原表数量 1d4+2，本规则包固定 3）。可重复：行标记在遭遇结束时复位（dnd-wander-reset）。",
+              "repeatable": true,
               "condition": {
                 "op": "flag_set",
                 "flag": "dnd-wander-night-8"
               },
               "encounter": {
-                "name": "野外遭遇（黑夜）：兽人",
+                "name": "野外遭遇（黑夜） d12=8：兽人",
                 "note": "规则包预置遭遇 · 原表 1d4+2 → 固定 3",
                 "location_id": "loc-lmop-0b7",
                 "enemies": [
@@ -1827,13 +1847,14 @@
             {
               "id": "tr-lmop-wander-night-9",
               "title": "野外遭遇（黑夜） d12=9：狼",
-              "hint": "规则包掷表：d20 ≥ 17 触发，d12=9 → 狼（原表数量 1d4+2，本规则包固定 3）。",
+              "hint": "规则包掷表：d20 ≥ 17 触发，d12=9 → 狼（原表数量 1d4+2，本规则包固定 3）。可重复：行标记在遭遇结束时复位（dnd-wander-reset）。",
+              "repeatable": true,
               "condition": {
                 "op": "flag_set",
                 "flag": "dnd-wander-night-9"
               },
               "encounter": {
-                "name": "野外遭遇（黑夜）：狼",
+                "name": "野外遭遇（黑夜） d12=9：狼",
                 "note": "规则包预置遭遇 · 原表 1d4+2 → 固定 3",
                 "location_id": "loc-lmop-0b7",
                 "enemies": [
@@ -1847,13 +1868,14 @@
             {
               "id": "tr-lmop-wander-night-10",
               "title": "野外遭遇（黑夜） d12=10：狼",
-              "hint": "规则包掷表：d20 ≥ 17 触发，d12=10 → 狼（原表数量 1d4+2，本规则包固定 3）。",
+              "hint": "规则包掷表：d20 ≥ 17 触发，d12=10 → 狼（原表数量 1d4+2，本规则包固定 3）。可重复：行标记在遭遇结束时复位（dnd-wander-reset）。",
+              "repeatable": true,
               "condition": {
                 "op": "flag_set",
                 "flag": "dnd-wander-night-10"
               },
               "encounter": {
-                "name": "野外遭遇（黑夜）：狼",
+                "name": "野外遭遇（黑夜） d12=10：狼",
                 "note": "规则包预置遭遇 · 原表 1d4+2 → 固定 3",
                 "location_id": "loc-lmop-0b7",
                 "enemies": [
@@ -1867,13 +1889,14 @@
             {
               "id": "tr-lmop-wander-night-11",
               "title": "野外遭遇（黑夜） d12=11：枭熊",
-              "hint": "规则包掷表：d20 ≥ 17 触发，d12=11 → 枭熊（原表数量 1，本规则包固定 1）。",
+              "hint": "规则包掷表：d20 ≥ 17 触发，d12=11 → 枭熊（原表数量 1，本规则包固定 1）。可重复：行标记在遭遇结束时复位（dnd-wander-reset）。",
+              "repeatable": true,
               "condition": {
                 "op": "flag_set",
                 "flag": "dnd-wander-night-11"
               },
               "encounter": {
-                "name": "野外遭遇（黑夜）：枭熊",
+                "name": "野外遭遇（黑夜） d12=11：枭熊",
                 "note": "规则包预置遭遇 · 原表 1 → 固定 1",
                 "location_id": "loc-lmop-0b7",
                 "enemies": [
@@ -1887,13 +1910,14 @@
             {
               "id": "tr-lmop-wander-night-12",
               "title": "野外遭遇（黑夜） d12=12：枭熊",
-              "hint": "规则包掷表：d20 ≥ 17 触发，d12=12 → 枭熊（原表数量 1，本规则包固定 1）。",
+              "hint": "规则包掷表：d20 ≥ 17 触发，d12=12 → 枭熊（原表数量 1，本规则包固定 1）。可重复：行标记在遭遇结束时复位（dnd-wander-reset）。",
+              "repeatable": true,
               "condition": {
                 "op": "flag_set",
                 "flag": "dnd-wander-night-12"
               },
               "encounter": {
-                "name": "野外遭遇（黑夜）：枭熊",
+                "name": "野外遭遇（黑夜） d12=12：枭熊",
                 "note": "规则包预置遭遇 · 原表 1 → 固定 1",
                 "location_id": "loc-lmop-0b7",
                 "enemies": [
@@ -2503,7 +2527,12 @@
         "xp": 700,
         "actionsNote": "**多重攻击。** 变形怪发动两次近战攻击。\n**猛击。** 近战武器攻击 命中+6，触及 5 尺，单一目标。命中：7（1d6 + 4）的钝击伤害。\n**读心。** 变形怪用魔法读取其60尺内一个生物的表层思想。该效应可穿透一些障碍物，但无法穿透3尺厚的木质或土质，2尺厚的石质，2寸厚的金属质或一薄层的铅板。目标身处该距离内时，变形怪只要保持专注就可以持续阅读思想（如同专注一个法术）。读取目标的思想时，变形怪对该目标进行的感知（洞悉）和魅力（欺瞒，威吓，游说）检定具有优势。"
       },
-      "notes": "图鉴导入 · 5e 源 bestiary-lmop-appendix-b.json（Doppelganger，MM p82）"
+      "notes": "图鉴导入 · 5e 源 bestiary-lmop-appendix-b.json（Doppelganger，MM p82）",
+      "attachments": {
+        "dnd-ambusher": [
+          "ambush-doppelganger"
+        ]
+      }
     },
     {
       "id": "mon-evil-mage",
@@ -2796,7 +2825,12 @@
         "xp": 700,
         "actionsNote": "**吸取生命。** 近战武器攻击 +5 攻击命中，触及 5 尺，单一生物。 命中：16 (3d8 + 3) 点暗蚀伤害，且目标必须进行一次 DC 13 体质豁免，豁免失败则其生命值上限降低等同于所受伤害的数值。若此攻击将目标的生命值上限降低至 0，则目标死亡。目标生命值上限的降低效果持续到目标完成一次长休为止。"
       },
-      "notes": "图鉴导入 · 5e 源 bestiary-lmop.json（Mormesk the Wraith，LMoP p59）"
+      "notes": "图鉴导入 · 5e 源 bestiary-lmop.json（Mormesk the Wraith，LMoP p59）",
+      "attachments": {
+        "dnd-sunlight-sensitivity": [
+          "sunlight-mormesk-the-wraith"
+        ]
+      }
     },
     {
       "id": "mon-nezznar-the-black-spider",
@@ -3274,6 +3308,9 @@
       "attachments": {
         "monster-armor": [
           "armor-wolf"
+        ],
+        "dnd-pack-tactics": [
+          "pack-wolf"
         ]
       }
     },
@@ -3413,6 +3450,10 @@
       "attachments": {
         "monster-armor": [
           "armor-lmop-talin-leather"
+        ],
+        "dnd-proficiency": [
+          "prof-pc-lmop-talin-dex",
+          "prof-pc-lmop-talin-wis"
         ]
       },
       "notes": "LMoP 规则包开局 PC（3 级游荡者取向）：HP 24 = 3d8+6 取平均；AC 14 = 10 + 敏捷调整值 +3 + 皮甲 +1（挂接修正）；六维取自 5e 标准数组。常驻地：凡达林。"
@@ -4964,7 +5005,7 @@
       "description": "战斗第一轮对受其突袭的生物的攻击检定有优势",
       "fields": {
         "creature_id": "mon-doppelganger",
-        "note": "附录 B 原文：战斗开始的第一轮里，该生物对任何成功受其突袭的生物所发动的攻击检定具有优势。"
+        "note": "附录 B 原文：战斗开始的第一轮里，该生物对任何成功受其突袭的生物所发动的攻击检定具有优势。「哪只生物有伏击」由本定义驱动（Lua 读模板挂接，不烘名单）。"
       }
     },
     {
@@ -5311,9 +5352,9 @@
       "id": "battle-round-lmop",
       "kind": "dnd-battle-round",
       "name": "战斗轮次（LMoP）",
-      "description": "dnd-in-combat 标记开闸，turn_end 自增，置 dnd-battle-round-1..3",
+      "description": "dnd-in-combat 标记开闸，turn_end 自增，清 1..3 后置当前轮",
       "fields": {
-        "note": "缺口 GAP-M（没有「有遭遇」条件）/ GAP-H（没有清标记原语）/ GAP-I（没有行动经济）。"
+        "note": "每轮先 clear_flag(dnd-battle-round-1..3) 再置当前轮：任何时刻至多一个轮次标记为真。仍存在的缺口：GAP-M（没有「有遭遇」条件，靠 dnd-in-combat 标记开闸）/ GAP-I（没有先攻与行动经济）。"
       }
     },
     {
@@ -5374,7 +5415,7 @@
       "fields": {
         "creature_id": "mon-wolf",
         "gate_flag": "dnd-flanked",
-        "note": "盟友 5 尺内这个事实引擎拿不到（缺口 GAP-A / GAP-B），由叙事层置位 dnd-flanked。"
+        "note": "盟友 5 尺内这个事实引擎拿不到（缺口 GAP-A / GAP-B），由叙事层置位 dnd-flanked；「哪只生物有集群战术」由本定义驱动（Lua 读模板挂接，不烘名单）。"
       }
     },
     {
@@ -5556,13 +5597,24 @@
       }
     },
     {
+      "id": "rule-dnd-wander-reset",
+      "kind": "dnd-rule",
+      "name": "规则 · 掷表标记复位（遭遇结束清标记）",
+      "description": "lua_mounts:dnd-wander-reset（挂载点 event）",
+      "fields": {
+        "mount": "event",
+        "coverage": "掷表标记复位（遭遇结束清标记）",
+        "note": "规则语义全在 Lua；引擎只提供通用原语。"
+      }
+    },
+    {
       "id": "rule-dnd-xp-award",
       "kind": "dnd-rule",
-      "name": "规则 · 经验值合计（每个掷表行一条）",
-      "description": "lua_mounts:dnd-xp-award（挂载点 turn_end）",
+      "name": "规则 · 经验值合计（每个被击败的怪物一条）",
+      "description": "lua_mounts:dnd-xp-award（挂载点 event）",
       "fields": {
-        "mount": "turn_end",
-        "coverage": "经验值合计（每个掷表行一条）",
+        "mount": "event",
+        "coverage": "经验值合计（每个被击败的怪物一条）",
         "note": "规则语义全在 Lua；引擎只提供通用原语。"
       }
     },
@@ -5604,10 +5656,11 @@
       "id": "sunlight-mormesk-the-wraith",
       "kind": "dnd-sunlight-sensitivity",
       "name": "日照敏感 · 缚灵·墨梅斯克",
-      "description": "阳光下攻击检定劣势（依赖视力的感知检定那一半表达不了，见缺口 GAP-D）",
+      "description": "阳光下攻击检定劣势，依赖视力的感知（察觉）检定也劣势（按判定签名区分）",
       "fields": {
         "creature_id": "mon-mormesk-the-wraith",
-        "note": "附录 B 原文：在阳光下，该生物在攻击骰上处于劣势，并且在依赖视力的感知（察觉）检定上也处于劣势。"
+        "signature_scope": "kind == attack ∨ (kind == attribute ∧ attribute == wis)",
+        "note": "附录 B 原文：在阳光下，该生物在攻击骰上处于劣势，并且在依赖视力的感知（察觉）检定上也处于劣势。两条分支都由 check_pre_roll 的判定签名区分；其它判定不受影响。"
       }
     },
     {
@@ -5620,7 +5673,7 @@
         "trigger_die": "1d20，17-20 触发",
         "row_die": "1d12",
         "rows": "1 → 蚊蝠（原表 1d8+2，本规则包固定 3）\n2 → 蚊蝠（原表 1d8+2，本规则包固定 3）\n3 → 食人魔（原表 1，本规则包固定 1）\n4 → 食人魔（原表 1，本规则包固定 1）\n5 → 地精（原表 1d6+3，本规则包固定 4）\n6 → 地精（原表 1d6+3，本规则包固定 4）\n7 → 大地精（原表 1d4+2，本规则包固定 3）\n8 → 大地精（原表 1d4+2，本规则包固定 3）\n9 → 兽人（原表 1d4+2，本规则包固定 3）\n10 → 兽人（原表 1d4+2，本规则包固定 3）\n11 → 狼（原表 1d4+2，本规则包固定 3）\n12 → 枭熊（原表 1，本规则包固定 1）",
-        "note": "缺口 GAP-G：预置遭遇的数量是静态整数，骰式数量只能取骰式下界。"
+        "note": "触发点 repeatable，遭遇结束时由 lua_mounts:dnd-wander-reset 清行标记复位——同一表项可反复出。仍存在的缺口：GAP-G（预置遭遇的数量是静态整数，骰式数量只能取骰式下界）。"
       }
     },
     {
@@ -5633,7 +5686,7 @@
         "trigger_die": "1d20，17-20 触发",
         "row_die": "1d12",
         "rows": "1 → 蚊蝠（原表 1d8+2，本规则包固定 3）\n2 → 蚊蝠（原表 1d8+2，本规则包固定 3）\n3 → 蚊蝠（原表 1d8+2，本规则包固定 3）\n4 → 食尸鬼（原表 1d4+1，本规则包固定 2）\n5 → 地精（原表 1d6+3，本规则包固定 4）\n6 → 大地精（原表 1d4+2，本规则包固定 3）\n7 → 兽人（原表 1d4+2，本规则包固定 3）\n8 → 兽人（原表 1d4+2，本规则包固定 3）\n9 → 狼（原表 1d4+2，本规则包固定 3）\n10 → 狼（原表 1d4+2，本规则包固定 3）\n11 → 枭熊（原表 1，本规则包固定 1）\n12 → 枭熊（原表 1，本规则包固定 1）",
-        "note": "缺口 GAP-G：预置遭遇的数量是静态整数，骰式数量只能取骰式下界。"
+        "note": "触发点 repeatable，遭遇结束时由 lua_mounts:dnd-wander-reset 清行标记复位——同一表项可反复出。仍存在的缺口：GAP-G（预置遭遇的数量是静态整数，骰式数量只能取骰式下界）。"
       }
     },
     {
@@ -5688,7 +5741,379 @@
       "fields": {
         "formula": "合计 = Σ(模板 statblock.xp × 遭遇内该模板数量)",
         "table": "灰烬丧尸=50；熊地精=200；平民=10；邪教徒=25；变形怪=700；邪恶法师=200；燃焰之颅=1100；食尸鬼=200；巨蜘蛛=200；地精=50；穴居攫怪=450；刚铎·寻岩者=10；大地精=100；缚灵·墨梅斯克=700；\"黑蜘蛛\"那兹纳尔=450；诺斯怪=450；南卓·寻岩者=10；赭果冻=450；食人魔=450；兽人=100；枭熊=700；红标帮恶霸=100；修达·霍温特=200；骷髅=50；观察者眼魔=700；蚊蝠=25；枯枝怪=25；狼=50；青年绿龙=3900；毒牙=3900；丧尸=50",
-        "note": "lua_mounts:dnd-xp-<表>-<d12> 在 when: encounter_cleared 时发放；缺口 GAP-F：引擎没有「敌人被击败」事件，导演即兴创建的遭遇拿不到 XP。"
+        "note": "lua_mounts:dnd-xp-award 在 event: enemy_defeated 时按 data.enemy.template_id 发放；导演出即兴遭遇也一样。逐模板值见同 kind 的 xp-<模板 id> 定义。"
+      }
+    },
+    {
+      "id": "xp-mon-ash-zombie",
+      "kind": "dnd-xp-award",
+      "name": "XP · 灰烬丧尸",
+      "description": "灰烬丧尸 被击败时发放 50 点经验值",
+      "fields": {
+        "template_id": "mon-ash-zombie",
+        "creature_name": "灰烬丧尸",
+        "xp": "50",
+        "note": "lua_mounts:dnd-xp-award 在 enemy_defeated 时按 fields.template_id 命中本条并 modify_resource。"
+      }
+    },
+    {
+      "id": "xp-mon-bugbear",
+      "kind": "dnd-xp-award",
+      "name": "XP · 熊地精",
+      "description": "熊地精 被击败时发放 200 点经验值",
+      "fields": {
+        "template_id": "mon-bugbear",
+        "creature_name": "熊地精",
+        "xp": "200",
+        "note": "lua_mounts:dnd-xp-award 在 enemy_defeated 时按 fields.template_id 命中本条并 modify_resource。"
+      }
+    },
+    {
+      "id": "xp-mon-commoner",
+      "kind": "dnd-xp-award",
+      "name": "XP · 平民",
+      "description": "平民 被击败时发放 10 点经验值",
+      "fields": {
+        "template_id": "mon-commoner",
+        "creature_name": "平民",
+        "xp": "10",
+        "note": "lua_mounts:dnd-xp-award 在 enemy_defeated 时按 fields.template_id 命中本条并 modify_resource。"
+      }
+    },
+    {
+      "id": "xp-mon-cultist",
+      "kind": "dnd-xp-award",
+      "name": "XP · 邪教徒",
+      "description": "邪教徒 被击败时发放 25 点经验值",
+      "fields": {
+        "template_id": "mon-cultist",
+        "creature_name": "邪教徒",
+        "xp": "25",
+        "note": "lua_mounts:dnd-xp-award 在 enemy_defeated 时按 fields.template_id 命中本条并 modify_resource。"
+      }
+    },
+    {
+      "id": "xp-mon-doppelganger",
+      "kind": "dnd-xp-award",
+      "name": "XP · 变形怪",
+      "description": "变形怪 被击败时发放 700 点经验值",
+      "fields": {
+        "template_id": "mon-doppelganger",
+        "creature_name": "变形怪",
+        "xp": "700",
+        "note": "lua_mounts:dnd-xp-award 在 enemy_defeated 时按 fields.template_id 命中本条并 modify_resource。"
+      }
+    },
+    {
+      "id": "xp-mon-evil-mage",
+      "kind": "dnd-xp-award",
+      "name": "XP · 邪恶法师",
+      "description": "邪恶法师 被击败时发放 200 点经验值",
+      "fields": {
+        "template_id": "mon-evil-mage",
+        "creature_name": "邪恶法师",
+        "xp": "200",
+        "note": "lua_mounts:dnd-xp-award 在 enemy_defeated 时按 fields.template_id 命中本条并 modify_resource。"
+      }
+    },
+    {
+      "id": "xp-mon-flameskull",
+      "kind": "dnd-xp-award",
+      "name": "XP · 燃焰之颅",
+      "description": "燃焰之颅 被击败时发放 1100 点经验值",
+      "fields": {
+        "template_id": "mon-flameskull",
+        "creature_name": "燃焰之颅",
+        "xp": "1100",
+        "note": "lua_mounts:dnd-xp-award 在 enemy_defeated 时按 fields.template_id 命中本条并 modify_resource。"
+      }
+    },
+    {
+      "id": "xp-mon-ghoul",
+      "kind": "dnd-xp-award",
+      "name": "XP · 食尸鬼",
+      "description": "食尸鬼 被击败时发放 200 点经验值",
+      "fields": {
+        "template_id": "mon-ghoul",
+        "creature_name": "食尸鬼",
+        "xp": "200",
+        "note": "lua_mounts:dnd-xp-award 在 enemy_defeated 时按 fields.template_id 命中本条并 modify_resource。"
+      }
+    },
+    {
+      "id": "xp-mon-giant-spider",
+      "kind": "dnd-xp-award",
+      "name": "XP · 巨蜘蛛",
+      "description": "巨蜘蛛 被击败时发放 200 点经验值",
+      "fields": {
+        "template_id": "mon-giant-spider",
+        "creature_name": "巨蜘蛛",
+        "xp": "200",
+        "note": "lua_mounts:dnd-xp-award 在 enemy_defeated 时按 fields.template_id 命中本条并 modify_resource。"
+      }
+    },
+    {
+      "id": "xp-mon-goblin",
+      "kind": "dnd-xp-award",
+      "name": "XP · 地精",
+      "description": "地精 被击败时发放 50 点经验值",
+      "fields": {
+        "template_id": "mon-goblin",
+        "creature_name": "地精",
+        "xp": "50",
+        "note": "lua_mounts:dnd-xp-award 在 enemy_defeated 时按 fields.template_id 命中本条并 modify_resource。"
+      }
+    },
+    {
+      "id": "xp-mon-grick",
+      "kind": "dnd-xp-award",
+      "name": "XP · 穴居攫怪",
+      "description": "穴居攫怪 被击败时发放 450 点经验值",
+      "fields": {
+        "template_id": "mon-grick",
+        "creature_name": "穴居攫怪",
+        "xp": "450",
+        "note": "lua_mounts:dnd-xp-award 在 enemy_defeated 时按 fields.template_id 命中本条并 modify_resource。"
+      }
+    },
+    {
+      "id": "xp-mon-gundren-rockseeker",
+      "kind": "dnd-xp-award",
+      "name": "XP · 刚铎·寻岩者",
+      "description": "刚铎·寻岩者 被击败时发放 10 点经验值",
+      "fields": {
+        "template_id": "mon-gundren-rockseeker",
+        "creature_name": "刚铎·寻岩者",
+        "xp": "10",
+        "note": "lua_mounts:dnd-xp-award 在 enemy_defeated 时按 fields.template_id 命中本条并 modify_resource。"
+      }
+    },
+    {
+      "id": "xp-mon-hobgoblin",
+      "kind": "dnd-xp-award",
+      "name": "XP · 大地精",
+      "description": "大地精 被击败时发放 100 点经验值",
+      "fields": {
+        "template_id": "mon-hobgoblin",
+        "creature_name": "大地精",
+        "xp": "100",
+        "note": "lua_mounts:dnd-xp-award 在 enemy_defeated 时按 fields.template_id 命中本条并 modify_resource。"
+      }
+    },
+    {
+      "id": "xp-mon-mormesk-the-wraith",
+      "kind": "dnd-xp-award",
+      "name": "XP · 缚灵·墨梅斯克",
+      "description": "缚灵·墨梅斯克 被击败时发放 700 点经验值",
+      "fields": {
+        "template_id": "mon-mormesk-the-wraith",
+        "creature_name": "缚灵·墨梅斯克",
+        "xp": "700",
+        "note": "lua_mounts:dnd-xp-award 在 enemy_defeated 时按 fields.template_id 命中本条并 modify_resource。"
+      }
+    },
+    {
+      "id": "xp-mon-nezznar-the-black-spider",
+      "kind": "dnd-xp-award",
+      "name": "XP · \"黑蜘蛛\"那兹纳尔",
+      "description": "\"黑蜘蛛\"那兹纳尔 被击败时发放 450 点经验值",
+      "fields": {
+        "template_id": "mon-nezznar-the-black-spider",
+        "creature_name": "\"黑蜘蛛\"那兹纳尔",
+        "xp": "450",
+        "note": "lua_mounts:dnd-xp-award 在 enemy_defeated 时按 fields.template_id 命中本条并 modify_resource。"
+      }
+    },
+    {
+      "id": "xp-mon-nothic",
+      "kind": "dnd-xp-award",
+      "name": "XP · 诺斯怪",
+      "description": "诺斯怪 被击败时发放 450 点经验值",
+      "fields": {
+        "template_id": "mon-nothic",
+        "creature_name": "诺斯怪",
+        "xp": "450",
+        "note": "lua_mounts:dnd-xp-award 在 enemy_defeated 时按 fields.template_id 命中本条并 modify_resource。"
+      }
+    },
+    {
+      "id": "xp-mon-nundro-rockseeker",
+      "kind": "dnd-xp-award",
+      "name": "XP · 南卓·寻岩者",
+      "description": "南卓·寻岩者 被击败时发放 10 点经验值",
+      "fields": {
+        "template_id": "mon-nundro-rockseeker",
+        "creature_name": "南卓·寻岩者",
+        "xp": "10",
+        "note": "lua_mounts:dnd-xp-award 在 enemy_defeated 时按 fields.template_id 命中本条并 modify_resource。"
+      }
+    },
+    {
+      "id": "xp-mon-ochre-jelly",
+      "kind": "dnd-xp-award",
+      "name": "XP · 赭果冻",
+      "description": "赭果冻 被击败时发放 450 点经验值",
+      "fields": {
+        "template_id": "mon-ochre-jelly",
+        "creature_name": "赭果冻",
+        "xp": "450",
+        "note": "lua_mounts:dnd-xp-award 在 enemy_defeated 时按 fields.template_id 命中本条并 modify_resource。"
+      }
+    },
+    {
+      "id": "xp-mon-ogre",
+      "kind": "dnd-xp-award",
+      "name": "XP · 食人魔",
+      "description": "食人魔 被击败时发放 450 点经验值",
+      "fields": {
+        "template_id": "mon-ogre",
+        "creature_name": "食人魔",
+        "xp": "450",
+        "note": "lua_mounts:dnd-xp-award 在 enemy_defeated 时按 fields.template_id 命中本条并 modify_resource。"
+      }
+    },
+    {
+      "id": "xp-mon-orc",
+      "kind": "dnd-xp-award",
+      "name": "XP · 兽人",
+      "description": "兽人 被击败时发放 100 点经验值",
+      "fields": {
+        "template_id": "mon-orc",
+        "creature_name": "兽人",
+        "xp": "100",
+        "note": "lua_mounts:dnd-xp-award 在 enemy_defeated 时按 fields.template_id 命中本条并 modify_resource。"
+      }
+    },
+    {
+      "id": "xp-mon-owlbear",
+      "kind": "dnd-xp-award",
+      "name": "XP · 枭熊",
+      "description": "枭熊 被击败时发放 700 点经验值",
+      "fields": {
+        "template_id": "mon-owlbear",
+        "creature_name": "枭熊",
+        "xp": "700",
+        "note": "lua_mounts:dnd-xp-award 在 enemy_defeated 时按 fields.template_id 命中本条并 modify_resource。"
+      }
+    },
+    {
+      "id": "xp-mon-redbrand-ruffian",
+      "kind": "dnd-xp-award",
+      "name": "XP · 红标帮恶霸",
+      "description": "红标帮恶霸 被击败时发放 100 点经验值",
+      "fields": {
+        "template_id": "mon-redbrand-ruffian",
+        "creature_name": "红标帮恶霸",
+        "xp": "100",
+        "note": "lua_mounts:dnd-xp-award 在 enemy_defeated 时按 fields.template_id 命中本条并 modify_resource。"
+      }
+    },
+    {
+      "id": "xp-mon-sildar-hallwinter",
+      "kind": "dnd-xp-award",
+      "name": "XP · 修达·霍温特",
+      "description": "修达·霍温特 被击败时发放 200 点经验值",
+      "fields": {
+        "template_id": "mon-sildar-hallwinter",
+        "creature_name": "修达·霍温特",
+        "xp": "200",
+        "note": "lua_mounts:dnd-xp-award 在 enemy_defeated 时按 fields.template_id 命中本条并 modify_resource。"
+      }
+    },
+    {
+      "id": "xp-mon-skeleton",
+      "kind": "dnd-xp-award",
+      "name": "XP · 骷髅",
+      "description": "骷髅 被击败时发放 50 点经验值",
+      "fields": {
+        "template_id": "mon-skeleton",
+        "creature_name": "骷髅",
+        "xp": "50",
+        "note": "lua_mounts:dnd-xp-award 在 enemy_defeated 时按 fields.template_id 命中本条并 modify_resource。"
+      }
+    },
+    {
+      "id": "xp-mon-spectator",
+      "kind": "dnd-xp-award",
+      "name": "XP · 观察者眼魔",
+      "description": "观察者眼魔 被击败时发放 700 点经验值",
+      "fields": {
+        "template_id": "mon-spectator",
+        "creature_name": "观察者眼魔",
+        "xp": "700",
+        "note": "lua_mounts:dnd-xp-award 在 enemy_defeated 时按 fields.template_id 命中本条并 modify_resource。"
+      }
+    },
+    {
+      "id": "xp-mon-stirge",
+      "kind": "dnd-xp-award",
+      "name": "XP · 蚊蝠",
+      "description": "蚊蝠 被击败时发放 25 点经验值",
+      "fields": {
+        "template_id": "mon-stirge",
+        "creature_name": "蚊蝠",
+        "xp": "25",
+        "note": "lua_mounts:dnd-xp-award 在 enemy_defeated 时按 fields.template_id 命中本条并 modify_resource。"
+      }
+    },
+    {
+      "id": "xp-mon-twig-blight",
+      "kind": "dnd-xp-award",
+      "name": "XP · 枯枝怪",
+      "description": "枯枝怪 被击败时发放 25 点经验值",
+      "fields": {
+        "template_id": "mon-twig-blight",
+        "creature_name": "枯枝怪",
+        "xp": "25",
+        "note": "lua_mounts:dnd-xp-award 在 enemy_defeated 时按 fields.template_id 命中本条并 modify_resource。"
+      }
+    },
+    {
+      "id": "xp-mon-venomfang",
+      "kind": "dnd-xp-award",
+      "name": "XP · 毒牙",
+      "description": "毒牙 被击败时发放 3900 点经验值",
+      "fields": {
+        "template_id": "mon-venomfang",
+        "creature_name": "毒牙",
+        "xp": "3900",
+        "note": "lua_mounts:dnd-xp-award 在 enemy_defeated 时按 fields.template_id 命中本条并 modify_resource。"
+      }
+    },
+    {
+      "id": "xp-mon-wolf",
+      "kind": "dnd-xp-award",
+      "name": "XP · 狼",
+      "description": "狼 被击败时发放 50 点经验值",
+      "fields": {
+        "template_id": "mon-wolf",
+        "creature_name": "狼",
+        "xp": "50",
+        "note": "lua_mounts:dnd-xp-award 在 enemy_defeated 时按 fields.template_id 命中本条并 modify_resource。"
+      }
+    },
+    {
+      "id": "xp-mon-young-green-dragon",
+      "kind": "dnd-xp-award",
+      "name": "XP · 青年绿龙",
+      "description": "青年绿龙 被击败时发放 3900 点经验值",
+      "fields": {
+        "template_id": "mon-young-green-dragon",
+        "creature_name": "青年绿龙",
+        "xp": "3900",
+        "note": "lua_mounts:dnd-xp-award 在 enemy_defeated 时按 fields.template_id 命中本条并 modify_resource。"
+      }
+    },
+    {
+      "id": "xp-mon-zombie",
+      "kind": "dnd-xp-award",
+      "name": "XP · 丧尸",
+      "description": "丧尸 被击败时发放 50 点经验值",
+      "fields": {
+        "template_id": "mon-zombie",
+        "creature_name": "丧尸",
+        "xp": "50",
+        "note": "lua_mounts:dnd-xp-award 在 enemy_defeated 时按 fields.template_id 命中本条并 modify_resource。"
       }
     }
   ],
@@ -5988,7 +6413,7 @@
     {
       "id": "dnd-sunlight-sensitivity",
       "mount": "check_pre_roll",
-      "source": "-- 规则包：日照敏感（缚灵·墨梅斯克，附录 B 第 3128 行原文）。\n-- 只在攻击检定上生效：check_pre_roll 拿不到判定种类（GAP-D），\n-- 攻击路径能通过 host.definition（本次技能声明）读到 check.kind = attack。\nlocal SUNLIGHT_SENSITIVE = {\n  ['mon-mormesk-the-wraith'] = true\n}\nlocal actor = host.actor.template_id or host.actor.instance_id\nif SUNLIGHT_SENSITIVE[actor] then\n  local definition = host.definition\n  local check = definition and definition.check\n  local kind = nil\n  if type(check) == \"table\" then kind = check.kind end\n  if kind == 'attack' then\n    host.modify_check('keep_low')\n  end\nend",
+      "source": "-- 规则包：日照敏感（缚灵·墨梅斯克，附录 B 原文）。\n-- 数据来源：开放内容（角色模板的 dnd-sunlight-sensitivity 挂接 → definition）。\n-- 判定签名在 check_pre_roll 就有（GAP-D 闭合）：\n--   kind == 'attack'                          → 攻击骰劣势（原文第一半）\n--   kind == 'attribute' and attribute == 'wis' → 依赖视力的感知（察觉）检定劣势（原文第二半）\n-- 其它判定（力量检定 / 体质豁免 / 敏捷豁免 …）一律不受影响。\nlocal ids = host.get_attachment('dnd-sunlight-sensitivity')\nif type(ids) ~= \"table\" or #ids == 0 then return end\nlocal kind = host.check_kind\nlocal attribute = host.check_attribute\nlocal attack = kind == 'attack'\nlocal sight = kind == 'attribute' and attribute == 'wis'\nif attack or sight then\n  host.modify_check('keep_low')\nend",
       "when": {
         "op": "flag_set",
         "flag": "dnd-sunlight"
@@ -5997,7 +6422,7 @@
     {
       "id": "dnd-pack-tactics",
       "mount": "check_pre_roll",
-      "source": "-- 规则包：集群战术（狼，附录 B 第 3700 行原文）。\n-- 「至少一个未处于失能的盟友在目标 5 尺内」这个事实引擎拿不到（GAP-A / GAP-B），\n-- 由叙事层置位 dnd-flanked；本脚本只负责「有该特性 + 闸门成立 → 取高」。\nlocal PACK_TACTICS = {\n  ['mon-wolf'] = true\n}\nlocal actor = host.actor.template_id or host.actor.instance_id\nif PACK_TACTICS[actor] then\n  host.modify_check('keep_high')\nend",
+      "source": "-- 规则包：集群战术（狼，附录 B 原文）。\n-- 「至少一个未处于失能的盟友在目标 5 尺内」这个事实引擎拿不到（GAP-A / GAP-B），\n-- 由叙事层置位 dnd-flanked；本脚本只负责「有该特性 + 闸门成立 → 取高」。\n-- 数据来源：开放内容（角色模板的 dnd-pack-tactics 挂接），脚本无生物名单。\nlocal ids = host.get_attachment('dnd-pack-tactics')\nif type(ids) == \"table\" and #ids > 0 then\n  host.modify_check('keep_high')\nend",
       "when": {
         "op": "flag_set",
         "flag": "dnd-flanked"
@@ -6006,7 +6431,7 @@
     {
       "id": "dnd-ambusher-keep-high",
       "mount": "check_pre_roll",
-      "source": "-- 规则包：伏击（变形怪，附录 B 第 2711 行原文）：战斗开始的第一轮里，\n-- 对任何成功受其突袭的生物所发动的攻击检定具有优势。\n-- host.target 读不到目标状态（GAP-L），用 dnd-surprised 标记近似。\nlocal AMBUSHER = {\n  ['mon-doppelganger'] = true\n}\nlocal actor = host.actor.template_id or host.actor.instance_id\nif AMBUSHER[actor] then\n  host.modify_check('keep_high')\nend",
+      "source": "-- 规则包：伏击（变形怪，附录 B 原文）：战斗开始的第一轮里，\n-- 对任何成功受其突袭的生物所发动的攻击检定具有优势。\n-- host.target 读不到目标状态（GAP-L），用 dnd-surprised 标记近似。\n-- 数据来源：开放内容（角色模板的 dnd-ambusher 挂接），脚本无生物名单。\nlocal ids = host.get_attachment('dnd-ambusher')\nif type(ids) == \"table\" and #ids > 0 then\n  host.modify_check('keep_high')\nend",
       "when": {
         "op": "all_of",
         "children": [
@@ -6028,8 +6453,8 @@
     },
     {
       "id": "dnd-proficiency",
-      "mount": "check_post_roll",
-      "source": "-- 规则包：熟练加值（模块第 194 行「隐匿技能调整值：+6」的同一条机制）。\n-- 引擎只在 check_post_roll 才给判定签名（GAP-D），所以加值走**掷骰后修正**\n-- （引擎会重算 total / margin / 档位，与掷骰前加值数值等价）。\n-- 只在 kind = attribute 上生效：攻击检定 / 豁免检定不吃熟练，避免误加。\nlocal PROFICIENCY = {\n  ['pc-lmop-talin'] = {\n    ['dex'] = 5,\n    ['wis'] = 3\n  }\n}\nlocal actor = host.actor.template_id or host.actor.instance_id\nlocal table_for_actor = PROFICIENCY[actor]\nif table_for_actor and host.check_kind == 'attribute' then\n  local bonus = table_for_actor[host.check_attribute]\n  if bonus then\n    host.modify_check('add', bonus)\n  end\nend"
+      "mount": "check_pre_roll",
+      "source": "-- 规则包：熟练加值（模块第 194 行「隐匿技能调整值：+6」的同一条机制）。\n-- 数据来源：开放内容（角色模板的 dnd-proficiency 挂接 → definition.fields）。\n-- 本脚本不含任何加值常量：加多少由故事书数据决定（改数据即改结果）。\n-- 判定签名在 check_pre_roll 就有（attribute / kind），所以加值走**掷骰前**修正。\nif host.check_kind ~= 'attribute' then return end\nlocal ids = host.get_attachment('dnd-proficiency')\nif type(ids) ~= \"table\" then return end\nlocal attribute = host.check_attribute\nfor _, id in ipairs(ids) do\n  local def = host.get_definition(id)\n  local fields = def and def.fields\n  if fields and fields.check_attribute == attribute then\n    local bonus = tonumber(fields.bonus)\n    if bonus and bonus ~= 0 then\n      host.modify_check('add', bonus)\n    end\n  end\nend"
     },
     {
       "id": "dnd-save-half",
@@ -6049,12 +6474,12 @@
     {
       "id": "dnd-save-ends",
       "mount": "status_tick",
-      "source": "-- 规则包：重复豁免（模块第 2541 行「生物可以在其每回合结束时重复进行豁免检定，若成功则提前终止效应」）。\n-- 时机原语 status_tick：引擎只给「谁 / 哪个状态 / 还剩多久」，要不要结束由规则包掷骰决定。\nlocal REPEAT_SAVES = {\n  ['dnd-eruption-penalty'] = { dc = 10, attribute = 'con' },\n  ['dnd-poisoned'] = { dc = 11, attribute = 'con' }\n}\nlocal rule = REPEAT_SAVES[host.status_id]\nif rule then\n  local score = host.get_attribute(rule.attribute)\n  local modifier = 0\n  if score then modifier = math.floor((score - 10) / 2) end\n  local roll = host.engine_rng(1, 20) + modifier\n  if roll >= rule.dc then\n    host.remove_status(host.actor.id, host.status_id)\n  end\nend"
+      "source": "-- 规则包：重复豁免（模块第 2541 行「生物可以在其每回合结束时重复进行豁免检定，若成功则提前终止效应」）。\n-- 时机原语 status_tick：引擎只给「谁 / 哪个状态 / 还剩多久」，要不要结束由规则包掷骰决定。\n-- 数据来源：开放内容（dnd-save-ends 定义），本脚本不含 DC / 属性常量。\nlocal rule = nil\nlocal defs = host.list_definitions('dnd-save-ends')\nfor _, def in ipairs(defs) do\n  local fields = def.fields\n  if fields and fields.status_id == host.status_id then rule = fields end\nend\nif rule then\n  local score = host.get_attribute(rule.attribute)\n  local modifier = 0\n  if score then modifier = math.floor((score - 10) / 2) end\n  local roll = host.engine_rng(1, 20) + modifier\n  if roll >= tonumber(rule.dc) then\n    host.remove_status(host.actor.id, host.status_id)\n  end\nend"
     },
     {
       "id": "dnd-battle-round",
       "mount": "turn_end",
-      "source": "-- 规则包：战斗轮次（突袭需要的「战斗第一轮」标记，模块第 195 行）。\n-- CondExpr 没有「当前有遭遇」这个条件（GAP-M），开闸靠 dnd-in-combat 标记。\n-- 缺口 GAP-H：引擎没有清标记原语，轮次标记只置不清。\nlocal round = (host.storage.dnd_battle_round or 0) + 1\nhost.storage.dnd_battle_round = round\nif round <= 3 then\n  host.apply_effect(host.actor.id, { kind = 'set_flag', flag = 'dnd-battle-round-' .. tostring(round) })\nend",
+      "source": "-- 规则包：战斗轮次（突袭需要的「战斗第一轮」标记，模块第 195 行）。\n-- CondExpr 没有「当前有遭遇」这个条件（GAP-M），开闸靠 dnd-in-combat 标记。\n-- 清标记原语（GAP-H 闭合）：每轮先清 1..3，再置当前轮——任何时刻至多一个轮次标记为真。\nlocal round = (host.storage.dnd_battle_round or 0) + 1\nhost.storage.dnd_battle_round = round\nhost.clear_flag('dnd-battle-round-1')\nhost.clear_flag('dnd-battle-round-2')\nhost.clear_flag('dnd-battle-round-3')\nif round <= 3 then\n  host.apply_effect(host.actor.id, { kind = 'set_flag', flag = 'dnd-battle-round-' .. tostring(round) })\nend",
       "when": {
         "op": "flag_set",
         "flag": "dnd-in-combat"
@@ -6063,7 +6488,7 @@
     {
       "id": "dnd-wander-day",
       "mount": "turn_end",
-      "source": "-- 规则包：野外遭遇掷表（模块第 1221 行原文）。\n-- 链路：Lua 掷骰 → set_flag → 触发点 condition: flag_set + encounter 预置 → 回合末自动建遭遇。\n-- 引擎不认识「遭遇表」，表只活在规则包 Lua 里。\nlocal check = host.engine_rng(1, 20)\nif check >= 17 then\n  local row = host.engine_rng(1, 12)\n  local FLAGS_BY_ROW = {\n  [1] = 'dnd-wander-day-1',\n  [2] = 'dnd-wander-day-2',\n  [3] = 'dnd-wander-day-3',\n  [4] = 'dnd-wander-day-4',\n  [5] = 'dnd-wander-day-5',\n  [6] = 'dnd-wander-day-6',\n  [7] = 'dnd-wander-day-7',\n  [8] = 'dnd-wander-day-8',\n  [9] = 'dnd-wander-day-9',\n  [10] = 'dnd-wander-day-10',\n  [11] = 'dnd-wander-day-11',\n  [12] = 'dnd-wander-day-12'\n  }\n  local flag = FLAGS_BY_ROW[row]\n  if flag then\n    host.apply_effect(host.actor.id, { kind = 'set_flag', flag = flag })\n  end\nend",
+      "source": "-- 规则包：野外遭遇掷表（模块第 1221 行原文）。\n-- 链路：Lua 掷骰 → set_flag → 触发点 condition: flag_set（repeatable）+ encounter 预置\n--       → 回合末骨架求值在边沿建遭遇；遭遇结束时由 dnd-wander-reset 清标记复位。\n-- 引擎不认识「遭遇表」，表只活在规则包 Lua 里。\nlocal check = host.engine_rng(1, 20)\nif check >= 17 then\n  local row = host.engine_rng(1, 12)\n  local FLAGS_BY_ROW = {\n  [1] = 'dnd-wander-day-1',\n  [2] = 'dnd-wander-day-2',\n  [3] = 'dnd-wander-day-3',\n  [4] = 'dnd-wander-day-4',\n  [5] = 'dnd-wander-day-5',\n  [6] = 'dnd-wander-day-6',\n  [7] = 'dnd-wander-day-7',\n  [8] = 'dnd-wander-day-8',\n  [9] = 'dnd-wander-day-9',\n  [10] = 'dnd-wander-day-10',\n  [11] = 'dnd-wander-day-11',\n  [12] = 'dnd-wander-day-12'\n  }\n  local flag = FLAGS_BY_ROW[row]\n  if flag then\n    host.set_flag(flag)\n  end\nend",
       "when": {
         "op": "all_of",
         "children": [
@@ -6091,213 +6516,9 @@
       }
     },
     {
-      "id": "dnd-xp-day-1",
-      "mount": "turn_end",
-      "source": "-- 规则包：经验值合计（模块第 1987 行「合计角色们克服的每个怪物的经验值」）。\n-- 引擎没有「敌人被击败」事件（GAP-F），只能用 when: encounter_cleared + 掷表行标记回补。\n-- 幂等：脚本私有存储区 host.storage 记住已发过一次。\nif host.storage.dnd_xp_awarded then return end\nhost.storage.dnd_xp_awarded = true\nhost.modify_resource(host.actor.id, 'res-xp', 75)",
-      "when": {
-        "op": "all_of",
-        "children": [
-          {
-            "op": "flag_set",
-            "flag": "dnd-wander-day-1"
-          },
-          {
-            "op": "encounter_cleared"
-          }
-        ]
-      }
-    },
-    {
-      "id": "dnd-xp-day-2",
-      "mount": "turn_end",
-      "source": "-- 规则包：经验值合计（模块第 1987 行「合计角色们克服的每个怪物的经验值」）。\n-- 引擎没有「敌人被击败」事件（GAP-F），只能用 when: encounter_cleared + 掷表行标记回补。\n-- 幂等：脚本私有存储区 host.storage 记住已发过一次。\nif host.storage.dnd_xp_awarded then return end\nhost.storage.dnd_xp_awarded = true\nhost.modify_resource(host.actor.id, 'res-xp', 75)",
-      "when": {
-        "op": "all_of",
-        "children": [
-          {
-            "op": "flag_set",
-            "flag": "dnd-wander-day-2"
-          },
-          {
-            "op": "encounter_cleared"
-          }
-        ]
-      }
-    },
-    {
-      "id": "dnd-xp-day-3",
-      "mount": "turn_end",
-      "source": "-- 规则包：经验值合计（模块第 1987 行「合计角色们克服的每个怪物的经验值」）。\n-- 引擎没有「敌人被击败」事件（GAP-F），只能用 when: encounter_cleared + 掷表行标记回补。\n-- 幂等：脚本私有存储区 host.storage 记住已发过一次。\nif host.storage.dnd_xp_awarded then return end\nhost.storage.dnd_xp_awarded = true\nhost.modify_resource(host.actor.id, 'res-xp', 450)",
-      "when": {
-        "op": "all_of",
-        "children": [
-          {
-            "op": "flag_set",
-            "flag": "dnd-wander-day-3"
-          },
-          {
-            "op": "encounter_cleared"
-          }
-        ]
-      }
-    },
-    {
-      "id": "dnd-xp-day-4",
-      "mount": "turn_end",
-      "source": "-- 规则包：经验值合计（模块第 1987 行「合计角色们克服的每个怪物的经验值」）。\n-- 引擎没有「敌人被击败」事件（GAP-F），只能用 when: encounter_cleared + 掷表行标记回补。\n-- 幂等：脚本私有存储区 host.storage 记住已发过一次。\nif host.storage.dnd_xp_awarded then return end\nhost.storage.dnd_xp_awarded = true\nhost.modify_resource(host.actor.id, 'res-xp', 450)",
-      "when": {
-        "op": "all_of",
-        "children": [
-          {
-            "op": "flag_set",
-            "flag": "dnd-wander-day-4"
-          },
-          {
-            "op": "encounter_cleared"
-          }
-        ]
-      }
-    },
-    {
-      "id": "dnd-xp-day-5",
-      "mount": "turn_end",
-      "source": "-- 规则包：经验值合计（模块第 1987 行「合计角色们克服的每个怪物的经验值」）。\n-- 引擎没有「敌人被击败」事件（GAP-F），只能用 when: encounter_cleared + 掷表行标记回补。\n-- 幂等：脚本私有存储区 host.storage 记住已发过一次。\nif host.storage.dnd_xp_awarded then return end\nhost.storage.dnd_xp_awarded = true\nhost.modify_resource(host.actor.id, 'res-xp', 200)",
-      "when": {
-        "op": "all_of",
-        "children": [
-          {
-            "op": "flag_set",
-            "flag": "dnd-wander-day-5"
-          },
-          {
-            "op": "encounter_cleared"
-          }
-        ]
-      }
-    },
-    {
-      "id": "dnd-xp-day-6",
-      "mount": "turn_end",
-      "source": "-- 规则包：经验值合计（模块第 1987 行「合计角色们克服的每个怪物的经验值」）。\n-- 引擎没有「敌人被击败」事件（GAP-F），只能用 when: encounter_cleared + 掷表行标记回补。\n-- 幂等：脚本私有存储区 host.storage 记住已发过一次。\nif host.storage.dnd_xp_awarded then return end\nhost.storage.dnd_xp_awarded = true\nhost.modify_resource(host.actor.id, 'res-xp', 200)",
-      "when": {
-        "op": "all_of",
-        "children": [
-          {
-            "op": "flag_set",
-            "flag": "dnd-wander-day-6"
-          },
-          {
-            "op": "encounter_cleared"
-          }
-        ]
-      }
-    },
-    {
-      "id": "dnd-xp-day-7",
-      "mount": "turn_end",
-      "source": "-- 规则包：经验值合计（模块第 1987 行「合计角色们克服的每个怪物的经验值」）。\n-- 引擎没有「敌人被击败」事件（GAP-F），只能用 when: encounter_cleared + 掷表行标记回补。\n-- 幂等：脚本私有存储区 host.storage 记住已发过一次。\nif host.storage.dnd_xp_awarded then return end\nhost.storage.dnd_xp_awarded = true\nhost.modify_resource(host.actor.id, 'res-xp', 300)",
-      "when": {
-        "op": "all_of",
-        "children": [
-          {
-            "op": "flag_set",
-            "flag": "dnd-wander-day-7"
-          },
-          {
-            "op": "encounter_cleared"
-          }
-        ]
-      }
-    },
-    {
-      "id": "dnd-xp-day-8",
-      "mount": "turn_end",
-      "source": "-- 规则包：经验值合计（模块第 1987 行「合计角色们克服的每个怪物的经验值」）。\n-- 引擎没有「敌人被击败」事件（GAP-F），只能用 when: encounter_cleared + 掷表行标记回补。\n-- 幂等：脚本私有存储区 host.storage 记住已发过一次。\nif host.storage.dnd_xp_awarded then return end\nhost.storage.dnd_xp_awarded = true\nhost.modify_resource(host.actor.id, 'res-xp', 300)",
-      "when": {
-        "op": "all_of",
-        "children": [
-          {
-            "op": "flag_set",
-            "flag": "dnd-wander-day-8"
-          },
-          {
-            "op": "encounter_cleared"
-          }
-        ]
-      }
-    },
-    {
-      "id": "dnd-xp-day-9",
-      "mount": "turn_end",
-      "source": "-- 规则包：经验值合计（模块第 1987 行「合计角色们克服的每个怪物的经验值」）。\n-- 引擎没有「敌人被击败」事件（GAP-F），只能用 when: encounter_cleared + 掷表行标记回补。\n-- 幂等：脚本私有存储区 host.storage 记住已发过一次。\nif host.storage.dnd_xp_awarded then return end\nhost.storage.dnd_xp_awarded = true\nhost.modify_resource(host.actor.id, 'res-xp', 300)",
-      "when": {
-        "op": "all_of",
-        "children": [
-          {
-            "op": "flag_set",
-            "flag": "dnd-wander-day-9"
-          },
-          {
-            "op": "encounter_cleared"
-          }
-        ]
-      }
-    },
-    {
-      "id": "dnd-xp-day-10",
-      "mount": "turn_end",
-      "source": "-- 规则包：经验值合计（模块第 1987 行「合计角色们克服的每个怪物的经验值」）。\n-- 引擎没有「敌人被击败」事件（GAP-F），只能用 when: encounter_cleared + 掷表行标记回补。\n-- 幂等：脚本私有存储区 host.storage 记住已发过一次。\nif host.storage.dnd_xp_awarded then return end\nhost.storage.dnd_xp_awarded = true\nhost.modify_resource(host.actor.id, 'res-xp', 300)",
-      "when": {
-        "op": "all_of",
-        "children": [
-          {
-            "op": "flag_set",
-            "flag": "dnd-wander-day-10"
-          },
-          {
-            "op": "encounter_cleared"
-          }
-        ]
-      }
-    },
-    {
-      "id": "dnd-xp-day-11",
-      "mount": "turn_end",
-      "source": "-- 规则包：经验值合计（模块第 1987 行「合计角色们克服的每个怪物的经验值」）。\n-- 引擎没有「敌人被击败」事件（GAP-F），只能用 when: encounter_cleared + 掷表行标记回补。\n-- 幂等：脚本私有存储区 host.storage 记住已发过一次。\nif host.storage.dnd_xp_awarded then return end\nhost.storage.dnd_xp_awarded = true\nhost.modify_resource(host.actor.id, 'res-xp', 150)",
-      "when": {
-        "op": "all_of",
-        "children": [
-          {
-            "op": "flag_set",
-            "flag": "dnd-wander-day-11"
-          },
-          {
-            "op": "encounter_cleared"
-          }
-        ]
-      }
-    },
-    {
-      "id": "dnd-xp-day-12",
-      "mount": "turn_end",
-      "source": "-- 规则包：经验值合计（模块第 1987 行「合计角色们克服的每个怪物的经验值」）。\n-- 引擎没有「敌人被击败」事件（GAP-F），只能用 when: encounter_cleared + 掷表行标记回补。\n-- 幂等：脚本私有存储区 host.storage 记住已发过一次。\nif host.storage.dnd_xp_awarded then return end\nhost.storage.dnd_xp_awarded = true\nhost.modify_resource(host.actor.id, 'res-xp', 700)",
-      "when": {
-        "op": "all_of",
-        "children": [
-          {
-            "op": "flag_set",
-            "flag": "dnd-wander-day-12"
-          },
-          {
-            "op": "encounter_cleared"
-          }
-        ]
-      }
-    },
-    {
       "id": "dnd-wander-night",
       "mount": "turn_end",
-      "source": "-- 规则包：野外遭遇掷表（模块第 1221 行原文）。\n-- 链路：Lua 掷骰 → set_flag → 触发点 condition: flag_set + encounter 预置 → 回合末自动建遭遇。\n-- 引擎不认识「遭遇表」，表只活在规则包 Lua 里。\nlocal check = host.engine_rng(1, 20)\nif check >= 17 then\n  local row = host.engine_rng(1, 12)\n  local FLAGS_BY_ROW = {\n  [1] = 'dnd-wander-night-1',\n  [2] = 'dnd-wander-night-2',\n  [3] = 'dnd-wander-night-3',\n  [4] = 'dnd-wander-night-4',\n  [5] = 'dnd-wander-night-5',\n  [6] = 'dnd-wander-night-6',\n  [7] = 'dnd-wander-night-7',\n  [8] = 'dnd-wander-night-8',\n  [9] = 'dnd-wander-night-9',\n  [10] = 'dnd-wander-night-10',\n  [11] = 'dnd-wander-night-11',\n  [12] = 'dnd-wander-night-12'\n  }\n  local flag = FLAGS_BY_ROW[row]\n  if flag then\n    host.apply_effect(host.actor.id, { kind = 'set_flag', flag = flag })\n  end\nend",
+      "source": "-- 规则包：野外遭遇掷表（模块第 1221 行原文）。\n-- 链路：Lua 掷骰 → set_flag → 触发点 condition: flag_set（repeatable）+ encounter 预置\n--       → 回合末骨架求值在边沿建遭遇；遭遇结束时由 dnd-wander-reset 清标记复位。\n-- 引擎不认识「遭遇表」，表只活在规则包 Lua 里。\nlocal check = host.engine_rng(1, 20)\nif check >= 17 then\n  local row = host.engine_rng(1, 12)\n  local FLAGS_BY_ROW = {\n  [1] = 'dnd-wander-night-1',\n  [2] = 'dnd-wander-night-2',\n  [3] = 'dnd-wander-night-3',\n  [4] = 'dnd-wander-night-4',\n  [5] = 'dnd-wander-night-5',\n  [6] = 'dnd-wander-night-6',\n  [7] = 'dnd-wander-night-7',\n  [8] = 'dnd-wander-night-8',\n  [9] = 'dnd-wander-night-9',\n  [10] = 'dnd-wander-night-10',\n  [11] = 'dnd-wander-night-11',\n  [12] = 'dnd-wander-night-12'\n  }\n  local flag = FLAGS_BY_ROW[row]\n  if flag then\n    host.set_flag(flag)\n  end\nend",
       "when": {
         "op": "all_of",
         "children": [
@@ -6322,208 +6543,14 @@
       }
     },
     {
-      "id": "dnd-xp-night-1",
-      "mount": "turn_end",
-      "source": "-- 规则包：经验值合计（模块第 1987 行「合计角色们克服的每个怪物的经验值」）。\n-- 引擎没有「敌人被击败」事件（GAP-F），只能用 when: encounter_cleared + 掷表行标记回补。\n-- 幂等：脚本私有存储区 host.storage 记住已发过一次。\nif host.storage.dnd_xp_awarded then return end\nhost.storage.dnd_xp_awarded = true\nhost.modify_resource(host.actor.id, 'res-xp', 75)",
-      "when": {
-        "op": "all_of",
-        "children": [
-          {
-            "op": "flag_set",
-            "flag": "dnd-wander-night-1"
-          },
-          {
-            "op": "encounter_cleared"
-          }
-        ]
-      }
+      "id": "dnd-wander-reset",
+      "mount": "event",
+      "source": "-- 规则包：掷表标记复位（repeatable 触发点的边沿复位）。\n-- 触发点 repeatable 只在条件「假 → 真」时再触发；遭遇结束后把行标记清掉，\n-- 下一次掷中同一行才是一次新的边沿——这就是「同一表项能反复出」的全部机制。\nif host.event_name ~= 'encounter_cleared' then return end\nlocal data = host.event_data\nlocal name = data and data.encounter and data.encounter.name\nif not name then return end\nlocal FLAG_BY_ENCOUNTER = {\n  ['野外遭遇（白昼） d12=1：蚊蝠'] = 'dnd-wander-day-1',\n  ['野外遭遇（白昼） d12=2：蚊蝠'] = 'dnd-wander-day-2',\n  ['野外遭遇（白昼） d12=3：食人魔'] = 'dnd-wander-day-3',\n  ['野外遭遇（白昼） d12=4：食人魔'] = 'dnd-wander-day-4',\n  ['野外遭遇（白昼） d12=5：地精'] = 'dnd-wander-day-5',\n  ['野外遭遇（白昼） d12=6：地精'] = 'dnd-wander-day-6',\n  ['野外遭遇（白昼） d12=7：大地精'] = 'dnd-wander-day-7',\n  ['野外遭遇（白昼） d12=8：大地精'] = 'dnd-wander-day-8',\n  ['野外遭遇（白昼） d12=9：兽人'] = 'dnd-wander-day-9',\n  ['野外遭遇（白昼） d12=10：兽人'] = 'dnd-wander-day-10',\n  ['野外遭遇（白昼） d12=11：狼'] = 'dnd-wander-day-11',\n  ['野外遭遇（白昼） d12=12：枭熊'] = 'dnd-wander-day-12',\n  ['野外遭遇（黑夜） d12=1：蚊蝠'] = 'dnd-wander-night-1',\n  ['野外遭遇（黑夜） d12=2：蚊蝠'] = 'dnd-wander-night-2',\n  ['野外遭遇（黑夜） d12=3：蚊蝠'] = 'dnd-wander-night-3',\n  ['野外遭遇（黑夜） d12=4：食尸鬼'] = 'dnd-wander-night-4',\n  ['野外遭遇（黑夜） d12=5：地精'] = 'dnd-wander-night-5',\n  ['野外遭遇（黑夜） d12=6：大地精'] = 'dnd-wander-night-6',\n  ['野外遭遇（黑夜） d12=7：兽人'] = 'dnd-wander-night-7',\n  ['野外遭遇（黑夜） d12=8：兽人'] = 'dnd-wander-night-8',\n  ['野外遭遇（黑夜） d12=9：狼'] = 'dnd-wander-night-9',\n  ['野外遭遇（黑夜） d12=10：狼'] = 'dnd-wander-night-10',\n  ['野外遭遇（黑夜） d12=11：枭熊'] = 'dnd-wander-night-11',\n  ['野外遭遇（黑夜） d12=12：枭熊'] = 'dnd-wander-night-12'\n}\nlocal flag = FLAG_BY_ENCOUNTER[name]\nif flag then\n  host.clear_flag(flag)\nend"
     },
     {
-      "id": "dnd-xp-night-2",
-      "mount": "turn_end",
-      "source": "-- 规则包：经验值合计（模块第 1987 行「合计角色们克服的每个怪物的经验值」）。\n-- 引擎没有「敌人被击败」事件（GAP-F），只能用 when: encounter_cleared + 掷表行标记回补。\n-- 幂等：脚本私有存储区 host.storage 记住已发过一次。\nif host.storage.dnd_xp_awarded then return end\nhost.storage.dnd_xp_awarded = true\nhost.modify_resource(host.actor.id, 'res-xp', 75)",
-      "when": {
-        "op": "all_of",
-        "children": [
-          {
-            "op": "flag_set",
-            "flag": "dnd-wander-night-2"
-          },
-          {
-            "op": "encounter_cleared"
-          }
-        ]
-      }
-    },
-    {
-      "id": "dnd-xp-night-3",
-      "mount": "turn_end",
-      "source": "-- 规则包：经验值合计（模块第 1987 行「合计角色们克服的每个怪物的经验值」）。\n-- 引擎没有「敌人被击败」事件（GAP-F），只能用 when: encounter_cleared + 掷表行标记回补。\n-- 幂等：脚本私有存储区 host.storage 记住已发过一次。\nif host.storage.dnd_xp_awarded then return end\nhost.storage.dnd_xp_awarded = true\nhost.modify_resource(host.actor.id, 'res-xp', 75)",
-      "when": {
-        "op": "all_of",
-        "children": [
-          {
-            "op": "flag_set",
-            "flag": "dnd-wander-night-3"
-          },
-          {
-            "op": "encounter_cleared"
-          }
-        ]
-      }
-    },
-    {
-      "id": "dnd-xp-night-4",
-      "mount": "turn_end",
-      "source": "-- 规则包：经验值合计（模块第 1987 行「合计角色们克服的每个怪物的经验值」）。\n-- 引擎没有「敌人被击败」事件（GAP-F），只能用 when: encounter_cleared + 掷表行标记回补。\n-- 幂等：脚本私有存储区 host.storage 记住已发过一次。\nif host.storage.dnd_xp_awarded then return end\nhost.storage.dnd_xp_awarded = true\nhost.modify_resource(host.actor.id, 'res-xp', 400)",
-      "when": {
-        "op": "all_of",
-        "children": [
-          {
-            "op": "flag_set",
-            "flag": "dnd-wander-night-4"
-          },
-          {
-            "op": "encounter_cleared"
-          }
-        ]
-      }
-    },
-    {
-      "id": "dnd-xp-night-5",
-      "mount": "turn_end",
-      "source": "-- 规则包：经验值合计（模块第 1987 行「合计角色们克服的每个怪物的经验值」）。\n-- 引擎没有「敌人被击败」事件（GAP-F），只能用 when: encounter_cleared + 掷表行标记回补。\n-- 幂等：脚本私有存储区 host.storage 记住已发过一次。\nif host.storage.dnd_xp_awarded then return end\nhost.storage.dnd_xp_awarded = true\nhost.modify_resource(host.actor.id, 'res-xp', 200)",
-      "when": {
-        "op": "all_of",
-        "children": [
-          {
-            "op": "flag_set",
-            "flag": "dnd-wander-night-5"
-          },
-          {
-            "op": "encounter_cleared"
-          }
-        ]
-      }
-    },
-    {
-      "id": "dnd-xp-night-6",
-      "mount": "turn_end",
-      "source": "-- 规则包：经验值合计（模块第 1987 行「合计角色们克服的每个怪物的经验值」）。\n-- 引擎没有「敌人被击败」事件（GAP-F），只能用 when: encounter_cleared + 掷表行标记回补。\n-- 幂等：脚本私有存储区 host.storage 记住已发过一次。\nif host.storage.dnd_xp_awarded then return end\nhost.storage.dnd_xp_awarded = true\nhost.modify_resource(host.actor.id, 'res-xp', 300)",
-      "when": {
-        "op": "all_of",
-        "children": [
-          {
-            "op": "flag_set",
-            "flag": "dnd-wander-night-6"
-          },
-          {
-            "op": "encounter_cleared"
-          }
-        ]
-      }
-    },
-    {
-      "id": "dnd-xp-night-7",
-      "mount": "turn_end",
-      "source": "-- 规则包：经验值合计（模块第 1987 行「合计角色们克服的每个怪物的经验值」）。\n-- 引擎没有「敌人被击败」事件（GAP-F），只能用 when: encounter_cleared + 掷表行标记回补。\n-- 幂等：脚本私有存储区 host.storage 记住已发过一次。\nif host.storage.dnd_xp_awarded then return end\nhost.storage.dnd_xp_awarded = true\nhost.modify_resource(host.actor.id, 'res-xp', 300)",
-      "when": {
-        "op": "all_of",
-        "children": [
-          {
-            "op": "flag_set",
-            "flag": "dnd-wander-night-7"
-          },
-          {
-            "op": "encounter_cleared"
-          }
-        ]
-      }
-    },
-    {
-      "id": "dnd-xp-night-8",
-      "mount": "turn_end",
-      "source": "-- 规则包：经验值合计（模块第 1987 行「合计角色们克服的每个怪物的经验值」）。\n-- 引擎没有「敌人被击败」事件（GAP-F），只能用 when: encounter_cleared + 掷表行标记回补。\n-- 幂等：脚本私有存储区 host.storage 记住已发过一次。\nif host.storage.dnd_xp_awarded then return end\nhost.storage.dnd_xp_awarded = true\nhost.modify_resource(host.actor.id, 'res-xp', 300)",
-      "when": {
-        "op": "all_of",
-        "children": [
-          {
-            "op": "flag_set",
-            "flag": "dnd-wander-night-8"
-          },
-          {
-            "op": "encounter_cleared"
-          }
-        ]
-      }
-    },
-    {
-      "id": "dnd-xp-night-9",
-      "mount": "turn_end",
-      "source": "-- 规则包：经验值合计（模块第 1987 行「合计角色们克服的每个怪物的经验值」）。\n-- 引擎没有「敌人被击败」事件（GAP-F），只能用 when: encounter_cleared + 掷表行标记回补。\n-- 幂等：脚本私有存储区 host.storage 记住已发过一次。\nif host.storage.dnd_xp_awarded then return end\nhost.storage.dnd_xp_awarded = true\nhost.modify_resource(host.actor.id, 'res-xp', 150)",
-      "when": {
-        "op": "all_of",
-        "children": [
-          {
-            "op": "flag_set",
-            "flag": "dnd-wander-night-9"
-          },
-          {
-            "op": "encounter_cleared"
-          }
-        ]
-      }
-    },
-    {
-      "id": "dnd-xp-night-10",
-      "mount": "turn_end",
-      "source": "-- 规则包：经验值合计（模块第 1987 行「合计角色们克服的每个怪物的经验值」）。\n-- 引擎没有「敌人被击败」事件（GAP-F），只能用 when: encounter_cleared + 掷表行标记回补。\n-- 幂等：脚本私有存储区 host.storage 记住已发过一次。\nif host.storage.dnd_xp_awarded then return end\nhost.storage.dnd_xp_awarded = true\nhost.modify_resource(host.actor.id, 'res-xp', 150)",
-      "when": {
-        "op": "all_of",
-        "children": [
-          {
-            "op": "flag_set",
-            "flag": "dnd-wander-night-10"
-          },
-          {
-            "op": "encounter_cleared"
-          }
-        ]
-      }
-    },
-    {
-      "id": "dnd-xp-night-11",
-      "mount": "turn_end",
-      "source": "-- 规则包：经验值合计（模块第 1987 行「合计角色们克服的每个怪物的经验值」）。\n-- 引擎没有「敌人被击败」事件（GAP-F），只能用 when: encounter_cleared + 掷表行标记回补。\n-- 幂等：脚本私有存储区 host.storage 记住已发过一次。\nif host.storage.dnd_xp_awarded then return end\nhost.storage.dnd_xp_awarded = true\nhost.modify_resource(host.actor.id, 'res-xp', 700)",
-      "when": {
-        "op": "all_of",
-        "children": [
-          {
-            "op": "flag_set",
-            "flag": "dnd-wander-night-11"
-          },
-          {
-            "op": "encounter_cleared"
-          }
-        ]
-      }
-    },
-    {
-      "id": "dnd-xp-night-12",
-      "mount": "turn_end",
-      "source": "-- 规则包：经验值合计（模块第 1987 行「合计角色们克服的每个怪物的经验值」）。\n-- 引擎没有「敌人被击败」事件（GAP-F），只能用 when: encounter_cleared + 掷表行标记回补。\n-- 幂等：脚本私有存储区 host.storage 记住已发过一次。\nif host.storage.dnd_xp_awarded then return end\nhost.storage.dnd_xp_awarded = true\nhost.modify_resource(host.actor.id, 'res-xp', 700)",
-      "when": {
-        "op": "all_of",
-        "children": [
-          {
-            "op": "flag_set",
-            "flag": "dnd-wander-night-12"
-          },
-          {
-            "op": "encounter_cleared"
-          }
-        ]
-      }
+      "id": "dnd-xp-award",
+      "mount": "event",
+      "source": "-- 规则包：经验值合计（模块第 1987 行「合计角色们克服的每个怪物的经验值」）。\n-- 时机：event 挂载点 + enemy_defeated（data.enemy.template_id / data.killer）。\n-- 数值：开放内容 dnd-xp-award 定义（fields.template_id → fields.xp），脚本无 XP 常量。\nif host.event_name ~= 'enemy_defeated' then return end\nlocal data = host.event_data\nlocal enemy = data and data.enemy\nlocal template_id = enemy and enemy.template_id\nif not template_id or template_id == \"\" then return end\nlocal xp = 0\nlocal defs = host.list_definitions('dnd-xp-award')\nfor _, def in ipairs(defs) do\n  local fields = def.fields\n  if fields and fields.template_id == template_id then xp = tonumber(fields.xp) or 0 end\nend\nif xp > 0 then\n  host.modify_resource(host.actor.id, 'res-xp', xp)\nend"
     }
   ]
 }

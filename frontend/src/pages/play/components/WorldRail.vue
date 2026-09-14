@@ -4,7 +4,7 @@ import { computed } from 'vue'
 import { usePlayStore } from '../stores/play'
 import type { SceneDef } from '@/types'
 import type { WorldSelection } from '../selection'
-import { isControlledChar } from '../utils'
+import { isControlledChar, unitTally, unitsAtLocation } from '../utils'
 import { IconTarget, IconFlag, IconMapPin, IconUsers, IconCheck, IconCircle, IconSwords } from '@tabler/icons-vue'
 
 const props = defineProps<{ selected: WorldSelection | null }>()
@@ -23,7 +23,8 @@ const scene = computed<SceneDef | null>(() => {
 const goals = computed(() => scene.value?.goals ?? [])
 const triggers = computed(() => scene.value?.triggers ?? [])
 const locations = computed(() => store.projection?.locations ?? [])
-const chars = computed(() => store.presentChars)
+/** 左栏「在场人物」**不含怪物**：怪物只在遭遇卡片 / 地图面板里出现（图鉴 §5.3、地图 §7）。 */
+const chars = computed(() => store.presentChars.filter(c => c.kind !== 'monster'))
 const currentLoc = computed(() => scene.value?.location_id ?? '')
 const goalDone = (id: string) => Boolean(store.projection?.progress.goals[id])
 const triggerDone = (id: string) => Boolean(store.projection?.progress.triggers[id])
@@ -36,7 +37,19 @@ const doneGoals = computed(() => goals.value.filter(g => goalDone(g.id)).length)
 const doneTriggers = computed(() => triggers.value.filter(t => triggerDone(t.id)).length)
 const isSel = (kind: WorldSelection['kind'], id: string) =>
   props.selected?.kind === kind && props.selected?.id === id
-const charsAt = (locId: string) => chars.value.filter(c => c.location_id === locId).length
+/**
+ * 地点栏人数：按**实例位置**（characters[].location_id）真实统计——替换原先按在场列表过滤
+ * 的写法（NPC 实例过去没有 location_id，那里恒为 0）。怪物实例与未落实例的临时敌人分开计。
+ */
+const EMPTY_STAT = { people: 0, monsters: 0, total: 0 }
+const locStats = computed<Record<string, { people: number; monsters: number; total: number }>>(() => {
+  const out: Record<string, { people: number; monsters: number; total: number }> = {}
+  for (const l of locations.value) out[l.id] = unitTally(unitsAtLocation(store.projection, l.id))
+  return out
+})
+function stat(locId: string): { people: number; monsters: number; total: number } {
+  return locStats.value[locId] ?? EMPTY_STAT
+}
 
 const rowBase = 'flex w-full cursor-pointer items-center gap-2 rounded-lg px-1.5 py-1.5 text-left text-[12.5px] text-foreground transition-colors hover:bg-muted/60'
 const rowOn = 'bg-primary/12 text-primary hover:bg-primary/15'
@@ -141,7 +154,11 @@ const textBase = 'min-w-0 flex-1 leading-[1.35]'
         <IconMapPin class="size-3.5 shrink-0" :class="l.id === currentLoc ? 'text-primary' : 'text-muted-foreground/50'" />
         <span :class="textBase">{{ l.name }}</span>
         <span v-if="l.id === currentLoc" :class="tagBase">当前</span>
-        <span v-else-if="charsAt(l.id)" :class="countBase">{{ charsAt(l.id) }} 人</span>
+        <span
+          v-if="stat(l.id).total"
+          :class="countBase"
+          :title="'此地点：' + stat(l.id).people + ' 人 · ' + stat(l.id).monsters + ' 怪（按实例位置统计）'"
+        ><template v-if="stat(l.id).people">{{ stat(l.id).people }} 人</template><span v-if="stat(l.id).monsters" :class="stat(l.id).people ? 'ml-0.5 text-destructive' : 'text-destructive'">{{ stat(l.id).monsters }} 怪</span></span>
       </button>
     </section>
 

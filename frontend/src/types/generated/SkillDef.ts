@@ -7,4 +7,9 @@ import type { SkillCheck } from "./SkillCheck";
 /**
  * 技能 / 法术（#01）：声明式定义 + 可选 Lua 钩子。
  */
-export type SkillDef = { id: string, name: string, description: string, category?: string | null, cost?: Array<ResourceCost>, cooldown?: Cooldown | null, target?: string | null, check?: SkillCheck | null, effect?: EffectDef | null, lua?: string | null, };
+export type SkillDef = { id: string, name: string, description: string, category?: string | null, cost?: Array<ResourceCost>, cooldown?: Cooldown | null, target?: string | null, check?: SkillCheck | null, 
+/**
+ * 判定属性维度 key（判定 C1）：声明后本技能用它掷骰（如匕首用 dex）。
+ * 优先级：技能 → 判定器 → 全局 → 'str'；必须命中 attribute_dimensions。
+ */
+attribute?: string | null, effect?: EffectDef | null, lua?: string | null, };

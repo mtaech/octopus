@@ -48,6 +48,11 @@ function kindList(d: Storybook, kind: string): Row[] | null {
     case 'resource': return d.world.resources as unknown as Row[]
     case 'dimension': return d.attribute_dimensions as unknown as Row[]
     case 'character': return d.characters as unknown as Row[]
+    case 'map': {
+      const w = d.world
+      if (!w.maps) w.maps = []
+      return w.maps as unknown as Row[]
+    }
     case 'skill': return d.skills as unknown as Row[]
     case 'item': return d.items as unknown as Row[]
     case 'object': return d.objects as unknown as Row[]
@@ -95,7 +100,7 @@ function normalizeKind(raw: string): string {
     locations: 'location', resources: 'resource', skills: 'skill', items: 'item',
     objects: 'object', factions: 'faction', relationships: 'relationship',
     chapters: 'chapter', scenes: 'scene', goals: 'goal', triggers: 'trigger',
-    statuses: 'status', lores: 'lore',
+    statuses: 'status', lores: 'lore', maps: 'map',
   }
   return alias[k] ?? k
 }
@@ -118,7 +123,7 @@ function entityExists(d: Storybook, kind: string, id: string): boolean {
 function kindLabel(kind: string): string {
   return {
     meta: '元信息', world: '世界设定',
-    location: '地点', resource: '资源', dimension: '属性维度', character: '人物',
+    location: '地点', map: '地图', resource: '资源', dimension: '属性维度', character: '角色库条目',
     skill: '技能', item: '物品', object: '物件', faction: '势力', chapter: '章节',
     scene: '场景', goal: '目标', trigger: '触发点', relationship: '关系',
     status: '状态', lore: '词条', flag: '标记', event: '事件', relationship_type: '关系类型', target_type: '目标类型',
@@ -148,7 +153,7 @@ function rowKey(e: Row): string { return String(e.id ?? e.key ?? '') }
 /** 实体的展示名 */
 function rowName(e: Row): string { return String(e.name ?? e.title ?? rowKey(e)) }
 const KIND_PREFIX: Record<string, string> = {
-  location: 'loc', resource: 'res', dimension: 'dim', character: 'char', skill: 'sk',
+  location: 'loc', map: 'map', resource: 'res', dimension: 'dim', character: 'char', skill: 'sk',
   item: 'it', object: 'obj', faction: 'fac', chapter: 'ch', scene: 'sc', goal: 'g', trigger: 'b', relationship: 'rel',
   status: 'st', definition: 'def', lore: 'lore'
 }
@@ -420,6 +425,7 @@ export const useEditorStore = defineStore('editor', () => {
         activeTab.value = 'characters'
         break
       case 'location':
+      case 'map':
       case 'resource':
         activeTab.value = 'world'
         break
@@ -506,6 +512,7 @@ export const useEditorStore = defineStore('editor', () => {
     switch (kind) {
       case 'chapter': return { scenes: [], ...patch }
       case 'character': return { background: '', personality: '', attributes: {}, skills: [], ...patch }
+      case 'map': return { pins: [], ...patch }
       case 'location': return { description: '', ...patch }
       case 'skill': return { description: '', ...patch }
       case 'item': return { description: '', ...patch }
@@ -989,6 +996,12 @@ export const useEditorStore = defineStore('editor', () => {
     if (kind === 'location') {
       d.skeleton.forEach(ch => ch.scenes.forEach(sc => { if (sc.location_id === id) sc.location_id = undefined }))
       d.objects.forEach(o => { if (o.location_id === id) o.location_id = undefined })
+      // 地图锚点指向地点：地点没了就摘掉锚点，别留悬空引用（校验会报 dangling_map_pin_location_ref）
+      d.world.maps?.forEach(m => { if (m.pins) m.pins = m.pins.filter(p => p.location_id !== id) })
+    }
+    if (kind === 'map') {
+      // 子图 parent_id 指向被删地图 → 摘掉，避免 dangling_map_parent_ref
+      d.world.maps?.forEach(m => { if (m.parent_id === id) delete m.parent_id })
     }
     if (kind === 'status') {
       d.skills.forEach(sk => {

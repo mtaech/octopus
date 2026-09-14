@@ -13,6 +13,7 @@ import DocumentB from './paradigms/document-b/DocumentB.vue'
 import ValidationDock from './components/refs/ValidationDock.vue'
 import PlaytestDialog from './components/PlaytestDialog.vue'
 import ThemeToggle from '@/components/ThemeToggle.vue'
+import AccountMenu from '@/components/AccountMenu.vue'
 import StorybookCover from '@/components/StorybookCover.vue'
 import { Button } from '@/components/ui/button'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
@@ -212,6 +213,9 @@ onUnmounted(() => {
 
       <!-- 主题切换 -->
       <ThemeToggle />
+
+      <!-- 账户 -->
+      <AccountMenu />
 
       <div class="h-4 w-px bg-border" />
 

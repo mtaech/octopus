@@ -8,10 +8,16 @@ import type {
   ValidateResult, ValidationIssue, UpgradeReport, Disposition,
   PairSuggestion, WorldProjection, PlayEvent, StreamStatus, PhaseStage,
   HistoryPage, SaveSettings, MaintenanceRow, AppConfig, ProviderTestResult, ProviderConfig, ProbeResult,
-  EntityRef, FocusEntity, PromptDef
+  EntityRef, FocusEntity, PromptDef,
+  AdminOverview, AdminUserRow, AdminCreateUserRequest, AdminUpdateUserRequest
 } from '@/types'
+import { authHeaders, handleUnauthorized, withTokenQuery } from '@/lib/auth'
+// 运行模式判定实现在 lib/mock-mode.ts（lib/auth.ts 也要用它，放本文件里会形成循环依赖）；
+// 这里原样转出，保持 `@/api` 作为页面唯一入口。
+import { isMockMode, setMockMode } from '@/lib/mock-mode'
 import * as mock from './mock/backend'
 import { delay } from './mock/backend'
+import { filenameFromContentDisposition, safeFileStem } from '@/lib/download'
 
 // ---- 轻量全局提示 ----
 type ToastKind = 'info' | 'ok' | 'warn' | 'error'
@@ -41,23 +47,7 @@ async function run<T>(fn: () => T | Promise<T>): Promise<T> {
   try { return await fn() } catch (e) { throw wrapErr(e) }
 }
 
-// ---- 运行模式判断 ----
-export function isMockMode(): boolean {
-  if (typeof window === 'undefined') return true
-  const params = new URLSearchParams(window.location.search)
-  if (params.get('mock') === '1') return true
-  if (localStorage.getItem('octopus:force_mock') === '1') return true
-  return false
-}
-
-export function setMockMode(forceMock: boolean): void {
-  if (forceMock) {
-    localStorage.setItem('octopus:force_mock', '1')
-  } else {
-    localStorage.removeItem('octopus:force_mock')
-  }
-  window.location.reload()
-}
+export { isMockMode, setMockMode }
 
 // ---- HTTP 工具函数 ----
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
@@ -67,6 +57,7 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
       ...init,
       headers: {
         'Content-Type': 'application/json',
+        ...authHeaders(),
         ...init?.headers,
       },
     })
@@ -81,6 +72,8 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
     } catch {}
     const code = errBody?.code ?? `HTTP_${res.status}`
     const msg = errBody?.message ?? res.statusText ?? '请求失败'
+    // 令牌失效：清本地登录态并回登录页（公开端点的 401 不会走到这里）。
+    if (res.status === 401) handleUnauthorized()
     throw mkErr(code, msg, errBody?.detail)
   }
 
@@ -94,6 +87,7 @@ async function fetchNoContent(url: string, init?: RequestInit): Promise<void> {
       ...init,
       headers: {
         'Content-Type': 'application/json',
+        ...authHeaders(),
         ...init?.headers,
       },
     })
@@ -108,6 +102,7 @@ async function fetchNoContent(url: string, init?: RequestInit): Promise<void> {
     } catch {}
     const code = errBody?.code ?? `HTTP_${res.status}`
     const msg = errBody?.message ?? res.statusText ?? '请求失败'
+    if (res.status === 401) handleUnauthorized()
     throw mkErr(code, msg, errBody?.detail)
   }
   // 消费响应体（这些端点多为 202 空体）：不读的话，浏览器会把「未读 body 被丢弃」
@@ -144,7 +139,7 @@ export async function uploadAsset(blob: Blob): Promise<UploadedAsset> {
   try {
     res = await fetch('/api/assets', {
       method: 'POST',
-      headers: { 'Content-Type': blob.type || 'application/octet-stream' },
+      headers: { 'Content-Type': blob.type || 'application/octet-stream', ...authHeaders() },
       body: blob,
     })
   } catch (e) {
@@ -157,10 +152,15 @@ export async function uploadAsset(blob: Blob): Promise<UploadedAsset> {
   return res.json() as Promise<UploadedAsset>
 }
 
-/** 资产名 → <img src>；兼容 Mock 模式下的 data URL */
+/**
+ * 资产名 → `<img src>`；兼容 Mock 模式下的 data URL。
+ *
+ * `<img>` 和 `EventSource` 一样带不了 `Authorization` 头，所以令牌走查询串
+ * （服务端只对 GET 接受 `?token=`）——否则加了鉴权后所有立绘 / 封面都会 401。
+ */
 export function assetUrl(name: string): string {
   if (!name) return ''
-  return name.startsWith('data:') ? name : `/api/assets/${name}`
+  return name.startsWith('data:') ? name : withTokenQuery(`/api/assets/${name}`)
 }
 
 // ================= 故事书（#23） =================
@@ -249,6 +249,68 @@ export function playtestStorybook(
       title: req?.title,
       controlled_character_id: req?.controlledCharacterId,
     }),
+  })
+}
+
+/**
+ * 导出故事书为自包含 zip 包（`.octopus-book.zip`：`storybook.json` + `assets/`）。
+ * 「都导出」：草稿 + 已发布版次快照 + 两者引用的全部图片。
+ */
+export async function exportStorybook(id: string): Promise<{ filename: string; blob: Blob }> {
+  if (isMockMode()) {
+    return net(run(async () => {
+      const d = mock.getStorybook(id)
+      if (!d) throw mkErr('NOT_FOUND', '故事书不存在')
+      const blob = new Blob([JSON.stringify({
+        format: 'octopus-storybook-package',
+        version: 1,
+        exported_at: new Date().toISOString(),
+        storybook: {
+          id: d.id,
+          title: d.draft?.meta?.title ?? d.id,
+          revision: d.revision,
+          updated_at: d.updated_at,
+          released_at: d.released_at ?? null,
+          published: d.published,
+          draft: d.draft,
+          released: d.released ?? null,
+        },
+      })], { type: 'application/json' })
+      return { filename: `${safeFileStem(d.draft?.meta?.title ?? '', d.id)}.octopus-book.zip`, blob }
+    }), 200)
+  }
+  const res = await fetch(`/api/storybooks/${encodeURIComponent(id)}/export`, { headers: { ...authHeaders() } })
+  if (!res.ok) {
+    const err = await res.json().catch(() => null)
+    throw new Error(err?.message ?? '导出失败')
+  }
+  const blob = await res.blob()
+  // 文件名以故事书标题为准（服务端出 filename*），兜底才是 id
+  const filename = filenameFromContentDisposition(
+    res.headers.get('content-disposition'),
+    `${id}.octopus-book.zip`
+  )
+  return { filename, blob }
+}
+
+/**
+ * 导入故事书 zip 包（`.octopus-book.zip`）。
+ * 后端同 id 冲突时分配新 id 并加「(导入)」后缀；已发布快照校验通过才保留发布态。
+ */
+export async function importStorybook(
+  file: Blob
+): Promise<{ doc: StorybookDocument; issues: ValidationIssue[] }> {
+  if (isMockMode()) {
+    return net(run(async () => {
+      const raw = file instanceof File ? file.name : ''
+      const title = raw.replace(/\.octopus-book\.zip$|\.zip$/i, '').trim() || '导入故事书'
+      return { doc: mock.createStorybookDraft(title), issues: [] as ValidationIssue[] }
+    }), 300)
+  }
+  return fetchJson<{ doc: StorybookDocument; issues: ValidationIssue[] }>('/api/storybooks/import', {
+    method: 'POST',
+    headers: { 'Content-Type': file.type || 'application/zip' },
+    body: file,
   })
 }
 
@@ -387,18 +449,20 @@ export async function exportSave(saveId: string): Promise<{ filename: string; bl
       const s = mock.getSave(saveId)
       if (!s) throw mkErr('NOT_FOUND', '存档不存在')
       const blob = new Blob([JSON.stringify({ format: 'octopus-save-package', version: 1, exported_at: new Date().toISOString(), save: s, commands: [], archived_commands: [], maintenance: [] })], { type: 'application/json' })
-      return { filename: s.id + '.octopus.zip', blob }
+      return { filename: `${safeFileStem(s.title, s.id)}.octopus.zip`, blob }
     }), 200)
   }
-  const res = await fetch(`/api/saves/${encodeURIComponent(saveId)}/export`)
+  const res = await fetch(`/api/saves/${encodeURIComponent(saveId)}/export`, { headers: { ...authHeaders() } })
   if (!res.ok) {
     const err = await res.json().catch(() => null)
     throw new Error(err?.message ?? '导出失败')
   }
   const blob = await res.blob()
-  const contentDisp = res.headers.get('content-disposition')
-  const match = contentDisp?.match(/filename="?([^"]+)"?/)
-  const filename = match?.[1] ?? `${saveId}.octopus.zip`
+  // 文件名以标题为准（服务端出 filename*），兜底才是 id
+  const filename = filenameFromContentDisposition(
+    res.headers.get('content-disposition'),
+    `${saveId}.octopus.zip`
+  )
   return { filename, blob }
 }
 
@@ -692,7 +756,7 @@ export async function pairChat(
   try {
     const res = await fetch('/api/pair/chat/stream', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
       signal: options?.signal,
       body: JSON.stringify({
         provider_id: options?.provider_id,
@@ -1039,7 +1103,8 @@ export function subscribe(
   const attach = () => {
     if (closed) return
     handlers.onStatus?.('connecting')
-    es = new EventSource(`/api/saves/${encodeURIComponent(saveId)}/stream`)
+    // EventSource 不能带 Authorization 头：令牌走查询串（服务端只对 GET 接受它）。
+    es = new EventSource(withTokenQuery(`/api/saves/${encodeURIComponent(saveId)}/stream`))
     es.addEventListener('play', (ev) => {
       try {
         const parsed = JSON.parse((ev as MessageEvent).data) as PlayEvent
@@ -1095,6 +1160,80 @@ export function setAutoConfirm(v: boolean): void {
 
 export function streamStatus(): StreamStatus {
   return 'open'
+}
+
+
+// ================= 管理后台（只有 is_admin 账户可达） =================
+//
+// 后端整棵 `/api/admin/*` 子树都挂在 `guard_admin` 之后：非管理员一律 403，
+// 前端只是「不给入口」，权限判定始终在服务端。
+
+/** Mock 模式下的静态样例：让后台页面在没有后端时也能看形状。 */
+const MOCK_ADMIN_OVERVIEW: AdminOverview = {
+  users: 2, admins: 1, saves: 3, storybooks: 2, active_sessions: 1,
+  db_path: '(mock)', db_bytes: 0, version: 'mock',
+}
+const MOCK_ADMIN_USERS: AdminUserRow[] = [
+  { id: 'mock-user', username: 'octopus', display_name: '本地演示', is_admin: true, must_change_password: false, created_at: new Date().toISOString(), last_login_at: new Date().toISOString(), saves: 3, storybooks: 2, active_sessions: 1, is_self: true },
+  { id: 'mock-mira', username: 'mira', display_name: '米拉', is_admin: false, must_change_password: false, created_at: new Date().toISOString(), last_login_at: null, saves: 0, storybooks: 0, active_sessions: 0, is_self: false },
+]
+function mockAdminUnsupported(): never {
+  throw mkErr('MOCK_UNSUPPORTED', 'Mock 模式不支持管理操作，请连接真实后端')
+}
+
+export function getAdminOverview(): Promise<AdminOverview> {
+  if (isMockMode()) return net(MOCK_ADMIN_OVERVIEW)
+  return fetchJson<AdminOverview>('/api/admin/overview')
+}
+
+export function listAdminUsers(): Promise<AdminUserRow[]> {
+  if (isMockMode()) return net(MOCK_ADMIN_USERS)
+  return fetchJson<AdminUserRow[]>('/api/admin/users')
+}
+
+export async function createAdminUser(req: AdminCreateUserRequest): Promise<AdminUserRow> {
+  if (isMockMode()) mockAdminUnsupported()
+  return fetchJson<AdminUserRow>('/api/admin/users', { method: 'POST', body: JSON.stringify(req) })
+}
+
+export async function updateAdminUser(id: string, req: AdminUpdateUserRequest): Promise<AdminUserRow> {
+  if (isMockMode()) mockAdminUnsupported()
+  return fetchJson<AdminUserRow>(`/api/admin/users/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(req),
+  })
+}
+
+/** 管理员直接设新口令：该账户的全部登录态会被吊销（必须重新登录）。 */
+export async function resetAdminUserPassword(id: string, newPassword: string): Promise<void> {
+  if (isMockMode()) mockAdminUnsupported()
+  await fetchNoContent(`/api/admin/users/${encodeURIComponent(id)}/password`, {
+    method: 'POST',
+    body: JSON.stringify({ new_password: newPassword }),
+  })
+}
+
+/** 退出该账户的全部设备（不改口令）。 */
+export async function revokeAdminUserSessions(id: string): Promise<{ revoked: number }> {
+  if (isMockMode()) mockAdminUnsupported()
+  return fetchJson<{ revoked: number }>(`/api/admin/users/${encodeURIComponent(id)}/sessions`, {
+    method: 'DELETE',
+  })
+}
+
+/**
+ * 删除账户。账户还有内容时后端默认 409；`purge=true` 表示「连同其存档与故事书一起删」。
+ * 返回被连带删除的内容条数。
+ */
+export async function deleteAdminUser(
+  id: string,
+  purge = false
+): Promise<{ saves_deleted: number; storybooks_deleted: number }> {
+  if (isMockMode()) mockAdminUnsupported()
+  return fetchJson<{ saves_deleted: number; storybooks_deleted: number }>(
+    `/api/admin/users/${encodeURIComponent(id)}${purge ? '?purge=true' : ''}`,
+    { method: 'DELETE' }
+  )
 }
 
 // 确保种子初始化（供 mock 模式随时可用）

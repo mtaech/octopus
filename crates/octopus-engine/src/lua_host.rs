@@ -242,6 +242,21 @@ pub struct MountEnv<'a> {
     pub gate: Option<&'a dyn Fn(&CondExpr) -> bool>,
     /// 已掷骰判定的快照（判定后挂载点可读）。
     pub check: Option<&'a LuaCheckContext>,
+    /// 事件挂载点的通用上下文（事件名 + 只读事实快照）。
+    ///
+    /// 只在 Lua Event 挂载点下发；其他挂载点为 None（脚本读 `host.event_name` /
+    /// `host.event_data` 得到 nil——旧脚本看不到新字段，也不会因此报错）。
+    pub event: Option<LuaEventContext<'a>>,
+}
+
+/// 一次事件派发的**通用**上下文：引擎只把「发生了什么（名字）」与「相关事实（任意 JSON）」
+/// 原样交给脚本，**不解释** data 的内容。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LuaEventContext<'a> {
+    /// 事件名；由派发方给出（引擎不认识它的含义）。
+    pub name: &'a str,
+    /// 该事件的只读事实快照（缺省 = 没有附加事实）。
+    pub data: Option<&'a Value>,
 }
 
 /// Lua 向引擎发起的写请求（请求-校验-执行：引擎负责校验与落状态）。
@@ -306,6 +321,12 @@ pub struct LuaHost {
     outbox: Arc<Mutex<Vec<LuaRequest>>>,
     instr: Arc<AtomicU64>,
     limits: SandboxLimits,
+    /// 只读开放内容快照（GAP-C）：故事书的 characters / definitions 原文。
+    ///
+    /// 引擎**不理解**它的语义（不认识 kind，也不解释 fields / modifiers），只负责按
+    /// 「当前角色模板 → 挂接 → definition」把原始数据交给脚本。缺省 Null = 无快照
+    /// （编辑器试跑等独立入口），脚本读到 nil / 空表。
+    read_data: Arc<Mutex<Value>>,
 }
 
 impl LuaHost {
@@ -356,11 +377,22 @@ impl LuaHost {
             outbox: Arc::new(Mutex::new(Vec::new())),
             instr,
             limits,
+            read_data: Arc::new(Mutex::new(Value::Null)),
         })
     }
 
     pub fn limits(&self) -> SandboxLimits {
         self.limits
+    }
+
+    /// 注入只读开放内容快照（GAP-C）：故事书的 `characters` / `definitions` 原文。
+    ///
+    /// 由会话组合根在**冻结故事书**上调用一次；引擎不理解数据语义，只做懒查表。
+    /// 没调用过的宿主（编辑器试跑 / 单测）读到 nil，行为与不注入时一致。
+    pub fn set_read_data(&self, data: Value) {
+        if let Ok(mut slot) = self.read_data.lock() {
+            *slot = data;
+        }
     }
 
     /// 引擎侧持有的同一 RNG 句柄（读取 consumed 或继续消费）。
@@ -594,6 +626,15 @@ impl LuaHost {
         host.set("present", present).map_err(lua_err)?;
         host.set("storage", self.script_storage(&ctx.script_id)?).map_err(lua_err)?;
 
+        // 事件上下文（Event 挂载点）：事件名 + 只读事实快照。
+        // 引擎只负责把「发生了什么」与相关事实原样交给脚本，不解释 data 的内容。
+        if let Some(event) = mount_env.event {
+            host.set("event_name", event.name).map_err(lua_err)?;
+            if let Some(data) = event.data {
+                host.set("event_data", json_to_lua(lua, data)?).map_err(lua_err)?;
+            }
+        }
+
         // host.actor：当前角色的只读快照；id 用存档寻址键，供 apply_status(target, ...) 等使用。
         let actor_id = if ctx.actor_id.is_empty() {
             ctx.actor
@@ -657,6 +698,69 @@ impl LuaHost {
                     })
                     .unwrap_or(false);
                 Ok(found)
+            })
+            .map_err(lua_err)?,
+        )
+        .map_err(lua_err)?;
+
+        // ---------- 只读开放内容（GAP-C）：挂接 / definition ----------
+        //
+        // 引擎只做「故事书数据 → 脚本」的搬运：不认识 kind，也不解释 fields / modifiers /
+        // mechanics；脚本据此自己决定怎么用。没有注入快照时全部返回 nil / 空表。
+        let read_data = self.read_data.clone();
+        let actor_for_atts = ctx.actor.clone();
+        host.set(
+            "get_attachments",
+            lua.create_function(move |lua, ()| {
+                let data = read_data.lock().map(|d| d.clone()).unwrap_or(Value::Null);
+                json_to_lua(lua, &Value::Object(attachment_map(&data, &actor_for_atts)))
+            })
+            .map_err(lua_err)?,
+        )
+        .map_err(lua_err)?;
+
+        let read_data = self.read_data.clone();
+        let actor_for_atts = ctx.actor.clone();
+        host.set(
+            "get_attachment",
+            lua.create_function(move |lua, kind: String| {
+                let data = read_data.lock().map(|d| d.clone()).unwrap_or(Value::Null);
+                match attachment_map(&data, &actor_for_atts).get(kind.trim()) {
+                    Some(v) => json_to_lua(lua, v),
+                    None => Ok(LuaValue::Nil),
+                }
+            })
+            .map_err(lua_err)?,
+        )
+        .map_err(lua_err)?;
+
+        let read_data = self.read_data.clone();
+        host.set(
+            "get_definition",
+            // 直接在大快照的锁内查表（只读，不做拷贝）：definition 可能成千条，
+            // 每次调用都克隆整段数据不划算。
+            lua.create_function(move |lua, id: String| {
+                let data = read_data
+                    .lock()
+                    .map_err(|_| mlua::Error::RuntimeError("read data poisoned".into()))?;
+                match find_definition(&data, id.trim()) {
+                    Some(def) => json_to_lua(lua, def),
+                    None => Ok(LuaValue::Nil),
+                }
+            })
+            .map_err(lua_err)?,
+        )
+        .map_err(lua_err)?;
+
+        let read_data = self.read_data.clone();
+        host.set(
+            "list_definitions",
+            lua.create_function(move |lua, kind: Option<String>| {
+                let data = read_data
+                    .lock()
+                    .map_err(|_| mlua::Error::RuntimeError("read data poisoned".into()))?;
+                let list = definitions_of(&data, kind.as_deref());
+                json_to_lua(lua, &Value::Array(list))
             })
             .map_err(lua_err)?,
         )
@@ -877,6 +981,27 @@ impl LuaHost {
         push!("modify_resource", |(target, resource, amount): (String, String, i64)| {
             LuaRequest::ModifyResource { target, resource, amount }
         });
+
+        // 标记原语（通用）：把 flag 置为某值——缺省 true（与旧 SetFlag 同义），
+        // clear_flag 是 set_flag(flag, false) 的具名写法。引擎只当它是**世界级键**，
+        // 与任何角色实体无关，也不解释值的含义（置位 / 清除由脚本按内容约定）。
+        push_try!("set_flag", |(flag, value): (String, Option<LuaValue>)| {
+            if flag.trim().is_empty() {
+                return Err("set_flag 需要非空 flag".to_string());
+            }
+            let value = match value {
+                Some(v) => lua_to_json(&v).map_err(|e| e.to_string())?,
+                None => Value::Bool(true),
+            };
+            Ok(LuaRequest::ApplyEffect {
+                target: String::new(),
+                effect: json!({ "kind": "set_flag", "flag": flag, "value": value }),
+            })
+        });
+        push!("clear_flag", |flag: String| LuaRequest::ApplyEffect {
+            target: String::new(),
+            effect: json!({ "kind": "set_flag", "flag": flag, "value": false }),
+        });
         }
 
         // 调试输出：不产生副作用（避免脚本污染宿主 stdout）。
@@ -1033,6 +1158,57 @@ fn read_int(t: &Table, key: &str) -> Result<i64, EngineError> {
             other.type_name()
         ))),
     }
+}
+
+/// 当前角色模板的挂接表（kind key → definition id 列表）：故事书 `characters[]` 的原文。
+///
+/// 引擎**不理解** kind 的含义，只是把作者挂在模板上的数据原样转给脚本；
+/// 缺快照 / 缺模板 / 没挂接都返回空表（脚本读到空，不是错误）。
+fn attachment_map(data: &Value, actor: &Value) -> serde_json::Map<String, Value> {
+    let template = actor
+        .get("template_id")
+        .or_else(|| actor.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    template
+        .and_then(|tid| {
+            data.get("characters")
+                .and_then(Value::as_array)
+                .and_then(|arr| arr.iter().find(|c| c.get("id").and_then(Value::as_str) == Some(tid)))
+        })
+        .and_then(|c| c.get("attachments"))
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// 按 id 找一条 definition（原文返回；找不到 / id 为空返回 None）。
+fn find_definition<'a>(data: &'a Value, id: &str) -> Option<&'a Value> {
+    if id.is_empty() {
+        return None;
+    }
+    data.get("definitions")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|d| d.get("id").and_then(Value::as_str) == Some(id))
+}
+
+/// 按 kind 列出 definition（kind 为空 = 全部）；顺序即故事书声明顺序，确定性可重放。
+fn definitions_of(data: &Value, kind: Option<&str>) -> Vec<Value> {
+    let kind = kind.map(str::trim).filter(|s| !s.is_empty());
+    data.get("definitions")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter(|d| match kind {
+                    Some(k) => d.get("kind").and_then(Value::as_str) == Some(k),
+                    None => true,
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// serde_json::Value → Lua 值（对象为 string key 表，数组为 1 基表）。
@@ -1458,12 +1634,12 @@ mod tests {
         assert_eq!(events(&host), vec!["always".to_string()]);
 
         let gate_false = |_: &CondExpr| false;
-        let env = MountEnv { gate: Some(&gate_false), check: None };
+        let env = MountEnv { gate: Some(&gate_false), check: None, event: None };
         assert_eq!(registry.run_chain_with(&host, LuaMount::Event, &c, &env).unwrap(), 1);
         assert_eq!(events(&host), vec!["always".to_string()]);
 
         let gate_true = |_: &CondExpr| true;
-        let env = MountEnv { gate: Some(&gate_true), check: None };
+        let env = MountEnv { gate: Some(&gate_true), check: None, event: None };
         assert_eq!(registry.run_chain_with(&host, LuaMount::Event, &c, &env).unwrap(), 2);
         assert_eq!(events(&host), vec!["always".to_string(), "gated".to_string()]);
     }
@@ -1548,7 +1724,7 @@ mod tests {
             .run_condition("return host.check == nil and host.check_result == nil", &c)
             .unwrap());
         // 判定后：脚本能读到判定结果（分档语义由 Lua 自己决定）。
-        let env = MountEnv { gate: None, check: Some(&check) };
+        let env = MountEnv { gate: None, check: Some(&check), event: None };
         host.run_hook_with(
             "assert(host.check.total == 12); assert(host.check.margin == -3);              assert(host.check.result == false); assert(host.check_level == 'barely');              assert(host.check_kind == 'save'); assert(host.check.rolls[1] == 9);              host.modify_resource('char-a', 'mana', host.check.total)",
             LuaMount::CheckPostRoll,
@@ -1571,5 +1747,120 @@ mod tests {
         let host = LuaHost::new(1).unwrap();
         let c = ctx(json!({}));
         assert!(host.run_hook("\u{1b}LuaQ", LuaMount::PostResolve, &c).is_err());
+    }
+
+    /// GAP-C：只读开放内容口——当前角色模板的挂接 + 按 id / kind 读 definition。
+    /// 引擎不认识 kind，也不解释 fields / modifiers，只把原文交给脚本。
+    #[test]
+    fn open_content_read_api_exposes_attachments_and_definitions() {
+        let host = LuaHost::new(1).unwrap();
+        host.set_read_data(json!({
+            "characters": [
+                { "id": "pc-1", "attachments": { "trait": ["tr-strong"] } }
+            ],
+            "definitions": [
+                { "id": "tr-strong", "kind": "trait", "name": "强壮",
+                  "fields": { "bonus": 3 },
+                  "modifiers": [ { "target": "str", "value": 1 } ] }
+            ]
+        }));
+        let c = ctx(json!({ "id": "pc-1", "template_id": "pc-1" }));
+        assert!(host
+            .run_condition("local a = host.get_attachments(); return a.trait[1] == 'tr-strong'", &c)
+            .unwrap());
+        assert!(host
+            .run_condition(
+                "local l = host.get_attachment('trait'); return #l == 1 and l[1] == 'tr-strong'",
+                &c
+            )
+            .unwrap());
+        assert!(host.run_condition("return host.get_attachment('nope') == nil", &c).unwrap());
+        assert!(host
+            .run_condition(
+                "local d = host.get_definition('tr-strong'); return d.kind == 'trait' and d.name == '强壮' and d.fields.bonus == 3 and d.modifiers[1].target == 'str' and d.modifiers[1].value == 1",
+                &c
+            )
+            .unwrap());
+        assert!(host.run_condition("return host.get_definition('missing') == nil", &c).unwrap());
+        assert!(host
+            .run_condition(
+                "local l = host.list_definitions('trait'); return #l == 1 and l[1].id == 'tr-strong'",
+                &c
+            )
+            .unwrap());
+        assert!(host.run_condition("return #host.list_definitions() == 1", &c).unwrap());
+        assert!(host.run_condition("return #host.list_definitions('other') == 0", &c).unwrap());
+        // 另一个模板 / 没注入快照的宿主：读到 nil / 空表，不报错（编辑器试跑等入口）。
+        let other = ctx(json!({ "id": "pc-2", "template_id": "pc-2" }));
+        assert!(host.run_condition("return host.get_attachment('trait') == nil", &other).unwrap());
+        let bare = LuaHost::new(1).unwrap();
+        assert!(bare
+            .run_condition(
+                "return host.get_definition('tr-strong') == nil and host.get_attachment('trait') == nil and #host.get_attachments() == 0",
+                &c
+            )
+            .unwrap());
+    }
+
+    /// GAP-F（读取侧）：事件名 + 通用事实快照只下发给 Event 挂载点；其他挂载点读到 nil。
+    #[test]
+    fn event_context_is_exposed_only_to_event_mounts() {
+        let host = LuaHost::new(1).unwrap();
+        let c = ctx(json!({}));
+        assert!(host
+            .run_condition("return host.event_name == nil and host.event_data == nil", &c)
+            .unwrap());
+        let data = json!({
+            "enemy": { "id": "e1", "name": "灰狼", "template_id": "mon-wolf" },
+            "encounter": { "id": "enc-1", "name": "遭遇" }
+        });
+        let env = MountEnv {
+            event: Some(LuaEventContext { name: "enemy_defeated", data: Some(&data) }),
+            ..Default::default()
+        };
+        host.run_hook_with(
+            "assert(host.event_name == 'enemy_defeated');              assert(host.event_data.enemy.template_id == 'mon-wolf');              assert(host.event_data.enemy.name == '灰狼');              assert(host.event_data.encounter.id == 'enc-1')",
+            LuaMount::Event,
+            &c,
+            &env,
+        )
+        .unwrap();
+        // 没有附加事实的事件：只有名字，data 仍是 nil。
+        let env = MountEnv {
+            event: Some(LuaEventContext { name: "scene", data: None }),
+            ..Default::default()
+        };
+        host.run_hook_with(
+            "assert(host.event_name == 'scene'); assert(host.event_data == nil)",
+            LuaMount::Event,
+            &c,
+            &env,
+        )
+        .unwrap();
+    }
+
+    /// GAP-H：标记原语是通用的「把 flag 置为某值」——缺省置真，给值即置为该值。
+    #[test]
+    fn set_and_clear_flag_are_generic_flag_writes() {
+        let host = LuaHost::new(1).unwrap();
+        let c = ctx(json!({}));
+        host.run_hook(
+            "host.set_flag('a'); host.set_flag('b', false); host.set_flag('c', 3); host.clear_flag('d')",
+            LuaMount::Event,
+            &c,
+        )
+        .unwrap();
+        let reqs = host.drain_requests();
+        assert_eq!(reqs.len(), 4);
+        let effect = |r: &LuaRequest| match r {
+            LuaRequest::ApplyEffect { effect, .. } => effect.clone(),
+            other => panic!("expected apply_effect, got {other:?}"),
+        };
+        assert_eq!(effect(&reqs[0]), json!({ "kind": "set_flag", "flag": "a", "value": true }));
+        assert_eq!(effect(&reqs[1]), json!({ "kind": "set_flag", "flag": "b", "value": false }));
+        assert_eq!(effect(&reqs[2]), json!({ "kind": "set_flag", "flag": "c", "value": 3 }));
+        assert_eq!(effect(&reqs[3]), json!({ "kind": "set_flag", "flag": "d", "value": false }));
+        // 空 flag 当场报错（不静默丢请求）。
+        assert!(host.run_hook("host.set_flag('  ')", LuaMount::Event, &c).is_err());
     }
 }

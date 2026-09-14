@@ -4,12 +4,16 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import {
-  listStorybooks, listSaves, createSave, importSave, deleteStorybook, deleteSave
+  listStorybooks, listSaves, createSave, importSave, exportStorybook, importStorybook,
+  deleteStorybook, deleteSave
 } from '@/api'
-import type { SaveListItem, StorybookListItem } from '@/types'
+import type { SaveListItem, StorybookDocument, StorybookListItem, ValidationIssue } from '@/types'
 
 export const useListStore = defineStore('list', () => {
+  /** 我的故事书（含草稿）——书架只显示自己创作的。 */
   const storybooks = ref<StorybookListItem[]>([])
+  /** 可开档库：**所有人**的已发布故事书（多账户下这是共享的那一份）。 */
+  const playable = ref<StorybookListItem[]>([])
   const saves = ref<SaveListItem[]>([])
   const loading = ref(false)
   const error = ref<string | null>(null)
@@ -19,19 +23,38 @@ export const useListStore = defineStore('list', () => {
   const recentSave = computed<SaveListItem | null>(() => saves.value[0] ?? null)
 
   /**
-   * 已发布子集：只有已发布故事书能开档（未发布会被后端 409）。
-   * 「我的故事书」列全部（含草稿），开档弹窗只吃这个子集。
+   * 可开档子集：只有已发布故事书能开档（未发布会被后端 409）。
+   * 来源是「所有人的已发布」（我的 + 别人的），这样玩别人的书、别人玩我的书都成立。
    */
-  const publishedStorybooks = computed<StorybookListItem[]>(() => storybooks.value.filter(s => s.published))
+  const publishedStorybooks = computed<StorybookListItem[]>(() => playable.value.filter(s => s.published))
 
-  /** 拉取两类数据（全部故事书 + 全部存档）；失败时以 error 呈现并保留空态引导 */
+  /**
+   * 存档封面按 storybook_id 查：我可能玩的是别人的已发布书，
+   * 所以必须合并「我的书 + 可开档库」，只看书架会查不到封面。
+   */
+  const knownStorybooks = computed<Map<string, StorybookListItem>>(() => {
+    const map = new Map<string, StorybookListItem>()
+    for (const b of playable.value) map.set(b.id, b)
+    for (const b of storybooks.value) map.set(b.id, b)
+    return map
+  })
+
+  /** 拉取三类数据（我的书 + 可开档库 + 我的存档）；失败时以 error 呈现并保留空态引导 */
   async function load() {
     loading.value = true
     error.value = null
     try {
-      // 列出全部（含草稿）：草稿必须能在首页找到，否则「我的故事书」名不副实。
-      const [sbList, saveList] = await Promise.all([listStorybooks(false), listSaves()])
+      // 三类数据各自有归属语义：
+      //   released_only=false → 我的（草稿必须能在首页找到，否则「我的故事书」名不副实）；
+      //   released_only=true  → 所有人的已发布（开档弹窗的候选）；
+      //   saves               → 我的存档（后端已按账户过滤）。
+      const [sbList, playableList, saveList] = await Promise.all([
+        listStorybooks(false),
+        listStorybooks(true),
+        listSaves(),
+      ])
       storybooks.value = sbList
+      playable.value = playableList
       saves.value = saveList
     } catch (e) {
       error.value = e instanceof Error ? e.message : String(e)
@@ -85,5 +108,19 @@ export const useListStore = defineStore('list', () => {
     return item
   }
 
-  return { storybooks, publishedStorybooks, saves, loading, loaded, error, recentSave, load, startNewGame, importFromFile, removeStorybook, removeSave, removeSaves }
+  /** 导入故事书：传故事书包文件本身（zip：storybook.json + assets/），随后刷新书架 */
+  async function importBookFromFile(
+    file: Blob
+  ): Promise<{ doc: StorybookDocument; issues: ValidationIssue[] }> {
+    const res = await importStorybook(file)
+    await load()
+    return res
+  }
+
+  /** 导出故事书：返回文件名与字节，由页面触发下载（下载是纯 UI 动作，不进 store） */
+  async function exportBook(id: string): Promise<{ filename: string; blob: Blob }> {
+    return exportStorybook(id)
+  }
+
+  return { storybooks, playable, publishedStorybooks, knownStorybooks, saves, loading, loaded, error, recentSave, load, startNewGame, importFromFile, importBookFromFile, exportBook, removeStorybook, removeSave, removeSaves }
 })

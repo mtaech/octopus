@@ -2,6 +2,25 @@
 import type { EnemyView } from "./EnemyView";
 
 /**
- * 结构化遭遇：导演创建，投影给前端与提示词。
+ * 结构化遭遇：导演创建 / 触发点预置（§6.3），投影给前端与提示词。
+ *
+ * 叙事与空间锚（scene / location / goal / template_ids）都是**创建时的快照**：
+ * 运行时事件必须可重放，查询「此刻的场景」在重放时会得到错误答案（§6.2）。
  */
-export type EncounterView = { id: string, name: string, enemies: Array<EnemyView>, note?: string | null, active: boolean, };
+export type EncounterView = { id: string, name: string, enemies: Array<EnemyView>, note?: string | null, active: boolean, 
+/**
+ * 创建时的场景（地图 P5 §6.4）：地图与提示词据此说明「这一战发生在哪一幕」。
+ */
+scene_id?: string | null, 
+/**
+ * 创建时的地点（缺省继承场景）；怪物实例也按它归位。
+ */
+location_id?: string | null, 
+/**
+ * 关联目标 id（可选）：创建时按所在场景推导后快照，任务面板据它显示「清剿中」。
+ */
+goal_id?: string | null, 
+/**
+ * 涉及的图鉴模板 id（去重、按创建顺序）：临时敌人不计入。
+ */
+template_ids?: Array<string>, };

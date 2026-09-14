@@ -8,6 +8,7 @@ import { ref, computed } from 'vue'
 import type { SaveDetail, SaveListItem, UpgradeReport, Disposition, MaintenanceRow } from '@/types'
 import { listSaves, getSave, getMaintenance, manualSave, exportSave, renameSave, deleteSave, newOrigin, upgradeDryRun, upgradeExecute, toast } from '@/api'
 import { usePlayStore } from './play'
+import { downloadBlob } from '@/lib/download'
 
 export type WizardStep = 0 | 1 | 2 | 3
 /** 0=未进入 1=迁移报告 2=确认执行 3=执行结果 */
@@ -99,14 +100,7 @@ export const useDrawerStore = defineStore('playDrawer', () => {
     if (!play.saveId) return
     try {
       const { filename, blob } = await exportSave(play.saveId)
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = filename
-      document.body.appendChild(a)
-      a.click()
-      a.remove()
-      setTimeout(() => URL.revokeObjectURL(url), 4000)
+      downloadBlob(filename, blob)
       toast('ok', '已导出 ' + filename)
     } catch (err) {
       toast('error', (err as Error)?.message ?? '导出失败')

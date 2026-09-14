@@ -9,12 +9,13 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardFooter } from '@/components/ui/card'
 import StorybookCover from '@/components/StorybookCover.vue'
-import { IconBook2, IconPencil, IconTrash } from '@tabler/icons-vue'
+import { IconBook2, IconDownload, IconPencil, IconTrash } from '@tabler/icons-vue'
 
 defineProps<{ storybook: StorybookListItem }>()
 defineEmits<{
   (e: 'new-game', storybookId: string): void
   (e: 'edit', storybookId: string): void
+  (e: 'export', storybookId: string): void
   (e: 'delete', storybookId: string): void
 }>()
 </script>
@@ -70,6 +71,16 @@ defineEmits<{
             继续编辑
           </Button>
         </template>
+        <Button
+          size="sm"
+          variant="ghost"
+          class="shrink-0 text-muted-foreground hover:bg-primary/10 hover:text-primary"
+          title="导出为 .octopus-book.zip（草稿 + 已发布版次 + 全部图片）"
+          aria-label="导出故事书"
+          @click="$emit('export', storybook.id)"
+        >
+          <IconDownload class="size-3.5" />
+        </Button>
         <Button
           size="sm"
           variant="ghost"

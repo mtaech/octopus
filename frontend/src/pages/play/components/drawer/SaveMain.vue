@@ -146,7 +146,7 @@ function fmt(iso: string) { return fmtTime(iso) }
               </Button>
             </div>
             <p class="mt-2 text-[11px] leading-relaxed text-muted-foreground/70">
-              导出为跨数据库自包含存档包（.octopus.json），内嵌冻结故事书与完整命令日志，便于异地备份与迁移。
+              导出为跨数据库自包含存档包（.octopus.zip：save.json + assets/），内嵌冻结故事书与完整命令日志，便于异地备份与迁移。
             </p>
           </div>
 

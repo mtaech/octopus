@@ -88,13 +88,15 @@ pub fn resolve_immediate(
                 let value = eval_amount(amount, rng)?;
                 out.push(resource_delta(target_id, resource, value));
             }
-            ImmediateEffect::SetFlag { flag } => {
+            // 标记是**世界级键**（entity_id = flag 名），与目标实体无关；引擎只负责写值。
+            // 缺省 value = true，逐字沿用旧行为；给 value 即可置为任意值（false = 清除）。
+            ImmediateEffect::SetFlag { flag, value } => {
                 out.push(StateDelta {
                     domain: DeltaDomain::Flag,
                     entity_id: flag.clone(),
                     field: "flag".into(),
                     op: DeltaOp::Set,
-                    value: serde_json::Value::Bool(true),
+                    value: value.clone().unwrap_or(serde_json::Value::Bool(true)),
                 });
             }
         }
@@ -259,7 +261,7 @@ mod tests {
             ImmediateEffect::Damage { amount: "10".into(), resource: Some("hp".into()) },
             ImmediateEffect::Heal { amount: "4".into(), resource: None },
             ImmediateEffect::ModifyResource { resource: "mana".into(), amount: "-3".into() },
-            ImmediateEffect::SetFlag { flag: "poisoned".into() },
+            ImmediateEffect::SetFlag { flag: "poisoned".into(), value: None },
         ];
         let deltas = resolve_immediate(&effects, "char-target", &mut rng).unwrap();
         assert_eq!(deltas.len(), 4);
@@ -272,6 +274,32 @@ mod tests {
         assert_eq!(deltas[3].domain, DeltaDomain::Flag);
         assert_eq!(deltas[3].entity_id, "poisoned");
         assert_eq!(deltas[3].value, json!(true));
+    }
+
+    /// GAP-H：标记原语是通用的「把 flag 置为某值」——缺省置真（旧行为逐字不变），
+    /// 给 value 可置为任意值（false / 0 / null 在条件求值里都是「未置位」）。
+    #[test]
+    fn set_flag_defaults_to_true_and_accepts_an_explicit_value() {
+        let mut rng = DeterministicRng::new(3);
+        let effects = vec![
+            // 旧写法：没有 value 字段（历史故事书 / 历史日志的形态）。
+            serde_json::from_value::<ImmediateEffect>(json!({ "kind": "set_flag", "flag": "old" }))
+                .unwrap(),
+            ImmediateEffect::SetFlag { flag: "cleared".into(), value: Some(json!(false)) },
+            ImmediateEffect::SetFlag { flag: "counted".into(), value: Some(json!(0)) },
+        ];
+        let deltas = resolve_immediate(&effects, "char-target", &mut rng).unwrap();
+        assert_eq!(deltas.len(), 3);
+        assert_eq!(deltas[0].domain, DeltaDomain::Flag);
+        assert_eq!(deltas[0].entity_id, "old");
+        assert_eq!(deltas[0].value, json!(true), "缺省 value 逐字沿用旧行为");
+        assert_eq!(deltas[1].entity_id, "cleared");
+        assert_eq!(deltas[1].op, DeltaOp::Set);
+        assert_eq!(deltas[1].value, json!(false));
+        assert_eq!(deltas[2].value, json!(0));
+        // 旧形态（不带 value）序列化回去不得多出字段。
+        let old = serde_json::to_value(&effects[0]).unwrap();
+        assert_eq!(old, json!({ "kind": "set_flag", "flag": "old" }));
     }
 
     fn status_defs_with(id: &str, name: &str, duration: i64, unit: StatusUnit) -> HashMap<String, StatusDef> {

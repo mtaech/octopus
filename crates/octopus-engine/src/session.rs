@@ -37,8 +37,8 @@ use crate::{
     effects::{build_status_instance, resolve_effect, resolve_immediate, status_delta},
     error::EngineError,
     lua_host::{
-        LuaCheckContext, LuaHost, LuaHostContext, LuaMount, LuaRegistry, LuaRequest, LuaStatusContext,
-        MountEnv, SandboxLimits,
+        LuaCheckContext, LuaEventContext, LuaHost, LuaHostContext, LuaMount, LuaRegistry, LuaRequest,
+        LuaStatusContext, MountEnv, SandboxLimits,
     },
     modifiers::AttrModifier,
     ports::{
@@ -196,6 +196,61 @@ pub struct SessionRules {
     profiles: std::collections::HashMap<String, ModifierProfile>,
     /// 角色模板 → 属性修正（来自挂接定义与已装备物品）。
     attribute_bonuses: std::collections::HashMap<String, std::collections::HashMap<String, AttrModifier>>,
+    /// 资源边界（#12 ③）：资源 id → (min, max)。只含**声明过** \`default_max\` / \`min\` 的资源，
+    /// 未声明的资源不参与夹取（对旧故事书零影响）。构造时算一次，热路径不解析 JSON。
+    resource_bounds: std::collections::HashMap<String, (Option<i64>, Option<i64>)>,
+}
+
+/// 解析故事书声明的资源边界（\`world.resources[].default_max\` / \`min\`）。
+fn resource_bounds_of(
+    storybook: &Value,
+) -> std::collections::HashMap<String, (Option<i64>, Option<i64>)> {
+    let mut out = std::collections::HashMap::new();
+    let Some(arr) = storybook.pointer("/world/resources").and_then(Value::as_array) else {
+        return out;
+    };
+    for def in arr {
+        let Some(id) = def.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let max = def.get("default_max").and_then(Value::as_i64);
+        let min = def.get("min").and_then(Value::as_i64);
+        if max.is_none() && min.is_none() {
+            continue;
+        }
+        out.insert(id.to_string(), (min, max));
+    }
+    out
+}
+
+/// Lua 只读开放内容快照（GAP-C）：只截取故事书里「人物模板的挂接」与「definitions」两段原文。
+///
+/// 引擎**不理解**这些数据的语义（不认识 kind，也不解释 fields / modifiers / mechanics）；
+/// 它只负责把作者写下的开放内容交给脚本，由规则包自己解释。
+fn lua_read_data(storybook: &Value) -> Value {
+    let section = |key: &str| storybook.get(key).cloned().unwrap_or(Value::Array(Vec::new()));
+    serde_json::json!({
+        "characters": section("characters"),
+        "definitions": section("definitions"),
+    })
+}
+
+/// 遭遇里的敌人是否**全灭**（通用判据，不预设任何规则集语义）。
+fn enemies_all_down(enemies: &[Value]) -> bool {
+    !enemies.is_empty()
+        && enemies
+            .iter()
+            .all(|e| e.get("hp").and_then(Value::as_i64).unwrap_or(0) <= 0)
+}
+
+/// 遭遇的叙事 / 空间锚（创建时快照）→ 事件上下文里的 encounter 事实。
+fn encounter_facts(enc: &Value, enc_id: &str) -> Value {
+    serde_json::json!({
+        "id": enc.get("id").cloned().unwrap_or_else(|| Value::from(enc_id)),
+        "name": enc.get("name").cloned().unwrap_or(Value::Null),
+        "scene_id": enc.get("scene_id").cloned().unwrap_or(Value::Null),
+        "location_id": enc.get("location_id").cloned().unwrap_or(Value::Null),
+    })
 }
 
 impl SessionRules {
@@ -225,7 +280,8 @@ impl SessionRules {
             }
         }
         let attribute_bonuses = crate::modifiers::attribute_modifiers(&storybook);
-        Self { storybook, skills, status_defs, profiles, attribute_bonuses }
+        let resource_bounds = resource_bounds_of(&storybook);
+        Self { storybook, skills, status_defs, profiles, attribute_bonuses, resource_bounds }
     }
 
     /// 角色模板 → 属性修正（挂接定义 + 已装备物品）。
@@ -238,6 +294,13 @@ impl SessionRules {
     /// 属性维度 → 修正配置（供判定中心偏移使用）。
     pub fn profiles(&self) -> &std::collections::HashMap<String, ModifierProfile> {
         &self.profiles
+    }
+
+    /// 资源边界（资源 id → (min, max)）：只含声明过边界的资源。
+    pub fn resource_bounds(
+        &self,
+    ) -> &std::collections::HashMap<String, (Option<i64>, Option<i64>)> {
+        &self.resource_bounds
     }
 
     pub fn skill(&self, id: &str) -> Option<&SkillDef> {
@@ -629,6 +692,13 @@ pub struct Session {
     confirmation_timeout_ms: u64,
     /// 事件广播递归深度（防止 Lua 事件脚本互相触发形成死循环）。
     dispatch_depth: AtomicU32,
+    /// 最近一次被驳回的意图原因 + 累计次数（#04 续轮回喂）。
+    ///
+    /// 驳回**不进叙事**（前端把它当引擎 QA 信息过滤），所以模型本来完全看不到
+    /// 「技能在冷却 / 资源不足」这类事实，会照着自己的想象把失败写成成功。
+    /// 回合内把原因回喂给模型，是「引擎真的拦」与「模型知道为什么」之间的唯一桥。
+    last_rejection: Mutex<Option<String>>,
+    rejection_count: AtomicU64,
 }
 
 impl Session {
@@ -651,6 +721,9 @@ impl Session {
         // Lua 宿主与引擎共享同一 RNG 序列（#12 ④：engine_rng 走确定性序列）。
         let lua = LuaHost::with_rng(rng.clone(), SandboxLimits::default())
             .expect("初始化 Lua 沙箱宿主失败");
+        // 只读开放内容快照（GAP-C）：把冻结故事书的 characters / definitions 原文交给脚本，
+        // 让规则由开放内容驱动。引擎不理解其语义（不认识 kind，也不解释 fields / modifiers）。
+        lua.set_read_data(lua_read_data(&storybook));
         // 规则集挂载点：随故事书声明装载；故事书随存档冻结，因此规则集也随存档冻结。
         let lua_registry = LuaRegistry::from_storybook(&storybook);
         let base_state = state.clone();
@@ -681,6 +754,8 @@ impl Session {
             scene_start_round: AtomicU32::new(0),
             confirmation_timeout_ms: 20_000,
             dispatch_depth: AtomicU32::new(0),
+            last_rejection: Mutex::new(None),
+            rejection_count: AtomicU64::new(0),
         }
     }
 
@@ -828,8 +903,15 @@ impl Session {
     }
 
     /// 真正构造并广播事件（不做 RNG 补记，供 flush 自身调用以防递归）。
-    fn emit_raw(&self, event: PlayEvent, actor: Option<ActorRef>, intent_id: Option<String>) -> EventEnvelope {
+    fn emit_raw(&self, mut event: PlayEvent, actor: Option<ActorRef>, intent_id: Option<String>) -> EventEnvelope {
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+        // 唯一的状态变更入口：实时与重放走同一条路径，保证二者结果一致。
+        // 资源边界夹取必须在 **delta 进日志之前**发生——否则重放会拿未夹取的 delta
+        // 再算一遍，实时与重放就分叉了（夹取后的 Set 进日志，重放逐字应用同一个值）。
+        if let Ok(mut st) = self.state.lock() {
+            self.clamp_event_resources(&st, &mut event);
+            apply_event(&mut st, &event);
+        }
         let env = EventEnvelope {
             id: uuid::Uuid::new_v4().to_string(),
             seq,
@@ -839,15 +921,73 @@ impl Session {
             intent_id,
             event,
         };
-        // 唯一的状态变更入口：实时与重放走同一条路径，保证二者结果一致。
-        if let Ok(mut st) = self.state.lock() {
-            apply_event(&mut st, &env.event);
-        }
         if let Ok(mut log) = self.event_log.lock() {
             log.push(env.clone());
         }
         self.sink.emit(env.clone());
         env
+    }
+
+    /// 资源边界夹取（#12 ③）：把「越过声明边界」的资源增量改写为夹取后的 Set。
+    ///
+    /// 语义（不预设规则体系；对未声明边界的资源零影响）：
+    /// - 只有故事书为该资源声明了 \`default_max\` / \`min\` 才夹；
+    /// - 只夹**运动方向上越过边界**的那一步：\`6/10 补 5\` 夹到 \`10\`；
+    ///   已经超过上限的值（如满血 30 而 default_max 是 8 的图鉴数据）**不会被拉回来**，
+    ///   避免把作者声明的初始值悄悄改小；
+    /// - **不设隐式下限**：没声明 \`min\` 的资源可以被扣成负数（D&D 的死亡豁免 / 溢伤
+    ///   需要「低于 0 多少」这个事实）；想要 0 下限的作者显式声明 \`min: 0\` 即可；
+    /// - 未实际越界时**不改写** delta，历史日志的形状（Add / 数值）逐字不变。
+    fn clamp_event_resources(&self, st: &WorldState, event: &mut PlayEvent) {
+        let bounds = self.rules.resource_bounds();
+        if bounds.is_empty() {
+            return;
+        }
+        let changes: &mut Vec<StateDelta> = match event {
+            PlayEvent::Resolution(p) => &mut p.state_changes,
+            PlayEvent::StateUpdate(p) => &mut p.changes,
+            _ => return,
+        };
+        // 同一事件内的多个 delta 按声明顺序折叠：后一条以「前一条之后的值」为基座。
+        let mut working: std::collections::HashMap<(String, String), i64> =
+            std::collections::HashMap::new();
+        for d in changes.iter_mut() {
+            if d.domain != DeltaDomain::Character {
+                continue;
+            }
+            let Some(resource) = d.field.strip_prefix("resources.") else { continue };
+            let Some((min, max)) = bounds.get(resource) else { continue };
+            let key = (d.entity_id.clone(), resource.to_string());
+            let cur = working.get(&key).copied().or_else(|| {
+                st.characters
+                    .get(&d.entity_id)
+                    .and_then(|c| c.resources.get(resource))
+                    .and_then(resource_num)
+            });
+            let Some(cur) = cur else { continue };
+            // Set 是显式赋值：等价增量 = 目标值 - 当前值；其余按 Add 处理。
+            let amount = match d.op {
+                DeltaOp::Set => d.value.as_i64().unwrap_or(cur).saturating_sub(cur),
+                _ => d.value.as_i64().unwrap_or(0),
+            };
+            let raw = cur.saturating_add(amount);
+            let mut clamped = raw;
+            if let Some(max) = max {
+                if clamped > *max {
+                    clamped = (*max).max(cur);
+                }
+            }
+            if let Some(min) = min {
+                if clamped < *min {
+                    clamped = (*min).min(cur);
+                }
+            }
+            working.insert(key, clamped);
+            if clamped != raw {
+                d.op = DeltaOp::Set;
+                d.value = Value::from(clamped);
+            }
+        }
     }
 
     fn emit_simple(&self, event: PlayEvent) -> EventEnvelope {
@@ -1550,6 +1690,7 @@ impl Session {
                     Intent::Speak { .. } | Intent::Emote { .. } => npc_fallback.clone(),
                     _ => story_fallback.clone(),
                 });
+                let rejections_before = self.rejection_count.load(Ordering::SeqCst);
                 if let Intent::Strike { enemy_id, skill_id } = intent {
                     struck = true;
                     let mut choice = text_choice.clone();
@@ -1557,11 +1698,18 @@ impl Session {
                         choice.skill_id = skill_id;
                     }
                     self.strike_enemy(enemy_id, choice, actor).await;
-                    continue;
-                }
-                // 只有 query_world / check / interact 会返回「新引擎信息」供下一轮回喂。
-                if let Some(info) = self.handle_intent(intent, actor).await {
+                } else if let Some(info) = self.handle_intent(intent, actor).await {
+                    // 只有 query_world / check / interact 会返回「新引擎信息」供下一轮回喂。
                     next_feedback.push(info);
+                }
+                // 驳回同样要回喂：驳回不进叙事（前端当引擎 QA 信息过滤），模型本来完全
+                // 看不到「技能在冷却 / 资源不足」，会照自己的想象把失败写成成功。
+                if self.rejection_count.load(Ordering::SeqCst) > rejections_before {
+                    if let Some(reason) =
+                        self.last_rejection.lock().expect("rejection poisoned").clone()
+                    {
+                        next_feedback.push(format!("引擎驳回了一条意图：{reason}"));
+                    }
                 }
             }
             if finished || next_feedback.is_empty() {
@@ -2429,12 +2577,22 @@ impl Session {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        // 击杀 / 遭遇结束的判据取「这一击**之前**」的事实：对已经倒下的敌人再补刀
+        // 不会重复派发事件（每个事件恰好一次），重放同一日志得到同一结论。
+        let enemy_down_before = hp_before <= 0;
+        let encounter_over_before = enc.get("active").and_then(Value::as_bool) == Some(false)
+            || enemies_all_down(&list);
         if let Some(entry) = list.get_mut(idx).and_then(Value::as_object_mut) {
             entry.insert("hp".into(), Value::from(hp_after));
         }
         let all_down = list
             .iter()
             .all(|e| e.get("hp").and_then(Value::as_i64).unwrap_or(0) <= 0);
+        // 通用事实（引擎不解释用途，只把「谁倒下了 / 哪场遭遇结束了」交给脚本）。
+        let killed = !enemy_down_before && hp_after <= 0;
+        let encounter_over_after = enc.get("active").and_then(Value::as_bool) == Some(false)
+            || enemies_all_down(&list);
+        let encounter_ended = !encounter_over_before && encounter_over_after;
 
         let mut state_changes: Vec<StateDelta> = outcome
             .effects
@@ -2461,7 +2619,7 @@ impl Session {
         }
         state_changes.push(StateDelta {
             domain: DeltaDomain::Encounter,
-            entity_id: enc_id,
+            entity_id: enc_id.clone(),
             field: "encounter".into(),
             op: DeltaOp::Set,
             value: serde_json::json!({ "enemies": list }),
@@ -2488,6 +2646,8 @@ impl Session {
                 difficulty = difficulty,
             )
         };
+        // 击杀者事实（供后续事件上下文用；actor 会在 emit 时被移走，先留一份）。
+        let killer = ActorRef { id: actor_key.clone(), name: actor.name.clone() };
         // 攻击判定的可观测（判定 C5）：与 use_skill / Intent::Check 同一条 CheckResult
         // 事件——玩家在 UI 看得到骰面 / 修正 / 总值 / 难度，前端 CheckCard 直接复用。
         // 发射顺序与技能判定一致：先 CheckResult，后 Resolution（叙事文案逐字不变）。
@@ -2534,6 +2694,40 @@ impl Session {
         }
         // Lua 判定器 / 挂载点的写请求（消耗 / 状态 / 事件）真正落到世界状态。
         self.apply_lua_requests(&outcome.requests, &actor_key);
+
+        // 把「敌人被击败 / 遭遇结束」作为**通用事实**派发给 Lua（Event 挂载点）。
+        // 放在所有既有事件之后：既有事件的相对顺序逐字不变，这里只追加；
+        // 没有声明 event 脚本时 dispatch_lua_event_with 直接返回（零开销、零行为变化）。
+        if killed {
+            let enemy = enc.pointer(&format!("/enemies/{idx}")).cloned().unwrap_or(Value::Null);
+            let mut facts = serde_json::Map::new();
+            facts.insert(
+                "enemy".into(),
+                serde_json::json!({
+                    "id": enemy.get("id").cloned().unwrap_or(Value::Null),
+                    "name": enemy.get("name").cloned().unwrap_or(Value::Null),
+                    "template_id": enemy.get("template_id").cloned().unwrap_or(Value::Null),
+                    "instance_id": enemy.get("instance_id").cloned().unwrap_or(Value::Null),
+                }),
+            );
+            facts.insert("encounter".into(), encounter_facts(&enc, &enc_id));
+            // 击杀者可选（若有）：无署名时不塞一个空对象，脚本读到的就是 nil。
+            if !killer.id.is_empty() || !killer.name.is_empty() {
+                facts.insert(
+                    "killer".into(),
+                    serde_json::json!({ "id": killer.id, "name": killer.name }),
+                );
+            }
+            self.dispatch_lua_event_with("enemy_defeated", Some(&Value::Object(facts)));
+        }
+        if encounter_ended {
+            let facts = serde_json::json!({
+                "encounter": encounter_facts(&enc, &enc_id),
+                "enemies": list.clone(),
+                "reason": if all_down { "all_down" } else { "inactive" },
+            });
+            self.dispatch_lua_event_with("encounter_cleared", Some(&facts));
+        }
     }
 
     /// 结算一次「遭遇里的敌人攻击某个角色」（图鉴 M2 §4.2 / §4.3）。
@@ -3853,6 +4047,12 @@ impl Session {
             reason = %narrative,
             "AI 意图被驳回"
         );
+        // 记账供回合内回喂（见 run_round 的 next_feedback）：驳回不进叙事，模型看不到。
+        self.last_rejection
+            .lock()
+            .expect("rejection poisoned")
+            .replace(format!("[{}] {narrative}", code.as_str()));
+        self.rejection_count.fetch_add(1, Ordering::SeqCst);
         self.emit_simple(PlayEvent::Resolution(ResolutionPayload {
             intent_id: None,
             status: ResolutionStatus::Rejected,
@@ -4372,7 +4572,7 @@ impl Session {
         }
         self.with_mount_gate(lua_ctx, |gate| {
             let registry = self.lua_registry.lock().expect("lua registry poisoned");
-            let env = MountEnv { gate, check };
+            let env = MountEnv { gate, check, event: None };
             match registry.run_chain_status(&self.lua, mount, lua_ctx, &env, status) {
                 Ok(_) => Ok(self.lua.drain_requests()),
                 Err(e) => {
@@ -4492,12 +4692,15 @@ impl Session {
     }
 
     fn dispatch_lua_event(&self, event: &str) {
-        let has_scripts = self
-            .lua_registry
-            .lock()
-            .map(|registry| registry.for_mount(LuaMount::Event).next().is_some())
-            .unwrap_or(false);
-        if !has_scripts {
+        self.dispatch_lua_event_with(event, None);
+    }
+
+    /// 派发一个带**只读事实快照**的 Lua 事件（Event 挂载点）。
+    ///
+    /// 引擎只把「事件名 + 相关事实」原样交给脚本（`host.event_name` / `host.event_data`），
+    /// 不解释数据内容；没有声明 event 脚本时直接返回（零开销、零行为变化）。
+    fn dispatch_lua_event_with(&self, event: &str, data: Option<&Value>) {
+        if !self.has_mount(LuaMount::Event) {
             return;
         }
         let (scene_id, controlled) = self
@@ -4515,7 +4718,7 @@ impl Session {
         };
         // 走统一入口：注册表锁只在链执行期间持有（写请求在锁释放后落状态），
         // 且 `when` 条件与世界快照一并生效。
-        match self.run_mount_chain(LuaMount::Event, &lua_ctx, None, None) {
+        match self.run_event_chain(&lua_ctx, event, data) {
             // Lua 事件脚本的写请求同样落状态（此前被直接丢弃）。
             Ok(requests) => self.apply_lua_requests(&requests, &controlled),
             Err(e) => {
@@ -4527,6 +4730,37 @@ impl Session {
                 }));
             }
         }
+    }
+
+    /// 事件挂载点链（带通用事件上下文）。
+    ///
+    /// 与 `run_mount_chain` 同一条执行路径，区别只是把事件名与事实快照放进 `MountEnv`。
+    /// 注册表锁只在链执行期间持有：链里的 trigger_event 请求会在锁释放后才派发，
+    /// 否则事件回到 dispatch_lua_event 再取同一把锁即死锁。
+    fn run_event_chain(
+        &self,
+        lua_ctx: &LuaHostContext,
+        name: &str,
+        data: Option<&Value>,
+    ) -> Result<Vec<LuaRequest>, EngineError> {
+        if !self.has_mount(LuaMount::Event) {
+            return Ok(Vec::new());
+        }
+        self.with_mount_gate(lua_ctx, |gate| {
+            let registry = self.lua_registry.lock().expect("lua registry poisoned");
+            let env = MountEnv {
+                gate,
+                check: None,
+                event: Some(LuaEventContext { name, data }),
+            };
+            match registry.run_chain_with(&self.lua, LuaMount::Event, lua_ctx, &env) {
+                Ok(_) => Ok(self.lua.drain_requests()),
+                Err(e) => {
+                    let _ = self.lua.drain_requests();
+                    Err(e)
+                }
+            }
+        })
     }
 
     /// 把 Lua 写请求落到世界状态（请求-校验-执行；状态变更走 StateUpdate 权威事件）。
@@ -4578,10 +4812,6 @@ impl Session {
                 // 施加即时效果：与声明式 ImmediateEffect 走同一条 resolve_effect 路径
                 //（骰子数量在这里消耗引擎 RNG，随后的 emit 会补记 rng_consume）。
                 LuaRequest::ApplyEffect { target, effect } => {
-                    let entity = self.resolve_lua_target(target, default_actor);
-                    if entity.is_empty() {
-                        continue;
-                    }
                     let immediate = match serde_json::from_value::<ImmediateEffect>(effect.clone())
                     {
                         Ok(e) => e,
@@ -4594,6 +4824,13 @@ impl Session {
                             continue;
                         }
                     };
+                    // 标记是**世界级键**（delta 的 entity_id = flag 名），与角色实体无关：
+                    // 目标解析不到也照常落 delta（与声明式 resolve_immediate 同口径）；
+                    // 其余效果仍要求解析出实体（保持旧行为）。
+                    let entity = self.resolve_lua_target(target, default_actor);
+                    if entity.is_empty() && !matches!(&immediate, ImmediateEffect::SetFlag { .. }) {
+                        continue;
+                    }
                     let def = EffectDef {
                         immediate: Some(vec![immediate]),
                         ..Default::default()
@@ -5738,6 +5975,312 @@ mod tests {
         println!("缺陷1 证据：resources.hp = {hp}（is_i64 = {}）", hp.is_i64());
         assert!(hp.is_i64(), "受伤后投影里的生命资源必须仍是 JSON 整数，实际 {hp}");
         assert_eq!(hp.as_i64(), Some(25), "30 - 5（常量伤害）");
+    }
+
+    // ---------- 第一批修复（#01 冷却 / #12 状态叠加 · 边界恢复 · 资源边界） ----------
+
+    /// 冷却（#01）：声明 cooldown.turns 的技能在冷却期内由**引擎**驳回。
+    /// 这才是「提示词告诉 AI 有冷却」与「引擎真的检查」的一致状态。
+    #[test]
+    fn skill_cooldown_blocks_second_use_then_expires_by_round() {
+        let sb = json!({
+            "skills": [{
+                "id": "sk-blast", "name": "爆裂",
+                "cooldown": { "turns": 2 },
+                "check": { "dice": "1d20" },
+                "effect": { "immediate": [{ "kind": "damage", "amount": "1", "resource": "hp" }] }
+            }],
+            "world": { "check": { "dice": "1d20" } }
+        });
+        let (session, sink) = session_with(sb);
+        let skill = session.rules.skill("sk-blast").cloned().unwrap();
+
+        // 第一次：结算成功并落下冷却起点（当前回合 = 0）。
+        session.resolve_skill(None, &skill, Some("char-a"), None);
+        assert_eq!(
+            session.state.lock().unwrap().cooldowns["char-a"]["sk-blast"], 0,
+            "用过的技能必须记下使用回合"
+        );
+
+        // 同一回合再用：引擎驳回 cooldown_active（不再靠 AI 自觉）。
+        session.resolve_skill(None, &skill, Some("char-a"), None);
+        let rejected = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|e| match &e.event {
+                PlayEvent::Resolution(p) if p.status == ResolutionStatus::Rejected => {
+                    p.rejection_code.clone()
+                }
+                _ => None,
+            });
+        assert_eq!(rejected.as_deref(), Some("cooldown_active"), "冷却期内必须驳回");
+
+        // 推进到第 2 回合：2 回合冷却已满，可以再用，并刷新起点。
+        session.round.store(2, Ordering::SeqCst);
+        session.resolve_skill(None, &skill, Some("char-a"), None);
+        assert_eq!(
+            session.state.lock().unwrap().cooldowns["char-a"]["sk-blast"], 2,
+            "冷却结束后可再用，并刷新使用回合"
+        );
+    }
+
+    /// 冷却起点随命令日志重放：重启后不会「冷却凭空消失」。
+    #[test]
+    fn cooldown_survives_replay() {
+        let sb = json!({
+            "skills": [{
+                "id": "sk-blast", "name": "爆裂",
+                "cooldown": { "turns": 3 },
+                "check": { "dice": "1d20" }
+            }],
+            "world": { "check": { "dice": "1d20" } }
+        });
+        let (session, _sink) = session_with(sb.clone());
+        let skill = session.rules.skill("sk-blast").cloned().unwrap();
+        session.resolve_skill(None, &skill, Some("char-a"), None);
+
+        let persisted = persisted_of(&session);
+        let (restarted, _sink2) = session_with(sb);
+        restarted.replay(&persisted);
+        assert_eq!(
+            restarted.state.lock().unwrap().cooldowns["char-a"]["sk-blast"], 0,
+            "冷却起点必须随命令日志重放"
+        );
+        // 重放后的会话照样拦得住。
+        let skill2 = restarted.rules.skill("sk-blast").cloned().unwrap();
+        assert!(restarted.cooldown_block("char-a", &skill2).is_some());
+    }
+
+    /// 未声明冷却的技能不写冷却记账（避免给每个技能刷无用状态）。
+    #[test]
+    fn skill_without_cooldown_records_nothing() {
+        let sb = json!({
+            "skills": [{ "id": "sk-plain", "name": "普通", "check": { "dice": "1d20" } }],
+            "world": { "check": { "dice": "1d20" } }
+        });
+        let (session, _sink) = session_with(sb);
+        let skill = session.rules.skill("sk-plain").cloned().unwrap();
+        session.resolve_skill(None, &skill, Some("char-a"), None);
+        assert!(session.state.lock().unwrap().cooldowns.is_empty(), "无冷却技能不该记冷却");
+        // 可以连续使用。
+        assert!(session.cooldown_block("char-a", &skill).is_none());
+    }
+
+    /// 状态叠加（#12 ③）：stack = add 把两次施加的时长相加，且不产生两条同名状态。
+    #[test]
+    fn status_stack_add_sums_duration_end_to_end() {
+        let sb = json!({
+            "statuses": [{ "id": "burn", "name": "灼烧", "duration": 2, "unit": "turns", "stack": "add" }],
+            "skills": [{
+                "id": "sk-ignite", "name": "点燃",
+                "check": { "dice": "1d20" },
+                "effect": { "status": ["burn"] }
+            }],
+            "world": { "check": { "dice": "1d20" } }
+        });
+        let (session, _sink) = session_with(sb);
+        let skill = session.rules.skill("sk-ignite").cloned().unwrap();
+        session.resolve_skill(None, &skill, Some("char-a"), None);
+        session.resolve_skill(None, &skill, Some("char-a"), None);
+        let st = session.state.lock().unwrap();
+        let burns: Vec<_> = st.characters["char-a"]
+            .statuses
+            .iter()
+            .filter(|s| s.id == "burn")
+            .collect();
+        assert_eq!(burns.len(), 1, "同名状态不该叠成两条");
+        assert_eq!(burns[0].turns_left, Some(4), "stack=add 时长相加（2 + 2）");
+    }
+
+    /// 状态叠加：未声明 stack 仍是 replace（旧故事书行为逐字不变）。
+    #[test]
+    fn status_without_stack_still_replaces() {
+        let sb = json!({
+            "statuses": [{ "id": "burn", "name": "灼烧", "duration": 2, "unit": "turns" }],
+            "skills": [{
+                "id": "sk-ignite", "name": "点燃",
+                "check": { "dice": "1d20" },
+                "effect": { "status": ["burn"] }
+            }],
+            "world": { "check": { "dice": "1d20" } }
+        });
+        let (session, _sink) = session_with(sb);
+        let skill = session.rules.skill("sk-ignite").cloned().unwrap();
+        session.resolve_skill(None, &skill, Some("char-a"), None);
+        session.resolve_skill(None, &skill, Some("char-a"), None);
+        let st = session.state.lock().unwrap();
+        let burns: Vec<_> = st.characters["char-a"].statuses.iter().filter(|s| s.id == "burn").collect();
+        assert_eq!(burns.len(), 1);
+        assert_eq!(burns[0].turns_left, Some(2), "缺省 replace：用新的 2 回合覆盖");
+    }
+
+    /// 边界恢复（#12 ④）：per_turn 在回合边界真的补量，且不超 default_max。
+    #[test]
+    fn per_turn_recovery_applies_at_turn_boundary() {
+        let sb = json!({
+            "world": {
+                "check": { "dice": "1d20" },
+                "resources": [{
+                    "id": "hp", "default_max": 30,
+                    "natural_recovery": { "amount": 4, "trigger": "per_turn" }
+                }]
+            }
+        });
+        let mut st = state_with_pc();
+        st.characters.get_mut("char-a").unwrap().resources.insert("hp".into(), json!(26));
+        let (session, _sink) = session_with_state(sb, st);
+        session.tick_statuses_turn();
+        assert_eq!(
+            session.projection().characters["char-a"]["resources"]["hp"],
+            json!(30),
+            "26 + 4 夹在 default_max 30"
+        );
+    }
+
+    /// 未声明 per_turn / per_scene 的故事书，边界 tick 不产生任何事件（旧行为零影响）。
+    #[test]
+    fn boundary_tick_emits_nothing_when_no_tick_recovery_declared() {
+        let sb = json!({
+            "world": {
+                "check": { "dice": "1d20" },
+                "resources": [{ "id": "hp", "default_max": 30 }]
+            }
+        });
+        let (session, sink) = session_with(sb);
+        let before = sink.0.lock().unwrap().len();
+        session.tick_statuses_turn();
+        session.tick_statuses_scene();
+        assert_eq!(
+            sink.0.lock().unwrap().len(),
+            before,
+            "没有 per_turn / per_scene 声明时不该多发事件"
+        );
+    }
+
+    /// 资源边界（#12 ③）：治疗不越过 default_max，且**进日志的就是夹取后的 Set**（可重放）。
+    #[test]
+    fn heal_is_capped_at_default_max_and_log_carries_clamped_set() {
+        let sb = json!({
+            "skills": [{
+                "id": "sk-heal", "name": "治疗",
+                "check": { "dice": "1d20" },
+                "effect": { "immediate": [{ "kind": "heal", "amount": "10", "resource": "hp" }] }
+            }],
+            "world": {
+                "check": { "dice": "1d20" },
+                "resources": [{ "id": "hp", "default_max": 30 }]
+            }
+        });
+        let mut st = state_with_pc();
+        st.characters.get_mut("char-a").unwrap().resources.insert("hp".into(), json!(25));
+        let (session, sink) = session_with_state(sb.clone(), st);
+        let skill = session.rules.skill("sk-heal").cloned().unwrap();
+        session.resolve_skill(None, &skill, Some("char-a"), None);
+        assert_eq!(
+            session.projection().characters["char-a"]["resources"]["hp"],
+            json!(30),
+            "25 + 10 必须夹到上限 30（而不是 35）"
+        );
+
+        // 日志里是夹取后的 Set，而不是 +10 的 Add：否则重放会加回 35。
+        let delta = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|e| match &e.event {
+                PlayEvent::Resolution(p) => {
+                    p.state_changes.iter().find(|d| d.field == "resources.hp").cloned()
+                }
+                _ => None,
+            })
+            .expect("资源 delta");
+        assert_eq!(delta.op, DeltaOp::Set, "越界时必须改写成 Set");
+        assert_eq!(delta.value, json!(30));
+
+        // 重放后世界状态逐字一致（夹取后的 Set 进日志，重放不会重新加一遍）。
+        let persisted = persisted_of(&session);
+        let (restarted, _s2) = session_with_state(sb, state_with_pc());
+        restarted.replay(&persisted);
+        assert_eq!(
+            serde_json::to_value(session.projection()).unwrap(),
+            serde_json::to_value(restarted.projection()).unwrap(),
+            "夹取后重放必须一致"
+        );
+    }
+
+    /// 资源边界：已经高于 default_max 的值**不被拉回来**（图鉴满血 30 而 default_max 是 8）。
+    #[test]
+    fn value_already_over_max_is_not_dragged_down() {
+        let sb = json!({
+            "skills": [{
+                "id": "sk-hit", "name": "打击",
+                "check": { "dice": "1d20" },
+                "effect": { "immediate": [{ "kind": "damage", "amount": "5", "resource": "hp" }] }
+            }],
+            "world": {
+                "check": { "dice": "1d20" },
+                "resources": [{ "id": "hp", "default_max": 8 }]
+            }
+        });
+        let mut st = state_with_pc();
+        st.characters.get_mut("char-a").unwrap().resources.insert("hp".into(), json!(30));
+        let (session, _sink) = session_with_state(sb, st);
+        let skill = session.rules.skill("sk-hit").cloned().unwrap();
+        session.resolve_skill(None, &skill, Some("char-a"), None);
+        assert_eq!(
+            session.projection().characters["char-a"]["resources"]["hp"],
+            json!(30),
+            "30 - 5 不得被夹到 8：夹取只拦「越过边界的那一步」，不改作者声明的初始值"
+        );
+    }
+
+    /// 资源边界：没声明 default_max / min 的资源完全不受影响（旧故事书零影响）。
+    #[test]
+    fn resource_without_declared_bounds_is_untouched() {
+        let sb = json!({
+            "skills": [{
+                "id": "sk-heal", "name": "治疗",
+                "check": { "dice": "1d20" },
+                "effect": { "immediate": [{ "kind": "heal", "amount": "100", "resource": "hp" }] }
+            }],
+            "world": { "check": { "dice": "1d20" } }
+        });
+        let (session, _sink) = session_with(sb);
+        let skill = session.rules.skill("sk-heal").cloned().unwrap();
+        session.resolve_skill(None, &skill, Some("char-a"), None);
+        assert_eq!(
+            session.projection().characters["char-a"]["resources"]["hp"],
+            json!(130),
+            "未声明边界的资源照旧不夹"
+        );
+    }
+
+    /// 资源边界：显式声明 min 的资源不会被扣穿。
+    #[test]
+    fn declared_min_floor_stops_damage() {
+        let sb = json!({
+            "skills": [{
+                "id": "sk-hit", "name": "打击",
+                "check": { "dice": "1d20" },
+                "effect": { "immediate": [{ "kind": "damage", "amount": "50", "resource": "hp" }] }
+            }],
+            "world": {
+                "check": { "dice": "1d20" },
+                "resources": [{ "id": "hp", "default_max": 30, "min": 0 }]
+            }
+        });
+        let (session, _sink) = session_with(sb);
+        let skill = session.rules.skill("sk-hit").cloned().unwrap();
+        session.resolve_skill(None, &skill, Some("char-a"), None);
+        assert_eq!(
+            session.projection().characters["char-a"]["resources"]["hp"],
+            json!(0),
+            "声明了 min: 0 的资源不该被扣成负数"
+        );
     }
 
     // ---------- 缺陷 2（回归）：use_skill 自目标回落 Lua 的 host.target ----------
@@ -8585,6 +9128,24 @@ mod tests {
         (Arc::new(session), sink)
     }
 
+    /// 同上，但用指定的初始世界状态（预置冷却 / 资源等）。
+    fn session_with_provider_and_state(
+        ai: Arc<dyn AiProvider>,
+        sb: Value,
+        state: WorldState,
+    ) -> (Arc<Session>, Arc<CaptureSink>) {
+        let sink = Arc::new(CaptureSink(StdMutex::new(vec![])));
+        let session = Session::new(
+            "s".into(),
+            state,
+            sink.clone() as Arc<dyn EventSink>,
+            ai_slot(ai),
+            true,
+            sb,
+        );
+        (Arc::new(session), sink)
+    }
+
     /// 第一轮查询世界，第二轮据查询结果续写并 finish_turn。
     struct QueryThenFinishAi {
         story_calls: StdMutex<usize>,
@@ -8656,6 +9217,79 @@ mod tests {
             narrations.iter().any(|t| t == "第二轮据查询结果续写。"),
             "续轮效果也要落地：{narrations:?}"
         );
+    }
+
+    /// 驳回回喂（#01 冷却）：技能在冷却中被引擎驳回时，模型必须在**同一回合**拿到原因。
+    /// 否则模型看不到叙事里不存在的驳回，会把「技能没生效」照样写成成功。
+    struct CooldownRetryAi {
+        story_calls: StdMutex<u32>,
+        contexts: StdMutex<Vec<TurnContext>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AiProvider for CooldownRetryAi {
+        async fn story_intents(&self, ctx: &TurnContext) -> Result<AiOutput, EngineError> {
+            let call = {
+                let mut n = self.story_calls.lock().unwrap();
+                *n += 1;
+                *n
+            };
+            self.contexts.lock().unwrap().push(ctx.clone());
+            if call == 1 {
+                Ok(AiOutput::from_intents(vec![Intent::UseSkill {
+                    skill_id: "sk-blast".into(),
+                    target_id: None,
+                }]))
+            } else {
+                Ok(AiOutput::from_intents(vec![
+                    Intent::Narrate { content: "冷却没好，改用别的招。".into(), actor_id: None },
+                    Intent::FinishTurn,
+                ]))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cooldown_rejection_is_fed_back_to_the_model_in_round() {
+        let ai = Arc::new(CooldownRetryAi {
+            story_calls: StdMutex::new(0),
+            contexts: StdMutex::new(vec![]),
+        });
+        let sb = json!({
+            "skills": [{ "id": "sk-blast", "name": "爆裂", "cooldown": { "turns": 3 }, "check": { "dice": "1d20" } }],
+            "world": { "check": { "dice": "1d20" } }
+        });
+        let mut st = state_with_pc();
+        // 预先埋好冷却起点（上一回合用过），本回合再用必须被拦。
+        st.cooldowns.insert(
+            "char-a".into(),
+            [("sk-blast".to_string(), 1u32)].into_iter().collect(),
+        );
+        let (session, sink) = session_with_provider_and_state(ai.clone() as Arc<dyn AiProvider>, sb, st);
+        session
+            .run_round(
+                RoundInput { channel: RoundChannel::Character, text: "再放一次爆裂".into(), refs: vec![] },
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(*ai.story_calls.lock().unwrap(), 2, "被驳回后必须追加一轮让模型改主意");
+        let contexts = ai.contexts.lock().unwrap();
+        assert!(contexts[0].turn_feedback.is_empty(), "首轮不携带任何反馈");
+        let feedback = contexts[1].turn_feedback.join(" | ");
+        assert!(
+            feedback.contains("cooldown_active") && feedback.contains("冷却"),
+            "续轮必须把冷却驳回原因回喂给模型：{feedback}"
+        );
+        drop(contexts);
+        // 驳回照样落一条 rejected 事件（可审计），只是不进叙事。
+        let rejected = sink.0.lock().unwrap().iter().any(|e| matches!(
+            &e.event,
+            PlayEvent::Resolution(p) if p.rejection_code.as_deref() == Some("cooldown_active")
+        ));
+        assert!(rejected, "冷却驳回必须留在命令日志里");
     }
 
     /// 永远只查询、从不 finish_turn：必须在轮次上限处停下。
@@ -10714,6 +11348,235 @@ mod tests {
         assert!(
             session.projection().locations.iter().all(|l| l.get("location_ids").is_none()),
             "地点条目不该被回写派生字段"
+        );
+    }
+
+    // ============================================================
+    // 通用原语补口（GAP-C 只读开放内容 / GAP-F 击败与遭遇结束事件 / GAP-H 标记）
+    // ============================================================
+
+    /// GAP-F 的事件脚本：把事件事实记进脚本私有存储，并在敌人被击败时发一次奖励资源。
+    /// （资源名叫什么由规则包决定；引擎只认识「给某个资源加个数」这个通用动作。）
+    const DEFEAT_EVENT_SOURCE: &str = r#"
+local d = host.storage.defeated or {}
+if host.event_name == 'enemy_defeated' then
+  d[#d + 1] = {
+    enemy = host.event_data.enemy,
+    encounter = host.event_data.encounter,
+    killer = host.event_data.killer
+  }
+  host.storage.defeated = d
+  host.modify_resource('', 'score', 50)
+elseif host.event_name == 'encounter_cleared' then
+  host.storage.cleared_count = (host.storage.cleared_count or 0) + 1
+  host.storage.cleared = {
+    encounter = host.event_data.encounter,
+    reason = host.event_data.reason,
+    count = #host.event_data.enemies
+  }
+end
+"#;
+
+    /// GAP-F 测试故事书：一只图鉴怪 + 一击必杀的技能 + Event 挂载点脚本。
+    fn defeat_storybook(event_source: &str) -> Value {
+        json!({
+            "attribute_dimensions": [
+                { "key": "str", "baseline": 10, "modifier_step": 2, "min": 1, "max": 30 }
+            ],
+            "characters": [{
+                "id": "mon-goblin", "name": "地精", "kind": "monster",
+                "attributes": { "str": 8 }, "resources": { "res-hp": 7 },
+                "skills": ["sk-finish"]
+            }],
+            "skills": [{
+                "id": "sk-finish", "name": "终结", "attribute": "str",
+                "check": { "lua": "return { total = 100, margin = 100 }" },
+                "effect": { "immediate": [
+                    { "kind": "damage", "amount": "99", "resource": "res-hp" } ] }
+            }],
+            "lua_mounts": [{ "id": "defeat-log", "mount": "event", "source": event_source }]
+        })
+    }
+
+    fn finish_choice() -> AttackChoice {
+        AttackChoice { skill_id: Some("sk-finish".into()), ..Default::default() }
+    }
+
+    /// GAP-C 端到端：脚本读「当前角色模板的挂接 → definition」里的加值并
+    /// `modify_check('add', N)`，判定总值随之变化；挂接清空后加值消失（数据驱动，非烘死）。
+    #[tokio::test]
+    async fn lua_reads_open_content_bonus_into_check_total() {
+        let source = r#"local ids = host.get_attachment('trait') or {}
+for _, id in ipairs(ids) do
+  local def = host.get_definition(id)
+  local bonus = def and def.fields and tonumber(def.fields.bonus)
+  if host.check_attribute == 'dex' and bonus then
+    host.modify_check('add', bonus)
+  end
+end"#;
+        let with_attachment = json!({
+            "attribute_dimensions": [
+                { "key": "dex", "baseline": 10, "modifier_step": 2, "min": 1, "max": 30 }
+            ],
+            "characters": [{
+                "id": "char-a", "name": "米拉", "kind": "pc",
+                "attributes": { "dex": 10 },
+                "attachments": { "trait": ["tr-trained"] }
+            }],
+            "definitions": [{
+                "id": "tr-trained", "kind": "trait", "name": "受训",
+                "fields": { "bonus": "4" },
+                "modifiers": [{ "target": "dex", "value": 4 }]
+            }],
+            "lua_mounts": [{
+                "id": "read-open-content", "mount": "check_post_roll", "source": source
+            }]
+        });
+        // 对照组：同一脚本、同一骰序，只是模板上没有挂接 → 读不到 definition，加值不生效。
+        let mut without = with_attachment.clone();
+        without["characters"][0]["attachments"] = json!({});
+
+        let check = |sb: Value| async move {
+            let (session, sink) = session_with(sb);
+            session
+                .handle_intent(
+                    Intent::Check {
+                        attribute: "dex".into(),
+                        difficulty: Some(1),
+                        actor_id: None,
+                        opponent_id: None,
+                    },
+                    None,
+                )
+                .await;
+            last_check(&sink)
+        };
+        let with_check = check(with_attachment).await;
+        let plain_check = check(without).await;
+        assert_eq!(with_check.rolls, plain_check.rolls, "同种子骰序不变");
+        let plain_roll = plain_check.rolls.as_ref().and_then(|r| r.first().copied()).unwrap_or(0);
+        assert_eq!(plain_check.total, plain_roll, "对照组没有加值");
+        assert_eq!(with_check.total, plain_check.total + 4, "挂接里的加值进判定总值");
+        assert_eq!(with_check.margin, plain_check.margin + 4, "差值同步重算");
+    }
+
+    /// GAP-H 端到端：Lua 能把标记置为 false（清除）；旧 SetFlag 缺省置真逐字不变。
+    #[tokio::test]
+    async fn lua_clear_flag_resets_a_flag_and_default_set_still_true() {
+        let sb = json!({
+            "lua_mounts": [{
+                "id": "toggle",
+                "mount": "event",
+                "source": "host.set_flag('kept'); host.clear_flag('done')"
+            }]
+        });
+        let mut st = state_with_pc();
+        st.flags.insert("done".into(), json!(true));
+        let (session, _sink) = session_with_state(sb, st);
+        session.dispatch_event("scene");
+        let flags = session.state.lock().unwrap().flags.clone();
+        assert_eq!(flags.get("kept"), Some(&json!(true)), "缺省仍置真（旧行为逐字不变）");
+        assert_eq!(flags.get("done"), Some(&json!(false)), "clear_flag 把标记置为 false");
+    }
+
+    /// GAP-F 端到端：导演即兴建的遭遇里，敌人 HP 归零 → 事件在击杀瞬间派发一次
+    ///（上下文含 enemy / encounter / killer）；敌人全灭 → 遭遇结束事件派发一次；
+    /// 重放同一日志得到同一结论。
+    #[tokio::test]
+    async fn defeat_and_encounter_end_events_fire_once_with_context_and_replay() {
+        let sb = defeat_storybook(DEFEAT_EVENT_SOURCE);
+        let (session, _sink) = session_with_state(sb.clone(), state_with_pc());
+        // 导演即兴建的遭遇（Intent::Encounter）——GAP-F 的核心诉求正是它也能拿到事件。
+        let enc = create_encounter(&session, vec![goblin_spec(2)]).await;
+        let score = |s: &Arc<Session>| {
+            s.projection().characters["char-a"]["resources"]["score"].as_i64().unwrap_or(0)
+        };
+
+        session.strike_enemy("e1".into(), finish_choice(), None).await;
+        assert_eq!(score(&session), 50, "击杀一只 → 派发一次击败事件");
+        // 已经倒下的敌人再补刀：不得重复派发（每个事件只派发一次）。
+        session.strike_enemy("e1".into(), finish_choice(), None).await;
+        assert_eq!(score(&session), 50, "同一只敌人只派发一次击败事件");
+        session.strike_enemy("e2".into(), finish_choice(), None).await;
+        assert_eq!(score(&session), 100, "两只各派发一次");
+        assert_eq!(enemy_hp(&session, &enc, 1), 0);
+
+        // 事件上下文：两次击败（enemy / encounter / killer）+ 一次遭遇结束。
+        let probe = LuaHostContext { script_id: "defeat-log".into(), ..Default::default() };
+        assert!(
+            session
+                .lua
+                .run_condition(
+                    r#"local d = host.storage.defeated
+return d ~= nil and #d == 2
+  and d[1].enemy.id == 'e1' and d[1].enemy.name == '地精'
+  and d[1].enemy.template_id == 'mon-goblin' and d[1].enemy.instance_id ~= nil
+  and d[2].enemy.id == 'e2'
+  and d[1].encounter.name == '遭遇' and d[1].encounter.scene_id == 'sc-1'
+  and d[1].encounter.id ~= nil
+  and d[1].killer.id == 'char-a' and d[1].killer.name == '米拉'"#,
+                    &probe,
+                )
+                .unwrap(),
+            "击败事件必须带上 enemy / encounter / killer 事实"
+        );
+        assert!(
+            session
+                .lua
+                .run_condition(
+                    r#"local c = host.storage.cleared
+local d = host.storage.defeated
+return host.storage.cleared_count == 1 and c ~= nil
+  and c.reason == 'all_down' and c.count == 2
+  and c.encounter.id == d[1].encounter.id
+  and c.encounter.name == '遭遇'"#,
+                    &probe,
+                )
+                .unwrap(),
+            "遭遇全灭 → 派发一次遭遇结束事件"
+        );
+
+        // 重放一致：事件派发产生的世界状态（奖励资源）随权威日志重建，不重跑 Lua。
+        let persisted = persisted_of(&session);
+        let (restarted, _sink2) = session_with_state(sb, state_with_pc());
+        restarted.replay(&persisted);
+        assert_eq!(
+            serde_json::to_value(session.projection()).unwrap(),
+            serde_json::to_value(restarted.projection()).unwrap(),
+            "重放后投影逐字一致（结论一致、不重复派发）"
+        );
+        assert_eq!(session.current_seq(), restarted.current_seq());
+    }
+
+    /// 没有 event 挂载点脚本的故事书：击杀 / 遭遇结束不产生任何新增事件（零行为变化）。
+    #[tokio::test]
+    async fn without_event_mount_a_defeat_adds_no_events_or_state() {
+        let mut sb = defeat_storybook(DEFEAT_EVENT_SOURCE);
+        sb.as_object_mut().unwrap().remove("lua_mounts");
+        let (session, sink) = session_with_state(sb, state_with_pc());
+        let _enc = create_encounter(&session, vec![goblin_spec(1)]).await;
+        let before = sink.0.lock().unwrap().len();
+        session.strike_enemy("e1".into(), finish_choice(), None).await;
+        let events = sink.0.lock().unwrap().clone();
+        let kinds: Vec<String> = events[before..]
+            .iter()
+            .map(|e| match &e.event {
+                PlayEvent::CheckResult(_) => "check".to_string(),
+                PlayEvent::Resolution(p) => {
+                    format!("resolution:{}", p.outcome.clone().unwrap_or_default())
+                }
+                PlayEvent::System(p) => format!("system:{}", p.code.clone().unwrap_or_default()),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["check", "resolution:strike", "system:encounter_cleared"],
+            "没有 event 挂载点时事件序列逐字不变（零新增）"
+        );
+        assert!(
+            session.projection().characters["char-a"]["resources"].get("score").is_none(),
+            "没有脚本就没有任何状态变化"
         );
     }
 }

@@ -170,8 +170,16 @@ pub enum ImmediateEffect {
     },
     /// 改资源：正负由 amount 符号决定。
     ModifyResource { resource: String, amount: String },
-    /// 设标记。
-    SetFlag { flag: String },
+    /// 设置标记的值（缺省 true = 置位；给 value 可置为任意值，如 false 即为清除）。
+    ///
+    /// 引擎只把 `flag` 当作一个**世界级键**写进 flags 表，不理解值的含义；
+    /// 缺省 `value` 时逐字沿用旧行为（写 true）。
+    SetFlag {
+        flag: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(type = "unknown")]
+        value: Option<Value>,
+    },
 }
 
 /// 状态持续单位。

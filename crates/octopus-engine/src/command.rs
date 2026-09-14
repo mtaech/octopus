@@ -395,7 +395,7 @@ fn run_mount(
     let Some((host, _)) = ctx.lua else {
         return Ok(Vec::new());
     };
-    let env = MountEnv { gate: ctx.mount_gate, check };
+    let env = MountEnv { gate: ctx.mount_gate, check, event: None };
     if let Some(registry) = ctx.registry {
         registry.run_chain_with(host, mount, lua_ctx, &env)?;
     }

@@ -12,11 +12,13 @@ import FeedChat from './components/feed/FeedChat.vue'
 import FlowLog from './components/FlowLog.vue'
 import WorldRail from './components/WorldRail.vue'
 import DetailPanel from './components/DetailPanel.vue'
+import MapPanel from './components/MapPanel.vue'
 import type { WorldSelection } from './selection'
 import SaveDrawer from './components/SaveDrawer.vue'
 import InputBar from './components/InputBar.vue'
 import NarrativePrefsDialog from './components/NarrativePrefsDialog.vue'
 import ThemeToggle from '@/components/ThemeToggle.vue'
+import AccountMenu from '@/components/AccountMenu.vue'
 import StorybookCover from '@/components/StorybookCover.vue'
 import type { AssetRef } from '@/types'
 import { Button } from '@/components/ui/button'
@@ -83,8 +85,10 @@ async function toggleAutoConfirm() {
 // ---------- 对话 / 流程日志 切换 ----------
 // 「日志」保留全部原始事件（含被驳回的意图），用于在游玩时复盘整个流程。
 const TAB_KEY = 'octopus:play-tab'
-const tab = ref<'chat' | 'log'>(localStorage.getItem(TAB_KEY) === 'log' ? 'log' : 'chat')
-async function switchTab(next: 'chat' | 'log') {
+type PlayTab = 'chat' | 'log' | 'map'
+const savedTab = localStorage.getItem(TAB_KEY)
+const tab = ref<PlayTab>(savedTab === 'log' || savedTab === 'map' ? savedTab : 'chat')
+async function switchTab(next: PlayTab) {
   tab.value = next
   try { localStorage.setItem(TAB_KEY, next) } catch { /* 隐私模式忽略 */ }
   await nextTick()
@@ -248,6 +252,9 @@ function goBack() { void router.push('/') }
       <!-- 主题切换 -->
       <ThemeToggle />
 
+      <!-- 账户 -->
+      <AccountMenu />
+
       <Separator orientation="vertical" class="h-5 bg-border" />
 
       <!-- 免确认开关（引擎侧：点击发 /免确认 元指令） -->
@@ -314,8 +321,15 @@ function goBack() { void router.push('/') }
             title="显示本会话全部原始事件（含被驳回的意图 / 阶段 / 思考 / 状态变更）"
             @click="switchTab('log')"
           >日志<span class="ml-1 font-mono text-[10px] opacity-70">{{ store.flowLog.length }}</span></button>
+          <button
+            type="button"
+            class="cursor-pointer rounded-md px-2.5 py-0.5 text-[11.5px] font-semibold transition-colors"
+            :class="tab === 'map' ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:text-foreground'"
+            title="地图：底图 + 地点锚点 + 当前地点高亮 + 按实例位置聚合的单位"
+            @click="switchTab('map')"
+          >地图</button>
           <span class="ml-auto truncate text-[10.5px] text-muted-foreground/60">
-            {{ tab === 'log' ? '引擎内部事件也在这里' : '' }}
+            {{ tab === 'log' ? '引擎内部事件也在这里' : tab === 'map' ? '单位按角色实例的位置归位' : '' }}
           </span>
         </div>
         <div class="relative flex min-h-0 flex-1 flex-col">
@@ -328,7 +342,8 @@ function goBack() { void router.push('/') }
               </div>
               <FeedChat :feed="store.entries" />
             </template>
-            <FlowLog v-else :lines="store.flowLog" />
+            <FlowLog v-else-if="tab === 'log'" :lines="store.flowLog" />
+            <MapPanel v-else :selected="selection" @select="(s: WorldSelection) => (selection = s)" />
           </div>
           <Button
             v-if="!atBottom"
@@ -343,7 +358,11 @@ function goBack() { void router.push('/') }
         </div>
         <InputBar />
       </section>
-      <DetailPanel :selected="selection" @switch="(id: string) => store.switchTo(id)" />
+      <DetailPanel
+        :selected="selection"
+        @select="(s: WorldSelection) => (selection = s)"
+        @switch="(id: string) => store.switchTo(id)"
+      />
     </main>
 
     <!-- 加载/错误态 -->

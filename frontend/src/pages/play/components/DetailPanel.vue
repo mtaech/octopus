@@ -3,13 +3,18 @@
 import { computed } from 'vue'
 import { usePlayStore } from '../stores/play'
 import CharacterSheet from './CharacterSheet.vue'
-import type { CharacterInstance, EncounterView, GoalDef, LocationDef, SceneDef, TriggerDef } from '@/types'
+import { assetUrl } from '@/api'
+import type { CharacterInstance, EncounterView, EnemyView, GoalDef, LocationDef, SceneDef, Storybook, TriggerDef } from '@/types'
 import type { WorldSelection } from '../selection'
-import { findCharacter, isControlledChar } from '../utils'
-import { IconTarget, IconFlag, IconMapPin, IconInfoCircle, IconUser, IconCheck, IconSwords } from '@tabler/icons-vue'
+import { findCharacter, initial, isControlledChar, nameTintClass, portraitOf, unitCount, unitsAtLocation } from '../utils'
+import type { LooseEnemy, LocationUnits } from '../utils'
+import { IconTarget, IconFlag, IconMapPin, IconInfoCircle, IconUser, IconCheck, IconSwords, IconShield, IconChevronRight, IconBook2, IconSkull } from '@tabler/icons-vue'
 
 const props = defineProps<{ selected: WorldSelection | null }>()
-const emit = defineEmits<{ (e: 'switch', characterId: string): void }>()
+const emit = defineEmits<{
+  (e: 'switch', characterId: string): void
+  (e: 'select', s: WorldSelection): void
+}>()
 
 const store = usePlayStore()
 /** 当前场景（骨架里按 scene_id 找） */
@@ -21,13 +26,30 @@ const scene = computed<SceneDef | null>(() => {
   return null
 })
 
+/** 地点详情里的一行单位（PC / NPC / 怪物排成一列，只靠 kind 区分）。 */
+interface LocUnitRow { instanceId: string; name: string; kind: string; controlled: boolean; present: boolean }
+
+function locRows(u: LocationUnits): LocUnitRow[] {
+  const rows: LocUnitRow[] = []
+  const push = (list: CharacterInstance[]): void => {
+    for (const c of list) {
+      rows.push({ instanceId: c.instance_id, name: c.name, kind: c.kind, controlled: isControlledChar(store.controlledId, c), present: c.present })
+    }
+  }
+  push(u.pc); push(u.npc); push(u.monster)
+  return rows
+}
+
 type Detail =
   | { kind: 'character'; actor: CharacterInstance }
   | { kind: 'goal'; goal: GoalDef; done: boolean }
   | { kind: 'trigger'; trigger: TriggerDef; done: boolean }
-  | { kind: 'location'; loc: LocationDef; current: boolean; chars: CharacterInstance[] }
+  | { kind: 'location'; loc: LocationDef; current: boolean; rows: LocUnitRow[]; loose: LooseEnemy[]; total: number }
   | { kind: 'encounter'; enc: EncounterView }
   | null
+
+/** 存档内嵌的冻结故事书：立绘 / 怪物数据卡都从这里取 */
+const sb = computed<Storybook | null>(() => store.detail?.storybook ?? null)
 
 const detail = computed<Detail>(() => {
   const p = store.projection
@@ -52,14 +74,16 @@ const detail = computed<Detail>(() => {
   if (sel?.kind === 'location') {
     const l = p.locations.find(x => x.id === sel.id)
     if (!l) return null
-    const current = l.id === (scene.value?.location_id ?? '')
-    // 当前场景地点：在场人物都在这里（实例的 location_id 可能没写）。
-    // 其它地点按实例的 location_id 归属。
+    // 归属按实例 location_id（地图与在场 §6.7），实例没写时用遭遇快照的地点兜底（见 unitsAtLocation）
+    // ——不再给「当前场景地点」留近似后门。
+    const units = unitsAtLocation(p, l.id)
     return {
       kind: 'location',
       loc: l,
-      current,
-      chars: current ? store.presentChars : store.presentChars.filter(c => c.location_id === l.id),
+      current: l.id === (scene.value?.location_id ?? ''),
+      rows: locRows(units),
+      loose: units.loose,
+      total: unitCount(units),
     }
   }
   const id = sel?.kind === 'character' ? sel.id : store.controlledId
@@ -67,7 +91,48 @@ const detail = computed<Detail>(() => {
   return a ? { kind: 'character', actor: a } : null
 })
 
-const kindLabel = computed(() => {
+/** 骨架里按 id 找场景（遭遇快照的 scene_id 可能已经不是当前场景）。 */
+function sceneById(id?: string | null): SceneDef | null {
+  if (!id) return null
+  for (const ch of store.detail?.storybook.skeleton ?? []) {
+    for (const sc of ch.scenes) if (sc.id === id) return sc
+  }
+  return null
+}
+/** 遭遇快照的场景标题：骨架优先，当前场景用投影标题兜底，其余回落 id。 */
+function sceneTitleOf(id?: string | null): string {
+  if (!id) return ''
+  const sc = sceneById(id)
+  if (sc) return sc.title
+  return id === store.projection?.scene_id ? (store.projection?.scene_title ?? id) : id
+}
+function locNameOf(id?: string | null): string {
+  if (!id) return ''
+  return store.projection?.locations.find(l => l.id === id)?.name ?? id
+}
+function locKnown(id?: string | null): boolean {
+  return !!id && (store.projection?.locations ?? []).some(l => l.id === id)
+}
+/** 关联任务（goal_id）：运行时任务优先，其次骨架目标，最后回落 id。 */
+function goalOf(id?: string | null): { text: string; done: boolean } | null {
+  if (!id) return null
+  const q = (store.projection?.quests ?? []).find(x => x.id === id)
+  if (q) return { text: q.text, done: q.done }
+  for (const ch of store.detail?.storybook.skeleton ?? []) {
+    for (const sc of ch.scenes) {
+      const g = sc.goals.find(x => x.id === id)
+      if (g) return { text: g.text, done: Boolean(store.projection?.progress.goals[id]) }
+    }
+  }
+  return { text: id, done: false }
+}
+/** 遭遇引用的图鉴条目（template_ids）：名字与是否怪物来自冻结故事书。 */
+function templateOf(id: string): { id: string; name: string; monster: boolean } {
+  const c = sb.value?.characters.find(x => x.id === id)
+  return { id, name: c?.name ?? id, monster: c?.kind === 'monster' }
+}
+
+const kindLabelText = computed(() => {
   const d = detail.value
   if (!d) return ''
   return d.kind === 'character' ? '人物'
@@ -76,6 +141,27 @@ const kindLabel = computed(() => {
     : d.kind === 'encounter' ? '遭遇'
     : '地点'
 })
+
+// ---- 遭遇里的敌方单位：有实例的走数据卡，临时敌人（无 instance_id）只读 ----
+function enemyActor(en: EnemyView): CharacterInstance | null {
+  if (!en.instance_id) return null
+  return findCharacter(store.projection, en.instance_id)
+}
+function enemySelected(en: EnemyView): boolean {
+  const a = enemyActor(en)
+  return !!a && props.selected?.kind === 'character' && props.selected.id === a.instance_id
+}
+function openEnemy(en: EnemyView): void {
+  const a = enemyActor(en)
+  if (a) emit('select', { kind: 'character', id: a.instance_id })
+}
+function portraitUrl(en: EnemyView): string {
+  const p = portraitOf(sb.value, en.template_id ?? undefined, en.name)
+  return p ? assetUrl(p.asset) : ''
+}
+function hpWidth(en: EnemyView): string {
+  return en.max > 0 ? Math.max(0, Math.min(100, (en.hp / en.max) * 100)) + '%' : '0%'
+}
 </script>
 
 <template>
@@ -83,7 +169,7 @@ const kindLabel = computed(() => {
     <div class="mb-3 flex items-center gap-1.5 border-b border-border/80 px-0.5 pb-2">
       <IconInfoCircle class="size-3.5 text-primary" />
       <span class="text-[11px] font-extrabold tracking-[1.5px] text-muted-foreground uppercase">详情</span>
-      <span v-if="kindLabel" class="ml-auto rounded-full border border-border bg-muted/60 px-2 py-0.5 text-[10.5px] font-bold text-muted-foreground">{{ kindLabel }}</span>
+      <span v-if="kindLabelText" class="ml-auto rounded-full border border-border bg-muted/60 px-2 py-0.5 text-[10.5px] font-bold text-muted-foreground">{{ kindLabelText }}</span>
     </div>
 
     <!-- 人物：只读角色卡 -->
@@ -138,24 +224,106 @@ const kindLabel = computed(() => {
         <div class="flex items-start gap-2">
           <IconSwords class="mt-0.5 size-4 shrink-0 text-destructive" />
           <span class="text-[13px] leading-relaxed font-bold text-foreground">{{ detail.enc.name }}</span>
+          <span class="ml-auto shrink-0 rounded-full px-1.5 text-[10px] font-bold" :class="detail.enc.active ? 'bg-destructive/15 text-destructive' : 'bg-muted text-muted-foreground/70'">
+            {{ detail.enc.active ? '进行中' : '已结束' }}
+          </span>
         </div>
         <p v-if="detail.enc.note" class="mt-2 text-[12px] leading-relaxed text-foreground/85">{{ detail.enc.note }}</p>
+
+        <!-- 叙事与空间锚（地图 P5 §6.4）：创建时的**快照**，不在运行时重新推导 -->
+        <div v-if="detail.enc.scene_id || detail.enc.location_id || detail.enc.goal_id" class="mt-2.5 space-y-1 border-t border-border/50 pt-2">
+          <div v-if="detail.enc.scene_id" class="flex items-start gap-1.5 text-[11.5px]">
+            <IconBook2 class="mt-0.5 size-3.5 shrink-0 text-muted-foreground/60" />
+            <span class="text-muted-foreground/70">所属场景</span>
+            <span class="min-w-0 flex-1 truncate font-semibold text-foreground/90" :title="detail.enc.scene_id">{{ sceneTitleOf(detail.enc.scene_id) }}</span>
+          </div>
+          <div v-if="detail.enc.location_id" class="flex items-start gap-1.5 text-[11.5px]">
+            <IconMapPin class="mt-0.5 size-3.5 shrink-0 text-info" />
+            <span class="text-muted-foreground/70">发生地点</span>
+            <button
+              v-if="locKnown(detail.enc.location_id)"
+              type="button"
+              class="min-w-0 max-w-full cursor-pointer truncate font-semibold text-info transition-colors hover:text-primary hover:underline"
+              title="点开该地点的详情"
+              @click="emit('select', { kind: 'location', id: detail.enc.location_id })"
+            >{{ locNameOf(detail.enc.location_id) }}</button>
+            <span v-else class="min-w-0 flex-1 truncate font-semibold text-muted-foreground/70" title="地点已不存在">{{ locNameOf(detail.enc.location_id) }}（地点已不存在）</span>
+          </div>
+          <div v-if="detail.enc.goal_id" class="flex items-start gap-1.5 text-[11.5px]">
+            <IconTarget class="mt-0.5 size-3.5 shrink-0 text-primary" />
+            <span class="text-muted-foreground/70">关联任务</span>
+            <button
+              type="button"
+              class="min-w-0 max-w-full cursor-pointer truncate text-left font-semibold text-foreground/90 transition-colors hover:text-primary"
+              title="点开该任务的详情"
+              @click="emit('select', { kind: 'goal', id: detail.enc.goal_id })"
+            >{{ goalOf(detail.enc.goal_id)?.text }}</button>
+            <span v-if="goalOf(detail.enc.goal_id)?.done" class="shrink-0 rounded-full bg-success/15 px-1.5 text-[10px] font-bold text-success">已完成</span>
+          </div>
+        </div>
+
+        <!-- 涉及的图鉴条目（template_ids）：临时敌人不计入 -->
+        <div v-if="detail.enc.template_ids?.length" class="mt-2 flex flex-wrap items-center gap-1">
+          <span class="text-[10.5px] font-bold tracking-wider text-muted-foreground/55 uppercase">图鉴</span>
+          <span
+            v-for="tid in detail.enc.template_ids"
+            :key="tid"
+            class="inline-flex max-w-full items-center gap-1 rounded-full border px-1.5 py-px text-[10.5px] font-semibold"
+            :class="templateOf(tid).monster ? 'border-warning/45 bg-warning/10 text-warning' : 'border-border bg-muted/60 text-foreground/80'"
+            :title="tid"
+          >
+            <IconSkull v-if="templateOf(tid).monster" class="size-3 shrink-0" />
+            <span class="truncate">{{ templateOf(tid).name }}</span>
+          </span>
+        </div>
       </div>
       <div class="mt-3">
         <div class="mb-1.5 text-[10.5px] font-bold tracking-wider text-muted-foreground/60 uppercase">敌方单位 · {{ detail.enc.enemies.length }}</div>
         <p v-if="!detail.enc.enemies.length" class="text-[11.5px] text-muted-foreground/60">这个遭遇没有登记敌人。</p>
         <div class="space-y-2">
-          <div v-for="(en, i) in detail.enc.enemies" :key="i">
-            <div class="flex items-baseline justify-between gap-2 text-[12px]">
-              <span class="truncate text-foreground/90">{{ en.name }}<span class="ml-1.5 font-mono text-[10px] text-muted-foreground/50">{{ en.id }}</span></span>
-              <span class="shrink-0 font-mono font-bold" :class="en.hp <= 0 ? 'text-muted-foreground/50 line-through' : 'text-destructive'">
-                {{ en.hp }}<span class="font-normal text-muted-foreground/50">/{{ en.max }}</span>
+          <!-- 带 instance_id 的敌方单位：立绘 + AC + HP 血条，点开就是它的数据卡（图鉴 M2 后数据完整） -->
+          <button
+            v-for="en in detail.enc.enemies"
+            :key="en.id"
+            type="button"
+            :disabled="!enemyActor(en)"
+            :title="enemyActor(en) ? '查看 ' + en.name + ' 的数据卡' : en.name + '（临时敌人：没有实例，不能查看数据卡）'"
+            class="w-full rounded-lg border p-2 text-left transition-colors"
+            :class="enemyActor(en)
+              ? [enemySelected(en) ? 'border-primary/60 bg-primary/10' : 'border-border/70 bg-card/60 hover:border-primary/40 hover:bg-muted/40', 'cursor-pointer']
+              : 'cursor-default border-border/60 bg-muted/25'"
+            @click="openEnemy(en)"
+          >
+            <div class="flex items-center gap-2">
+              <span class="flex size-9 shrink-0 items-center justify-center overflow-hidden rounded-lg border border-border/70">
+                <img v-if="portraitUrl(en)" :src="portraitUrl(en)" :alt="en.name" class="size-full object-cover" loading="lazy" decoding="async" />
+                <span v-else class="text-[13px] font-extrabold" :class="nameTintClass(en.name)">{{ initial(en.name) }}</span>
+              </span>
+              <span class="min-w-0 flex-1">
+                <span class="flex items-baseline gap-1.5">
+                  <span class="truncate text-[12.5px] font-semibold" :class="en.hp <= 0 ? 'text-muted-foreground/60 line-through' : 'text-foreground/95'">{{ en.name }}</span>
+                  <span class="font-mono text-[10px] text-muted-foreground/50">{{ en.id }}</span>
+                  <span v-if="en.template_id" class="shrink-0 rounded-full bg-warning/15 px-1.5 text-[9.5px] font-bold text-warning">怪物</span>
+                  <span v-else class="shrink-0 rounded-full bg-muted px-1.5 text-[9.5px] font-bold text-muted-foreground/70">临时</span>
+                </span>
+                <span class="mt-1 flex items-center gap-1.5">
+                  <span class="h-1 min-w-0 flex-1 overflow-hidden rounded-full bg-muted">
+                    <span class="block h-full rounded-full bg-destructive transition-all" :style="{ width: hpWidth(en) }"></span>
+                  </span>
+                  <span class="shrink-0 font-mono text-[10.5px] font-bold" :class="en.hp <= 0 ? 'text-muted-foreground/50' : 'text-destructive'">
+                    {{ en.hp }}<span class="font-normal text-muted-foreground/50">/{{ en.max }}</span>
+                  </span>
+                </span>
+              </span>
+              <span class="flex shrink-0 flex-col items-end gap-1">
+                <span class="inline-flex items-center gap-1 rounded-full border border-border bg-muted/50 px-1.5 py-px text-[10px] font-bold text-muted-foreground" :title="'护甲等级 AC ' + en.ac">
+                  <IconShield class="size-3" />AC {{ en.ac }}
+                </span>
+                <span v-if="enemyActor(en)" class="inline-flex items-center text-[10px] font-bold text-primary">数据卡<IconChevronRight class="size-3" /></span>
+                <span v-else class="text-[10px] text-muted-foreground/50">无实例</span>
               </span>
             </div>
-            <div class="mt-0.5 h-1 overflow-hidden rounded-full bg-muted">
-              <div class="h-full rounded-full bg-destructive transition-all" :style="{ width: en.max > 0 ? Math.max(0, Math.min(100, (en.hp / en.max) * 100)) + '%' : '0%' }"></div>
-            </div>
-          </div>
+          </button>
         </div>
       </div>
     </template>
@@ -173,12 +341,19 @@ const kindLabel = computed(() => {
         <p class="mt-2 font-mono text-[10.5px] text-muted-foreground/50">{{ detail.loc.id }}</p>
       </div>
       <div class="mt-3">
-        <div class="mb-1.5 text-[10.5px] font-bold tracking-wider text-muted-foreground/60 uppercase">此处人物 · {{ detail.chars.length }}</div>
-        <p v-if="!detail.chars.length" class="text-[11.5px] text-muted-foreground/60">这里暂时没有人。</p>
-        <div v-for="c in detail.chars" :key="c.instance_id" class="flex items-center gap-2 py-0.5 text-[12px]">
-          <IconUser class="size-3.5 shrink-0 text-muted-foreground/60" />
-          <span class="truncate text-foreground/90">{{ c.name }}</span>
-          <span v-if="isControlledChar(store.controlledId, c)" class="ml-auto shrink-0 rounded-full bg-primary/12 px-1.5 text-[10px] font-bold text-primary">你</span>
+        <div class="mb-1.5 text-[10.5px] font-bold tracking-wider text-muted-foreground/60 uppercase">此处角色 · {{ detail.total }}</div>
+        <p v-if="!detail.total" class="text-[11.5px] text-muted-foreground/60">按实例位置统计，这里暂时没有角色。</p>
+        <div v-for="r in detail.rows" :key="r.instanceId" class="flex items-center gap-2 py-0.5 text-[12px]">
+          <IconUser class="size-3.5 shrink-0" :class="r.kind === 'monster' ? 'text-destructive/70' : 'text-muted-foreground/60'" />
+          <span class="truncate" :class="r.present ? 'text-foreground/90' : 'text-muted-foreground/60'">{{ r.name }}</span>
+          <span v-if="r.kind === 'monster'" class="shrink-0 rounded-full bg-destructive/12 px-1.5 text-[10px] font-bold text-destructive">怪物</span>
+          <span v-else-if="r.kind === 'npc'" class="shrink-0 rounded-full bg-muted px-1.5 text-[10px] font-bold text-muted-foreground/70">NPC</span>
+          <span v-if="r.controlled" class="ml-auto shrink-0 rounded-full bg-primary/12 px-1.5 text-[10px] font-bold text-primary">你</span>
+        </div>
+        <div v-for="e in detail.loose" :key="e.id" class="flex items-center gap-2 py-0.5 text-[12px]">
+          <IconSwords class="size-3.5 shrink-0 text-destructive/70" />
+          <span class="truncate text-muted-foreground/80">{{ e.name }}</span>
+          <span class="shrink-0 rounded-full border border-dashed border-destructive/50 px-1.5 text-[10px] font-bold text-destructive/90">临时</span>
         </div>
       </div>
     </template>

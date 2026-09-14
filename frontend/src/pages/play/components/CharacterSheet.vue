@@ -5,7 +5,7 @@
 import { computed } from 'vue'
 import { usePlayStore } from '../stores/play'
 import { assetUrl, toast } from '@/api'
-import { initial, nameTintClass, portraitOf } from '../utils'
+import { initial, kindLabel, nameTintClass, portraitOf, vitalResourceKey } from '../utils'
 import { computeDerived } from '@/lib/derived'
 import type {
   AttributeDimension, CharacterDef, CharacterInstance, Definition, FieldDef, ItemDef,
@@ -14,7 +14,7 @@ import type {
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { IconUserCheck, IconSwords, IconPackage, IconHeartbeat } from '@tabler/icons-vue'
+import { IconUserCheck, IconSwords, IconPackage, IconHeartbeat, IconSkull } from '@tabler/icons-vue'
 
 const props = defineProps<{ actor: CharacterInstance; controlled: boolean }>()
 const emit = defineEmits<{ (e: 'switch', characterId: string): void }>()
@@ -65,6 +65,25 @@ function derivedText(key: string): string {
   if (!d || d.value == null) return '—'
   return (d.signed && d.value >= 0 ? '+' : '') + d.value
 }
+
+// ---- 怪物数据卡（图鉴 M1/M2 §5.3）：展示型 statblock + 要结算的 AC / HP 投影 ----
+const isMonster = computed(() => template.value?.kind === 'monster' || props.actor.kind === 'monster')
+const statblock = computed(() => template.value?.statblock ?? null)
+/** AC：故事书 derived 里的 ac；没声明时引擎按缺省 12 处理（与 derived.rs 回落一致）。 */
+const monsterAc = computed<number | null>(() => derivedOf('ac')?.value ?? null)
+/**
+ * HP：生命资源的实例当前值 + 故事书声明的上限。
+ * 资源 id 与引擎 `vital_resource_key` 同口径——`hp` 优先，否则取 `*-hp` / `_hp`
+ * （LMoP 导入的图鉴用 `res-hp`）；写死 `resources.hp` 会让那些怪的 HP 条不显示。
+ */
+const monsterHp = computed<{ id: string; value: number; max?: number } | null>(() => {
+  const id = vitalResourceKey(props.actor.resources)
+  if (!id) return null
+  const raw = props.actor.resources[id]
+  if (raw == null) return null
+  const def = resourceDefs.value.find(r => r.id === id)
+  return { id, value: Number(raw), max: def?.type === 'numerical' ? def.default_max : undefined }
+})
 
 // ---- 挂接内容（种族 / 职业 / 背景 / 特性 / 语言…） ----
 interface KindGroup { kindKey: string; label: string; defs: Definition[]; fieldless: boolean }
@@ -148,7 +167,7 @@ async function copyId() {
         <div class="flex flex-wrap items-center gap-1.5">
           <span class="truncate text-[15px] leading-tight font-extrabold text-foreground">{{ actor.name }}</span>
           <Badge v-if="controlled" class="h-4 bg-primary px-1.5 text-[9.5px] font-extrabold text-primary-foreground">你</Badge>
-          <span class="font-mono text-[9.5px] font-semibold text-muted-foreground/70 uppercase">{{ actor.kind === 'pc' ? 'PC' : 'NPC' }}</span>
+          <span class="font-mono text-[9.5px] font-semibold text-muted-foreground/70 uppercase">{{ kindLabel(actor.kind) }}</span>
         </div>
         <div class="mt-1 flex flex-wrap gap-1">
           <span v-for="s in actor.statuses" :key="s.id" class="rounded-full border border-warning/40 bg-warning/15 px-1.5 py-px text-[10px] text-warning">
@@ -172,6 +191,38 @@ async function copyId() {
       <IconUserCheck class="mr-1 size-3.5" />
       切换为受控角色
     </Button>
+
+    <!-- 怪物数据卡（图鉴 M1/M2）：展示型 statblock + 结算用的 AC / HP -->
+    <section v-if="isMonster">
+      <h4 :class="secHead"><IconSkull class="mr-1 inline size-3 align-[-2px]" />怪物数据卡</h4>
+      <div class="space-y-1.5 rounded-lg border border-warning/40 bg-warning/10 p-2.5">
+        <div class="flex flex-wrap items-center gap-1.5">
+          <span class="inline-flex items-baseline gap-1 rounded-full border border-border bg-card/70 px-2 py-0.5 text-[11.5px]" title="护甲等级：故事书 derived 里的 ac（攻击判定的难度）">
+            <span class="text-muted-foreground/70">AC</span>
+            <span class="font-mono font-bold text-foreground">{{ monsterAc ?? 12 }}</span>
+            <span v-if="monsterAc == null" class="text-[10px] text-muted-foreground/60">缺省</span>
+          </span>
+          <span v-if="monsterHp" class="inline-flex items-baseline gap-1 rounded-full border border-border bg-card/70 px-2 py-0.5 text-[11.5px]" :title="'生命值：生命资源 ' + monsterHp.id + '（hp 优先，否则 *-hp / _hp）的实例当前值'">
+            <span class="text-muted-foreground/70">HP</span>
+            <span class="font-mono font-bold text-foreground">{{ monsterHp.value }}<span v-if="monsterHp.max != null" class="font-normal text-muted-foreground/50">/{{ monsterHp.max }}</span></span>
+            <span class="font-mono text-[9.5px] text-muted-foreground/55">{{ monsterHp.id }}</span>
+          </span>
+          <span v-if="statblock?.creatureType" class="rounded-full bg-muted/60 px-2 py-0.5 text-[11px] text-foreground/85">{{ statblock.creatureType }}</span>
+          <span v-if="statblock?.challenge" class="rounded-full bg-muted/60 px-2 py-0.5 text-[11px] text-foreground/85">CR {{ statblock.challenge }}</span>
+          <span v-if="statblock?.xp != null" class="rounded-full bg-muted/60 px-2 py-0.5 text-[11px] text-foreground/85">{{ statblock.xp }} XP</span>
+        </div>
+        <p v-if="monsterHp && monsterHp.max" class="h-1 overflow-hidden rounded-full bg-muted">
+          <span class="block h-full rounded-full bg-destructive transition-all" :style="{ width: pct(monsterHp.value, monsterHp.max) }"></span>
+        </p>
+        <p v-if="statblock?.traits" class="text-[11.5px] leading-relaxed whitespace-pre-wrap text-foreground/85">{{ statblock.traits }}</p>
+        <p v-if="statblock?.actionsNote" class="text-[11.5px] leading-relaxed whitespace-pre-wrap text-foreground/85">
+          <span class="font-bold text-muted-foreground/70">动作 · </span>{{ statblock.actionsNote }}
+        </p>
+        <p v-if="!statblock && monsterAc == null && !monsterHp" class="text-[11.5px] text-muted-foreground/70">
+          这个怪物条目还没有数据卡内容（statblock / 派生 AC / HP 资源都为空）。
+        </p>
+      </div>
+    </section>
 
     <!-- 属性（分区声明里没有属性，始终显示） -->
     <section v-if="dims.length">

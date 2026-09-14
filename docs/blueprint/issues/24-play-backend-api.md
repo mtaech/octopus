@@ -70,6 +70,9 @@ Blocked by: 03, 04, 06, 17, 20
 - 导出 = 抽单存档为独立 `.sqlite` 包；导入分配新 `save_id`。
 - `POST /rounds` 增加 `request_id` 幂等；非 idle 提交返回 `409 round_in_progress`。
 - 安全边界：只绑 `127.0.0.1`、无鉴权、导入加大小/结构上限。
+  - _修订（多账户登录落地后）_：受保护路由需要 `Authorization: Bearer`（SSE / `<img>` 用 `?token=`），
+    存档按账户隔离、故事书「草稿私有 / 已发布可开档」；绑 `0.0.0.0` 时必须前置 TLS 反代。
+    见 [账户与登录](../../auth-accounts.md)。
 
 详见 [决策记录](../decision-log-design-pass.md)。
 

@@ -1,0 +1,15 @@
+[package]
+name = "lmop-engine-check"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# 独立于仓库 workspace 的校验器 crate（inScope: scripts/）。构建命令见 story_example/lmop-import.md：
+#   CARGO_TARGET_DIR=$PWD/.scratch/lmop-engine-check-target \
+#     cargo build --manifest-path scripts/lmop-engine-check/Cargo.toml
+[workspace]
+
+[dependencies]
+octopus-engine = { path = "../../crates/octopus-engine" }
+octopus-types = { path = "../../crates/octopus-types" }
+serde_json = "1"

@@ -7,4 +7,16 @@ export type EnemySpec = { name: string, hp: bigint | null,
 /**
  * 防御值（缺省 12：越高越难打中）
  */
-ac: bigint | null, };
+ac: bigint | null, 
+/**
+ * 图鉴引用（图鉴 M1）：命中 storybook.characters[] 中 kind='monster' 的条目 id。
+ */
+template_id?: string | null, 
+/**
+ * 展开数量（默认 1）：3 只地精 = 1 条 template_id + count=3。
+ */
+count?: number | null, 
+/**
+ * 覆盖攻击技能（缺省用图鉴条目的第一个攻击技能）。
+ */
+skill_id?: string | null, };
