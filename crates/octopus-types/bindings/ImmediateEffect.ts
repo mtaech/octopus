@@ -3,4 +3,4 @@
 /**
  * 即时效果（#12 ③）。数量字段支持骰子表达式（如 2d6+3）。
  */
-export type ImmediateEffect = { "kind": "damage", amount: string, resource?: string | null, } | { "kind": "heal", amount: string, resource?: string | null, } | { "kind": "modify_resource", resource: string, amount: string, } | { "kind": "set_flag", flag: string, };
+export type ImmediateEffect = { "kind": "damage", amount: string, resource?: string | null, } | { "kind": "heal", amount: string, resource?: string | null, } | { "kind": "modify_resource", resource: string, amount: string, } | { "kind": "set_flag", flag: string, value?: unknown, };
